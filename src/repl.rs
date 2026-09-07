@@ -250,6 +250,10 @@ struct App {
     // arrangement. `None` on a system that would not give us one, which
     // costs the warning and nothing else.
     file_watcher: Option<crate::watch::Watcher>,
+    /// Debug sessions driven over the Debug Adapter Protocol, keyed the
+    /// same way `debug_frames` keys the bish-script ones. A buffer has
+    /// at most one of either.
+    dap_frames: HashMap<EditFrameId, DapFrame>,
     term_rows: usize,
     term_cols: usize,
 }
@@ -459,6 +463,7 @@ pub fn run(mut shell: Shell, start_promoted: bool) {
         registers: Registers::new(),
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
+        dap_frames: HashMap::new(),
         term_rows,
         term_cols,
     };
@@ -1646,6 +1651,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         registers: Registers::new(),
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
+        dap_frames: HashMap::new(),
         term_rows,
         term_cols,
     };
@@ -3770,6 +3776,109 @@ fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, R
 // own editor pane, if `:dbg` has attached a session -- `None` before
 // the first `:dbg` run, or after `:dbg quit`/the file closing removed
 // it.
+// A debug session driven over the Debug Adapter Protocol -- the other
+// kind of `:dbg`, for a program in a language bish knows nothing about.
+//
+// `debugger::DebugSession` is the bish-script one and stays what it is:
+// it runs the script *in this process* so that breakpoints are visible
+// inside subshells, and a pause blocks in place inside the run. This
+// one cannot work that way and must not: the adapter is a subprocess
+// that sends events whenever it likes, so the session is polled from
+// the editor's own idle tick (`sync_debug_adapter`) and the editor
+// stays live the whole time. Stopping is something that *arrives*, not
+// something that blocks.
+struct DapFrame {
+    session: crate::dapclient::Session,
+    /// What is being debugged, for the status line -- the adapter takes
+    /// a program, not the source file being looked at.
+    program: String,
+    /// The thread the last stop was on, which every step command needs
+    /// and which only a `stopped` event can say.
+    thread: Option<i64>,
+    /// The stack as of the last stop, innermost first. Empty while
+    /// running.
+    frames: Vec<crate::dap::StackFrame>,
+    /// The `stackTrace` request whose answer is still coming, so the
+    /// idle tick knows to look for it.
+    awaiting_stack: Option<i64>,
+    /// A `print`/`locals` answer being waited on, and what to label it
+    /// with when it lands.
+    awaiting_answer: Option<(i64, String)>,
+    /// Set when a stop has been seen but the cursor has not been moved
+    /// to it yet -- the move happens once the stack arrives, since only
+    /// that says which line.
+    landing: bool,
+}
+
+impl DapFrame {
+    /// The frame the user is looking at, which is the innermost one.
+    /// Everything that takes a `frameId` -- `scopes`, `evaluate` --
+    /// means this one.
+    fn current_frame(&self) -> Option<i64> {
+        self.frames.first().map(|f| f.id)
+    }
+
+    fn describe_stop(&self) -> String {
+        match self.frames.first() {
+            Some(frame) => {
+                let reason = match self.session.execution() {
+                    crate::dapclient::Execution::Stopped(stop) => stop.reason.clone(),
+                    crate::dapclient::Execution::Running => "running".to_string(),
+                };
+                let where_ = match &frame.source_path {
+                    Some(path) => format!("{}:{}", path.rsplit('/').next().unwrap_or(path), frame.line),
+                    None => format!("{}:{}", frame.name, frame.line),
+                };
+                format!("bish: dbg: {reason} in {} ({where_})", frame.name)
+            }
+            None => "bish: dbg: stopped".to_string(),
+        }
+    }
+}
+
+/// `[--adapter=COMMAND] PROGRAM` -- the arguments `:dbg launch` takes.
+///
+/// `None` when there is no program, which is the only thing that is
+/// genuinely required: an adapter has a default for the languages that
+/// have one, and a program does not.
+///
+/// **The program is the last word**, and an `--adapter=` runs from
+/// where it starts to just before it. That rule exists because an
+/// adapter is a command *line* and not a word -- `gdb -i=dap` is two,
+/// `lldb-dap --port 0` is three -- and any rule that stopped at the
+/// first space would make the commonest adapter unspellable.
+///
+/// Quoting is deliberately not implemented: a path with a space in it
+/// would need it, and this says so rather than pretending, because a
+/// half-working quote is worse than none.
+fn parse_launch_arguments(rest: &str) -> Option<(Option<Vec<String>>, String)> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let (program, before) = words.split_last()?;
+    if program.starts_with("--adapter=") {
+        return None; // an adapter and no program to run under it
+    }
+    let adapter = before
+        .first()
+        .and_then(|w| w.strip_prefix("--adapter="))
+        .map(|first| std::iter::once(first).chain(before[1..].iter().copied()).map(str::to_string).collect());
+    Some((adapter, program.to_string()))
+}
+
+/// The adapter to run for a language, when the user did not name one.
+///
+/// Deliberately tiny, and deliberately not a configuration mechanism
+/// yet: `gdb` has spoken this protocol since version 14, it is on
+/// almost every machine that has a compiler, and it debugs all three of
+/// these. Anything else is named on the command line
+/// (`:dbg launch --adapter=... PROGRAM`), which is what the registry
+/// would generalise once it is clear what people actually type.
+fn default_debug_adapter(language: &str) -> Option<Vec<String>> {
+    match language {
+        "c" | "cpp" | "c++" | "rust" | "go" | "zig" => Some(vec!["gdb".to_string(), "-i=dap".to_string()]),
+        _ => None,
+    }
+}
+
 fn debug_run_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::DebugRun(edit_frame_id))).map(|p| p.id)
 }
@@ -6528,6 +6637,11 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     let recoloured = sync_semantic_tokens(&mut app.sessions, session_id, buf);
     let reprogressed = sync_language_server_progress(&mut app.sessions, session_id, buf);
     let rewatched = sync_watched_file(app.file_watcher.as_mut(), buf);
+    // A debug adapter is deliberately *not* serviced here. This is the
+    // idle tick of Insert mode, and a program that hits a breakpoint
+    // while somebody is typing must not move the cursor out from under
+    // them -- the stop is noticed on the next tick in Normal mode,
+    // which is where every other `:dbg` answer appears anyway.
     // Insert mode too: the marks follow the cursor, and typing moves it.
     let remarked = sync_document_highlights(&mut app.sessions, session_id, buf);
     let rehinted = sync_inlay_hints(&mut app.sessions, session_id, buf);
@@ -6776,6 +6890,9 @@ fn run_normal_mode_navigation(
                 diagnosed |= sync_semantic_tokens(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_language_server_progress(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_watched_file(app.file_watcher.as_mut(), tb);
+                if let Some(id) = edit_frame_id {
+                    diagnosed |= sync_debug_adapter(app, id, tb);
+                }
                 diagnosed |= sync_document_highlights(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_inlay_hints(&mut app.sessions, session_id, tb);
             }
@@ -8590,6 +8707,143 @@ fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState
 // This is the named risk of the whole feature made visible: a cold
 // server answers nothing, and until now every `K` against one cost a
 // full `lsp_timeout_ms` with no hint that waiting would have helped.
+// Advances a Debug Adapter Protocol session by whatever has arrived,
+// and lands the cursor when the program stops.
+//
+// The whole reason this is an idle-tick job rather than a loop of its
+// own: an adapter sends events when it feels like it, and the editor
+// has to stay usable in between. A stop arrives here, the stack is
+// asked for, and the *next* tick moves the cursor -- two ticks, because
+// only the stack says which line, and waiting for it inline would be
+// the blocking read this design exists to avoid.
+//
+// Returns true when something changed that the screen should show.
+fn sync_debug_adapter(app: &mut App, edit_frame_id: EditFrameId, buf: &mut TextBuffer) -> bool {
+    if !app.dap_frames.contains_key(&edit_frame_id) {
+        return false;
+    }
+    // The pane the program's own output belongs in, resolved before the
+    // frame is borrowed -- both live on `app`.
+    let screen = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
+        .map(|pane_id| app.windows[app.current_window].pane(pane_id).owning_session())
+        .and_then(|sid| app.sessions.get(&sid))
+        .map(|session| Rc::clone(&session.screen));
+    let frame = app.dap_frames.get_mut(&edit_frame_id).expect("checked");
+    advance_debug_adapter(frame, buf, screen.as_ref())
+}
+
+/// The half of `sync_debug_adapter` that is only about the session --
+/// separated from the pane arithmetic so it can be driven by a test
+/// against a real adapter, which is the only way any of this was ever
+/// going to be right.
+fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Option<&Rc<RefCell<vt100::Screen>>>) -> bool {
+    let events = frame.session.service();
+    let mut changed = false;
+
+    // The program's own output goes to the debug-run pane, which is
+    // what that pane is for -- fed to it as terminal bytes, since it is
+    // a terminal grid and the program may well be writing escape
+    // sequences into it. A bare newline becomes a carriage return and
+    // one, because a grid moves down but not back.
+    let output = frame.session.take_output();
+    if !output.is_empty() {
+        if let Some(screen) = screen {
+            let mut screen = screen.borrow_mut();
+            for piece in output.iter().filter(|o| o.category != "console") {
+                screen.feed(piece.output.replace('\n', "\r\n").as_bytes());
+            }
+        }
+        changed = true;
+    }
+
+    for event in &events {
+        let crate::dap::Message::Event { event, .. } = event else { continue };
+        match event.as_str() {
+            "stopped" => {
+                if let crate::dapclient::Execution::Stopped(stop) = frame.session.execution() {
+                    frame.thread = stop.thread_id;
+                }
+                frame.frames.clear();
+                if let Some(thread) = frame.thread {
+                    frame.awaiting_stack = Some(frame.session.stack_trace(thread));
+                    frame.landing = true;
+                }
+                changed = true;
+            }
+            "continued" => {
+                frame.frames.clear();
+                changed = true;
+            }
+            "terminated" | "exited" => {
+                buf.echoed_message = Some(match frame.session.exit_code() {
+                    Some(code) => format!("bish: dbg: {} exited with status {code}", frame.program),
+                    None => format!("bish: dbg: {} ended", frame.program),
+                });
+                frame.frames.clear();
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    // The stack, when it lands: this is what says where the cursor
+    // goes.
+    if let Some(seq) = frame.awaiting_stack
+        && let Some(answer) = frame.session.take_response(seq)
+    {
+        frame.awaiting_stack = None;
+        if let Ok(body) = answer {
+            frame.frames = crate::dap::stack_frames(&body);
+        }
+        if frame.landing {
+            frame.landing = false;
+            let notice = frame.describe_stop();
+            // Only when the stop is in *this* file. A breakpoint inside
+            // a library moves the cursor nowhere, because there is
+            // nothing here to move it to -- and jumping to a line
+            // number that belongs to another file would be worse than
+            // staying put.
+            let here = buf.path().map(|p| p.to_path_buf());
+            if let (Some(here), Some(top)) = (here, frame.frames.first())
+                && top.source_path.as_deref().map(std::path::Path::new).is_some_and(|p| same_file(p, &here))
+            {
+                let row = top.line.saturating_sub(1).min(buf.line_count().saturating_sub(1));
+                buf.set_cursor(row, 0);
+            }
+            buf.echoed_message = Some(notice);
+        }
+        changed = true;
+    }
+
+    // An answer somebody asked for from the command line, once the
+    // adapter has it.
+    if let Some((seq, label)) = frame.awaiting_answer.clone()
+        && let Some(answer) = frame.session.take_response(seq)
+    {
+        frame.awaiting_answer = None;
+        buf.echoed_message = Some(match answer {
+            Ok(body) => format!("{label} = {}", crate::dap::evaluated(&body).result),
+            Err(why) => format!("{label}: {why}"),
+        });
+        changed = true;
+    }
+
+    changed
+}
+
+/// Whether two paths name the same file, without insisting they were
+/// spelled the same way. An adapter reports the path it was given,
+/// which need not be the one the editor opened.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 // Keeps a watch on the file behind `buf`, and says so when it changes.
 //
 // The check itself is a hash of the file's contents, exactly as `:w`'s
@@ -11852,6 +12106,215 @@ fn run_command_mode(
                                 // own top-of-file doc comment). Kept here,
                                 // sharing the name, purely for an honest
                                 // error instead of "unknown subcommand".
+                                // `:dbg launch [--adapter=CMD] PROGRAM`
+                                // -- the Debug Adapter Protocol half.
+                                // A separate verb from bare `:dbg`
+                                // because it debugs a *program*, not
+                                // this file: the source on screen is
+                                // what the adapter reports positions
+                                // in, and the thing that runs is
+                                // whatever was built from it.
+                                "launch" => {
+                                    if app.debug_frames.contains_key(&edit_frame_id) {
+                                        show_command_mode_error(
+                                            "bish: dbg: this buffer already has a script debug session -- :dbg quit first",
+                                            app.term_rows,
+                                            app.term_cols,
+                                        );
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                    let (adapter, program) = match subarg.and_then(parse_launch_arguments) {
+                                        Some(parsed) => parsed,
+                                        None => {
+                                            show_command_mode_error(
+                                                "bish: dbg: usage: dbg launch [--adapter=COMMAND] PROGRAM",
+                                                app.term_rows,
+                                                app.term_cols,
+                                            );
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    };
+                                    let language = fileeditor::language_of(tb);
+                                    let Some(adapter): Option<Vec<String>> = adapter.or_else(|| default_debug_adapter(&language)) else {
+                                        show_command_mode_error(
+                                            &format!("bish: dbg: no debug adapter known for {language} -- name one with --adapter=COMMAND"),
+                                            app.term_rows,
+                                            app.term_cols,
+                                        );
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    // Relative to the file being
+                                    // debugged, not to the shell: `:dbg
+                                    // launch ./prog` beside the source
+                                    // is what anyone would type, and
+                                    // the pane's own cwd may be
+                                    // anywhere.
+                                    let base = tb.path().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."));
+                                    let program_path = base.join(&program);
+                                    let program_path = std::fs::canonicalize(&program_path).unwrap_or(program_path);
+                                    let launch = crate::json::Value::Object(vec![
+                                        ("program".to_string(), crate::json::Value::Str(program_path.to_string_lossy().into_owned())),
+                                        ("cwd".to_string(), crate::json::Value::Str(base.to_string_lossy().into_owned())),
+                                    ]);
+                                    let mut session = match crate::dapclient::Session::start(&adapter, &base, launch) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            show_command_mode_error(&format!("bish: dbg: {e}"), app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    };
+                                    // Whatever is already marked in the
+                                    // gutter. Recorded now and sent by
+                                    // the session when the adapter says
+                                    // it is ready for them -- which is
+                                    // why they can be set before there
+                                    // is anything to set them on.
+                                    if let Some(path) = tb.path() {
+                                        let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
+                                        session.set_breakpoints(path, &lines);
+                                    }
+                                    let pane_id = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
+                                        .unwrap_or_else(|| split_debug_run_pane(app, edit_frame_id).0);
+                                    let sid = app.windows[app.current_window].pane(pane_id).owning_session();
+                                    render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, &format!("{} -- running", program));
+                                    app.dap_frames.insert(
+                                        edit_frame_id,
+                                        DapFrame {
+                                            session,
+                                            program: program.clone(),
+                                            thread: None,
+                                            frames: Vec::new(),
+                                            awaiting_stack: None,
+                                            awaiting_answer: None,
+                                            landing: false,
+                                        },
+                                    );
+                                    compositor_redraw(app);
+                                    let output = format!("{}: launched under {}", program, adapter.join(" "));
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // The step commands, when the session is
+                                // an adapter's. The bish-script debugger
+                                // answers these from inside its own
+                                // paused run instead -- see the arm
+                                // below, which is what is left when
+                                // neither applies.
+                                "continue" | "next" | "step" | "out" | "finish"
+                                    if subarg.is_none() && app.dap_frames.contains_key(&edit_frame_id) =>
+                                {
+                                    let frame = app.dap_frames.get_mut(&edit_frame_id).expect("checked");
+                                    let Some(thread) = frame.thread else {
+                                        show_command_mode_error("bish: dbg: not stopped yet", app.term_rows, app.term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    match subcmd {
+                                        "continue" => frame.session.resume(thread),
+                                        "next" => frame.session.step_over(thread),
+                                        "step" => frame.session.step_into(thread),
+                                        _ => frame.session.step_out(thread),
+                                    };
+                                    frame.frames.clear();
+                                    let output = format!("{subcmd}...");
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // `:dbg print EXPR` against an adapter
+                                // is `evaluate`, and the answer arrives
+                                // later -- so the request goes out here
+                                // and `sync_debug_adapter` shows what
+                                // comes back.
+                                "print" | "p" if app.dap_frames.contains_key(&edit_frame_id) => {
+                                    let Some(expression) = subarg else {
+                                        show_command_mode_error("bish: dbg: usage: dbg print EXPRESSION", app.term_rows, app.term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    };
+                                    let frame = app.dap_frames.get_mut(&edit_frame_id).expect("checked");
+                                    let at = frame.current_frame();
+                                    // `watch`, not `repl`. The context
+                                    // is not decoration: gdb reads a
+                                    // `repl` evaluation as a *debugger
+                                    // command*, so `a + b` comes back
+                                    // as `Ambiguous command "a + b":
+                                    // actions, add-auto-load-...`
+                                    // rather than as 1. Every other
+                                    // context evaluates it as an
+                                    // expression, which is what
+                                    // `:dbg print` means.
+                                    let seq = frame.session.evaluate(expression, at, "watch");
+                                    frame.awaiting_answer = Some((seq, expression.to_string()));
+                                    let output = format!("{expression}...");
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                // Where the program is, and how it got
+                                // there. Answered from what the last
+                                // stop already fetched, so it costs
+                                // nothing and is always current.
+                                "where" | "bt" if app.dap_frames.contains_key(&edit_frame_id) => {
+                                    let frame = &app.dap_frames[&edit_frame_id];
+                                    let output = match frame.frames.is_empty() {
+                                        true => "running -- not stopped anywhere".to_string(),
+                                        false => frame
+                                            .frames
+                                            .iter()
+                                            .map(|f| match &f.source_path {
+                                                Some(path) => format!("{} at {}:{}", f.name, path.rsplit('/').next().unwrap_or(path), f.line),
+                                                None => f.name.clone(),
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                    };
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                "quit" | "q" if subarg.is_none() && app.dap_frames.contains_key(&edit_frame_id) => {
+                                    if let Some(mut frame) = app.dap_frames.remove(&edit_frame_id) {
+                                        frame.session.terminate();
+                                        // One tick so the request
+                                        // actually reaches the adapter
+                                        // before the session is dropped
+                                        // -- and dropping it kills the
+                                        // adapter, so a terminate it
+                                        // never saw would be a
+                                        // discourtesy rather than a
+                                        // shutdown.
+                                        frame.session.service();
+                                    }
+                                    if let Some(pane_id) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id) {
+                                        close_pane(&mut app.windows[app.current_window], pane_id);
+                                        close_orphaned_sessions(&mut app.sessions, &app.windows);
+                                    }
+                                    compositor_redraw(app);
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: String::new(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output: String::new(), status: 0 };
+                                }
                                 "continue" | "next" | "step" if subarg.is_none() => {
                                     show_command_mode_error(
                                         "bish: dbg: not paused -- these only work while stopped at a breakpoint",
@@ -11862,12 +12325,19 @@ fn run_command_mode(
                                     continue;
                                 }
                                 // `:dbg break [line]` / `:dbg break add|remove N`.
+                                //
+                                // Works with no session at all, which
+                                // it did not used to. A breakpoint is a
+                                // mark on a line meaning "stop here
+                                // when something runs this", and the
+                                // gutter already draws it; requiring an
+                                // attachment first was an artificial
+                                // order to do things in. `:dbg launch`
+                                // made that visible -- the marks have
+                                // to be settable *before* the program
+                                // runs, because the first stop is the
+                                // one worth having.
                                 "break" => {
-                                    if !app.debug_frames.contains_key(&edit_frame_id) {
-                                        show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", app.term_rows, app.term_cols);
-                                        buffer.clear();
-                                        continue;
-                                    }
                                     let output = match subarg {
                                         None => {
                                             let line = tb.cursor().0 + 1;
@@ -11932,6 +12402,14 @@ fn run_command_mode(
                                             }
                                         }
                                     };
+                                    // A live adapter is told at once:
+                                    // `setBreakpoints` replaces a
+                                    // file's whole set, so what it
+                                    // needs is the set, not the change.
+                                    if let (Some(frame), Some(path)) = (app.dap_frames.get_mut(&edit_frame_id), tb.path()) {
+                                        let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
+                                        frame.session.set_breakpoints(path, &lines);
+                                    }
                                     app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: output.clone(),
@@ -11992,7 +12470,7 @@ fn run_command_mode(
                                 _ => {
                                     show_command_mode_error(
                                         &format!(
-                                            "bish: dbg: unknown subcommand '{subcmd}' (expected: run, break, continue, next, step, print, quit, help)"
+                                            "bish: dbg: unknown subcommand '{subcmd}' (expected: launch, run, break, continue, next, step, out, print, where, quit, help)"
                                         ),
                                         app.term_rows,
                                         app.term_cols,
@@ -14429,5 +14907,231 @@ mod watched_file_tests {
         let mut watcher = crate::watch::Watcher::new().unwrap();
         assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
         assert!(!sync_watched_file(None, &mut buf), "and no watcher at all is not an error either");
+    }
+}
+
+#[cfg(test)]
+mod debug_adapter_tests {
+    use super::*;
+
+    /// Same skip-rather-than-fail contract the dapclient tests have:
+    /// this needs a C compiler and a gdb new enough to speak DAP.
+    fn fixture(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        std::process::Command::new("gdb")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success()
+            .then_some(())?;
+        let dir = std::env::temp_dir().join(format!("bish-dbg-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let source = dir.join("prog.c");
+        std::fs::write(
+            &source,
+            "#include <stdio.h>\nint add(int a, int b) { int s = a + b; return s; }\nint main(void) {\n    int total = 0;\n    for (int i = 1; i <= 3; i++) { total = add(total, i); }\n    printf(\"%d\\n\", total);\n    return 0;\n}\n",
+        )
+        .ok()?;
+        let program = dir.join("prog");
+        std::process::Command::new("cc")
+            .args(["-g", "-O0", "-o"])
+            .arg(&program)
+            .arg(&source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success()
+            .then_some((dir, source, program))
+    }
+
+    fn launched(source: &Path, program: &Path, breakpoints: &[usize]) -> Option<(DapFrame, TextBuffer)> {
+        let mut buf = TextBuffer::open(source, 20).ok()?;
+        for line in breakpoints {
+            buf.breakpoints.insert(*line);
+        }
+        let dir = source.parent().expect("a directory");
+        let launch = crate::json::Value::Object(vec![
+            ("program".to_string(), crate::json::Value::Str(program.to_string_lossy().into_owned())),
+            ("cwd".to_string(), crate::json::Value::Str(dir.to_string_lossy().into_owned())),
+        ]);
+        let mut session = crate::dapclient::Session::start(&["gdb".to_string(), "-i=dap".to_string()], dir, launch).expect("gdb starts");
+        session.set_breakpoints(source, breakpoints);
+        Some((
+            DapFrame {
+                session,
+                program: program.file_name()?.to_string_lossy().into_owned(),
+                thread: None,
+                frames: Vec::new(),
+                awaiting_stack: None,
+                awaiting_answer: None,
+                landing: false,
+            },
+            buf,
+        ))
+    }
+
+    /// Ticks the way the editor's own idle loop does, until `done`.
+    fn until(
+        frame: &mut DapFrame,
+        buf: &mut TextBuffer,
+        screen: Option<&Rc<RefCell<vt100::Screen>>>,
+        seconds: u64,
+        done: impl Fn(&DapFrame, &TextBuffer) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        while std::time::Instant::now() < deadline {
+            advance_debug_adapter(frame, buf, screen);
+            if done(frame, buf) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// The whole point of the feature: a program stops, and the cursor
+    /// is sitting on the line it stopped at.
+    #[test]
+    fn a_stop_lands_the_cursor_on_the_line_it_stopped_at() {
+        let Some((dir, source, program)) = fixture("land") else { return };
+        let (mut frame, mut buf) = launched(&source, &program, &[2]).expect("a session");
+        assert_eq!(buf.cursor().0, 0, "the cursor starts at the top");
+
+        let landed = until(&mut frame, &mut buf, None, 20, |f, _| !f.frames.is_empty());
+        let cursor = buf.cursor().0;
+        let notice = buf.echoed_message.clone();
+        let names: Vec<String> = frame.frames.iter().map(|f| f.name.clone()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(landed, "never stopped: {:?}", frame.session.log());
+        // Line 2 of the file is `int add(...)`, and the cursor counts
+        // from zero.
+        assert_eq!(cursor, 1, "the cursor did not move to the breakpoint");
+        assert_eq!(names.first().map(String::as_str), Some("add"), "{names:?}");
+        let notice = notice.expect("the status line says where it is");
+        assert!(notice.contains("breakpoint"), "{notice}");
+        assert!(notice.contains("add"), "{notice}");
+        assert!(notice.contains("prog.c:2"), "{notice}");
+    }
+
+    // A breakpoint set before there is anything to set it on: the marks
+    // go in the gutter first, and the session sends them when the
+    // adapter says it is ready. This is why `:dbg break` no longer
+    // insists on being attached first.
+    #[test]
+    fn breakpoints_set_before_the_program_ran_are_the_ones_that_stop_it() {
+        let Some((dir, source, program)) = fixture("early") else { return };
+        // Line 4 is `int total = 0;`, the first statement of `main`.
+        let (mut frame, mut buf) = launched(&source, &program, &[4]).expect("a session");
+        let landed = until(&mut frame, &mut buf, None, 20, |f, _| !f.frames.is_empty());
+        let (cursor, top) = (buf.cursor().0, frame.frames.first().map(|f| f.name.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(landed, "never stopped: {:?}", frame.session.log());
+        assert_eq!(cursor, 3);
+        assert_eq!(top.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn an_evaluated_expression_comes_back_to_the_status_line() {
+        let Some((dir, source, program)) = fixture("evaluate") else { return };
+        let (mut frame, mut buf) = launched(&source, &program, &[2]).expect("a session");
+        assert!(until(&mut frame, &mut buf, None, 20, |f, _| !f.frames.is_empty()), "{:?}", frame.session.log());
+
+        // What `:dbg print a + b` does: send it, then let the idle tick
+        // pick the answer up.
+        let at = frame.current_frame();
+        let seq = frame.session.evaluate("a + b", at, "watch");
+        frame.awaiting_answer = Some((seq, "a + b".to_string()));
+        let answered = until(&mut frame, &mut buf, None, 10, |f, _| f.awaiting_answer.is_none());
+        let shown = buf.echoed_message.clone();
+
+        // And a refusal reaches the user as the debugger's own words.
+        let seq = frame.session.evaluate("no_such_symbol", at, "watch");
+        frame.awaiting_answer = Some((seq, "no_such_symbol".to_string()));
+        let refused = until(&mut frame, &mut buf, None, 10, |f, _| f.awaiting_answer.is_none());
+        let refusal = buf.echoed_message.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(answered);
+        assert_eq!(shown.as_deref(), Some("a + b = 1"), "add(0, 1) on the first call");
+        assert!(refused);
+        assert!(refusal.is_some_and(|r| r.to_lowercase().contains("no symbol")), "the debugger's own words");
+    }
+
+    // Program output belongs in the debug-run pane, and a bare newline
+    // has to become a carriage return and one -- a terminal grid moves
+    // down but not back, so without that the second line starts where
+    // the first ended.
+    #[test]
+    fn the_programs_own_output_reaches_the_run_pane() {
+        let Some((dir, source, program)) = fixture("output") else { return };
+        let (mut frame, mut buf) = launched(&source, &program, &[]).expect("a session");
+        let screen = Rc::new(RefCell::new(vt100::Screen::new(10, 40)));
+        let ran = until(&mut frame, &mut buf, Some(&screen), 20, |_, b| {
+            b.echoed_message.as_deref().is_some_and(|m| m.contains("exited") || m.contains("ended"))
+        });
+        let painted: String = {
+            let screen = screen.borrow();
+            (0..screen.size().0).map(|row| screen.row_text(row)).collect()
+        };
+        let notice = buf.echoed_message.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(ran, "the program never finished: {:?}", frame.session.log());
+        assert!(painted.contains('6'), "0+1+2+3, printed by the program: {painted:?}");
+        // The message names the program, not just "the program".
+        assert!(notice.is_some_and(|n| n.contains("prog")), "the exit message names what exited");
+    }
+
+    // A stop in a file that is not the one on screen moves nothing.
+    // Jumping to a line number belonging to another file would be worse
+    // than staying put.
+    #[test]
+    fn a_stop_somewhere_else_leaves_the_cursor_alone() {
+        let Some((dir, source, program)) = fixture("elsewhere") else { return };
+        let (mut frame, mut _unused) = launched(&source, &program, &[2]).expect("a session");
+        // The buffer is pointed at a different file than the one the
+        // adapter will report, which is the situation a breakpoint
+        // inside a library produces.
+        let other = dir.join("other.c");
+        std::fs::write(&other, "int main(void) { return 0; }\n").unwrap();
+        let mut elsewhere = TextBuffer::open(&other, 20).unwrap();
+        elsewhere.set_cursor(0, 0);
+
+        let landed = until(&mut frame, &mut elsewhere, None, 20, |f, _| !f.frames.is_empty());
+        let cursor = elsewhere.cursor().0;
+        let notice = elsewhere.echoed_message.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(landed, "{:?}", frame.session.log());
+        assert_eq!(cursor, 0, "the cursor stayed where it was");
+        // It still says what happened, which is the part that is useful
+        // wherever the stop was.
+        assert!(notice.is_some_and(|n| n.contains("add")), "the stop is still reported");
+    }
+
+    #[test]
+    fn launch_arguments_are_read_the_way_they_are_typed() {
+        assert_eq!(parse_launch_arguments("./prog"), Some((None, "./prog".to_string())));
+        assert_eq!(parse_launch_arguments("--adapter=lldb-dap ./prog"), Some((Some(vec!["lldb-dap".to_string()]), "./prog".to_string())));
+        assert_eq!(
+            parse_launch_arguments("--adapter=gdb -i=dap ./prog").map(|(a, _)| a),
+            Some(Some(vec!["gdb".to_string(), "-i=dap".to_string()])),
+            "an adapter is a command line, not a word"
+        );
+        // A program is the one thing with no default.
+        assert_eq!(parse_launch_arguments("--adapter=gdb"), None);
+        assert_eq!(parse_launch_arguments(""), None);
+    }
+
+    #[test]
+    fn a_language_with_no_known_adapter_says_so_rather_than_guessing() {
+        assert_eq!(default_debug_adapter("c"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
+        assert_eq!(default_debug_adapter("rust"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
+        assert_eq!(default_debug_adapter("python"), None);
+        assert_eq!(default_debug_adapter("bash"), None, "bish debugs its own scripts, and not through an adapter");
     }
 }
