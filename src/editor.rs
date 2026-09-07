@@ -191,6 +191,19 @@ impl MouseEvent {
         self.pressed && self.button & 0x40 == 0 && self.button & 0x20 != 0 && self.button & 0x03 == 0
     }
 
+    // Motion with no button held -- the mouse simply passing over a
+    // cell. Terminals send these only once "any-event" tracking is on
+    // (DECSET 1003, which `mouse_hover` asks for and the rest of the
+    // shell does not), so this is silent for anyone who has turned that
+    // off.
+    //
+    // The low two bits are the button, and 3 is their "none" -- the
+    // same encoding a release uses, which is why the motion bit is what
+    // separates the two here.
+    pub fn is_hover(&self) -> bool {
+        self.pressed && self.button & 0x40 == 0 && self.button & 0x20 != 0 && self.button & 0x03 == 0x03
+    }
+
     // Any button release. The final byte is what distinguishes it, not
     // the button bits -- xterm reports which button was let go, but
     // nothing here needs to know.
@@ -3907,6 +3920,26 @@ mod tests {
         let coloured = "a\u{1f468}\x1b[1m\u{200d}\u{1f469}\x1b[0m";
         assert_eq!(truncate_visible(coloured, 3), coloured);
         assert_eq!(truncate_visible(coloured, 2), "a", "the pair does not fit, so none of it goes");
+    }
+
+    // The four kinds of report that share one encoding, told apart by
+    // the motion bit and the low two. Hover is the one that needs
+    // DECSET 1003 to arrive at all, and it looks exactly like a release
+    // except for the motion bit -- which is why that is what separates
+    // them here.
+    #[test]
+    fn a_motion_with_no_button_is_a_hover_and_nothing_else_is() {
+        let ev = |button| MouseEvent { button, col: 1, row: 1, pressed: true };
+        assert!(ev(35).is_hover(), "32 (motion) + 3 (no button)");
+        assert!(!ev(35).is_left_click());
+        assert!(!ev(35).is_left_drag());
+
+        assert!(!ev(0).is_hover(), "a plain left press");
+        assert!(ev(32).is_left_drag(), "32 is motion with the left button held");
+        assert!(!ev(32).is_hover(), "...which is a drag, not a hover");
+        assert!(!ev(64).is_hover(), "a wheel notch");
+        // A release carries the same "no button" bits and no motion.
+        assert!(!MouseEvent { button: 3, col: 1, row: 1, pressed: false }.is_hover());
     }
 
     #[test]

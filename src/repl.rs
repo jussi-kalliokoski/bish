@@ -6866,6 +6866,15 @@ fn run_normal_mode_navigation(
     // terminal keeps its own click-and-drag selection.
     let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
     let _guard = term::RawGuard::enable_maybe_mouse(0, mouse)?;
+    // `mouse_hover`: motion reports with no button held, which is the
+    // only way a terminal can say where the pointer is *resting*.
+    //
+    // Not asked for in `RawGuard` with the rest of the mouse, and not
+    // just switched on for the length of this call: this same loop also
+    // drives a plain prompt, where nothing reads these and they are a
+    // report per cell of pure traffic. So it follows the buffer --
+    // see the `set` at the top of the loop below.
+    let hover_wanted = mouse && app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse_hover"));
     // Repaints the whole screen first -- necessary the very first time
     // normal mode ever triggers promotion (the alternate screen buffer
     // starts out blank), harmless otherwise -- then this pane's own
@@ -6897,6 +6906,16 @@ fn run_normal_mode_navigation(
     // too late.
     let mut click_streak: u32 = 0;
     let mut ranged_selection = false;
+    // Where the pointer came to rest and when, for hover -- and whether
+    // a popup is currently on screen because of it.
+    //
+    // A dwell rather than acting on the motion itself: the terminal
+    // reports every cell the pointer crosses, and looking each one up
+    // would ask a language server a question per cell of a sweep across
+    // the screen. Waiting for the pointer to *stop* is also what makes
+    // it a hover rather than a flicker -- see `HOVER_DWELL`.
+    let mut hover_at: Option<(std::time::Instant, u16, u16)> = None;
+    let mut hover_shown = false;
     // What `gd` (or `gy`/`gD`) last found, which one the cursor is on,
     // and which question was asked -- the last so that cycling through
     // the answers says "type definition 2/3" rather than mislabelling
@@ -6936,7 +6955,20 @@ fn run_normal_mode_navigation(
         // A queued key -- a macro replay, or a mapping's expansion -- is
         // not a byte on stdin, so polling for one would block with keys
         // already in hand and hand them out one per real keystroke.
+        // On only while a real file is in front: a prompt has nothing
+        // to hover over, and the reports would go nowhere.
+        term::set_hover_tracking(hover_wanted && matches!(buf, NavBuffer::Editable(_)));
         while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
+            // The pointer has stopped somewhere and the dwell has run
+            // out: say what `K` would say about that cell. This loop is
+            // the only place the editor is while nothing is being
+            // typed, which is exactly when a hover should appear -- and
+            // it is the one that can reach `buf` and `vk`, for the
+            // reason the comment above gives.
+            if let Some(popup) = hover_popup_due(app, session_id, edit_frame_id, &buf, rect, &mut hover_at, &mut hover_shown) {
+                print!("{popup}");
+                let _ = io::stdout().flush();
+            }
             let attached = service_background_jobs(app);
             // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
             // an Insert-mode session left behind on its way out) reach
@@ -7072,6 +7104,24 @@ fn run_normal_mode_navigation(
         // a no-op -- re-render (in case a PendingView overlay was just
         // cleared above) and keep navigating.
         if let Key::Mouse(ev) = key {
+            // The pointer moving with nothing held. Noted, not acted on
+            // here: the dwell check further down is what decides it has
+            // come to rest. Any movement puts away a popup already on
+            // screen, since that one was about the cell just left.
+            if ev.is_hover() {
+                if hover_at.is_none_or(|(_, r, c)| (r, c) != (ev.row, ev.col)) {
+                    hover_at = Some((std::time::Instant::now(), ev.row, ev.col));
+                    if std::mem::take(&mut hover_shown) {
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                    }
+                }
+                continue 'nav;
+            }
+            // Anything else the mouse does -- a click, a drag, a wheel
+            // notch -- overtakes the popup; the arms below redraw on
+            // their own.
+            hover_at = None;
+            hover_shown = false;
             if ev.is_left_click() {
                 match hit_test_click(app, ev) {
                     Some(ClickTarget::Window(idx)) if idx != app.current_window => {
@@ -7197,6 +7247,16 @@ fn run_normal_mode_navigation(
             }
             render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             continue 'nav;
+        }
+
+        // Every mouse event has been dealt with above, so this is a
+        // keystroke -- and typing puts a hover popup away. Redrawn
+        // here rather than left to the arms below, since not all of
+        // them repaint and a popup nobody removes stays on screen over
+        // whatever comes next.
+        if std::mem::take(&mut hover_shown) {
+            hover_at = None;
+            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
         }
 
         // `n`/`N` step through the definitions `gd` just found, and
@@ -7549,33 +7609,14 @@ fn run_normal_mode_navigation(
                 let NavBuffer::Editable(tb) = &buf else { unreachable!("guarded by this arm's own match above") };
                 let (row, col) = tb.cursor();
                 let chars = tb.line_chars(row);
-                let line_text: String = chars.iter().collect();
-                let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
-                // A language server's answer wins when there is one:
-                // it knows the actual language, where `docs.rs` knows
-                // bash and this buffer's own comments. Everything about
-                // the fallback is unchanged, so a bash file with no
-                // server behaves exactly as it always has.
-                let hover_lines = ask_server_at_cursor(
-                    app,
-                    session_id,
-                    tb,
-                    row,
-                    col,
-                    CursorRequest { method: "textDocument/hover", capability: "hoverProvider", extra: &[] },
-                )
-                .and_then(|result| crate::lsp::hover_lines(&result))
-                .unwrap_or_else(|| {
-                    let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
-                    let debug_session = edit_frame_id.and_then(|id| app.debug_frames.get(&id));
-                    match docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name))) {
-                        // A keypress deserves an answer even when there
-                        // is nothing under the cursor -- see
-                        // `NOTHING_UNDER_THE_CURSOR`.
-                        lines if lines.is_empty() => vec![docs::NOTHING_UNDER_THE_CURSOR.to_string()],
-                        lines => lines,
-                    }
-                });
+                let hover_lines = match hover_lines_at(app, session_id, edit_frame_id, tb, row, col) {
+                    // A keypress deserves an answer even when there is
+                    // nothing under the cursor -- see
+                    // `NOTHING_UNDER_THE_CURSOR`. Hover, which nobody
+                    // asked for, says nothing instead.
+                    lines if lines.is_empty() => vec![docs::NOTHING_UNDER_THE_CURSOR.to_string()],
+                    lines => lines,
+                };
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
                 let cursor_display_col = col_of(&chars, col);
@@ -8421,6 +8462,11 @@ fn run_normal_mode_navigation(
         }
     };
 
+    // Whatever is next, it is not this buffer. Reached only on the
+    // paths that actually return here -- see `set_hover_tracking` for
+    // why that is not all of them, and why this is a switch rather than
+    // a guard.
+    term::set_hover_tracking(false);
     compositor_redraw(app);
     Ok(result)
 }
@@ -9807,6 +9853,104 @@ struct CursorRequest<'a> {
     extra: &'a [(&'a str, crate::json::Value)],
 }
 
+/// The hover popup to print, if the pointer has been resting long
+/// enough on something worth describing.
+///
+/// `None` almost every time it is called -- this runs on every idle
+/// poll -- so everything that would cost anything is behind the cheap
+/// checks: the option, the dwell, and whether a popup is already up.
+///
+/// Takes `hover_shown` by reference and sets it, so the caller cannot
+/// print a popup without recording that one is on screen; the two going
+/// out of step is how a popup gets left behind with nothing to remove
+/// it.
+#[allow(clippy::too_many_arguments)]
+fn hover_popup_due(
+    app: &mut App,
+    session_id: SessionId,
+    edit_frame_id: Option<EditFrameId>,
+    buf: &NavBuffer,
+    rect: Rect,
+    hover_at: &mut Option<(std::time::Instant, u16, u16)>,
+    hover_shown: &mut bool,
+) -> Option<String> {
+    if *hover_shown {
+        return None;
+    }
+    let (since, row1, col1) = (*hover_at)?;
+    if since.elapsed() < HOVER_DWELL {
+        return None;
+    }
+    // Only where `K` itself means something: a real file buffer. A
+    // pane's scrollback has no symbols to look up.
+    let NavBuffer::Editable(tb) = buf else { return None };
+    // `is_none_or`, matching the guard that asked the terminal for
+    // these reports in the first place: no session is the `bish tool
+    // edit` case, and the two disagreeing meant the mode was enabled
+    // and then nothing ever read it.
+    if !app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse_hover")) {
+        return None;
+    }
+    let (row0, col0) = ((row1 as usize).saturating_sub(1), (col1 as usize).saturating_sub(1));
+    let Some((line, col)) = fileeditor::position_at_screen(tb, rect, row0, col0) else {
+        *hover_at = None;
+        return None;
+    };
+    let lines = hover_lines_at(app, session_id, edit_frame_id, tb, line, col);
+    // A man page still being fetched in the background. Left pending on
+    // purpose -- `hover_at` is not cleared, so the next idle poll asks
+    // again and the popup appears when the page lands. `K`'s own answer
+    // for this is "press K again in a moment", which is advice about a
+    // key nobody pressed.
+    if docs::is_still_looking(&lines) {
+        return None;
+    }
+    // Asked and answered, whatever the answer was: without clearing
+    // this, a cell with nothing to say is looked up again on every idle
+    // poll for as long as the pointer rests on it.
+    *hover_at = None;
+    // Nothing worth interrupting for. `K` says "no info available"
+    // because it was asked; a popup that appears on its own has no
+    // business appearing to say that.
+    if docs::says_nothing(&lines) {
+        return None;
+    }
+    *hover_shown = true;
+    // Anchored to the cell the pointer is on, not to the text cursor --
+    // the popup belongs to what is being pointed at.
+    Some(fileeditor::render_hover_popup(&lines, row0, col0, rect))
+}
+
+/// Everything this editor knows about whatever is at `(row, col)` --
+/// what `K` prints, and what resting the pointer there shows.
+///
+/// One function because they are one question. They were the same code
+/// written once, and a hover that disagreed with `K` about the same
+/// word would be the sort of difference nobody thinks to test for.
+///
+/// Empty when there is nothing to say. The two callers differ only in
+/// what they do about that: `K` was asked and answers anyway, hover was
+/// not and stays quiet.
+fn hover_lines_at(app: &mut App, session_id: SessionId, edit_frame_id: Option<EditFrameId>, tb: &TextBuffer, row: usize, col: usize) -> Vec<String> {
+    // A language server's answer wins when there is one: it knows the
+    // actual language, where `docs.rs` knows bash and this buffer's own
+    // comments.
+    if let Some(lines) =
+        ask_server_at_cursor(app, session_id, tb, row, col, CursorRequest { method: "textDocument/hover", capability: "hoverProvider", extra: &[] })
+            .and_then(|result| crate::lsp::hover_lines(&result))
+    {
+        return lines;
+    }
+    let chars = tb.line_chars(row);
+    let line_text: String = chars.iter().collect();
+    let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
+    // Rebuilt from this buffer's own *live* text every time, not
+    // re-read off disk, so an unsaved edit is reflected immediately.
+    let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
+    let debug_session = edit_frame_id.and_then(|id| app.debug_frames.get(&id));
+    docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)))
+}
+
 fn ask_server_at_cursor(
     app: &mut App,
     session_id: SessionId,
@@ -10312,6 +10456,16 @@ enum ClickTarget {
 // use, and deliberately paired with an exact same-cell test so a slow
 // drag across two characters can never read as one.
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+// How long the pointer has to sit still before a hover popup appears.
+//
+// Also bish's own judgement, and the number that decides whether this
+// feature is helpful or infuriating. Too short and a popup chases the
+// pointer across the screen; too long and it feels broken. This is
+// about what an editor with a mouse conventionally waits, and it is
+// long enough that a sweep across a line asks a language server
+// nothing at all -- the lookup only happens where the pointer stops.
+const HOVER_DWELL: std::time::Duration = std::time::Duration::from_millis(350);
 
 // `fileeditor::position_at_screen`'s counterpart for a `ScreenBuffer` --
 // simpler because a read-only pane has neither a gutter nor horizontal

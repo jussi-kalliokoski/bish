@@ -16084,6 +16084,19 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // on, dragging is bish's gesture and there is no way to sweep a
     // region for the system clipboard.
     ("mouse", BishOptDefault::Bool(true)),
+    // Whether resting the pointer on a word in the editor shows what
+    // `K` would say about it, without pressing anything.
+    //
+    // On, and separate from `mouse` rather than folded into it, because
+    // it costs something the rest of the mouse does not: the terminal
+    // reports every cell the pointer crosses (DECSET 1003), where
+    // clicking and dragging need no traffic at all until a button goes
+    // down. Somebody on a slow link, or who simply does not want a
+    // popup arriving unasked, turns this off and keeps the mouse.
+    //
+    // `mouse` off turns this off with it -- there are no reports to
+    // read.
+    ("mouse_hover", BishOptDefault::Bool(true)),
     // Whether the terminal's cursor changes shape to show the mode: a
     // block in Normal and Visual, a bar in Insert, an underline in
     // Replace. Off leaves the cursor however the terminal draws it, for
@@ -16226,6 +16239,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("smartcase", "With ignorecase on, an uppercase letter in the pattern makes that one search case-sensitive again."),
     ("editorconfig", "Let a project's `.editorconfig` override the settings below it."),
     ("mouse", "Ask the terminal to report mouse events. Off gives the terminal's own selection back."),
+    ("mouse_hover", "Show what `K` would say when the pointer rests on a word in the editor."),
     ("cursorshape", "Change the terminal's cursor shape to show the editor's mode."),
     ("expandtab", "Indent with spaces rather than a literal tab."),
     ("shiftwidth", "How many columns one indent is."),

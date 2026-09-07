@@ -146,7 +146,52 @@ pub fn suspend_self() {
 // doc comment for why it can't just use `RawGuard` itself: it needs to
 // track ON/OFF independently of any raw-mode guard's own lifetime).
 pub const MOUSE_REPORTING_ENABLE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-pub const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+// 1003 goes off here too, though nothing above turns it on: it is asked
+// for separately (see `HOVER_TRACKING_ENABLE`) and by one view only,
+// and a mode left set on the way out is one the next program inherits.
+pub const MOUSE_REPORTING_DISABLE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+// DECSET 1003, "any-event" tracking: report the pointer crossing a cell
+// even with no button held. That is the whole difference between 1002
+// and this one, and the only way a terminal can say where the mouse is
+// resting rather than where it was dragged.
+//
+// Its own pair rather than part of the block above, for the reason
+// bracketed paste has its own: this is asked for by one view (the
+// editor, for hover) and for the duration of that view, not by
+// everything that wants a mouse. It is also a *lot* of traffic -- one
+// report per cell crossed -- which is worth paying only where something
+// reads it.
+/// Any-event mouse tracking: on exactly while something is reading it.
+///
+/// Process-global, because that is what a terminal mode is -- there is
+/// one terminal, and its modes are not anybody's local variable. An
+/// earlier attempt made this a guard owned by the editor's loop, and
+/// that is worth recording as the wrong shape: the editor does not
+/// unwind that loop on its way out (`:q!` reaches a prompt without the
+/// call returning), so a `Drop` there never ran and the mode outlived
+/// what it was for. Anything that draws says what it needs instead, and
+/// the last word wins.
+///
+/// The mode can still outlive an editor in flows that neither redraw
+/// nor return -- the same way this shell already leaves 1000/1002/1006
+/// on across a session. The cost is motion reports arriving at a loop
+/// that ignores them; `mouse_hover` is the switch for anyone who would
+/// rather not pay it.
+///
+/// Idempotent, so callers can say it on every redraw without thinking
+/// about what was set before.
+pub fn set_hover_tracking(on: bool) {
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ON.swap(on, std::sync::atomic::Ordering::SeqCst) == on {
+        return;
+    }
+    print!("{}", if on { HOVER_TRACKING_ENABLE } else { HOVER_TRACKING_DISABLE });
+    let _ = io::stdout().flush();
+}
+
+pub const HOVER_TRACKING_ENABLE: &str = "\x1b[?1003h";
+pub const HOVER_TRACKING_DISABLE: &str = "\x1b[?1003l";
 
 // DECSET 2004: ask the terminal to wrap pasted text in `CSI 200 ~` and
 // `CSI 201 ~`, so a burst of characters can be told apart from typing.

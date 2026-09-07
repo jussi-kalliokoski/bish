@@ -323,6 +323,32 @@ pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
 /// way.
 pub const NOTHING_UNDER_THE_CURSOR: &str = "no identifier under the cursor";
 
+/// What a hover says when it looked and found nothing to tell you.
+pub const NO_INFO: &str = "no info available";
+
+/// What it says while a man page is still being fetched in the
+/// background -- advice about a key, which is right for `K` and wrong
+/// for anything the user did not press.
+pub const STILL_LOOKING: &str = "looking up man page... press K again in a moment";
+
+/// Whether these lines are a placeholder rather than an answer: the
+/// lookup is still in flight, and asking again in a moment will say
+/// something better.
+///
+/// Exists so a caller that is not a keypress can decline to show them.
+/// `K` was asked and answers with whatever it has; a popup that
+/// appears on its own should wait until there is something worth
+/// appearing for.
+pub fn is_still_looking(lines: &[String]) -> bool {
+    lines.iter().any(|l| l == STILL_LOOKING)
+}
+
+/// Whether these lines amount to "nothing known" -- a word that was
+/// recognised but has no documentation anywhere.
+pub fn says_nothing(lines: &[String]) -> bool {
+    lines.is_empty() || lines.iter().all(|l| l == NO_INFO || l == NOTHING_UNDER_THE_CURSOR) || lines.last().is_some_and(|l| l == NO_INFO)
+}
+
 pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIndex, live_value: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let identifier = identifier_at(chars, col);
     if let Some(name) = &identifier {
@@ -344,7 +370,7 @@ pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIn
         // mouse-over does not, and `bish tool lsp-server` wants the
         // silence.
         WordRole::Other => match identifier {
-            Some(name) => vec![name, "no info available".to_string()],
+            Some(name) => vec![name, NO_INFO.to_string()],
             None => Vec::new(),
         },
     }
@@ -517,8 +543,8 @@ fn hover_lines_for_command(name: &str) -> Vec<String> {
             Some(snippet) => lines.push(snippet.clone()),
             None => lines.push("(found a man page, but no NAME section)".to_string()),
         },
-        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
-        ManStatus::Missing => lines.push("no info available".to_string()),
+        ManStatus::Pending => lines.push(STILL_LOOKING.to_string()),
+        ManStatus::Missing => lines.push(NO_INFO.to_string()),
     }
     lines
 }
@@ -540,8 +566,8 @@ fn hover_lines_for_subcommand(command: &str, subcommand: &str) -> Vec<String> {
             Some(snippet) => lines.push(snippet.clone()),
             None => lines.push(format!("(found {full}, but no NAME section)")),
         },
-        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
-        ManStatus::Missing => lines.push("no info available".to_string()),
+        ManStatus::Pending => lines.push(STILL_LOOKING.to_string()),
+        ManStatus::Missing => lines.push(NO_INFO.to_string()),
     }
     lines
 }
@@ -562,8 +588,8 @@ fn hover_lines_for_flag(command: &str, flag: &str) -> Vec<String> {
             Some(desc) => lines.push(desc.clone()),
             None => lines.push(format!("(found a man page for {command}, but no description for {key})")),
         },
-        ManStatus::Pending => lines.push("looking up man page... press K again in a moment".to_string()),
-        ManStatus::Missing => lines.push("no info available".to_string()),
+        ManStatus::Pending => lines.push(STILL_LOOKING.to_string()),
+        ManStatus::Missing => lines.push(NO_INFO.to_string()),
     }
     lines
 }
@@ -719,5 +745,33 @@ mod classify_word_tests {
             WordRole::Command(name) => assert_eq!(name, "grep"),
             _ => panic!("expected Command"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hover_quietness_tests {
+    use super::*;
+
+    /// The distinction the two callers turn on: `K` was asked and
+    /// answers whatever it has, while a popup that appears on its own
+    /// should stay quiet unless it has something to say.
+    #[test]
+    fn a_placeholder_is_told_apart_from_an_answer() {
+        assert!(is_still_looking(&["grep".to_string(), STILL_LOOKING.to_string()]));
+        assert!(!is_still_looking(&["grep".to_string(), "grep - print lines that match".to_string()]));
+
+        assert!(says_nothing(&[]));
+        assert!(says_nothing(&["deploy".to_string(), NO_INFO.to_string()]));
+        assert!(says_nothing(&[NOTHING_UNDER_THE_CURSOR.to_string()]));
+        assert!(!says_nothing(&["greet".to_string(), "Greets somebody.".to_string()]));
+    }
+
+    // A real answer whose *last* line happens to be about something
+    // else must not be mistaken for silence -- the marker is the whole
+    // line, not a substring of one.
+    #[test]
+    fn an_answer_mentioning_the_marker_in_passing_still_counts() {
+        assert!(!says_nothing(&["x".to_string(), format!("see also: {NO_INFO}")]));
+        assert!(!is_still_looking(&["x".to_string(), format!("almost: {STILL_LOOKING}!")]));
     }
 }
