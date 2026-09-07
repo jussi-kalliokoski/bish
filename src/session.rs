@@ -333,6 +333,20 @@ pub enum Message {
     /// client, and the only message a client both waits for and then
     /// exits on.
     CaptureReply(Vec<u8>),
+    /// One JSON-RPC message for whatever is asking about this session
+    /// from outside -- `bish tool mcp-server` today. Client -> server.
+    ///
+    /// Opaque here on purpose: this layer carries bytes and counts them,
+    /// and every question about what they mean belongs to whoever
+    /// answers them. Same stance `Passthrough` already takes.
+    Rpc(Vec<u8>),
+    /// The answer, and also the unsolicited notifications that go the
+    /// same way. Server -> client.
+    ///
+    /// One kind for both because a JSON-RPC notification has no `id` and
+    /// so already says which it is; a second message kind would only be
+    /// restating that in a second place.
+    RpcReply(Vec<u8>),
 }
 
 const KIND_BYTES: u8 = 0;
@@ -341,6 +355,8 @@ const KIND_RESIZE: u8 = 2;
 const KIND_PASSTHROUGH: u8 = 3;
 const KIND_CAPTURE_REQUEST: u8 = 4;
 const KIND_CAPTURE_REPLY: u8 = 5;
+const KIND_RPC: u8 = 6;
+const KIND_RPC_REPLY: u8 = 7;
 
 impl Message {
     // Header (5 bytes: 1 kind + 4 big-endian length) followed by that
@@ -359,6 +375,8 @@ impl Message {
             Message::Passthrough(b) => (KIND_PASSTHROUGH, b.clone()),
             Message::CaptureRequest => (KIND_CAPTURE_REQUEST, Vec::new()),
             Message::CaptureReply(b) => (KIND_CAPTURE_REPLY, b.clone()),
+            Message::Rpc(b) => (KIND_RPC, b.clone()),
+            Message::RpcReply(b) => (KIND_RPC_REPLY, b.clone()),
             Message::Handshake { rows, cols, term, colorterm } => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&rows.to_be_bytes());
@@ -460,6 +478,8 @@ impl Decoder {
             KIND_PASSTHROUGH => Message::Passthrough(payload),
             KIND_CAPTURE_REQUEST => Message::CaptureRequest,
             KIND_CAPTURE_REPLY => Message::CaptureReply(payload),
+            KIND_RPC => Message::Rpc(payload),
+            KIND_RPC_REPLY => Message::RpcReply(payload),
             KIND_RESIZE => {
                 if payload.len() != 4 {
                     return Err(format!("malformed Resize payload: {} bytes, expected 4", payload.len()));
@@ -589,6 +609,16 @@ pub struct SessionBridge {
     // the module doc comment). repl.rs, which does, answers them --
     // see `answer_capture_requests`.
     capture_requests: Vec<ClientId>,
+    // JSON-RPC messages that have arrived and not been answered yet,
+    // each tagged with who asked. Recorded rather than answered for
+    // exactly the reason `capture_requests` is -- see
+    // `answer_rpc_requests`.
+    pending_rpc: Vec<(ClientId, Vec<u8>)>,
+    // Every client that has ever sent one. A peer that asks questions is
+    // also a peer that wants to be told when something changes, so this
+    // doubles as the subscriber list for `push_rpc_notification`; there
+    // is no separate subscribe message to get wrong.
+    rpc_clients: Vec<ClientId>,
     // The main thread's own pty-master handle -- writes only (client
     // input, `Pty::set_size`); the background thread owns the read side
     // via its own separate fd (see SessionBridge::new).
@@ -690,6 +720,8 @@ impl SessionBridge {
             pidfile: None,
             reported_attached: 0,
             capture_requests: Vec::new(),
+            pending_rpc: Vec::new(),
+            rpc_clients: Vec::new(),
             pty_master,
             just_attached: false,
             pending_capability: None,
@@ -806,6 +838,8 @@ impl SessionBridge {
     // is attached. The pty resizes afterwards: with the smallest client
     // gone, everyone left can have the room it was holding them to.
     fn detach(&mut self, id: ClientId) {
+        self.rpc_clients.retain(|other| *other != id);
+        self.pending_rpc.retain(|(other, _)| *other != id);
         self.clients.retain(|c| c.id != id);
         self.writes.lock().unwrap_or_else(|p| p.into_inner()).retain(|(other, _)| *other != id);
         self.resize_to_smallest_client();
@@ -905,7 +939,16 @@ impl SessionBridge {
                     // session's grid, which this module cannot reach.
                     self.capture_requests.push(id);
                 }
-                Ok(Some(Message::Passthrough(_) | Message::CaptureReply(_))) => {
+                Ok(Some(Message::Rpc(payload))) => {
+                    // Recorded, not answered -- same reason as a capture
+                    // request just above, and answered from the same
+                    // place (`answer_rpc_requests`).
+                    if !self.rpc_clients.contains(&id) {
+                        self.rpc_clients.push(id);
+                    }
+                    self.pending_rpc.push((id, payload));
+                }
+                Ok(Some(Message::Passthrough(_) | Message::CaptureReply(_) | Message::RpcReply(_))) => {
                     // Server -> client messages (see Message's own doc
                     // comments). A client never sends these; tolerated
                     // as a no-op rather than treated as malformed, in
@@ -921,6 +964,40 @@ impl SessionBridge {
     // Whether anybody is waiting to be told what the screen shows.
     fn wants_capture(&self) -> bool {
         !self.capture_requests.is_empty()
+    }
+
+    // Whether any JSON-RPC message is waiting to be answered.
+    fn wants_rpc(&self) -> bool {
+        !self.pending_rpc.is_empty()
+    }
+
+    // Hands every waiting message to `handle` and sends back whatever it
+    // makes of each. `None` from `handle` is a notification -- something
+    // with no answer to give -- and sends nothing.
+    fn answer_rpc(&mut self, handle: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>) {
+        for (id, payload) in std::mem::take(&mut self.pending_rpc) {
+            let Some(reply) = handle(&payload) else { continue };
+            self.send_to(id, &Message::RpcReply(reply).encode());
+        }
+    }
+
+    // An unsolicited message to every RPC peer. Nothing is queued for a
+    // peer that is not there: a notification describes a moment, and a
+    // client that connects later wants the state it finds, not a replay.
+    fn notify_rpc(&mut self, payload: &[u8]) {
+        let encoded = Message::RpcReply(payload.to_vec()).encode();
+        for id in self.rpc_clients.clone() {
+            self.send_to(id, &encoded);
+        }
+    }
+
+    // One already-encoded message to one client, if it is still there.
+    fn send_to(&mut self, id: ClientId, encoded: &[u8]) {
+        if let Ok(guard) = self.writes.lock()
+            && let Some((_, stream)) = guard.iter().find(|(other, _)| *other == id)
+        {
+            let _ = (&*stream).write_all(encoded);
+        }
     }
 
     // Sends `text` to every client waiting for a capture, and closes
@@ -978,6 +1055,42 @@ pub fn answer_capture_requests(screen: impl FnOnce() -> String) -> bool {
         bridge.answer_captures(&text);
         true
     })
+}
+
+/// Answers every JSON-RPC message that has arrived from a peer, and
+/// says whether there was one.
+///
+/// `handle` is only called when something is actually waiting, and
+/// returns `None` for a message with no answer (a notification). A
+/// closure for the same reason `answer_capture_requests` takes one: what
+/// the answers are made of lives in repl.rs, which this module has no
+/// access to and keeps none of.
+pub fn answer_rpc_requests(mut handle: impl FnMut(&[u8]) -> Option<Vec<u8>>) -> bool {
+    ACTIVE_BRIDGE.with(|b| {
+        let mut guard = b.borrow_mut();
+        let Some(bridge) = guard.as_mut() else { return false };
+        if !bridge.wants_rpc() {
+            return false;
+        }
+        bridge.answer_rpc(&mut handle);
+        true
+    })
+}
+
+/// Sends one unsolicited JSON-RPC message to every peer that has spoken
+/// to us. A no-op when there are none, which is the ordinary case.
+pub fn push_rpc_notification(payload: &[u8]) {
+    ACTIVE_BRIDGE.with(|b| {
+        if let Some(bridge) = b.borrow_mut().as_mut() {
+            bridge.notify_rpc(payload);
+        }
+    });
+}
+
+/// Whether anything is listening for notifications -- so a caller can
+/// skip building one nobody will read.
+pub fn has_rpc_peers() -> bool {
+    ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| !bridge.rpc_clients.is_empty()))
 }
 
 // True at most once per attach (a first attach or a reattach) -- lets
@@ -1089,6 +1202,125 @@ pub fn run_ls() -> io::Result<i32> {
         println!("{name:width$}  {attached:<10}  {age:>4} old  {cwd}");
     }
     Ok(0)
+}
+
+/// A live question-and-answer connection to a running session, for a
+/// process that needs more than one answer.
+///
+/// `run_capture` asks once and exits, so it can afford to be a function.
+/// This is what a peer that stays -- `bish tool mcp-server` -- holds:
+/// the same socket, the same framing, but with the connection kept open
+/// so the daemon can also push notifications back down it.
+pub struct Peer {
+    stream: UnixStream,
+    decoder: Decoder,
+}
+
+impl Peer {
+    /// Connects to `name`, or says why it could not in words that name
+    /// the likely cause: a session that was never started looks exactly
+    /// like a typo, and the message has to serve both.
+    pub fn connect(name: &str) -> io::Result<Peer> {
+        check_name(name)?;
+        let path = socket_path(name);
+        let stream = UnixStream::connect(&path).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                io::Error::new(e.kind(), format!("no live session named '{name}' (try `bish session ls`)"))
+            }
+            _ => e,
+        })?;
+        Ok(Peer { stream, decoder: Decoder::default() })
+    }
+
+    /// A peer over an already-connected socket, for tests: the daemon
+    /// this talks to needs a controlling terminal, and a socketpair
+    /// exercises every byte of the protocol without one.
+    #[cfg(test)]
+    pub fn over(stream: UnixStream) -> Peer {
+        Peer { stream, decoder: Decoder::default() }
+    }
+
+    /// Says something with no answer expected.
+    ///
+    /// What a peer announcing itself uses: the daemon only knows a peer
+    /// exists once one has spoken, and some of what it will be asked
+    /// about is only kept current while somebody is listening.
+    pub fn tell(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.stream.write_all(&Message::Rpc(payload.to_vec()).encode())?;
+        self.stream.flush()
+    }
+
+    /// Asks one question and waits for its answer, up to `timeout`.
+    ///
+    /// The daemon answers from its own idle tick (see
+    /// `answer_rpc_requests`), so an answer takes as long as whatever it
+    /// is currently doing -- a foreground command holds the loop, and
+    /// waiting forever behind one would wedge the caller with no way to
+    /// say why. The timeout is what turns that into an error message.
+    pub fn ask(&mut self, payload: &[u8], timeout: std::time::Duration) -> io::Result<Vec<u8>> {
+        self.stream.write_all(&Message::Rpc(payload.to_vec()).encode())?;
+        self.stream.flush()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(reply) = self.next_reply()? {
+                return Ok(reply);
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now());
+            let Some(left) = left else {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "the session did not answer in time"));
+            };
+            self.stream.set_read_timeout(Some(left.min(std::time::Duration::from_millis(250))))?;
+            let mut buf = [0u8; 8192];
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session went away")),
+                Ok(n) => self.decoder.feed(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// This connection's own descriptor, for a caller that has to wait
+    /// on it alongside something else -- which anything reading
+    /// notifications does, since they arrive unasked.
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.stream.as_raw_fd()
+    }
+
+    /// Reads whatever has arrived without waiting, and returns every
+    /// complete message in it. This is how a notification is collected:
+    /// nobody asked for it, so nobody is waiting on it.
+    pub fn poll(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        self.stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
+        let mut buf = [0u8; 8192];
+        match self.stream.read(&mut buf) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session went away")),
+            Ok(n) => self.decoder.feed(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+        let mut out = Vec::new();
+        while let Some(reply) = self.next_reply()? {
+            out.push(reply);
+        }
+        Ok(out)
+    }
+
+    /// The next already-arrived reply, if there is one. Everything else
+    /// this connection carries -- the session's own screen bytes, which
+    /// arrive here because any connected client gets them -- is dropped:
+    /// a peer asking questions is not a terminal.
+    fn next_reply(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            match self.decoder.next_message() {
+                Ok(Some(Message::RpcReply(payload))) => return Ok(Some(payload)),
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            }
+        }
+    }
 }
 
 /// The bytes a `bish session send` argument stands for.
@@ -1760,6 +1992,64 @@ mod tests {
             ensure_socket_dir().expect("ensure_socket_dir");
             assert!(!is_daemon_alive("nonexistent"));
         });
+    }
+
+    #[test]
+    fn the_rpc_messages_round_trip() {
+        // A JSON-RPC body is just bytes here, and deliberately so -- the
+        // point of these two cases is that the framing does not care.
+        let request = Message::Rpc(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec());
+        let mut dec = Decoder::new();
+        dec.feed(&request.encode());
+        assert_eq!(dec.next_message().unwrap(), Some(request));
+
+        let reply = Message::RpcReply(br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#.to_vec());
+        let mut dec = Decoder::new();
+        dec.feed(&reply.encode());
+        assert_eq!(dec.next_message().unwrap(), Some(reply));
+
+        // Including a body that is not text at all: this layer counts
+        // bytes and never looks inside them.
+        let raw = Message::Rpc(vec![0x00, 0xff, 0xfe, b'\n']);
+        let mut dec = Decoder::new();
+        dec.feed(&raw.encode());
+        assert_eq!(dec.next_message().unwrap(), Some(raw));
+    }
+
+    // Two messages of the new kinds arriving glued together, byte by
+    // byte -- the case a stream socket actually produces, and the one a
+    // length prefix exists for.
+    #[test]
+    fn rpc_messages_survive_arriving_in_pieces() {
+        let one = Message::Rpc(b"{\"id\":1}".to_vec());
+        let two = Message::RpcReply(b"{\"id\":2}".to_vec());
+        let mut wire = one.encode();
+        wire.extend_from_slice(&two.encode());
+
+        let first = one.encode().len();
+        let mut dec = Decoder::new();
+        let mut seen = Vec::new();
+        for (at, byte) in wire.iter().enumerate() {
+            dec.feed(&[*byte]);
+            while let Some(msg) = dec.next_message().unwrap() {
+                // Each one appears on the byte that completes it, and
+                // not one byte earlier.
+                assert!(at + 1 == first || at + 1 == wire.len(), "a message surfaced at byte {}", at + 1);
+                seen.push(msg);
+            }
+        }
+        assert_eq!(seen, vec![one, two]);
+    }
+
+    // The same header check every other kind gets: refused on the five
+    // header bytes, before the peer has sent a single byte of body.
+    #[test]
+    fn an_oversized_rpc_frame_is_refused_on_its_header() {
+        let mut dec = Decoder::new();
+        let mut header = vec![6u8];
+        header.extend_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
+        dec.feed(&header);
+        assert!(dec.next_message().is_err());
     }
 
     #[test]

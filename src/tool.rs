@@ -14,6 +14,13 @@ use std::io::{self, Read, Write};
 
 // Used both for the "expected:" line and for the "did you mean" beside
 // it, so the two cannot disagree about what exists.
+//
+// `mcp-server` is deliberately absent while it settles: it dispatches
+// below and works, but it is not listed, not suggested and not
+// described, because listing something is a promise that its shape will
+// hold. A hidden entry point can be changed or withdrawn without
+// breaking anyone who was told about it -- and the only thing using it
+// so far is a script somebody wrote against it on purpose.
 const SUBCOMMANDS: &[&str] = &["check", "format", "lsp-server", "debug", "edit", "keys"];
 
 pub fn run(args: &[String]) -> i32 {
@@ -21,6 +28,8 @@ pub fn run(args: &[String]) -> i32 {
         Some("check") => run_check(&args[1..]),
         Some("format") => run_format(&args[1..]),
         Some("lsp-server") => crate::lspserver::run(&args[1..]),
+        // Unlisted on purpose -- see SUBCOMMANDS.
+        Some("mcp-server") => crate::mcp::run(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
         Some("keys") => run_keys(&args[1..]),

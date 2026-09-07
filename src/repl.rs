@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use crate::lspclient;
+use crate::mcp;
 
 use crate::archive;
 use crate::bishedit::Buffer as BisheditBuffer;
@@ -257,6 +258,17 @@ struct App {
     /// same way `debug_frames` keys the bish-script ones. A buffer has
     /// at most one of either.
     dap_frames: HashMap<EditFrameId, DapFrame>,
+    /// What the editor is currently showing, for anything asking from
+    /// outside this process.
+    ///
+    /// It has to be a *snapshot* rather than a lookup, because the
+    /// buffer being edited is not in `edit_frames` while it is being
+    /// edited -- `run_edit_frame` takes it out and hands it to the
+    /// navigation loop, so `edit_frames` holds every buffer except the
+    /// one that matters. The navigation loop, which does hold it,
+    /// publishes here on its idle tick; `service_background_jobs` reads
+    /// it and needs nothing else.
+    focus: Option<mcp::FileState>,
     term_rows: usize,
     term_cols: usize,
 }
@@ -524,6 +536,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
         dap_frames: HashMap::new(),
+        focus: None,
         term_rows,
         term_cols,
     };
@@ -1713,6 +1726,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
         dap_frames: HashMap::new(),
+        focus: None,
         term_rows,
         term_cols,
     };
@@ -4574,6 +4588,104 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
 // view (a `Frame::Edit`'s own real content, see run_normal_mode_
 // navigation's own on_idle closure for the caller that needs to react
 // to this return value; every other caller correctly ignores it).
+/// One open buffer, in the shape anything outside this process reads it
+/// in. Positions come out as 0-based (line, character), which is what
+/// every protocol wants and what only this side can compute -- a
+/// diagnostic is stored as a flat char offset, and the buffer is the
+/// only thing that knows where its lines begin.
+fn file_state(tb: &TextBuffer, focused: bool) -> Option<mcp::FileState> {
+    let path = tb.path()?.to_path_buf();
+    let selection = tb.selections.first().map(|range| {
+        let (from, to) = if range.from <= range.to { (range.from, range.to) } else { (range.to, range.from) };
+        (from.0, from.1, to.0, to.1)
+    });
+    let selected_text = match tb.selections.first() {
+        Some(range) => motion::extract_text(tb, range),
+        None => String::new(),
+    };
+    let diagnostics = tb
+        .diagnostics
+        .iter()
+        .map(|d| mcp::Diag {
+            message: d.message.clone(),
+            severity: d.severity,
+            start: fileeditor::diagnostic_position(tb, d.start),
+            end: fileeditor::diagnostic_position(tb, d.end),
+            source: d.source.clone(),
+            code: d.code.to_string(),
+        })
+        .collect();
+    Some(mcp::FileState { path, line_count: tb.line_count(), focused, dirty: tb.is_dirty(), selection, selected_text, diagnostics })
+}
+
+/// Everything bish is willing to say about itself: the focused buffer as
+/// the navigation loop last published it, plus every other one still in
+/// `edit_frames`.
+fn editor_state(app: &App) -> mcp::EditorState {
+    let mut files: Vec<mcp::FileState> = app.focus.iter().cloned().collect();
+    for session in app.edit_frames.values() {
+        // The focused buffer is not in here (see `App::focus`), but a
+        // second pane on the same file can be, and one entry per path is
+        // what a reader expects.
+        if files.iter().any(|f| Some(f.path.as_path()) == session.buffer.path()) {
+            continue;
+        }
+        if let Some(state) = file_state(&session.buffer, false) {
+            files.push(state);
+        }
+    }
+    mcp::EditorState { files }
+}
+
+/// Publishes what the focused editor is showing, and says whether it
+/// changed.
+///
+/// The change is the interesting part: it is what a selection
+/// notification fires on, so nothing needs a hook of its own for that.
+fn publish_focus(app: &mut App, buf: &NavBuffer) -> bool {
+    match buf.as_editable() {
+        Some(tb) => publish_focus_buffer(app, tb),
+        // A pane showing something that is not a file has nothing to
+        // publish, and saying so is the point: a reader must be able to
+        // tell "no file" from "the file I saw last time".
+        None => {
+            let changed = app.focus.is_some();
+            app.focus = None;
+            changed
+        }
+    }
+}
+
+fn publish_focus_buffer(app: &mut App, tb: &TextBuffer) -> bool {
+    // Deliberately *not* gated on anybody currently listening, which is
+    // what it was at first. A peer becomes known only once it has
+    // spoken, and it speaks a few milliseconds before its first
+    // question -- inside the same idle tick, whose publishing step comes
+    // after the answering step. So the gate made the very first question
+    // a peer ever asked report an editor with nothing open in it, every
+    // time. Being always current is the only version of this that is
+    // right the first time, and the cost is one comparison per idle tick
+    // against work this loop already does far more of.
+    let next = file_state(tb, true);
+    if next == app.focus {
+        return false;
+    }
+    app.focus = next;
+    true
+}
+
+/// Tells every peer what is selected now, if anything changed enough to
+/// be worth saying.
+///
+/// Debounced by construction rather than by a timer: this only runs on
+/// an idle tick, and only when the published snapshot actually differs
+/// from the last one, so a keystroke that moves the cursor within one
+/// line says nothing.
+fn notify_selection(app: &App) {
+    let Some(payload) = mcp::selection_notification(app.focus.as_ref()) else { return };
+    session::push_rpc_notification(&payload);
+}
+
 fn service_background_jobs(app: &mut App) -> bool {
     use std::io::Read;
 
@@ -4640,6 +4752,14 @@ fn service_background_jobs(app: &mut App) -> bool {
     // `bool` returned here is what lets such a caller notice and follow
     // up with its own direct redraw of the real content it alone has
     // access to.
+    // Beside the capture answer above and for the same reason: the
+    // bridge holds no session state, so the answers are produced here,
+    // where `App` is, and handed down.
+    // Built inside the closure, which only runs when a question is
+    // actually waiting -- unlike the snapshot above, this walks every
+    // open buffer, and nothing asks on most ticks.
+    let asked = &*app;
+    session::answer_rpc_requests(|question| mcp::answer(&editor_state(asked), question));
     let just_attached = session::take_bridge_just_attached();
     // Whatever the background jobs have said since the last tick, into
     // the grid of whichever session started each one -- see
@@ -6701,6 +6821,11 @@ fn tabular_style(shell: &exec::Shell, language: &str) -> Option<crate::bishedit:
 // See fileeditor::IdleRedraw for why the two can't be separated.
 fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
     let repaint = service_background_jobs(app);
+    // The Insert-mode counterpart of the navigation loop's own call --
+    // see `App::focus`. Typing moves the cursor too.
+    if publish_focus_buffer(app, buf) {
+        notify_selection(app);
+    }
     // Typing is the case document synchronization exists for, and this
     // is the only path that runs while it is happening -- keystrokes
     // themselves never come back through here (the loop above only
@@ -6985,6 +7110,13 @@ fn run_normal_mode_navigation(
                 let _ = io::stdout().flush();
             }
             let attached = service_background_jobs(app);
+            // Published from here because this is one of only two places
+            // holding both `App` and the buffer being edited -- see
+            // `App::focus`. Whether it changed is also what tells the
+            // notification below there is anything to say.
+            if publish_focus(app, &buf) {
+                notify_selection(app);
+            }
             // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
             // an Insert-mode session left behind on its way out) reach
             // the server from here. This is the idle path, so it also

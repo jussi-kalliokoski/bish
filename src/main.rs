@@ -36,6 +36,7 @@ mod lsp;
 mod lspclient;
 mod lspserver;
 mod markdown;
+mod mcp;
 mod pager;
 mod parser;
 mod pathspec;
