@@ -2384,6 +2384,111 @@ pub(crate) fn set_last_filename(buf: &TextBuffer, registers: &mut Registers) {
     }
 }
 
+/// `%` in a `:!` command line: the file this buffer is editing, spelled
+/// the way it was opened, with vim's own `:h`/`:t`/`:r`/`:e`/`:p`
+/// modifiers after it. `\%` is a literal `%`.
+///
+/// Only `:!` gets this. vim expands `%` across its whole ex line, which
+/// is why `:!printf '%s' x` is a famous vim annoyance -- but bish's
+/// colon line is a *shell* line, where `%` is real syntax (`${v%.c}`,
+/// `printf '%s'`, `jobs %1`). Expanding it everywhere would break every
+/// one of those to fix one command, so the `!` is what marks a line as
+/// wanting vim's rules instead of the shell's.
+///
+/// `#` is left alone for the same reason turned the other way: bish has
+/// no alternate file for it to mean, and `#` starts a comment in the
+/// shell this line is about to be handed to.
+pub(crate) fn expand_filename_macros(line: &str, buf: &TextBuffer) -> Result<String, String> {
+    // vim's own text, and its own rule: an expansion that came out empty
+    // stops the command rather than running it with a hole in it.
+    const EMPTY: &str = "E499: Empty file name for '%'";
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // The backslash goes and the `%` stays -- and only for `%`,
+            // since every other `\x` here belongs to the shell.
+            '\\' if chars.get(i + 1) == Some(&'%') => {
+                out.push('%');
+                i += 2;
+            }
+            '%' => {
+                let Some(path) = buf.path() else { return Err(EMPTY.to_string()) };
+                i += 1;
+                let expanded = apply_filename_modifiers(&path.to_string_lossy(), &chars, &mut i);
+                if expanded.is_empty() {
+                    return Err(EMPTY.to_string());
+                }
+                out.push_str(&expanded);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The `:h`/`:t`/`:r`/`:e`/`:p` that may follow a `%`, applied left to
+/// right so `%:p:h` is the directory of the full path and `%:t:r` is the
+/// basename without its extension. An unknown `:x` is not a modifier at
+/// all: it stays in the command line, which is what makes `:!make %:2`
+/// keep its own colon.
+fn apply_filename_modifiers(name: &str, chars: &[char], i: &mut usize) -> String {
+    let mut value = name.to_string();
+    while chars.get(*i) == Some(&':') {
+        let Some(&modifier) = chars.get(*i + 1) else { break };
+        value = match modifier {
+            // `.` when there is nowhere above to go, matching vim --
+            // not the empty string, which would abort the command.
+            'h' => match value.rsplit_once('/') {
+                Some((head, _)) if !head.is_empty() => head.to_string(),
+                Some(_) => "/".to_string(),
+                None => ".".to_string(),
+            },
+            't' => value.rsplit('/').next().unwrap_or(&value).to_string(),
+            // One extension, and a leading dot is not one: `.hidden`
+            // is its own root, exactly as vim reads it.
+            'r' => match split_extension(&value) {
+                Some((root, _)) => root.to_string(),
+                None => value,
+            },
+            'e' => match split_extension(&value) {
+                Some((_, ext)) => ext.to_string(),
+                None => String::new(),
+            },
+            'p' => std::fs::canonicalize(&value).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| absolute_path(&value)),
+            _ => break,
+        };
+        *i += 2;
+    }
+    value
+}
+
+/// Splits `a/b/c.txt` into `a/b/c` and `txt`. `None` when the last
+/// component has no extension to speak of -- no dot, or the only dot is
+/// the one that makes it a dotfile.
+fn split_extension(path: &str) -> Option<(&str, &str)> {
+    let start = path.rfind('/').map_or(0, |at| at + 1);
+    let dot = path[start..].rfind('.')? + start;
+    (dot > start).then(|| (&path[..dot], &path[dot + 1..]))
+}
+
+/// `:p` for a file that does not exist yet, where `canonicalize` has
+/// nothing to resolve: the cwd in front of it, without following any
+/// links, which is as much as can honestly be said about it.
+fn absolute_path(path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
 // All of this pane's own rect -- the mode-line lives in the terminal's
 // own global status row now (repl::render_global_status_row), not
 // carved out of this pane's own rect. `.max(1)`: a degenerate
@@ -6398,6 +6503,73 @@ mod pre_save_hook_tests {
         let painted: Vec<String> = spans.iter().map(|s| chars[s.start..s.end].iter().collect()).collect();
         assert!(painted.iter().all(|p| p == "let" || p == "'\u{2026}'" || p == "1"), "{painted:?}");
         assert_eq!(painted.iter().filter(|p| *p == "let").count(), 2, "both `let`s, and the second one is the point: {painted:?}");
+    }
+
+    fn named(path: &str) -> TextBuffer {
+        TextBuffer::from_text(std::path::Path::new(path), "x\n", 10)
+    }
+
+    // Checked against real vim (`vim -u NONE -i NONE -N`), which is
+    // where every one of these expectations comes from -- `%:r` keeping
+    // `sub/a.b` rather than `sub/a`, `%:h` on a bare name being `.`, and
+    // `.hidden` counting as its own root with no extension at all.
+    #[test]
+    fn percent_is_the_file_with_vims_own_modifiers() {
+        let buf = named("sub/a.b.c");
+        let expand = |line: &str| expand_filename_macros(line, &buf).unwrap();
+        assert_eq!(expand("echo %"), "echo sub/a.b.c");
+        assert_eq!(expand("echo %:t"), "echo a.b.c");
+        assert_eq!(expand("echo %:r"), "echo sub/a.b");
+        assert_eq!(expand("echo %:e"), "echo c");
+        assert_eq!(expand("echo %:h"), "echo sub");
+        // Left to right, so each modifier sees the last one's answer.
+        assert_eq!(expand("echo %:t:r"), "echo a.b");
+        // Twice in one line, and not only at a word boundary.
+        assert_eq!(expand("cp % %.bak"), "cp sub/a.b.c sub/a.b.c.bak");
+
+        let bare = named("noext");
+        assert_eq!(expand_filename_macros("echo %:h", &bare).unwrap(), "echo .");
+        assert_eq!(expand_filename_macros("echo %:r", &bare).unwrap(), "echo noext");
+
+        let hidden = named(".hidden");
+        assert_eq!(expand_filename_macros("echo %:r", &hidden).unwrap(), "echo .hidden");
+    }
+
+    // `\%` is how vim writes a literal one, and the only escape this
+    // touches -- every other backslash belongs to the shell that is
+    // about to read the same line.
+    #[test]
+    fn a_backslash_makes_a_percent_literal() {
+        let buf = named("f.txt");
+        assert_eq!(expand_filename_macros("echo \\%", &buf).unwrap(), "echo %");
+        assert_eq!(expand_filename_macros("printf '\\%s' %", &buf).unwrap(), "printf '%s' f.txt");
+        // Not an escape this cares about: it reaches the shell intact.
+        assert_eq!(expand_filename_macros("echo \\n %", &buf).unwrap(), "echo \\n f.txt");
+    }
+
+    // vim refuses rather than running the command with a hole where the
+    // name should be, and so does this.
+    #[test]
+    fn an_empty_expansion_is_an_error_not_an_empty_string() {
+        assert!(expand_filename_macros("echo %", &TextBuffer::new_unnamed(10)).is_err());
+        // `:e` on a name with no extension is empty, which vim treats
+        // exactly like having no name at all.
+        assert!(expand_filename_macros("echo %:e", &named("noext")).is_err());
+        assert!(expand_filename_macros("echo %:e", &named(".hidden")).is_err());
+    }
+
+    // `#` has no alternate file to name in bish, and starts a comment in
+    // the shell this line is handed to -- so it stays exactly as typed.
+    // A colon that is not a modifier stays too, which is what keeps
+    // `%:2` and a `PATH`-ish argument readable.
+    #[test]
+    fn what_is_not_a_macro_is_left_alone() {
+        let buf = named("f.txt");
+        let expand = |line: &str| expand_filename_macros(line, &buf).unwrap();
+        assert_eq!(expand("echo % # a comment"), "echo f.txt # a comment");
+        assert_eq!(expand("echo %:2"), "echo f.txt:2");
+        assert_eq!(expand("echo %:"), "echo f.txt:");
+        assert_eq!(expand("grep -n x %:t:9"), "grep -n x f.txt:9");
     }
 
     // The dispatch, not the highlighters themselves (each has its own

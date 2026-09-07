@@ -11852,6 +11852,63 @@ fn run_command_mode(
                         }
                     }
 
+                    // `:!cmd` -- vim's "run this through the shell".
+                    // Nearly free here, since this colon line already
+                    // ends in the shell (see the `run_program` call at
+                    // the bottom of this function): the `!` says the
+                    // rest wants vim's `%` expansion rather than the
+                    // shell's own reading of it, and then hands the
+                    // remainder straight down. Without this the `!` went
+                    // to the shell attached to the command name, and
+                    // `:!echo %` looked for a command called `!echo`.
+                    match parse_bang_command(&trimmed) {
+                        Some(BangCommand::Filter) => {
+                            // Recognized and refused, rather than
+                            // dropping the range and running the command
+                            // anyway -- `:%!sort` silently behaving like
+                            // `:!sort` would eat the buffer's worth of
+                            // work it was asked to filter.
+                            show_command_mode_error(
+                                "bish: filtering lines through a command ([range]!cmd) isn't supported yet",
+                                app.term_rows,
+                                app.term_cols,
+                            );
+                            buffer.clear();
+                            continue;
+                        }
+                        Some(BangCommand::Run(rest)) => match fileeditor::expand_filename_macros(rest, tb) {
+                            Ok(expanded) if expanded.trim().is_empty() => {
+                                // vim repeats the last `:!` here. bish
+                                // has nowhere to keep one yet, so say so
+                                // rather than run an empty line.
+                                show_command_mode_error("bish: E34: No previous command", app.term_rows, app.term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                            Ok(expanded) => {
+                                // History gets what was typed, not what
+                                // it expanded to: `!ls %` recalled as
+                                // `ls sample.txt` would name whichever
+                                // file happened to be open when it ran,
+                                // in a buffer that has since moved on.
+                                if !buffer_unrecorded {
+                                    app.cmd_history.record(&trimmed, None);
+                                }
+                                buffer_unrecorded = true;
+                                // Replaces what the rest of this
+                                // function runs, so the expansion is
+                                // what reaches the lexer and the shell.
+                                buffer = expanded;
+                            }
+                            Err(e) => {
+                                show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
+                                buffer.clear();
+                                continue;
+                            }
+                        },
+                        None => {}
+                    }
+
                     if let Some(cmd) = parse_line_command(&trimmed) {
                         if let LineCommand::Normal(keys) = cmd {
                             return CommandModeOutcome::RunNormal(keys);
@@ -13362,6 +13419,40 @@ enum LineCommand {
         times: usize,
     },
     Normal(String),
+}
+
+/// What a `!` at the head of a colon line turned out to be. `None` from
+/// `parse_bang_command` means there was no `!` there at all, and every
+/// other command in this dispatch is untouched.
+enum BangCommand<'a> {
+    /// `:!cmd` -- run it through the shell. The `&str` is everything
+    /// after the `!`, still unexpanded.
+    Run(&'a str),
+    /// `:[range]!cmd` -- vim's filter, which replaces those lines with
+    /// what the command makes of them. Carries nothing because nothing
+    /// runs it yet; it exists so a range can be refused out loud rather
+    /// than quietly dropped.
+    Filter,
+}
+
+/// A leading `!`, with or without a range in front of it. `:5!x` and
+/// `:%!x` are the filter; a bare `:!x` is the plain shell command.
+/// `:'<,'>!x` is *not* recognized as either, because `parse_range_prefix`
+/// does not read visual-mode marks -- see its own comment. It reaches
+/// the shell as a command named `'<,'>!x`, which is what it did before
+/// this existed.
+///
+/// Deliberately not folded into `parse_line_command`: that one answers
+/// with a `LineCommand` the buffer can carry out on its own, and both of
+/// these need a shell, which lives a long way up in the session.
+fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
+    if let Some(rest) = trimmed.strip_prefix('!') {
+        return Some(BangCommand::Run(rest));
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    parse_range_prefix(&chars, &mut i)?;
+    (chars.get(i) == Some(&'!')).then_some(BangCommand::Filter)
 }
 
 /// `None` when `trimmed` is not one of these at all, so the ordinary
@@ -14885,6 +14976,30 @@ mod substitute_command_tests {
         let cmd = parse_substitute_command("s/foo/bar").unwrap().unwrap();
         assert_eq!(cmd.replacement, "bar");
         assert!(!cmd.global);
+    }
+
+    // `!` at the head of the line, with or without a range in front of
+    // it -- and nothing else in this dispatch mistaken for one.
+    #[test]
+    fn a_leading_bang_is_a_shell_command_and_a_range_before_it_is_a_filter() {
+        assert!(matches!(parse_bang_command("!echo %"), Some(BangCommand::Run("echo %"))));
+        // Everything after the `!` is the command, spaces and all --
+        // `:! ls` is `: ls`, which the shell reads the same way.
+        assert!(matches!(parse_bang_command("! ls"), Some(BangCommand::Run(" ls"))));
+        assert!(matches!(parse_bang_command("!"), Some(BangCommand::Run(""))));
+
+        for line in ["%!sort", "1,5!sort", ".!date", "$!tac", "1,$!tac"] {
+            assert!(matches!(parse_bang_command(line), Some(BangCommand::Filter)), "{line}");
+        }
+        // Not a range this parser reads, so not a filter either -- see
+        // parse_range_prefix's own note on visual-mode marks.
+        assert!(parse_bang_command("'<,'>!sort").is_none());
+
+        // Not a bang command at all, and the ordinary dispatch must
+        // still see every one of these unchanged.
+        for line in ["w", "wq", "q!", "s/a/b/", "normal dd", "1,5d", "diag", "echo hi!"] {
+            assert!(parse_bang_command(line).is_none(), "{line}");
+        }
     }
 
     #[test]
