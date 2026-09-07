@@ -149,14 +149,43 @@ pub(crate) fn classify_word_role(prefix_text: &str) -> CmdRole {
 // insertion order, which would otherwise vary source to source (HashSet
 // iteration for command names, read_dir order for files).
 fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
-    let mut scored: Vec<(i32, CompletionCandidate)> = names
+    let mut scored: Vec<(i32, bool, CompletionCandidate)> = names
         .into_iter()
         .filter_map(|name| {
-            fuzzy::fuzzy_match(prefix, &name).map(|m| (m.score, CompletionCandidate { display: name, matched_positions: m.positions }))
+            let hidden = hidden_name(&name) && !asking_for_hidden(prefix);
+            fuzzy::fuzzy_match(prefix, &name).map(|m| (m.score, hidden, CompletionCandidate { display: name, matched_positions: m.positions }))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.display.cmp(&b.1.display)));
-    scored.into_iter().map(|(_, c)| c).collect()
+    // Hidden *first*, ahead of the score, not as a tiebreak after it.
+    // A dotfile is unlikely however well it happens to fuzzy-match, and
+    // as a tiebreak this did nothing the moment two candidates scored
+    // differently -- which for any non-empty prefix is almost always,
+    // since the score largely tracks name length. `.env` came second
+    // for `./` on no better grounds than being short.
+    scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)).then_with(|| a.2.display.cmp(&b.2.display)));
+    scored.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// Whether the *last* path segment of a candidate starts with a dot.
+///
+/// The segment, not the whole string: `src/.gitignore` is hidden and
+/// `./main.rs` is not, and a test on the first character would get both
+/// backwards.
+fn hidden_name(name: &str) -> bool {
+    let bare = name.strip_suffix('/').unwrap_or(name);
+    bare.rsplit('/').next().is_some_and(|seg| seg.starts_with('.'))
+}
+
+/// Whether the word being completed is reaching for a hidden name --
+/// in which case they stop being unlikely and sort like anything else.
+///
+/// `.`, `..` and `./` are the exception inside the exception: they are
+/// how anyone writes an ordinary relative path, and reading them as
+/// "show me the dotfiles" would put `.git/` in front of the file they
+/// are actually typing.
+fn asking_for_hidden(prefix: &str) -> bool {
+    let last = prefix.rsplit('/').next().unwrap_or(prefix);
+    last.starts_with('.') && !matches!(last, "." | "..")
 }
 
 // A registered completion spec's own candidates are shown exactly as it
@@ -433,6 +462,42 @@ impl CompletionProvider for BuiltinCompletionProvider {
     }
 }
 
+/// The commands whose argument is a *directory* rather than any file,
+/// and where.
+///
+/// The same shape as `host_position` just below, and the same honest
+/// answer to "how does a shell know this": it is written down. There is
+/// no general way to derive it. A man page's SYNOPSIS does often name
+/// the operand (`mkdir ... DIRECTORY`, `cat ... FILE`), and bish
+/// already parses man pages -- but that data is fetched in a background
+/// thread and is `Pending` on the first lookup, so the first Tab after
+/// a fresh shell would not have it, which is precisely the Tab that
+/// needs it. fish, which is where this idea comes from, hard-codes the
+/// same knowledge in its own per-command completion files; its
+/// man-page scraper extracts *options*, not operand types.
+///
+/// So: a short list of the commands where offering a plain file is
+/// always wrong, and nothing beyond it. Anything else a user wants is
+/// `complete -d -c name`, which already works and which this
+/// deliberately does not override.
+///
+/// `cd -` and `cd ~-` are not paths at all, but they are two
+/// characters to type and nothing here needs to know about them.
+///
+/// Every argument, not a position: unlike `ssh`, none of these takes a
+/// remote command or anything else afterwards, so there is no index at
+/// which the answer changes.
+fn directory_position(command: Option<&str>) -> bool {
+    matches!(
+        command,
+        // The whole point of them.
+        Some("cd" | "pushd" | "chdir" | "rmdir")
+        // `mkdir a/b` names a directory that does not exist yet, and
+        // the parent it goes in is still completed as one.
+        | Some("mkdir")
+    )
+}
+
 // The commands whose arguments are hosts, and where.
 //
 // `ssh`, `sftp`, `mosh` and `ssh-copy-id` take exactly one host and then
@@ -538,6 +603,10 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
             CmdRole::Argument { command, arg_index } if host_position(command.as_deref(), arg_index) => {
                 self.host_candidates(command.as_deref(), &prefix)
             }
+            // A command whose argument can only be a directory is
+            // offered only directories -- a file there is not a
+            // near-miss, it is an answer that cannot work.
+            CmdRole::Argument { command, .. } if directory_position(command.as_deref()) => self.directory_candidates(&prefix),
             CmdRole::Argument { command, arg_index: 0 } => self.subcommand_or_file_candidates(command.as_deref(), &prefix),
             CmdRole::Argument { .. } => self.file_candidates(&prefix),
         };
@@ -640,6 +709,16 @@ impl<'a> ShellCompletionProvider<'a> {
     // works out naturally: the directory part is a literal prefix of
     // both, so it always matches contiguously at the front, and the fuzzy
     // step only has real work left to do on the filename itself.
+    /// `file_candidates`, minus everything that is not a directory --
+    /// for a command where a plain file is not a near-miss but an
+    /// answer that cannot work. See `directory_position`.
+    fn directory_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
+        // Every directory this lists is marked with a trailing `/` by
+        // `file_candidates`, which is what makes the filter a property
+        // of the name rather than a second trip to the filesystem.
+        self.file_candidates(prefix).into_iter().filter(|c| c.display.ends_with('/')).collect()
+    }
+
     fn file_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
         let Some(cwd) = self.cwd else { return Vec::new() };
         let dir_part = match prefix.rfind('/') {
@@ -722,6 +801,81 @@ impl<'a> ShellCompletionProvider<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranked(prefix: &str, names: &[&str]) -> Vec<String> {
+        rank(prefix, names.iter().map(|n| n.to_string()).collect()).into_iter().map(|c| c.display).collect()
+    }
+
+    const LISTING: &[&str] = &["Makefile", "README.md", "main.rs", "zebra.txt", ".env", ".gitignore", "src/", "node_modules/", ".git/"];
+
+    // Tabbing with nothing typed used to offer `.env`, `.git/` and
+    // `.gitignore` first, because every candidate scores the same and
+    // the alphabetical tiebreak puts `.` before every letter. They are
+    // the least likely thing anyone meant.
+    #[test]
+    fn tabbing_at_nothing_does_not_lead_with_dotfiles() {
+        let order = ranked("", LISTING);
+        let first_hidden = order.iter().position(|n| n.starts_with('.')).expect("they are still offered");
+        assert_eq!(first_hidden, 6, "every visible name comes first: {order:?}");
+        assert_eq!(&order[6..], &[".env".to_string(), ".git/".to_string(), ".gitignore".to_string()]);
+    }
+
+    // Asked for by name, they stop being unlikely -- a `.` is not a
+    // typo, it is the start of what somebody is typing.
+    #[test]
+    fn a_leading_dot_is_a_request_for_them() {
+        let order = ranked(".g", LISTING);
+        // Both `.git/` and `.gitignore` match, and which of the two
+        // leads is the score's business; what this pins is that a
+        // hidden name is no longer pushed behind everything else.
+        assert!(order.first().is_some_and(|n| n.starts_with(".git")), "{order:?}");
+        assert!(order.iter().take(2).all(|n| n.starts_with('.')), "{order:?}");
+    }
+
+    // `./` is how a relative path is written, not a request for hidden
+    // names -- and this is the case that shows why `hidden` has to
+    // outrank the score rather than break ties under it. Every one of
+    // these matches `./` at the same place, so the only thing left for
+    // the score to measure is name length, which put `./.env` second on
+    // no better grounds than being short.
+    #[test]
+    fn an_explicit_relative_path_is_not_a_request_for_them() {
+        let names: Vec<String> = LISTING.iter().map(|n| format!("./{n}")).collect();
+        let order: Vec<String> = rank("./", names).into_iter().map(|c| c.display).collect();
+        let first_hidden = order.iter().position(|n| n.starts_with("./.")).expect("still offered");
+        assert_eq!(first_hidden, 6, "{order:?}");
+    }
+
+    // The last segment decides, not the first character: `src/.env` is
+    // hidden and `./main.rs` is not, and testing the whole string gets
+    // both backwards.
+    #[test]
+    fn hidden_is_a_property_of_the_last_segment() {
+        assert!(hidden_name(".env") && hidden_name("src/.env") && hidden_name(".git/"));
+        assert!(!hidden_name("./main.rs") && !hidden_name("src/") && !hidden_name("a.b"));
+    }
+
+    #[test]
+    fn dot_and_dotdot_are_paths_rather_than_a_request() {
+        assert!(!asking_for_hidden("."), "`.` is how you write the current directory");
+        assert!(!asking_for_hidden(".."));
+        assert!(!asking_for_hidden("src/"));
+        assert!(asking_for_hidden(".git"));
+        assert!(asking_for_hidden("src/.env"), "the segment being typed is what counts");
+    }
+
+    // There is no deriving this -- see `directory_position`'s own doc
+    // comment. The list is short and the test says what is on it.
+    #[test]
+    fn the_commands_that_can_only_take_a_directory_are_written_down() {
+        for cmd in ["cd", "pushd", "chdir", "rmdir", "mkdir"] {
+            assert!(directory_position(Some(cmd)), "{cmd}");
+        }
+        for cmd in ["cat", "ls", "grep", "vim", "git"] {
+            assert!(!directory_position(Some(cmd)), "{cmd} takes files too");
+        }
+        assert!(!directory_position(None), "a command this could not resolve gets the general answer");
+    }
 
     #[test]
     fn fignore_leaves_out_the_suffixes_it_names() {

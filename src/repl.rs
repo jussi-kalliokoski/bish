@@ -9993,14 +9993,57 @@ fn gutter_hover_lines(tb: &TextBuffer, line: usize, column: fileeditor::GutterKi
     }
 }
 
-/// What clicking a gutter column does. `Some` is a line for the status
-/// row.
+/// What a click on a gutter column *means*, decided without doing it.
 ///
+/// Separated from `gutter_click` so the policy -- which column does
+/// what -- can be stated and tested on its own. That matters most for
+/// the columns that deliberately do nothing: "nothing" is a decision
+/// here rather than the absence of code somewhere, and a test can hold
+/// it to that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GutterAction {
+    /// 1-based, the way breakpoints are numbered everywhere else.
+    ToggleBreakpoint(usize),
+    /// 0-based, the way the buffer numbers its lines.
+    GoToLine(usize),
+    /// Deliberately nothing -- see `gutter_action`.
+    Nothing,
+}
+
 /// The division is that **clicking acts and hovering informs**: a
 /// column whose click would only be "tell me about this line" does not
-/// need one, because resting the pointer there already says it. So the
-/// two columns that *do* something get a click, and the three that
-/// describe something get a hover instead.
+/// need one, because resting the pointer there already says it.
+///
+/// Two columns act, one goes where it points, and two do nothing on
+/// purpose:
+///
+///   - **Breakpoint** -- the marker is the control, so clicking it is
+///     how you set one and how you take it away again.
+///   - **Line number** -- goes to the line, which is what clicking one
+///     means everywhere it means anything.
+///   - **Diagnostic**, **blame** and **diff** -- nothing at all, and
+///     that is the decision rather than an omission. Each has an
+///     obvious action waiting for it: clicking a problem marker should
+///     offer the fix, clicking a blame line should open that commit,
+///     clicking a diff marker should go to the hunk. None is settled,
+///     and an incidental "puts the cursor on the line" is exactly the
+///     sort of behaviour that becomes load-bearing while nobody is
+///     looking -- at which point giving the click its real meaning is
+///     a change that takes something away. Reserving them costs
+///     nothing now and keeps that a free choice.
+fn gutter_action(column: fileeditor::GutterKind, line: usize) -> GutterAction {
+    match column {
+        fileeditor::GutterKind::Breakpoint => GutterAction::ToggleBreakpoint(line + 1),
+        fileeditor::GutterKind::LineNumber => GutterAction::GoToLine(line),
+        fileeditor::GutterKind::Diagnostic | fileeditor::GutterKind::Blame | fileeditor::GutterKind::Diff => GutterAction::Nothing,
+    }
+}
+
+/// Carries out `gutter_action`. `Some` is a line for the status row.
+///
+/// A reserved column still *consumes* the click: letting it fall
+/// through would place the cursor by the text path, which is the
+/// behaviour being withheld.
 fn gutter_click(
     app: &mut App,
     edit_frame_id: Option<EditFrameId>,
@@ -10008,12 +10051,8 @@ fn gutter_click(
     line: usize,
     column: fileeditor::GutterKind,
 ) -> Option<String> {
-    match column {
-        // The marker is the control: clicking it is how you set one and
-        // how you take it away again. Only during a debug session,
-        // which is the only time the column is there to click.
-        fileeditor::GutterKind::Breakpoint => {
-            let at = line + 1;
+    match gutter_action(column, line) {
+        GutterAction::ToggleBreakpoint(at) => {
             let added = match edit_frame_id {
                 Some(id) => toggle_breakpoint(app, id, tb, at),
                 // No frame means no adapter to tell, but the marker is
@@ -10028,18 +10067,11 @@ fn gutter_click(
             };
             Some(format!("bish: breakpoint {} at line {at}", if added { "set" } else { "cleared" }))
         }
-        // Which is what `:N` does, and what clicking a line number
-        // means everywhere it means anything.
-        fileeditor::GutterKind::LineNumber => {
+        GutterAction::GoToLine(line) => {
             tb.set_cursor(line.min(tb.line_count().saturating_sub(1)), 0);
             None
         }
-        // These three say something rather than do something, and the
-        // pointer resting on them already says it.
-        fileeditor::GutterKind::Blame | fileeditor::GutterKind::Diff | fileeditor::GutterKind::Diagnostic => {
-            tb.set_cursor(line.min(tb.line_count().saturating_sub(1)), 0);
-            None
-        }
+        GutterAction::Nothing => None,
     }
 }
 
@@ -15327,6 +15359,26 @@ mod gutter_hover_tests {
         assert!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Diff)[0].contains("added"));
         assert!(gutter_hover_lines(&tb, 2, fileeditor::GutterKind::Diff)[0].contains("removed"));
         assert!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Diff).is_empty(), "an unchanged line has no marker to explain");
+    }
+
+    // Blame and diff do nothing on purpose, and this is where that is
+    // held. Both have an obvious action waiting for them, and shipping
+    // an incidental "puts the cursor on the line" in the meantime is
+    // how a placeholder becomes something people rely on -- after
+    // which giving the click its real meaning takes something away.
+    #[test]
+    fn the_undecided_columns_are_reserved_rather_than_given_a_default() {
+        assert_eq!(gutter_action(fileeditor::GutterKind::Blame, 3), GutterAction::Nothing);
+        assert_eq!(gutter_action(fileeditor::GutterKind::Diff, 3), GutterAction::Nothing);
+        assert_eq!(gutter_action(fileeditor::GutterKind::Diagnostic, 3), GutterAction::Nothing);
+    }
+
+    #[test]
+    fn the_decided_columns_do_what_their_marker_says() {
+        // 1-based on the way out, because that is how breakpoints are
+        // numbered everywhere else.
+        assert_eq!(gutter_action(fileeditor::GutterKind::Breakpoint, 3), GutterAction::ToggleBreakpoint(4));
+        assert_eq!(gutter_action(fileeditor::GutterKind::LineNumber, 3), GutterAction::GoToLine(3));
     }
 
     // These two are controls rather than descriptions: the breakpoint
