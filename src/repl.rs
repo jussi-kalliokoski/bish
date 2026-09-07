@@ -11976,7 +11976,20 @@ fn run_command_mode(
                         }
                     }
 
-                    if let Some(parsed) = parse_substitute_command(&trimmed) {
+                    // `:s`, `:&`, `:&&`, `:~` -- "that again". Checked
+                    // first, and deliberately narrow enough not to
+                    // shadow a real `:s/a/b/` (see
+                    // `parse_repeat_substitute`).
+                    let repeat = parse_repeat_substitute(&trimmed).map(|parsed| {
+                        parsed.and_then(|(from, to, kind, flags)| repeat_substitute(app.last_substitute.as_ref(), last_search, from, to, kind, flags))
+                    });
+                    // Either shape arrives here as the same thing: a
+                    // `SubstituteCmd`, or the reason there isn't one.
+                    if let Some(parsed) = repeat.or_else(|| parse_substitute_command(&trimmed)) {
+                        // A no-op for a repeat, which arrives with its
+                        // pattern and flags already decided -- the two
+                        // reach back for different things and
+                        // `repeat_substitute` documents why.
                         let resolved = parsed.and_then(|cmd| resolve_substitute(cmd, app.last_substitute.as_ref(), last_search));
                         // `c` cannot run here -- see the outcome's own
                         // doc comment. Recorded first, so the `:s//x/`
@@ -13443,14 +13456,6 @@ struct SubstituteCmd {
     /// it is in vim, and inherits the flags only: a count is not one,
     /// confirmed by running vim.
     keep_flags: bool,
-    /// `r` -- accepted, and deliberately without effect. See
-    /// `resolve_substitute` for the vim runs that show why: `:s` writes
-    /// the search pattern too, so "the last search pattern" and "the
-    /// last substitute pattern" are the same string by the time this
-    /// could consult them. Kept as a field so the flag is parsed rather
-    /// than rejected, and so the reason has somewhere to live.
-    #[allow(dead_code, reason = "parsed so `r` is accepted; see resolve_substitute for why it changes nothing")]
-    use_search_pattern: bool,
     /// `p` / `#` / `l` -- print the last line a substitution touched.
     print: Option<PrintStyle>,
     /// `c` -- ask about each match before making it.
@@ -13480,6 +13485,11 @@ struct SubstituteFlags {
     count_only: bool,
     no_error: bool,
     keep_flags: bool,
+    /// `r` -- reach for the last *search* pattern rather than the last
+    /// substitute's. It means something on `:&r`, which is how vim
+    /// spells `:~` (see `repeat_substitute`); on a `:s//repl/` it
+    /// changes nothing, and `resolve_substitute` has the vim runs that
+    /// show why.
     use_search_pattern: bool,
     print: Option<PrintStyle>,
     confirm: bool,
@@ -13641,6 +13651,106 @@ fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
     // but slicing `trimmed` wants the byte one regardless.
     let at = trimmed.char_indices().nth(i).map(|(at, _)| at)?;
     Some(BangCommand::Filter { from, to, cmd: &trimmed[at + 1..] })
+}
+
+/// Which of the three "do that again" commands this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatSubstitute {
+    /// `:s` on its own and `:&` -- the last substitute's pattern and
+    /// replacement, and *none* of its flags.
+    Bare,
+    /// `:&&` -- the same, keeping the flags.
+    KeepFlags,
+    /// `:~` -- the last substitute's replacement, but the last *search*
+    /// pattern. `:&r` is spelled differently and means this.
+    LastSearch,
+}
+
+/// `:[range]s`, `:[range]&`, `:[range]&&`, `:[range]~`, each with its
+/// own optional flags and count after it.
+///
+/// Checked before `parse_substitute_command`, and careful not to shadow
+/// it: an `s` here has to be followed by the end of the line or a space,
+/// so `:s/a/b/` stays a substitute and `:set`/`:sort` stay themselves.
+fn parse_repeat_substitute(trimmed: &str) -> Option<Result<(LineRef, LineRef, RepeatSubstitute, SubstituteFlags), String>> {
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    let (from, to) = parse_range_prefix(&chars, &mut i).unwrap_or((LineRef::Current, LineRef::Current));
+    let kind = match (chars.get(i), chars.get(i + 1)) {
+        (Some('&'), Some('&')) => {
+            i += 2;
+            RepeatSubstitute::KeepFlags
+        }
+        (Some('&'), _) => {
+            i += 1;
+            RepeatSubstitute::Bare
+        }
+        (Some('~'), _) => {
+            i += 1;
+            RepeatSubstitute::LastSearch
+        }
+        // A bare `s`, and only a bare one.
+        (Some('s'), None) | (Some('s'), Some(' ')) => {
+            i += 1;
+            RepeatSubstitute::Bare
+        }
+        _ => return None,
+    };
+    let flags: String = chars[i..].iter().collect();
+    Some(parse_substitute_flags(&flags).map(|f| (from, to, kind, f)))
+}
+
+/// Turns one of those into the `:s` it stands for.
+///
+/// The pattern is taken deliberately rather than through
+/// `resolve_substitute`'s "whichever was more recent" rule: `:&` means
+/// the last *substitute*'s pattern even when a `/` search has happened
+/// since, which is exactly where that rule and this one part company.
+/// Confirmed by running vim.
+fn repeat_substitute(
+    last: Option<&LastSubstitute>,
+    last_search: &str,
+    from: LineRef,
+    to: LineRef,
+    kind: RepeatSubstitute,
+    flags: SubstituteFlags,
+) -> Result<SubstituteCmd, String> {
+    let Some(previous) = last else { return Err("E33: No previous substitute regular expression".to_string()) };
+    let search_pattern = kind == RepeatSubstitute::LastSearch || flags.use_search_pattern;
+    let pattern = match search_pattern {
+        true if !last_search.is_empty() => last_search.to_string(),
+        _ => previous.cmd.pattern.clone(),
+    };
+    // `:&&` starts from the previous flags and `:s`/`:&`/`:~` start from
+    // none, and either way the ones written here go on top.
+    let base = match kind {
+        RepeatSubstitute::KeepFlags => &previous.cmd,
+        _ => &SubstituteCmd {
+            global: false,
+            ignore_case: None,
+            count_only: false,
+            no_error: false,
+            confirm: false,
+            print: None,
+            ..previous.cmd.clone()
+        },
+    };
+    Ok(SubstituteCmd {
+        from,
+        to,
+        pattern,
+        replacement: previous.cmd.replacement.clone(),
+        global: base.global || flags.global,
+        ignore_case: flags.ignore_case.or(base.ignore_case),
+        // A count belongs to the command that writes it and is never
+        // inherited -- see `SubstituteCmd::count`.
+        count: flags.count,
+        count_only: base.count_only || flags.count_only,
+        no_error: base.no_error || flags.no_error,
+        keep_flags: false,
+        print: flags.print.or(base.print),
+        confirm: base.confirm || flags.confirm,
+    })
 }
 
 /// `None` when `trimmed` is not one of these at all, so the ordinary
@@ -13985,7 +14095,6 @@ fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, Strin
         count_only: f.count_only,
         no_error: f.no_error,
         keep_flags: f.keep_flags,
-        use_search_pattern: f.use_search_pattern,
         print: f.print,
         confirm: f.confirm,
     }))
@@ -14325,14 +14434,14 @@ fn resolve_substitute(mut cmd: SubstituteCmd, last: Option<&LastSubstitute>, las
         // since the last `:s` is newer than it, otherwise the `:s` is.
         //
         // `r` does not enter into this, and that is not an oversight.
-        // Its documented job is to prefer the last *search* pattern over
-        // the last *substitute* pattern -- but `:s` writes the search
-        // pattern too, so after `/cCc` then `:s/a/Z/` the "previously
-        // used search pattern" is `a`, and real vim answers `:s//W/r`
-        // with `a` exactly as it answers `:s//W/`. Confirmed by running
-        // all four orderings. `r` only diverges in `:&r`/`:~`, which
-        // bish does not have; it is accepted here so the flag is not an
-        // error, and it changes nothing.
+        // Its job is to prefer the last *search* pattern over the last
+        // *substitute* pattern -- but `:s` writes the search pattern
+        // too, so after `/cCc` then `:s/a/Z/` the "previously used
+        // search pattern" is `a`, and real vim answers `:s//W/r` with
+        // `a` exactly as it answers `:s//W/`. Confirmed by running all
+        // four orderings. Where `r` does bite is `:&r`, which is `:~` --
+        // see `repeat_substitute`, whose whole point is that it reaches
+        // back deliberately rather than by recency.
         let searched_since = last.is_none_or(|l| l.search_then != last_search);
         let substituted = previous.map(|p| p.pattern.as_str()).filter(|p| !p.is_empty());
         let pattern = match searched_since {
@@ -15772,6 +15881,65 @@ mod substitute_command_tests {
         assert!(parse("%s/a/Z/0").is_err(), "a zero count is a typo, not an empty range");
     }
 
+    // `:s`, `:&`, `:&&`, `:~` -- and the `s` here must not shadow a
+    // real one, nor `:set`/`:sort`.
+    #[test]
+    fn the_repeat_commands_parse_without_shadowing_anything() {
+        let kind = |line: &str| parse_repeat_substitute(line).map(|r| r.map(|(from, to, k, f)| (from, to, k, f.global)));
+        assert!(matches!(kind("s"), Some(Ok((LineRef::Current, LineRef::Current, RepeatSubstitute::Bare, _)))));
+        assert!(matches!(kind("&"), Some(Ok((_, _, RepeatSubstitute::Bare, _)))));
+        assert!(matches!(kind("&&"), Some(Ok((_, _, RepeatSubstitute::KeepFlags, _)))));
+        assert!(matches!(kind("~"), Some(Ok((_, _, RepeatSubstitute::LastSearch, _)))));
+        // Ranges, own flags, own count.
+        assert!(matches!(kind("2,3&&"), Some(Ok((LineRef::Number(2), LineRef::Number(3), RepeatSubstitute::KeepFlags, _)))));
+        assert!(matches!(kind("%~g"), Some(Ok((LineRef::Number(1), LineRef::Last, RepeatSubstitute::LastSearch, true)))));
+        assert!(matches!(kind("s g"), Some(Ok((_, _, RepeatSubstitute::Bare, true)))));
+
+        // Not repeats: a real substitute, and two ordinary commands that
+        // merely start with the same letter.
+        for line in ["s/a/b/", "s/a/b/g", "set", "sort", "w", "1,5d"] {
+            assert!(parse_repeat_substitute(line).is_none(), "{line}");
+        }
+    }
+
+    // What each of them reaches back for. The distinction the whole `r`
+    // flag exists for is here: `:&` takes the last *substitute*'s
+    // pattern even when a `/` search has happened since, where a
+    // `:s//x/` would have taken the search. Checked against real vim.
+    #[test]
+    fn a_repeat_takes_its_pattern_deliberately_not_by_recency() {
+        let previous = LastSubstitute {
+            cmd: parse_substitute_command("%s/a/Z/g").unwrap().unwrap(),
+            // The search at the time -- a later `/cCc` is newer than it.
+            search_then: String::new(),
+        };
+        let repeat = |line: &str| {
+            let Some(Ok((from, to, kind, flags))) = parse_repeat_substitute(line) else { panic!("{line}") };
+            repeat_substitute(Some(&previous), "cCc", from, to, kind, flags).unwrap()
+        };
+
+        // `:&` and a bare `:s` take the substitute's pattern, and drop
+        // its flags.
+        for line in ["&", "s"] {
+            let cmd = repeat(line);
+            assert_eq!(cmd.pattern, "a", "{line}");
+            assert_eq!(cmd.replacement, "Z", "{line}");
+            assert!(!cmd.global, "{line}: the flags do not come along");
+        }
+        // `:&&` keeps them.
+        assert!(repeat("&&").global);
+        // `:~` and `:&r` are the same command spelled two ways.
+        assert_eq!(repeat("~").pattern, "cCc");
+        assert_eq!(repeat("&r").pattern, "cCc");
+        // Its own flags go on top of whichever base it started from.
+        assert!(repeat("&g").global);
+        assert_eq!(repeat("&& 2").count, Some(2), "a count is never inherited, only written");
+
+        // Nothing to repeat.
+        let Some(Ok((from, to, kind, flags))) = parse_repeat_substitute("&") else { panic!() };
+        assert!(repeat_substitute(None, "", from, to, kind, flags).is_err());
+    }
+
     #[test]
     fn the_remaining_flags_parse() {
         let parse = |line: &str| parse_substitute_command(line).expect("recognized as `s`");
@@ -15900,7 +16068,6 @@ mod substitute_command_tests {
             count_only: false,
             no_error: false,
             keep_flags: false,
-            use_search_pattern: false,
             print: None,
             confirm: false,
         };
@@ -15924,7 +16091,6 @@ mod substitute_command_tests {
             count_only: false,
             no_error: false,
             keep_flags: false,
-            use_search_pattern: false,
             print: None,
             confirm: false,
         };
@@ -15948,7 +16114,6 @@ mod substitute_command_tests {
             count_only: false,
             no_error: false,
             keep_flags: false,
-            use_search_pattern: false,
             print: None,
             confirm: false,
         };
@@ -15973,7 +16138,6 @@ mod substitute_command_tests {
             count_only: false,
             no_error: false,
             keep_flags: false,
-            use_search_pattern: false,
             print: None,
             confirm: false,
         };
@@ -15998,7 +16162,6 @@ mod substitute_command_tests {
             count_only: false,
             no_error: false,
             keep_flags: false,
-            use_search_pattern: false,
             print: None,
             confirm: false,
         };
