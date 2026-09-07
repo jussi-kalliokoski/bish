@@ -94,6 +94,44 @@ pub fn query(command: &str) -> ManStatus {
     ManStatus::Pending
 }
 
+/// `query`, for a caller that has nothing else to do until the answer
+/// arrives: the page is found and parsed on *this* thread instead of a
+/// background one, so the result is never `Pending`.
+///
+/// The editor must never call this -- a redraw that stops to read a man
+/// page is a redraw that stutters, which is the whole reason `query`
+/// spawns. `bish tool lsp-server` is the opposite case: a hover request
+/// is one question with one answer, the client is showing a spinner
+/// until it comes, and "press K again in a moment" is advice about a
+/// key that does not exist there.
+///
+/// Shares the cache with `query`, so a page either has already fetched
+/// is returned rather than fetched twice. A fetch already in flight is
+/// waited for rather than duplicated.
+pub fn query_blocking(command: &str) -> ManStatus {
+    loop {
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().unwrap();
+        match guard.get(command) {
+            Some(CacheEntry::Ready(data)) => return ManStatus::Ready(Arc::clone(data)),
+            Some(CacheEntry::Missing) => return ManStatus::Missing,
+            // Somebody else's background fetch. Waiting for it is what
+            // the caller asked for; the lock is released first, since
+            // the fetch needs it to finish.
+            Some(CacheEntry::Pending) => {
+                drop(guard);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            None => {
+                guard.insert(command.to_string(), CacheEntry::Pending);
+            }
+        }
+        drop(guard);
+        fetch_and_store(command.to_string());
+    }
+}
+
 fn fetch_and_store(command: String) {
     let result = fetch_and_parse(&command);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));

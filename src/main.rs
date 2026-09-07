@@ -31,6 +31,7 @@ mod keymap;
 mod lexer;
 mod lsp;
 mod lspclient;
+mod lspserver;
 mod markdown;
 mod pager;
 mod parser;

@@ -14,12 +14,13 @@ use std::io::{self, Read, Write};
 
 // Used both for the "expected:" line and for the "did you mean" beside
 // it, so the two cannot disagree about what exists.
-const SUBCOMMANDS: &[&str] = &["check", "format", "debug", "edit", "keys"];
+const SUBCOMMANDS: &[&str] = &["check", "format", "lsp-server", "debug", "edit", "keys"];
 
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("check") => run_check(&args[1..]),
         Some("format") => run_format(&args[1..]),
+        Some("lsp-server") => crate::lspserver::run(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
         Some("keys") => run_keys(&args[1..]),
@@ -30,7 +31,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         None => {
             eprintln!(
-                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool debug FILE, bish tool edit [--hex] FILE..., bish tool keys [SEQUENCE | --action TEXT])"
+                "bish tool: expected a subcommand (usage: bish tool check [--fix] [FILE...], bish tool format [--check] [FILE...], bish tool lsp-server, bish tool debug FILE, bish tool edit [--hex] FILE..., bish tool keys [SEQUENCE | --action TEXT])"
             );
             2
         }

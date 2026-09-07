@@ -316,7 +316,10 @@ impl PauseState {
         let (row, col) = self.nav_buf.cursor();
         let chars = self.nav_buf.line_chars(row);
         let line_text: String = chars.iter().collect();
-        self.hover_lines = docs::hover_lines_at(&chars, col, &line_text, &self.docs, |name| shell.debug_peek_var(name));
+        self.hover_lines = match docs::hover_lines_at(&chars, col, &line_text, &self.docs, |name| shell.debug_peek_var(name)) {
+            lines if lines.is_empty() => vec![docs::NOTHING_UNDER_THE_CURSOR.to_string()],
+            lines => lines,
+        };
     }
 
     // Draws the real editor pane's own rect from scratch: the global

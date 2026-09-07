@@ -178,6 +178,30 @@ fn pipeline_commands(and_or: &AndOr) -> Vec<&Command> {
 // case) and only the *first* one seen wins, so the entry script's own
 // declarations always take precedence over a same-named one pulled in
 // from a `source`d file.
+/// Every function `src` defines at the top level, in source order,
+/// each with the line it starts on (1-based) and its doc comment when
+/// it has one.
+///
+/// Not `DocIndex`, deliberately, even though the scan is the same walk:
+/// that index records only *documented* symbols, because a hover with
+/// nothing to say is not a hover. An outline is the other question --
+/// it wants every function, and an undocumented one is exactly the one
+/// somebody is looking for the definition of.
+pub fn functions_in(src: &str) -> Vec<(String, usize, Vec<String>)> {
+    let Ok(toks) = Lexer::new(src).tokenize() else { return Vec::new() };
+    let Ok(program) = Parser::new(toks).parse_program() else { return Vec::new() };
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for item in &program {
+        for cmd in pipeline_commands(&item.and_or) {
+            if let Command::FuncDef { name, .. } = cmd {
+                out.push((name.clone(), item.line, doc_comment_above(&lines, item.line)));
+            }
+        }
+    }
+    out
+}
+
 fn record_symbol(symbols: &mut HashMap<String, SymbolDoc>, name: String, kind: SymbolKind, file: &Path, line: usize, doc: Vec<String>) {
     if doc.is_empty() {
         return;
@@ -294,6 +318,11 @@ pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
 // word that only *looks* identifier-shaped because it's sitting inside
 // a quoted string ("please deploy the app") -- correctly finds nothing
 // rather than spawning a pointless `man` lookup for prose.
+/// What `K` says when `hover_lines_at` found nothing at all. Lives
+/// here so the editor's own hover and the debugger's say it the same
+/// way.
+pub const NOTHING_UNDER_THE_CURSOR: &str = "no identifier under the cursor";
+
 pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIndex, live_value: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let identifier = identifier_at(chars, col);
     if let Some(name) = &identifier {
@@ -308,9 +337,15 @@ pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIn
         WordRole::Flag { command, flag } => hover_lines_for_flag(&command, &flag),
         WordRole::Command(name) => hover_lines_for_command(&name),
         WordRole::Subcommand { command, subcommand } => hover_lines_for_subcommand(&command, &subcommand),
+        // Empty means "there is nothing here", which is different
+        // from "there is a word here and nothing is known about it".
+        // `K` turns the first into `NOTHING_UNDER_THE_CURSOR`, because
+        // a keypress deserves an answer; a hover that fires on
+        // mouse-over does not, and `bish tool lsp-server` wants the
+        // silence.
         WordRole::Other => match identifier {
             Some(name) => vec![name, "no info available".to_string()],
-            None => vec!["no identifier under the cursor".to_string()],
+            None => Vec::new(),
         },
     }
 }

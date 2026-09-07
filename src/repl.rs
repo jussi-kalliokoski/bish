@@ -7387,7 +7387,13 @@ fn run_normal_mode_navigation(
                 .unwrap_or_else(|| {
                     let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
                     let debug_session = edit_frame_id.and_then(|id| app.debug_frames.get(&id));
-                    docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)))
+                    match docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name))) {
+                        // A keypress deserves an answer even when there
+                        // is nothing under the cursor -- see
+                        // `NOTHING_UNDER_THE_CURSOR`.
+                        lines if lines.is_empty() => vec![docs::NOTHING_UNDER_THE_CURSOR.to_string()],
+                        lines => lines,
+                    }
                 });
                 let gutter_width = rect.cols.saturating_sub(fileeditor::editor_content_cols(tb, rect));
                 let cursor_row = rect.row + row.saturating_sub(tb.viewport_top());
