@@ -1536,6 +1536,23 @@ pub struct Shell {
     // registered default", `--unset` removes the entry outright rather
     // than writing the default back, so "explicitly unset" and "never
     // touched" collapse to the same state.
+    /// What `$$` reports: the PID of the shell that started, not of
+    /// whichever process is asking.
+    ///
+    /// Read from state rather than from `getpid` because a forked child
+    /// -- a background job, a `( ... ) &` -- must still say the
+    /// *parent's* PID. POSIX is explicit that `$$` does not change in a
+    /// subshell, and scripts depend on it: `kill -HUP -$$` from a
+    /// background helper means "signal the whole thing I am part of",
+    /// and with the child's own PID it means nothing at all. `BASHPID`
+    /// is the one that answers "which process is this", and it asks the
+    /// kernel every time.
+    ///
+    /// A re-exec'd continuation of this shell is told the value
+    /// through `REEXEC_SHELL_PID`; a genuinely new shell process (a
+    /// user's own `bish -c`, the session daemon) gets its own from
+    /// `Shell::new`.
+    pub(crate) shell_pid: u32,
     pub(crate) bishopts: std::collections::HashMap<String, BishOptValue>,
     // `::bish theme begin`/`::bish theme end`'s own registry -- theme
     // name -> the bishopt overrides captured while declaring it (see
@@ -2052,7 +2069,14 @@ impl Shell {
         // time it is called. That was 169us of this function's 253us on
         // a 74-variable environment, and every re-exec'd construct pays
         // it.
-        let mut inherited: Vec<(String, String)> = std::env::vars().collect();
+        // Taken before the environment is collected, and filtered out
+        // of it: this is a private channel between a shell and the
+        // continuation of itself, not a variable. Left in, it would
+        // become an ordinary exported variable -- visible to `env`,
+        // and inherited by a *new* `bish -c` further down, which would
+        // then report its parent's `$$` instead of its own.
+        let shell_pid = inherited_shell_pid();
+        let mut inherited: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k != REEXEC_SHELL_PID).collect();
         // `PS4` is a real variable with a default, not a fallback used
         // when it is missing. The difference shows the moment a script
         // says `unset PS4`: bash then traces with no prefix at all,
@@ -2098,6 +2122,7 @@ impl Shell {
             nameref_local_stack: Vec::new(),
             dir_stack: Vec::new(),
             shopt_options: std::collections::HashMap::new(),
+            shell_pid: shell_pid.unwrap_or_else(std::process::id),
             bishopts: std::collections::HashMap::new(),
             themes: std::collections::HashMap::new(),
             hl: std::collections::HashMap::new(),
@@ -2464,6 +2489,7 @@ impl Shell {
             nameref_local_stack: Vec::new(),
             dir_stack: self.dir_stack.clone(),
             shopt_options: self.shopt_options.clone(),
+            shell_pid: self.shell_pid,
             bishopts: self.bishopts.clone(),
             themes: self.themes.clone(),
             hl: self.hl.clone(),
@@ -3057,6 +3083,28 @@ impl Shell {
         // different directories. A caller that wants somewhere else
         // still says so afterwards.
         command.current_dir(&self.cwd);
+        command
+    }
+
+    /// `command`, for the case where the child is *this shell
+    /// continuing* rather than a new one: a backgrounded subshell, a
+    /// co-process, a pipeline stage, a redirected compound.
+    ///
+    /// bish re-execs itself for those where bash forks, so a child
+    /// cannot inherit `$$` through memory the way a forked one does --
+    /// it has to be told. Without that, `$$` in a background subshell
+    /// was the child's own PID, and `kill -HUP -$$` from one signalled
+    /// a process group that did not exist.
+    ///
+    /// Deliberately not in `command` itself, even though that is the
+    /// one place a child's environment is built and this would then be
+    /// impossible to forget. A user's own `bish -c 'echo $$'` is an
+    /// ordinary external command and goes through `command` -- it is a
+    /// *new* shell and must report its own PID, and inheriting this
+    /// would make it lie.
+    pub(crate) fn reexec_command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = self.command(program);
+        command.env(REEXEC_SHELL_PID, self.shell_pid.to_string());
         command
     }
 
@@ -4445,19 +4493,48 @@ impl Shell {
     // statement in run_program -- frequent enough to feel responsive for
     // real scripts, without needing signal-safety anywhere outside the
     // one-line handler itself.
-    fn check_pending_signals(&mut self) {
+    /// `Some(Exit)` when a handler called `exit` -- which the caller
+    /// must propagate rather than carry on.
+    ///
+    /// This used to return `()` and drop what `run_source_here` gave
+    /// back, so `trap "exit 1" TERM` ran its body and then let the
+    /// script continue. Against a loop that was not merely a wrong
+    /// status: the loop ran to completion, and against `while :;` it
+    /// never stopped at all -- the signal that was supposed to end the
+    /// program was the one thing that could not. `exit` inside a trap
+    /// is *the* way a shell script arranges to be interruptible, so it
+    /// is worth the return type.
+    ///
+    /// Only `Exit` propagates. A trap body is its own execution
+    /// context, not part of whatever it interrupted, so a `break` or
+    /// `continue` in one has no loop of the interrupted script's to
+    /// act on -- letting those out would make a handler able to break
+    /// a loop it never entered.
+    #[must_use]
+    fn check_pending_signals(&mut self) -> Option<ExecResult> {
         let pending = PENDING_SIGNALS.swap(0, std::sync::atomic::Ordering::SeqCst);
         if pending == 0 {
-            return;
+            return None;
         }
+        let mut exit = None;
         for sig in 1..=64 {
             if pending & (1u64 << (sig - 1)) == 0 {
                 continue;
             }
             if let Some(TrapAction::Run(code)) = self.traps.get(&sig).cloned() {
-                self.run_source_here(&code, "trap");
+                // Every pending handler still runs, even once one has
+                // asked to exit: they arrived before the decision did,
+                // and a handler skipped here is one that never runs at
+                // all. The first `exit` is the one that counts, the
+                // same way the first of several `exit`s in a row does.
+                if let ExecResult::Exit(code) = self.run_source_here(&code, "trap")
+                    && exit.is_none()
+                {
+                    exit = Some(ExecResult::Exit(code));
+                }
             }
         }
+        exit
     }
 
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
@@ -4465,7 +4542,9 @@ impl Shell {
         let Some(last_item) = prog.last() else { return result };
         for item in prog {
             self.current_line = item.line;
-            self.check_pending_signals();
+            if let Some(exit) = self.check_pending_signals() {
+                return exit;
+            }
             // Nothing is reading this stage's output any more. A stage
             // that was its own process would already be dead of
             // SIGPIPE; this is where the in-process one stops instead,
@@ -5281,7 +5360,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        let mut command = self.command(exe);
+        let mut command = self.reexec_command(exe);
         command.arg("-c").arg(script).current_dir(&self.cwd);
         // Attached to its own pty, for exactly the reason run_single's own
         // background spawn already is (see `use_pty` there): inherited
@@ -5339,7 +5418,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + &crate::serialize::serialize_command(body);
-        let mut command = self.command(exe);
+        let mut command = self.reexec_command(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
         command.stdin(Stdio::from(in_r));
@@ -5408,7 +5487,7 @@ impl Shell {
         // have it apply them a second time -- and, for a compound, take
         // this same path again and spawn another child.
         let script = self.functions_preamble() + &crate::serialize::serialize_command_body(cmd);
-        let mut command = self.command(exe);
+        let mut command = self.reexec_command(exe);
         command.arg("-c").arg(script);
         command.current_dir(&self.cwd);
         // Whichever of this job's own streams the redirects *didn't*
@@ -9519,7 +9598,7 @@ impl Shell {
                         };
                         let script_line: String = argv.iter().map(|a| crate::serialize::quote_literal(a)).collect::<Vec<_>>().join(" ");
                         let script = self.functions_preamble() + &script_line;
-                        let mut command = self.command(exe);
+                        let mut command = self.reexec_command(exe);
                         command.arg("-c").arg(script);
                         command
                     } else {
@@ -9594,7 +9673,7 @@ impl Shell {
                         }
                     };
                     let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
-                    let mut command = self.command(exe);
+                    let mut command = self.reexec_command(exe);
                     command.arg("-c").arg(script);
                     command.stdin(default_stdin);
                     command.stdout(default_stdout);
@@ -11047,7 +11126,7 @@ impl Shell {
             // as effectively magic rather than ordinary settable
             // variables (SECONDS is the one partial exception -- see
             // assign_var's special-case for `SECONDS=n`).
-            "$" => std::process::id().to_string(),
+            "$" => self.shell_pid.to_string(),
             "!" => self.jobs.borrow().last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
             // These four read something outside the shell's own state
             // (the RNG, the clock), so an otherwise-effectless function
@@ -14278,6 +14357,23 @@ pub fn take_winch() -> bool {
 // Name <-> number for the signals scripts actually trap. KILL (9) and
 // STOP (19) are intentionally absent -- neither can be caught or ignored,
 // matching real bash's own refusal to let `trap` touch them.
+/// How a re-exec'd continuation of a shell learns the `$$` it must
+/// report. Not a variable any script sets or sees: it is removed from
+/// the child's own environment the moment it is read, so
+/// `env | grep BISH` in a background subshell shows nothing and an
+/// exported copy cannot leak on to a grandchild that is a *new* shell.
+const REEXEC_SHELL_PID: &str = "BISH_REEXEC_SHELL_PID";
+
+/// The `$$` this process was told to report, if it was told one.
+fn inherited_shell_pid() -> Option<u32> {
+    let value = std::env::var(REEXEC_SHELL_PID).ok()?;
+    // Taken, not read: see REEXEC_SHELL_PID. Removing it here is what
+    // keeps it out of `export -p`, out of a child's environment, and
+    // out of the way of anything that enumerates variables.
+    unsafe { std::env::remove_var(REEXEC_SHELL_PID) };
+    value.parse().ok()
+}
+
 pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
     ("HUP", 1),
     ("INT", 2),
@@ -14348,8 +14444,11 @@ fn realtime_signal_number(bare: &str) -> Option<i32> {
 
 // The two `trap` must refuse, kept out of SIGNAL_NAMES precisely so
 // that list can *be* trap's answer to "may I catch this?" -- and put
-// back by everything whose job is only to name a signal, which is what
-// `kill -l` and a job's own status line do.
+// back by everything that is not asking that question. Naming a signal
+// is one such job (`kill -l`, a job's own status line); *sending* one
+// is the other, and is the case this comment used to leave out.
+// `kill -KILL` was refused for as long as it did, which is a strange
+// thing for a shell not to accept -- see `kill_signal_number`.
 pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", 19)];
 
 /// Every signal by name and number, in numeric order -- the named ones

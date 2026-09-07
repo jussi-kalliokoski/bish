@@ -443,15 +443,32 @@ fn signal_name_or_number(arg: &str) -> Option<String> {
     crate::exec::all_signals().iter().find(|(name, _)| **name == bare).map(|(_, num)| num.to_string())
 }
 
-// `kill`'s own reading of a signal spec. Unlike `trap`'s it admits 0,
-// which is not a signal at all: it delivers nothing and only reports
-// whether the process is there, which is what makes `kill -0 $$` the
-// idiom for "is it still running". `signal_number` rejects it -- rightly,
-// for a trap -- and `kill -0` was failing with "invalid signal
-// specification".
+// `kill`'s own reading of a signal spec, which differs from `trap`'s in
+// two ways -- both because sending a signal and catching one are
+// different questions.
+//
+// It admits 0, which is not a signal at all: it delivers nothing and
+// only reports whether the process is there, which is what makes
+// `kill -0 $$` the idiom for "is it still running". `signal_number`
+// rejects it -- rightly, for a trap -- and `kill -0` was failing with
+// "invalid signal specification".
+//
+// And it admits KILL and STOP, which `signal_number` also rejects, and
+// for the same reason turned inside out: they are absent from
+// SIGNAL_NAMES so that list can be trap's own answer to "may I catch
+// this?", and they cannot be caught. But they can certainly be *sent*
+// -- `kill -KILL` is the most-typed signal name there is -- and this
+// borrowed trap's refusal along with trap's table. `kill -9` worked
+// throughout, because a number takes a different path, which is what
+// made the gap look like "kill wants numbers" rather than "two names
+// are missing".
 fn kill_signal_number(spec: &str) -> Option<i32> {
     if spec == "0" || spec == "SIG0" {
         return Some(0);
+    }
+    let bare = spec.strip_prefix("SIG").unwrap_or(spec);
+    if let Some(&(_, n)) = crate::exec::UNCATCHABLE_SIGNALS.iter().find(|(name, _)| *name == bare) {
+        return Some(n);
     }
     crate::exec::signal_number(spec)
 }
@@ -460,9 +477,26 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
     let mut sig = 15; // SIGTERM
     let mut targets: Vec<&String> = Vec::new();
     let mut i = 0;
+    // Whether a signal has been named yet. Only the *first* argument
+    // can be one, which is what lets a negative number after it be
+    // read as what it is: a process group.
+    //
+    // `kill -TERM -$$` is the shape that matters -- signal the whole
+    // group -- and it is how a benchmark harness or a job-control
+    // script stops everything it started. bish read the `-12345` as
+    // another signal spec, found no such signal, and refused the whole
+    // command: "invalid signal specification" naming a number that was
+    // never meant to be one. `kill -- -12345` worked, which is the
+    // spelling nobody uses.
+    let mut signal_given = false;
     while i < args.len() {
         let a = &args[i];
-        if let Some(rest) = a.strip_prefix('-') {
+        // A signal may only be named first. After that -- once a signal
+        // has been given, or once any target has been -- a leading `-`
+        // belongs to a process group id, and bash reads it that way
+        // too: `kill 111 -222` signals process 111 and group 222.
+        let still_options = !signal_given && targets.is_empty();
+        if let Some(rest) = a.strip_prefix('-').filter(|_| still_options) {
             if rest == "l" {
                 // `kill -l` on its own lists them; with arguments it
                 // translates each one the other way -- a number to its
@@ -509,6 +543,7 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
                 match kill_signal_number(spec) {
                     Some(n) => {
                         sig = n;
+                        signal_given = true;
                         i += 2;
                         continue;
                     }
@@ -520,6 +555,7 @@ pub(crate) fn run_kill(sh: &mut Shell, args: &[String]) -> i32 {
             }
             if let Some(n) = kill_signal_number(rest) {
                 sig = n;
+                signal_given = true;
                 i += 1;
                 continue;
             }

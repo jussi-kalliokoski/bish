@@ -296,6 +296,49 @@ mod tests {
         case("regex-interval-on-a-group", r#"re="^(ab){2}$"; for v in ab abab ababab; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-on-a-class", r#"re="^[0-9]{3}$"; for v in 12 123 1234; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-captures", r#"re="^(a{2})(b{1,2})$"; [[ aabb =~ $re ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#),
+        // `exit` inside a trap handler ends the script, and the
+        // statements after the signal never run. It used to run the
+        // handler and then carry on: against a `while :;` loop that
+        // meant the signal which was supposed to stop the program was
+        // the one thing that could not, and `shellbench` -- which stops
+        // every benchmark with `trap "exit 1" TERM` -- hung on bish
+        // for ever.
+        case("trap-exit-ends-the-script", r#"trap 'echo TRAP; exit 7' TERM; kill -TERM $$; echo NOTREACHED"#),
+        case("trap-exit-skips-the-statements-after-it", r#"trap 'exit 3' TERM; kill -TERM $$; for i in 1 2 3; do echo $i; done; echo NOTREACHED"#),
+        case("trap-without-exit-carries-on", r#"trap 'echo TRAP' TERM; kill -TERM $$; echo AFTER"#),
+        // `$$` is the shell that started, in every context -- POSIX is
+        // explicit that a subshell does not change it, and `BASHPID` is
+        // the one that answers "which process is this". bish re-execs
+        // where bash forks, so a backgrounded subshell could not
+        // inherit the value through memory and reported its own pid
+        // instead. `kill -HUP -$$` from a background helper then
+        // signalled a process group that did not exist, which is how a
+        // benchmark harness came to wait for ever.
+        case("dollar-dollar-is-the-same-in-a-background-subshell", r#"main=$$; ( [ "$$" = "$main" ] && echo same || echo differs ) & wait"#),
+        case("dollar-dollar-is-the-same-in-a-plain-subshell", r#"main=$$; ( [ "$$" = "$main" ] && echo same || echo differs )"#),
+        // A negative target is a process group, and only the *first*
+        // argument to `kill` may be a signal. bish read the `-12345` of
+        // `kill -TERM -12345` as a second signal spec, found no such
+        // signal, and refused the whole command.
+        case("kill-takes-a-process-group-as-a-target", r#"kill -TERM -999999 2>&1 | sed 's/.*kill: //'; kill -9 -999999 2>&1 | sed 's/.*kill: //'"#),
+        case("kill-still-reads-a-leading-number-as-a-signal", r#"kill -999999 2>&1 | sed 's/.*kill: //'"#),
+        case("kill-after-a-target-a-negative-is-another-target", r#"kill 999999 -888888 2>&1 | sed 's/.*kill: //'"#),
+        // POSIX lets a `case` arm open with `(`, and real scripts use
+        // it -- it is what keeps a `case` inside a `$( )` readable to
+        // anything counting parens. bish read `(a*)` as a subshell and
+        // called it a syntax error.
+        case("case-arm-may-open-with-a-paren", r#"case abc in (a*) echo one;; (*) echo other;; esac"#),
+        case("case-arm-paren-with-alternation", r#"for v in ab cd ef; do case $v in (a*|c*) echo "$v yes";; (*) echo "$v no";; esac; done"#),
+        case("case-arm-paren-around-a-quoted-pattern", r#"case 'x|y' in ("x|y") echo quoted;; (*) echo other;; esac"#),
+        // KILL and STOP are the two signals `trap` must refuse, and
+        // bish keeps them out of the table that answers "may I catch
+        // this?" for exactly that reason. `kill` shared the table and
+        // so refused to *send* them -- while `kill -9` worked, since a
+        // number takes a different path.
+        case(
+            "kill-accepts-the-uncatchable-signals-by-name",
+            r#"for s in KILL SIGKILL STOP TERM; do kill -$s 2>&1 >/dev/null | grep -q 'invalid signal' && echo "$s rejected" || echo "$s ok"; done"#,
+        ),
         // A brace that does not open a well-formed interval stays an
         // ordinary character, which is what every `awk '{print}'`
         // pattern depends on.

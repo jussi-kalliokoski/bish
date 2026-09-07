@@ -287,7 +287,7 @@ impl Parser {
     fn expect(&mut self, want: Tok) -> Result<(), String> {
         match self.advance() {
             Some(t) if t == want => Ok(()),
-            other => Err(format!("expected {:?}, got {:?}", want, other)),
+            other => Err(format!("expected `{}', found `{}'", describe_token(&want), describe_next(other.as_ref()))),
         }
     }
 
@@ -301,7 +301,7 @@ impl Parser {
     pub fn parse_program(&mut self) -> Result<Program, String> {
         let prog = self.parse_list_until(&[])?;
         if let Some(other) = self.peek() {
-            return Err(format!("unexpected token: {:?}", other));
+            return Err(format!("unexpected `{}'", describe_token(other)));
         }
         Ok(prog)
     }
@@ -335,7 +335,8 @@ impl Parser {
                 if stops.is_empty() {
                     break;
                 }
-                return Err(format!("unexpected end of input, expected one of {:?}", stops));
+                let expected: Vec<String> = stops.iter().map(|t| format!("`{}'", describe_token(t))).collect();
+                return Err(format!("unexpected end of input, expected one of {}", expected.join(", ")));
             }
             let line = self.current_line();
             let and_or = self.parse_and_or()?;
@@ -444,8 +445,7 @@ impl Parser {
     // -- the keyword or the word itself, not its Debug spelling.
     fn offending_token_text(&self) -> String {
         match self.peek() {
-            Some(Tok::Word(chunks, _)) => word_to_plain_name(chunks).unwrap_or_else(|| "word".to_string()),
-            Some(tok) => keyword_text(tok).unwrap_or("token").to_string(),
+            Some(tok) => describe_token(tok),
             None => "end of input".to_string(),
         }
     }
@@ -493,7 +493,7 @@ impl Parser {
         let atoms = self.parse_test_atoms()?;
         match self.advance() {
             Some(Tok::KwRBracket2) => {}
-            other => return Err(format!("expected ']]', got {:?}", other)),
+            other => return Err(format!("expected `]]', found `{}'", describe_next(other.as_ref()))),
         }
         let redirects = self.parse_trailing_redirects()?;
         Ok(Command::Test(atoms, redirects))
@@ -556,7 +556,7 @@ impl Parser {
                 Some(Tok::Newline) => {
                     self.advance();
                 }
-                other => return Err(format!("unexpected token in '[[ ]]': {:?}", other)),
+                other => return Err(format!("unexpected `{}' in `[[ ]]'", describe_next(other))),
             }
         }
         Ok(atoms)
@@ -613,7 +613,7 @@ impl Parser {
         self.advance(); // KwFunction
         let name = match self.advance() {
             Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain function name".to_string())?,
-            other => return Err(format!("expected function name, got {:?}", other)),
+            other => return Err(format!("expected a function name, found `{}'", describe_next(other.as_ref()))),
         };
         if matches!(self.peek(), Some(Tok::Subshell { raw, .. }) if raw.is_empty()) {
             self.advance();
@@ -653,7 +653,7 @@ impl Parser {
                     let redirects = self.parse_trailing_redirects()?;
                     return Ok(Command::If { branches, else_branch: None, redirects });
                 }
-                other => return Err(format!("expected elif/else/fi, got {:?}", other)),
+                other => return Err(format!("expected `elif', `else' or `fi', found `{}'", describe_next(other))),
             }
         }
     }
@@ -688,7 +688,7 @@ impl Parser {
         }
         let var = match self.advance() {
             Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain variable name after 'for'".to_string())?,
-            other => return Err(format!("expected variable name after 'for', got {:?}", other)),
+            other => return Err(format!("expected a variable name after `for', found `{}'", describe_next(other.as_ref()))),
         };
         self.skip_terminators();
 
@@ -718,7 +718,7 @@ impl Parser {
         self.advance(); // KwSelect
         let var = match self.advance() {
             Some(Tok::Word(chunks, _)) => word_to_plain_name(&chunks).ok_or_else(|| "expected a plain variable name after 'select'".to_string())?,
-            other => return Err(format!("expected variable name after 'select', got {:?}", other)),
+            other => return Err(format!("expected a variable name after `select', found `{}'", describe_next(other.as_ref()))),
         };
         self.skip_terminators();
 
@@ -795,12 +795,29 @@ impl Parser {
 
         let mut arms = Vec::new();
         while !matches!(self.peek(), Some(Tok::KwEsac)) {
-            let mut patterns = vec![self.expect_word()?];
-            while matches!(self.peek(), Some(Tok::Pipe)) {
-                self.advance();
-                patterns.push(self.expect_word()?);
-            }
-            self.expect(Tok::RParen)?;
+            // POSIX allows an arm to open with `(`, and plenty of real
+            // scripts use it -- it is what makes a `case` inside a
+            // `$( )` readable to an editor counting parens. The lexer
+            // has already folded `(a*|b*)` into one `Subshell` token by
+            // the time it gets here, since nothing there knows it is in
+            // a case: so the patterns are recovered by lexing that
+            // token's own text, and there is no `)` left to expect
+            // afterwards because it went into the token too.
+            let patterns = match self.peek() {
+                Some(Tok::Subshell { .. }) => {
+                    let Some(Tok::Subshell { raw, .. }) = self.advance() else { unreachable!("just peeked") };
+                    parse_case_patterns(&raw)?
+                }
+                _ => {
+                    let mut patterns = vec![self.expect_word()?];
+                    while matches!(self.peek(), Some(Tok::Pipe)) {
+                        self.advance();
+                        patterns.push(self.expect_word()?);
+                    }
+                    self.expect(Tok::RParen)?;
+                    patterns
+                }
+            };
             self.skip_terminators();
             let body = self.parse_list_until(&[Tok::DSemi, Tok::SemiAmp, Tok::DSemiAmp, Tok::KwEsac])?;
             let term = match self.peek() {
@@ -1159,10 +1176,88 @@ impl Parser {
             Some(Tok::Word(chunks, globbable)) => Ok(Word { chunks, globbable }),
             Some(tok) => match keyword_text(&tok) {
                 Some(s) => Ok(Word { chunks: vec![Chunk::Str(s.to_string())], globbable: true }),
-                None => Err(format!("expected word, got {:?}", Some(tok))),
+                None => Err(format!("expected a word, found `{}'", describe_token(&tok))),
             },
-            None => Err("expected word, got None".to_string()),
+            None => Err("expected a word, found the end of the input".to_string()),
         }
+    }
+}
+
+/// A token as something to put in front of a user. `{:?}` on a `Tok`
+/// spells its Rust shape -- `Some(Subshell { raw: "a*", attached:
+/// false })` was a real parser error message -- which describes this
+/// program's insides rather than the script that was written.
+/// `describe_token` for a token that may not be there at all, which is
+/// what `advance()` hands back at the end of the input.
+fn describe_next(tok: Option<&Tok>) -> String {
+    match tok {
+        Some(tok) => describe_token(tok),
+        None => "the end of the input".to_string(),
+    }
+}
+
+fn describe_token(tok: &Tok) -> String {
+    match tok {
+        Tok::Word(chunks, _) => word_to_plain_name(chunks).unwrap_or_else(|| "word".to_string()),
+        Tok::Subshell { raw, .. } => format!("({raw})"),
+        // The operators, which `keyword_text` does not cover and should
+        // not: its job is turning a keyword back into the *word* it can
+        // also be, and `;;` is never a word. An error message wants
+        // them spelled anyway -- "found `;;'" is the whole of what went
+        // wrong in `case a in ;; esac`.
+        Tok::DSemi => ";;".to_string(),
+        Tok::SemiAmp => ";&".to_string(),
+        Tok::DSemiAmp => ";;&".to_string(),
+        Tok::Semi => ";".to_string(),
+        Tok::Pipe => "|".to_string(),
+        Tok::Or => "||".to_string(),
+        Tok::And => "&&".to_string(),
+        Tok::Amp => "&".to_string(),
+        Tok::RParen => ")".to_string(),
+        Tok::LBrace => "{".to_string(),
+        Tok::RBrace => "}".to_string(),
+        Tok::Newline => "newline".to_string(),
+        other => keyword_text(other).unwrap_or("token").to_string(),
+    }
+}
+
+/// The patterns of a `(a*|b*)` case arm, from the text between its
+/// parens.
+///
+/// Lexed rather than split on `|` directly: a pattern is a word, and a
+/// `|` inside quotes or a bracket expression (`[a|b]`) is a character
+/// and not a separator. The lexer already knows which is which.
+fn parse_case_patterns(raw: &str) -> Result<Vec<Word>, String> {
+    let toks = crate::lexer::Lexer::new(raw).tokenize()?;
+    let mut patterns = Vec::new();
+    let mut expecting = true;
+    // The lexer pairs each token with the line it came from; a pattern
+    // list has no use for that.
+    for (tok, _line) in toks {
+        match tok {
+            Tok::Word(chunks, globbable) if expecting => {
+                patterns.push(Word { chunks, globbable });
+                expecting = false;
+            }
+            Tok::Pipe if !expecting => expecting = true,
+            // A newline inside the parens is layout, not a pattern --
+            // `(\n  a*\n)` is legal and means what it looks like.
+            Tok::Newline => {}
+            other => match keyword_text(&other) {
+                // `case x in (in) ...` -- a keyword is an ordinary word
+                // in pattern position, exactly as it is outside the
+                // parens.
+                Some(text) if expecting => {
+                    patterns.push(Word { chunks: vec![Chunk::Str(text.to_string())], globbable: true });
+                    expecting = false;
+                }
+                _ => return Err(format!("unexpected `{}' in a case pattern", describe_token(&other))),
+            },
+        }
+    }
+    match patterns.is_empty() {
+        true => Err("a case arm needs a pattern".to_string()),
+        false => Ok(patterns),
     }
 }
 
@@ -1281,7 +1376,7 @@ fn split_array_literal_words(raw: &str) -> Result<Vec<ArrayLiteralItem>, String>
                 });
             }
             Tok::Newline => {}
-            other => return Err(format!("unexpected token in array literal: {:?}", other)),
+            other => return Err(format!("unexpected `{}' in an array literal", describe_token(&other))),
         }
     }
     Ok(items)
@@ -1395,5 +1490,90 @@ mod line_tracking_tests {
     #[test]
     fn two_statements_on_one_line_share_that_line() {
         assert_eq!(lines_of("echo a; echo b\necho c\n"), vec![1, 1, 2]);
+    }
+    /// A word's literal text, quoting undone -- `word_to_plain_name`
+    /// will not do: it answers "is this an identifier?", and `a*` is
+    /// not one.
+    fn literal_text(chunks: &[Chunk]) -> String {
+        chunks
+            .iter()
+            .map(|c| match c {
+                Chunk::Str(s) => s.clone(),
+                Chunk::LiteralStr(s, _) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The patterns of an arm, as plain text -- enough to see how a
+    /// `(a*|b*)` was split without asserting on the whole AST.
+    fn case_patterns(src: &str) -> Vec<Vec<String>> {
+        let toks = crate::lexer::Lexer::new(src).tokenize().expect("lexes");
+        let prog = Parser::new(toks).parse_program().expect("parses");
+        prog.iter()
+            .flat_map(|item| std::iter::once(&item.and_or.first).chain(item.and_or.rest.iter().map(|(_, p)| p)).flat_map(|p| p.commands.iter()))
+            .filter_map(|cmd| match cmd {
+                Command::Case { arms, .. } => Some(arms),
+                _ => None,
+            })
+            .flat_map(|arms| {
+                arms.iter().map(|(patterns, _, _)| patterns.iter().map(|w| literal_text(&w.chunks)).collect::<Vec<String>>()).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    // POSIX's optional `(` before a case pattern. The lexer folds
+    // `(a*)` into a Subshell before the parser sees it, so the arm has
+    // to put it back -- and an arm written without the paren must go on
+    // parsing exactly as it did.
+    #[test]
+    fn a_case_arm_may_open_with_a_paren() {
+        assert_eq!(case_patterns("case x in (a*) :;; (b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
+        assert_eq!(case_patterns("case x in a*) :;; b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
+        // Both spellings in one statement, which is legal and is what a
+        // half-converted script looks like.
+        assert_eq!(case_patterns("case x in (a*) :;; b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
+    }
+
+    #[test]
+    fn a_parenthesised_arm_splits_its_alternatives() {
+        assert_eq!(case_patterns("case x in (a*|b*|c) :;; esac"), vec![vec!["a*", "b*", "c"]]);
+    }
+
+    // A `|` is only a separator between patterns. Inside a bracket
+    // expression or a quoted word it is a character, which is why the
+    // patterns are lexed rather than split on the byte.
+    #[test]
+    fn a_pipe_that_is_not_a_separator_stays_in_its_pattern() {
+        assert_eq!(case_patterns(r#"case x in ("a|b") :;; esac"#), vec![vec!["a|b"]]);
+        assert_eq!(case_patterns(r#"case x in (a\|b) :;; esac"#), vec![vec!["a|b"]]);
+    }
+
+    // A keyword is an ordinary word in pattern position -- `case $x in
+    // (in)` is not a syntax error outside the parens and must not
+    // become one inside them.
+    #[test]
+    fn a_keyword_is_a_pattern_like_any_other_word() {
+        assert_eq!(case_patterns("case x in (in) :;; (esac) :;; esac"), vec![vec!["in"], vec!["esac"]]);
+    }
+
+    #[test]
+    fn an_arm_with_no_pattern_at_all_is_refused() {
+        let toks = crate::lexer::Lexer::new("case x in () :;; esac").tokenize().expect("lexes");
+        let e = Parser::new(toks).parse_program().expect_err("no pattern to match on");
+        assert!(e.contains("needs a pattern"), "{e}");
+    }
+
+    // A parser error names what was written, not what this program
+    // calls it internally: `Some(Subshell { raw: "a*", attached: false
+    // })` was a real message a user could see.
+    #[test]
+    fn a_syntax_error_does_not_print_rust_debug_output() {
+        let toks = crate::lexer::Lexer::new("case a in ;; esac").tokenize().expect("lexes");
+        let e = Parser::new(toks).parse_program().expect_err("`;;' is not a pattern");
+        assert!(e.contains("`;;'"), "the message names the token as written: {e}");
+        for leak in ["Subshell", "Tok::", "Some(", "chunks", "{ raw"] {
+            assert!(!e.contains(leak), "{leak:?} leaked into a user-facing message: {e}");
+        }
     }
 }
