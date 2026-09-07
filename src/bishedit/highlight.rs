@@ -119,6 +119,9 @@ pub enum HighlightKind {
     Key,
 }
 
+/// A run of `text` that reads as one thing, in **character** offsets --
+/// the unit `compose` indexes its `&[char]` by, and so the unit every
+/// `Highlighter` owes its caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSpan {
     pub start: usize,
@@ -130,8 +133,52 @@ pub struct HighlightSpan {
     pub link: Option<String>,
 }
 
+/// Offsets in `HighlightSpan` are **character** offsets into `text`, not
+/// byte offsets: `compose` paints over a `&[char]`, one cell per
+/// character, and `lint::Diagnostic`, `url::find` and the LSP's own
+/// converted positions all count the same way. Every implementation here
+/// but one already produces them naturally, having been written against
+/// a `Vec<char>` in the first place; the exception is `CodeHighlighter`,
+/// whose scanners walk a `&str` and are converted at that seam.
 pub trait Highlighter {
     fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan>;
+}
+
+/// Rewrites byte offsets into character offsets, in place -- for a
+/// `Highlighter` whose underlying scanner counts bytes.
+///
+/// One walk of the text answers every offset at once: they are sorted
+/// first, so the walk and the answers advance together. An offset that
+/// lands *inside* a character (nothing here produces one, but a scanner
+/// that lost its place could) reads as that character's own index rather
+/// than panicking -- the same "a few spans come out wrong beats a crash"
+/// choice `next_span` already makes.
+fn char_offsets(text: &str, spans: &mut [HighlightSpan]) {
+    // One byte, one character, same number: nothing to do, which is the
+    // case for very nearly every buffer.
+    if text.is_ascii() {
+        return;
+    }
+    let mut wanted: Vec<usize> = spans.iter().flat_map(|s| [s.start, s.end]).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut answer = vec![0usize; wanted.len()];
+    let mut next = 0;
+    let mut count = 0;
+    for (index, (byte, ch)) in text.char_indices().enumerate() {
+        let after = byte + ch.len_utf8();
+        while next < wanted.len() && wanted[next] < after {
+            answer[next] = index;
+            next += 1;
+        }
+        count = index + 1;
+    }
+    // Whatever is left is the end of the text, or past it.
+    answer[next..].fill(count);
+    for span in spans.iter_mut() {
+        span.start = answer[wanted.partition_point(|&w| w < span.start)];
+        span.end = answer[wanted.partition_point(|&w| w < span.end)];
+    }
 }
 
 pub struct BashHighlighter;
@@ -578,7 +625,15 @@ type CodeScanner = fn(&str) -> Vec<(std::ops::Range<usize>, HighlightKind)>;
 
 impl Highlighter for CodeHighlighter {
     fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
-        (self.0)(text).into_iter().map(|(range, kind)| span(range, kind)).collect()
+        // The one place in this module where the two units meet. A
+        // scanner over a `&str` has byte offsets and nothing else --
+        // `s.pos`, a `Range<usize>` from `str::find` -- while everything
+        // downstream counts characters, and the two agree right up until
+        // the text stops being ASCII. Converted here rather than in each
+        // of the eight scanners, which would be eight chances to forget.
+        let mut spans: Vec<HighlightSpan> = (self.0)(text).into_iter().map(|(range, kind)| span(range, kind)).collect();
+        char_offsets(text, &mut spans);
+        spans
     }
 }
 
@@ -1796,6 +1851,48 @@ mod tests {
         let rendered = render_styled(&cells);
         // One SGR to enter the style, one to reset -- no per-char churn.
         assert_eq!(rendered.matches('\x1b').count(), 2);
+    }
+
+    // The scanners in codehighlight.rs count bytes; every other
+    // highlighter in this module, and everything that reads any of them,
+    // counts characters. Two units that agree for as long as the text is
+    // ASCII and then quietly stop.
+    #[test]
+    fn every_highlighter_reports_the_unit_compose_indexes_by() {
+        // The assertion is always about the span *after* the non-ASCII
+        // character, since that is the one an offset in the wrong unit
+        // moves.
+        let cases: &[(&str, &str, HighlightKind, &str)] = &[
+            ("rust", "let \u{e4} = 1;", HighlightKind::Number, "1"),
+            ("go", "var \u{e4} = 1", HighlightKind::Number, "1"),
+            ("python", "\u{e4} = 1", HighlightKind::Number, "1"),
+            ("javascript", "let \u{e4} = 1", HighlightKind::Number, "1"),
+            ("css", "a::after { content: \"\u{e4}\"; color: red }", HighlightKind::Key, "color"),
+            ("yaml", "a: \u{e4}\nb: 1\n", HighlightKind::Number, "1"),
+            ("html", "<p>\u{e4}</p>\n<b>x</b>\n", HighlightKind::Keyword, "<b"),
+            ("bash", "echo \u{e4} # x", HighlightKind::Comment, "# x"),
+            ("json", "{\"\u{e4}\": 1}", HighlightKind::Number, "1"),
+            ("toml", "[\u{e4}]\nk = 1\n", HighlightKind::Number, "1"),
+            ("markdown", "\u{e4}\n\n`code`\n", HighlightKind::String, "`code`"),
+        ];
+        for (language, text, kind, expected) in cases {
+            let chars: Vec<char> = text.chars().collect();
+            let spans = highlighter_for_language(language).expect(language).highlight(text, HighlightContext::default());
+            let found: Vec<String> = spans.iter().filter(|s| s.kind == *kind).map(|s| chars[s.start..s.end].iter().collect::<String>()).collect();
+            assert!(found.iter().any(|f| f == expected), "{language}: wanted {expected:?} among {kind:?} spans, got {found:?}");
+        }
+    }
+
+    // An offset that lands inside a character reads as that character
+    // rather than panicking -- nothing here produces one, but a scanner
+    // that lost its place could, and a wrong colour beats a crash.
+    #[test]
+    fn an_offset_inside_a_character_does_not_panic() {
+        let text = "a\u{e4}b";
+        let mut spans = vec![span(0..2, HighlightKind::Keyword), span(2..4, HighlightKind::String)];
+        char_offsets(text, &mut spans);
+        assert_eq!((spans[0].start, spans[0].end), (0, 1));
+        assert_eq!((spans[1].start, spans[1].end), (1, 3));
     }
 
     // Regression test for a real bug caught during interactive

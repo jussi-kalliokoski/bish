@@ -6383,6 +6383,23 @@ mod pre_save_hook_tests {
         buf
     }
 
+    // The end of the chain `highlight::CodeHighlighter` sits at the
+    // start of: its scanners count bytes, this pass counts characters,
+    // and one non-ASCII character anywhere in the buffer used to shift
+    // every span below it by the extra bytes that character costs --
+    // which is why this asserts on a `let` below the ellipsis rather
+    // than on the line holding it.
+    #[test]
+    fn a_wide_character_does_not_shift_the_highlighting_under_it() {
+        let text = "let a = '\u{2026}';\nlet b = 1;\n";
+        let buf = buf_with_ext(text, "rs");
+        let chars: Vec<char> = text.chars().collect();
+        let spans = buffer_highlight_spans(&buf, None);
+        let painted: Vec<String> = spans.iter().map(|s| chars[s.start..s.end].iter().collect()).collect();
+        assert!(painted.iter().all(|p| p == "let" || p == "'\u{2026}'" || p == "1"), "{painted:?}");
+        assert_eq!(painted.iter().filter(|p| *p == "let").count(), 2, "both `let`s, and the second one is the point: {painted:?}");
+    }
+
     // The dispatch, not the highlighters themselves (each has its own
     // tests in bishedit::highlight) -- what this pins is that the editor
     // asks the right one and, for a language with none, quietly renders
