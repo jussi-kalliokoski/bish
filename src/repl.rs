@@ -226,6 +226,9 @@ struct App {
     // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
     location_lists: HashMap<EditFrameId, LocationList>,
     cmd_history: History,
+    /// The last `:s` that ran, with its pattern and flags already
+    /// resolved -- what `:s//repl/` and the `&` flag reach back for.
+    last_substitute: Option<LastSubstitute>,
     // The whole-shell register table (yank/put/<C-r>) -- one instance,
     // shared globally across every window/pane/session, matching both
     // vim (registers are global to the editor instance, not per-buffer)
@@ -516,6 +519,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         debug_frames: HashMap::new(),
         location_lists: HashMap::new(),
         cmd_history: History::load(".bish_cmd_history", history_size),
+        last_substitute: None,
         registers: Registers::new(),
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
@@ -1704,6 +1708,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         debug_frames: HashMap::new(),
         location_lists: HashMap::new(),
         cmd_history: History::load(".bish_cmd_history", history_size),
+        last_substitute: None,
         registers: Registers::new(),
         sinks_are_grid: false,
         file_watcher: crate::watch::Watcher::new().ok(),
@@ -1812,8 +1817,13 @@ fn handle_command_mode(
     // Keys a mapping produced that this colon line has to finish
     // delivering -- see editor::read_line's own `queued` parameter.
     queued: Vec<Key>,
+    // The `/` pattern most recently searched for, which lives on the
+    // caller's own `VimKeys` -- `:s//repl/` and the `r` flag are the
+    // only things in here that want it, and a caller with no search
+    // history of its own passes "".
+    last_search: &str,
 ) -> CommandModeOutcome {
-    let outcome = run_command_mode(app, session_id, editing, seed, queued);
+    let outcome = run_command_mode(app, session_id, editing, seed, queued, last_search);
     match outcome {
         CommandModeOutcome::Action(ref action) => {
             apply_window_action(app, action.clone());
@@ -1823,6 +1833,7 @@ fn handle_command_mode(
         | CommandModeOutcome::Ran { .. }
         | CommandModeOutcome::Symbols(_)
         | CommandModeOutcome::RunNormal(_)
+        | CommandModeOutcome::ConfirmSubstitute(_)
         | CommandModeOutcome::NoHighlight => {
             if app.sinks_are_grid {
                 // No window action, but command mode may still have
@@ -2981,6 +2992,9 @@ fn run_browse_frame(
                 // Nothing maps into the browser's colon line, so there is
                 // never a partly-delivered right-hand side to finish.
                 Vec::new(),
+                // The browser has no buffer to substitute in, so no
+                // search of its own for `:s//` to reach back to.
+                "",
             );
             // Whatever `:bishopt` just changed has to be picked up
             // before the next redraw rather than on the next `e .` --
@@ -3004,6 +3018,7 @@ fn run_browse_frame(
                 | CommandModeOutcome::Action(_)
                 | CommandModeOutcome::Symbols(_)
                 | CommandModeOutcome::RunNormal(_)
+                | CommandModeOutcome::ConfirmSubstitute(_)
                 | CommandModeOutcome::NoHighlight => {}
             }
             // The colon line drew over the global status row and
@@ -7657,6 +7672,9 @@ fn run_normal_mode_navigation(
             // dropped here rather than refused, and gating on `is_idle`
             // would newly swallow the `:` as well.
             Key::Char(':') if vk.is_idle_except_count() => {
+                // Read before the call, since `buf` is borrowed mutably
+                // by it and `vk` is read again inside.
+                let last_search = vk.last_search_text().to_string();
                 let outcome = handle_command_mode(
                     app,
                     session_id,
@@ -7668,6 +7686,7 @@ fn run_normal_mode_navigation(
                     // never looks at it, so `<Esc>:w<CR>` would otherwise fire
                     // its `:` and drop the `w<CR>`.
                     vk.take_replay_queue(),
+                    &last_search,
                 );
                 // `:diag` (only command that can, today) may have grafted
                 // a sibling pane in below this one -- recomputed here,
@@ -7721,6 +7740,27 @@ fn run_normal_mode_navigation(
                     CommandModeOutcome::RunNormal(keys) => {
                         vk.queue_keys(keys.chars().map(Key::Char));
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        continue;
+                    }
+                    // `:s/.../.../c`. Driven here because every question
+                    // it asks needs the pane drawn under it first.
+                    CommandModeOutcome::ConfirmSubstitute(cmd) => {
+                        let done = confirm_substitute(&mut buf, &vk, &cmd, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                        let message = match done {
+                            Ok(out) => match (cmd.print, out.last_row) {
+                                (Some(style), Some(row)) => buf.as_editable().map(|tb| printed_line(tb, row, style)).unwrap_or_default(),
+                                _ => format!(
+                                    "{} substitution{} on {} line{}",
+                                    out.substitutions,
+                                    if out.substitutions == 1 { "" } else { "s" },
+                                    out.lines,
+                                    if out.lines == 1 { "" } else { "s" }
+                                ),
+                            },
+                            Err(e) => format!("bish: {e}"),
+                        };
+                        show_command_mode_error(&message, app.term_rows, app.term_cols);
                         continue;
                     }
                     // Back to normal mode too, per this session's own
@@ -11522,7 +11562,10 @@ enum CommandModeOutcome {
     // last_status right after it ran. The caller (run_normal_mode_
     // navigation) is the one that actually shows this -- see its own
     // doc comment on PendingView for how.
-    Ran { output: String, status: i32 },
+    Ran {
+        output: String,
+        status: i32,
+    },
     // `:noh`/`:nohlsearch` -- stop drawing the current search's matches.
     //
     // Handed back rather than done here for the reason `Symbols` is:
@@ -11535,6 +11578,11 @@ enum CommandModeOutcome {
     // Handed back for the same reason `NoHighlight` is: the keys go
     // through `VimKeys`, which command mode does not have.
     RunNormal(String),
+    /// `:s/.../.../c` -- the range has to be walked one match at a time
+    /// with the pane redrawn between each, which needs the caller's own
+    /// rect and `VimKeys`. Same reason `RunNormal` is handed back rather
+    /// than run here.
+    ConfirmSubstitute(Box<SubstituteCmd>),
     // `:sym QUERY` -- ask the language server for matching symbols
     // across the whole project. Handed back rather than done here
     // because the answer goes into the locations pane, and command mode
@@ -11600,6 +11648,8 @@ fn run_command_mode(
     // See editor::read_line's own `queued` parameter: a mapping whose
     // right-hand side opened this colon line has more keys to deliver.
     mut queued: Vec<Key>,
+    // See handle_command_mode's own parameter of the same name.
+    last_search: &str,
 ) -> CommandModeOutcome {
     let mut editing = editing;
     let mut buffer = String::new();
@@ -11927,19 +11977,42 @@ fn run_command_mode(
                     }
 
                     if let Some(parsed) = parse_substitute_command(&trimmed) {
-                        match parsed.and_then(|cmd| run_substitute(tb, &cmd).map(|counts| (cmd.count_only, counts))) {
-                            Ok((count_only, (subs, lines))) => {
+                        let resolved = parsed.and_then(|cmd| resolve_substitute(cmd, app.last_substitute.as_ref(), last_search));
+                        // `c` cannot run here -- see the outcome's own
+                        // doc comment. Recorded first, so the `:s//x/`
+                        // after it still knows the pattern.
+                        if let Ok(cmd) = &resolved
+                            && cmd.confirm
+                        {
+                            app.last_substitute = Some(LastSubstitute { cmd: cmd.clone(), search_then: last_search.to_string() });
+                            return CommandModeOutcome::ConfirmSubstitute(Box::new(cmd.clone()));
+                        }
+                        let ran = resolved.and_then(|cmd| run_substitute(tb, &cmd).map(|out| (cmd, out)));
+                        match ran {
+                            Ok((cmd, out)) => {
+                                // Remembered *after* resolving, so a
+                                // later `:s//x/` sees the pattern this
+                                // one actually used rather than the
+                                // empty one it was written with.
+                                app.last_substitute = Some(LastSubstitute { cmd: cmd.clone(), search_then: last_search.to_string() });
+                                let (subs, lines) = (out.substitutions, out.lines);
                                 // `n` changed nothing, so saying it made
                                 // substitutions would be a lie.
-                                let what = if count_only { "match" } else { "substitution" };
+                                let what = if cmd.count_only { "match" } else { "substitution" };
                                 let plural = if subs == 1 {
                                     ""
-                                } else if count_only {
+                                } else if cmd.count_only {
                                     "es"
                                 } else {
                                     "s"
                                 };
-                                let output = format!("{subs} {what}{plural} on {lines} line{}", if lines == 1 { "" } else { "s" });
+                                let mut output = format!("{subs} {what}{plural} on {lines} line{}", if lines == 1 { "" } else { "s" });
+                                // `p`/`#`/`l` show the line the command
+                                // finished on, in place of the tally --
+                                // that is what was asked for.
+                                if let (Some(style), Some(row)) = (cmd.print, out.last_row) {
+                                    output = printed_line(tb, row, style);
+                                }
                                 app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
@@ -13345,7 +13418,7 @@ impl LineRef {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SubstituteCmd {
     from: LineRef,
     to: LineRef,
@@ -13366,6 +13439,35 @@ struct SubstituteCmd {
     count_only: bool,
     /// `e` -- a pattern that matches nothing is not an error.
     no_error: bool,
+    /// `&` -- take the previous `:s`'s flags. Must be written first, as
+    /// it is in vim, and inherits the flags only: a count is not one,
+    /// confirmed by running vim.
+    keep_flags: bool,
+    /// `r` -- accepted, and deliberately without effect. See
+    /// `resolve_substitute` for the vim runs that show why: `:s` writes
+    /// the search pattern too, so "the last search pattern" and "the
+    /// last substitute pattern" are the same string by the time this
+    /// could consult them. Kept as a field so the flag is parsed rather
+    /// than rejected, and so the reason has somewhere to live.
+    #[allow(dead_code, reason = "parsed so `r` is accepted; see resolve_substitute for why it changes nothing")]
+    use_search_pattern: bool,
+    /// `p` / `#` / `l` -- print the last line a substitution touched.
+    print: Option<PrintStyle>,
+    /// `c` -- ask about each match before making it.
+    confirm: bool,
+}
+
+/// How `p`, `#` and `l` each spell the line they print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintStyle {
+    /// `p` -- the line's own text.
+    Plain,
+    /// `#` -- with its line number in front, right-aligned the way vim
+    /// aligns it.
+    Numbered,
+    /// `l` -- `:list` style, which marks the end of the line with `$`
+    /// and shows a tab as `^I`, so trailing space is visible.
+    List,
 }
 
 /// Everything after `:s/pat/repl/`, which is the same set of answers
@@ -13377,6 +13479,10 @@ struct SubstituteFlags {
     count: Option<usize>,
     count_only: bool,
     no_error: bool,
+    keep_flags: bool,
+    use_search_pattern: bool,
+    print: Option<PrintStyle>,
+    confirm: bool,
 }
 
 /// Reads them.
@@ -13386,39 +13492,47 @@ struct SubstituteFlags {
 /// and report success -- a wrong answer, where an error would at least
 /// have been true.
 fn parse_substitute_flags(text: &str) -> Result<SubstituteFlags, String> {
-    let SubstituteFlags { mut global, mut ignore_case, mut count, mut count_only, mut no_error } = SubstituteFlags::default();
-    for c in text.chars() {
+    let mut f = SubstituteFlags::default();
+    let mut digits: Option<usize> = None;
+    for (at, c) in text.chars().enumerate() {
         // A count ends the flags: everything from the first digit on is
         // the number, and a letter after it is trailing junk.
-        if let Some(n) = count {
+        if let Some(n) = digits {
             match c.to_digit(10) {
                 Some(d) => {
-                    count = Some(n.saturating_mul(10).saturating_add(d as usize));
+                    digits = Some(n.saturating_mul(10).saturating_add(d as usize));
                     continue;
                 }
                 None => return Err(format!("E488: Trailing characters: {c}")),
             }
         }
         match c {
-            'g' => global = true,
-            'i' => ignore_case = Some(true),
-            'I' => ignore_case = Some(false),
-            'n' => count_only = true,
-            'e' => no_error = true,
-            // Recognized, and refused rather than ignored: `c` steps
-            // through the matches asking about each, and command mode
-            // has nowhere to ask.
-            'c' => return Err("E:  `:s` flag `c` needs a confirmation prompt, which command mode has no way to show".to_string()),
+            'g' => f.global = true,
+            'i' => f.ignore_case = Some(true),
+            'I' => f.ignore_case = Some(false),
+            'n' => f.count_only = true,
+            'e' => f.no_error = true,
+            'c' => f.confirm = true,
+            'r' => f.use_search_pattern = true,
+            'p' => f.print = Some(PrintStyle::Plain),
+            '#' => f.print = Some(PrintStyle::Numbered),
+            'l' => f.print = Some(PrintStyle::List),
+            // `&` means "the previous command's flags" and vim accepts
+            // it only in first position -- written anywhere else it
+            // rejects the command rather than reading it out of order.
+            '&' if at == 0 => f.keep_flags = true,
+            '&' => return Err("E488: Trailing characters: & (it only means anything written first)".to_string()),
             ' ' | '\t' => {}
-            '0'..='9' => count = Some(c.to_digit(10).expect("matched a digit") as usize),
+            '0'..='9' => digits = Some(c.to_digit(10).expect("matched a digit") as usize),
             _ => return Err(format!("E488: Trailing characters: {c}")),
         }
     }
     // `:s/a/b/0` is not "zero lines", it is a typo.
-    if count == Some(0) {
+    if digits == Some(0) {
         return Err("E939: Positive count required".to_string());
     }
-    Ok(SubstituteFlags { global, ignore_case, count, count_only, no_error })
+    f.count = digits;
+    Ok(f)
 }
 
 fn parse_one_line_ref(chars: &[char], i: &mut usize) -> Option<LineRef> {
@@ -13850,17 +13964,31 @@ fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, Strin
     };
     i += 1;
 
+    // An empty pattern is `:s//repl/` -- "the last one again" -- and is
+    // filled in by `resolve_substitute`, which is the only place that
+    // knows what the last one was.
     let pattern = scan_until_delim(&chars, &mut i, delim);
-    if pattern.is_empty() {
-        return Some(Err("E35: no previous regular expression".to_string()));
-    }
     let replacement = scan_until_delim(&chars, &mut i, delim);
     let flags: String = chars[i..].iter().collect();
-    let SubstituteFlags { global, ignore_case, count, count_only, no_error } = match parse_substitute_flags(&flags) {
+    let f = match parse_substitute_flags(&flags) {
         Ok(parsed) => parsed,
         Err(e) => return Some(Err(e)),
     };
-    Some(Ok(SubstituteCmd { from, to, pattern, replacement, global, ignore_case, count, count_only, no_error }))
+    Some(Ok(SubstituteCmd {
+        from,
+        to,
+        pattern,
+        replacement,
+        global: f.global,
+        ignore_case: f.ignore_case,
+        count: f.count,
+        count_only: f.count_only,
+        no_error: f.no_error,
+        keep_flags: f.keep_flags,
+        use_search_pattern: f.use_search_pattern,
+        print: f.print,
+        confirm: f.confirm,
+    }))
 }
 
 // Applies `once` (the very next appended char only, `\u`/`\l`) or,
@@ -14147,7 +14275,7 @@ fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
             let mut one = parsed?;
             one.from = LineRef::Number(row + 1);
             one.to = LineRef::Number(row + 1);
-            if run_substitute(tb, &one)?.0 > 0 {
+            if run_substitute(tb, &one)?.substitutions > 0 {
                 ran += 1;
             }
         }
@@ -14156,7 +14284,238 @@ fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
     Err(format!("g: cannot run '{body}' on each line (expected `d` or `s/.../.../`)"))
 }
 
-fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, usize), String> {
+/// The last `:s`, plus what the last `/` search was at the moment it
+/// ran.
+///
+/// The second half is how "whichever pattern was used most recently"
+/// gets answered without a clock. vim keeps one shared last-used
+/// pattern that both `/` and `:s` write, so `:s/a/b/` then `/cCc` then
+/// `:s//W/` substitutes `cCc` -- confirmed by running vim. Comparing the
+/// search pattern now against the one recorded here says whether a
+/// search has happened since, which is the same answer.
+#[derive(Debug, Clone)]
+struct LastSubstitute {
+    cmd: SubstituteCmd,
+    search_then: String,
+}
+
+/// Fills in the parts of a `:s` that refer to an earlier one: `&`
+/// (that command's flags), and an empty pattern (`:s//repl/`, "the last
+/// one again"), which `r` points at the last *search* instead.
+///
+/// `&` with nothing before it is not an error -- there are simply no
+/// flags to take, which is also what vim does.
+fn resolve_substitute(mut cmd: SubstituteCmd, last: Option<&LastSubstitute>, last_search: &str) -> Result<SubstituteCmd, String> {
+    let previous = last.map(|l| &l.cmd);
+    if cmd.keep_flags
+        && let Some(p) = previous
+    {
+        // The flags, and only the flags: a count is not one of them, and
+        // vim does not carry it over.
+        cmd.global = p.global;
+        cmd.ignore_case = p.ignore_case;
+        cmd.count_only = p.count_only;
+        cmd.no_error = p.no_error;
+        cmd.confirm = p.confirm;
+        cmd.print = p.print;
+    }
+    if cmd.pattern.is_empty() {
+        // Whichever of the two was used more recently, which is what
+        // vim's single shared pattern register amounts to: a search
+        // since the last `:s` is newer than it, otherwise the `:s` is.
+        //
+        // `r` does not enter into this, and that is not an oversight.
+        // Its documented job is to prefer the last *search* pattern over
+        // the last *substitute* pattern -- but `:s` writes the search
+        // pattern too, so after `/cCc` then `:s/a/Z/` the "previously
+        // used search pattern" is `a`, and real vim answers `:s//W/r`
+        // with `a` exactly as it answers `:s//W/`. Confirmed by running
+        // all four orderings. `r` only diverges in `:&r`/`:~`, which
+        // bish does not have; it is accepted here so the flag is not an
+        // error, and it changes nothing.
+        let searched_since = last.is_none_or(|l| l.search_then != last_search);
+        let substituted = previous.map(|p| p.pattern.as_str()).filter(|p| !p.is_empty());
+        let pattern = match searched_since {
+            true if !last_search.is_empty() => last_search,
+            _ => substituted.unwrap_or(last_search),
+        };
+        if pattern.is_empty() {
+            return Err("E35: no previous regular expression".to_string());
+        }
+        cmd.pattern = pattern.to_string();
+    }
+    Ok(cmd)
+}
+
+/// `:s/.../.../c` -- one match at a time, with the cursor on it and a
+/// question under it.
+///
+/// Its own loop rather than a flag threaded through `run_substitute`,
+/// because it is a different shape entirely: that one walks the range
+/// deciding nothing, and this one has to draw, ask, and wait between
+/// every match. It runs at the caller's level (`run_normal_mode_
+/// navigation`) for the same reason `:normal` does -- that is where the
+/// pane's rect, its `VimKeys` and its redraw live.
+///
+/// Answers are vim's: `y` replace, `n` skip, `a` all the rest without
+/// asking, `q`/`Esc` stop here, `l` this one and then stop. Anything
+/// else is ignored and the same match is asked about again.
+///
+/// The buffer is re-borrowed at each step rather than held: drawing the
+/// frame needs the whole `NavBuffer`, and the question cannot be asked
+/// without drawing what it is about.
+fn confirm_substitute(
+    buf: &mut NavBuffer,
+    vk: &VimKeys,
+    cmd: &SubstituteCmd,
+    rect: Rect,
+    term_rows: usize,
+    term_cols: usize,
+    color_overrides: Option<&highlight::ColorOverrides>,
+) -> Result<SubstituteOutcome, String> {
+    const NOT_EDITABLE: &str = "E21: not an editable buffer";
+    let (mut row, mut end, fold) = {
+        let tb = buf.as_editable_mut().ok_or(NOT_EDITABLE)?;
+        let last = tb.line_count().saturating_sub(1);
+        let current = tb.cursor().0;
+        let (row, end) = substitute_rows(cmd.from.resolve(current, last), cmd.to.resolve(current, last), cmd);
+        (row, end, cmd.ignore_case.unwrap_or_else(|| tb.search_ignore_case(&cmd.pattern)))
+    };
+    let re = crate::regex::Regex::compile(&cmd.pattern, fold);
+    let mut out = SubstituteOutcome { substitutions: 0, lines: 0, last_row: None };
+    let mut ask = true;
+    let mut stop = false;
+
+    while !stop {
+        let (line_count, line_len) = {
+            let tb = buf.as_editable_mut().ok_or(NOT_EDITABLE)?;
+            (tb.line_count(), tb.line_len(row.min(tb.line_count().saturating_sub(1))))
+        };
+        if row > end || row >= line_count {
+            break;
+        }
+        let mut col = 0;
+        let mut touched = false;
+        while col <= line_len {
+            let found = {
+                let tb = buf.as_editable_mut().ok_or(NOT_EDITABLE)?;
+                let chars: Vec<char> = tb.line_chars(row);
+                re.find_at_with_captures(&chars, col).map(|(start, match_end, caps)| (start, match_end, expand_replacement(&cmd.replacement, &caps)))
+            };
+            let Some((start, match_end, replacement)) = found else { break };
+
+            let answer = if ask {
+                // The cursor goes on the match before the question is
+                // drawn, so the thing being asked about is the thing
+                // under the cursor -- that *is* the question.
+                buf.as_editable_mut().ok_or(NOT_EDITABLE)?.set_cursor(row, start);
+                render_nav_frame(buf, vk, rect, term_rows, term_cols, color_overrides);
+                show_command_mode_error(&format!("replace with {replacement} (y/n/a/q/l)?"), term_rows, term_cols);
+                // A read that gives nothing is the terminal going away,
+                // which is a `q` as far as this loop is concerned.
+                match editor::read_key_idle(&mut || {}) {
+                    Ok(Some(key)) => key,
+                    _ => Key::Char('q'),
+                }
+            } else {
+                Key::Char('y')
+            };
+            let (replace, last) = match answer {
+                Key::Char('y') => (true, false),
+                Key::Char('n') => (false, false),
+                // Every remaining match, without asking again.
+                Key::Char('a') => {
+                    ask = false;
+                    (true, false)
+                }
+                Key::Char('l') => (true, true),
+                Key::Char('q') | Key::Escape => (false, true),
+                // vim ignores a key it has no answer for and asks the
+                // same question again.
+                _ => continue,
+            };
+            if replace {
+                let tb = buf.as_editable_mut().ok_or(NOT_EDITABLE)?;
+                let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, start), to: (row, match_end) };
+                tb.delete_range(&range);
+                tb.insert_text((row, start), &replacement);
+                out.substitutions += 1;
+                out.last_row = Some(row);
+                touched = true;
+                // A replacement may carry newlines (a `\r` in the
+                // replacement text), which pushes the rest of the range
+                // down with it.
+                let added = replacement.matches('\n').count();
+                end += added;
+                // `.max(start + 1)` so an empty replacement of an empty
+                // match still advances, rather than asking about the
+                // same position forever.
+                col = (start + replacement.chars().count()).max(start + 1);
+                if added > 0 {
+                    row += added;
+                    col = 0;
+                }
+            } else {
+                col = match_end.max(start + 1);
+            }
+            if last {
+                stop = true;
+                break;
+            }
+            if !cmd.global {
+                break;
+            }
+        }
+        if touched {
+            out.lines += 1;
+        }
+        row += 1;
+    }
+    if out.substitutions == 0 && !cmd.no_error {
+        return Err(format!("E486: Pattern not found: {}", cmd.pattern));
+    }
+    Ok(out)
+}
+
+/// The rows a `:s` acts on, from its already-resolved range ends.
+///
+/// A trailing count replaces the range instead of narrowing it: vim
+/// reads `:1,2s/x/y/ 3` as "three lines from line 2", which can reach
+/// past where the range ended. See `SubstituteCmd::count`.
+fn substitute_rows(a: usize, b: usize, cmd: &SubstituteCmd) -> (usize, usize) {
+    match cmd.count {
+        Some(n) => (a.max(b), a.max(b).saturating_add(n - 1)),
+        None => (a.min(b), a.max(b)),
+    }
+}
+
+/// One line as `p`, `#` or `l` would show it.
+fn printed_line(tb: &TextBuffer, row: usize, style: PrintStyle) -> String {
+    let text: String = tb.line_chars(row).into_iter().collect();
+    match style {
+        PrintStyle::Plain => text,
+        // vim right-aligns the number in three columns and follows it
+        // with one space.
+        PrintStyle::Numbered => format!("{:>3} {text}", row + 1),
+        // `:list` spelling: `$` marks where the line ends, so trailing
+        // whitespace is visible, and a tab shows as the two characters
+        // it would be typed as rather than as a jump the eye cannot
+        // measure.
+        PrintStyle::List => format!("{}$", text.replace('\\', "\\\\").replace('\t', "^I")),
+    }
+}
+
+/// What one `:s` did, for the caller's report line and for `p`/`#`/`l`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubstituteOutcome {
+    substitutions: usize,
+    lines: usize,
+    /// The last row a substitution touched, which is the line `p`, `#`
+    /// and `l` print -- vim shows where it finished, not where it began.
+    last_row: Option<usize>,
+}
+
+fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<SubstituteOutcome, String> {
     let last = tb.line_count().saturating_sub(1);
     let current = tb.cursor().0;
     let a = cmd.from.resolve(current, last);
@@ -14167,15 +14526,7 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
     // interactive prompt plumbed through command mode for that; just
     // swapping is the more useful default and matches what confirming
     // that prompt would do anyway.
-    let mut row = a.min(b);
-    let mut end = a.max(b);
-    // A trailing count replaces the range instead of narrowing it: vim
-    // reads `:1,2s/x/y/ 3` as "three lines from line 2", which can reach
-    // past where the range ended. See `SubstituteCmd::count`.
-    if let Some(n) = cmd.count {
-        row = a.max(b);
-        end = row.saturating_add(n - 1);
-    }
+    let (mut row, mut end) = substitute_rows(a, b, cmd);
     // `i`/`I` when either was given, and only otherwise the
     // 'ignorecase'/'smartcase' answer the buffer would have used on its
     // own.
@@ -14183,12 +14534,14 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
     let re = crate::regex::Regex::compile(&cmd.pattern, fold);
     let mut total = 0usize;
     let mut lines_changed = 0usize;
+    let mut last_row = None;
     while row <= end && row < tb.line_count() {
         let original: String = tb.line_chars(row).into_iter().collect();
         let (new_text, count) = substitute_line(&original, &re, &cmd.replacement, cmd.global);
         if count > 0 {
             total += count;
             lines_changed += 1;
+            last_row = Some(row);
             // `n` counts and leaves the buffer alone -- the whole point
             // of asking is to find out before deciding.
             if !cmd.count_only {
@@ -14207,7 +14560,7 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
     if total == 0 && !cmd.no_error {
         return Err(format!("E486: Pattern not found: {}", cmd.pattern));
     }
-    Ok((total, lines_changed))
+    Ok(SubstituteOutcome { substitutions: total, lines: lines_changed, last_row })
 }
 
 // Command mode allows full control-flow syntax (if/while/for/etc -- every
@@ -15274,9 +15627,14 @@ mod substitute_command_tests {
         assert_eq!(cmd.replacement, "c");
     }
 
+    // Still an error, but no longer at parse time: `:s//bar/` is a real
+    // command meaning "that pattern again", so the parser accepts it and
+    // `resolve_substitute` is what finds there is no previous one.
     #[test]
-    fn parse_empty_pattern_is_an_error() {
-        assert_eq!(parse_substitute_command("s//bar/").unwrap().unwrap_err(), "E35: no previous regular expression");
+    fn an_empty_pattern_with_nothing_before_it_is_an_error() {
+        let cmd = parse_substitute_command("s//bar/").unwrap().unwrap();
+        assert_eq!(cmd.pattern, "", "the parser passes it along");
+        assert_eq!(resolve_substitute(cmd, None, "").unwrap_err(), "E35: no previous regular expression");
     }
 
     #[test]
@@ -15412,10 +15770,77 @@ mod substitute_command_tests {
         assert!(parse("%s/a/Z/gq").is_err(), "an unknown flag is an error");
         assert!(parse("%s/a/Z/2x").is_err(), "a letter after the count is trailing junk");
         assert!(parse("%s/a/Z/0").is_err(), "a zero count is a typo, not an empty range");
-        // Recognized specifically, so the message can say *why* rather
-        // than calling it a trailing character.
-        let Err(e) = parse("%s/a/Z/gc") else { panic!("`c` must be refused") };
-        assert!(e.contains("confirmation"), "{e}");
+    }
+
+    #[test]
+    fn the_remaining_flags_parse() {
+        let parse = |line: &str| parse_substitute_command(line).expect("recognized as `s`");
+        assert!(parse("%s/a/Z/c").unwrap().confirm);
+        assert!(parse("%s/a/Z/&").unwrap().keep_flags);
+        assert_eq!(parse("%s/a/Z/p").unwrap().print, Some(PrintStyle::Plain));
+        assert_eq!(parse("%s/a/Z/#").unwrap().print, Some(PrintStyle::Numbered));
+        assert_eq!(parse("%s/a/Z/l").unwrap().print, Some(PrintStyle::List));
+        // vim takes `&` only in first position and rejects the command
+        // otherwise rather than reading it out of order.
+        assert!(parse("%s/a/Z/g&").is_err());
+        assert!(parse("%s/a/Z/&g").is_ok());
+    }
+
+    // `&` takes the previous command's flags -- and only its flags. A
+    // count is not one of them, which is the part I would have guessed
+    // wrong: `:1,2s/A/Z/ 3` then `:%s/a/Y/&` acts on the whole buffer.
+    #[test]
+    fn ampersand_takes_the_previous_flags_but_not_its_count() {
+        let previous = parse_substitute_command("1,2s/A/Z/gi 3").unwrap().unwrap();
+        let cmd = parse_substitute_command("%s/a/Y/&").unwrap().unwrap();
+        let last = LastSubstitute { cmd: previous, search_then: String::new() };
+        let resolved = resolve_substitute(cmd, Some(&last), "").unwrap();
+        assert!(resolved.global);
+        assert_eq!(resolved.ignore_case, Some(true));
+        assert_eq!(resolved.count, None, "the count stays with the command that wrote it");
+        // Nothing before it is not an error -- there are simply no flags
+        // to take.
+        let cmd = parse_substitute_command("%s/a/Y/&").unwrap().unwrap();
+        assert!(resolve_substitute(cmd, None, "").is_ok());
+    }
+
+    // `:s//repl/` means "that pattern again", and which one that is
+    // depends on whether a `/` search has happened since. All four
+    // orderings were checked against real vim.
+    #[test]
+    fn an_empty_pattern_takes_whichever_was_used_more_recently() {
+        let ran = |pattern: &str, search_then: &str| LastSubstitute {
+            cmd: parse_substitute_command(&format!("%s/{pattern}/Z/")).unwrap().unwrap(),
+            search_then: search_then.to_string(),
+        };
+        let empty = || parse_substitute_command("%s//W/").unwrap().unwrap();
+
+        // A search since the `:s` is the newer of the two.
+        let last = ran("a", "");
+        assert_eq!(resolve_substitute(empty(), Some(&last), "cCc").unwrap().pattern, "cCc");
+        // No search since, so the substitute's own pattern stands.
+        let last = ran("a", "cCc");
+        assert_eq!(resolve_substitute(empty(), Some(&last), "cCc").unwrap().pattern, "a");
+        // `r` changes neither answer -- see resolve_substitute for the
+        // vim runs that show why.
+        let with_r = parse_substitute_command("%s//W/r").unwrap().unwrap();
+        assert_eq!(resolve_substitute(with_r, Some(&last), "cCc").unwrap().pattern, "a");
+        // Nothing at all to fall back on.
+        assert!(resolve_substitute(empty(), None, "").is_err());
+        // A search, but no substitute yet.
+        assert_eq!(resolve_substitute(empty(), None, "cCc").unwrap().pattern, "cCc");
+    }
+
+    #[test]
+    fn p_and_hash_and_l_spell_the_line_the_way_vim_does() {
+        let buf = buf_from("aAa\nb\tb\naAa");
+        assert_eq!(printed_line(&buf, 2, PrintStyle::Plain), "aAa");
+        // Right-aligned in three columns, then one space -- vim's own
+        // layout.
+        assert_eq!(printed_line(&buf, 2, PrintStyle::Numbered), "  3 aAa");
+        // `:list` style: the end of the line is marked, so trailing
+        // space shows, and a tab is spelled rather than jumped.
+        assert_eq!(printed_line(&buf, 1, PrintStyle::List), "b^Ib$");
     }
 
     #[test]
@@ -15446,7 +15871,8 @@ mod substitute_command_tests {
     fn n_counts_without_touching_the_buffer_and_e_forgives_a_miss() {
         let mut buf = buf_from("aAa\nbBb\naAa");
         let cmd = parse_substitute_command("%s/a/Z/gn").unwrap().unwrap();
-        assert_eq!(run_substitute(&mut buf, &cmd).unwrap(), (4, 2));
+        let out = run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!((out.substitutions, out.lines), (4, 2));
         assert_eq!(text_of(&buf), "aAa\nbBb\naAa", "`n` answers the question and changes nothing");
 
         // A pattern that matches nothing is an error...
@@ -15455,7 +15881,8 @@ mod substitute_command_tests {
         assert!(run_substitute(&mut buf, &cmd).is_err());
         // ...unless `e` says it is fine.
         let cmd = parse_substitute_command("%s/zzz/Z/e").unwrap().unwrap();
-        assert_eq!(run_substitute(&mut buf, &cmd).unwrap(), (0, 0));
+        let out = run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!((out.substitutions, out.lines), (0, 0));
     }
 
     #[test]
@@ -15472,8 +15899,13 @@ mod substitute_command_tests {
             count: None,
             count_only: false,
             no_error: false,
+            keep_flags: false,
+            use_search_pattern: false,
+            print: None,
+            confirm: false,
         };
-        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        let out = run_substitute(&mut buf, &cmd).unwrap();
+        let (subs, lines) = (out.substitutions, out.lines);
         assert_eq!((subs, lines), (1, 1));
         assert_eq!(text_of(&buf), "foo\nbar\nfoo");
     }
@@ -15491,8 +15923,13 @@ mod substitute_command_tests {
             count: None,
             count_only: false,
             no_error: false,
+            keep_flags: false,
+            use_search_pattern: false,
+            print: None,
+            confirm: false,
         };
-        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        let out = run_substitute(&mut buf, &cmd).unwrap();
+        let (subs, lines) = (out.substitutions, out.lines);
         assert_eq!((subs, lines), (3, 2));
         assert_eq!(text_of(&buf), "X X\nX\nbaz");
     }
@@ -15510,6 +15947,10 @@ mod substitute_command_tests {
             count: None,
             count_only: false,
             no_error: false,
+            keep_flags: false,
+            use_search_pattern: false,
+            print: None,
+            confirm: false,
         };
         run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!(text_of(&buf), "world hello");
@@ -15531,8 +15972,13 @@ mod substitute_command_tests {
             count: None,
             count_only: false,
             no_error: false,
+            keep_flags: false,
+            use_search_pattern: false,
+            print: None,
+            confirm: false,
         };
-        let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
+        let out = run_substitute(&mut buf, &cmd).unwrap();
+        let (subs, lines) = (out.substitutions, out.lines);
         assert_eq!(subs, 1);
         assert_eq!(lines, 1);
         assert_eq!(text_of(&buf), "a\na\nb");
@@ -15551,6 +15997,10 @@ mod substitute_command_tests {
             count: None,
             count_only: false,
             no_error: false,
+            keep_flags: false,
+            use_search_pattern: false,
+            print: None,
+            confirm: false,
         };
         assert_eq!(run_substitute(&mut buf, &cmd).unwrap_err(), "E486: Pattern not found: zzz");
     }
@@ -15561,7 +16011,8 @@ mod substitute_command_tests {
         // just each in isolation.
         let mut buf = buf_from("cat cat\ndog");
         let parsed = parse_substitute_command("%s/cat/dog/g").unwrap().unwrap();
-        let (subs, lines) = run_substitute(&mut buf, &parsed).unwrap();
+        let out = run_substitute(&mut buf, &parsed).unwrap();
+        let (subs, lines) = (out.substitutions, out.lines);
         assert_eq!((subs, lines), (2, 1));
         assert_eq!(text_of(&buf), "dog dog\ndog");
     }
