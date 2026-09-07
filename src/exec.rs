@@ -5649,6 +5649,50 @@ impl Shell {
         self.strip_nuls_from_substitution(s)
     }
 
+    /// Runs `cmd` with `input` on its standard input and hands back
+    /// what it wrote to standard output, plus its exit status.
+    ///
+    /// What `:[range]!cmd` is: the editor's filter. Deliberately built
+    /// on the same `run_in_child_shell` + anonymous-file pair that
+    /// `$( )` already uses, because an external command's stdout goes
+    /// to a real descriptor and *cannot* be caught by
+    /// `OutputSink::Capture` -- that only ever sees this shell's own
+    /// builtin writes (see `exec_cmd_inside_a_subshell_does_not_kill_
+    /// the_real_process`'s own comment). A filter whose whole purpose is
+    /// `sort` and `column -t` needs the mechanism that works for a real
+    /// child, and this is it.
+    ///
+    /// Unlike `$( )` the trailing newline is kept: it is what ends the
+    /// last line, and the caller is putting lines back into a buffer,
+    /// not building a word.
+    ///
+    /// stderr comes back separately rather than being left to the real
+    /// terminal. The editor is on the alternate screen, so anything the
+    /// command printed there would flash and be painted over by the next
+    /// redraw -- and since a failed filter still replaces the range (as
+    /// it does in vim), "the buffer emptied and nothing said why" is
+    /// precisely the outcome that has to be avoided.
+    pub(crate) fn filter_through_command(&mut self, cmd: &str, input: &str) -> std::io::Result<(String, String, i32)> {
+        use std::io::{Seek, SeekFrom, Write};
+        // Same two-way choice `run_command_substitution` makes: an
+        // anonymous file when the kernel gives one, a named temp file
+        // when it does not.
+        let mut stdin = match capture_file() {
+            Some(f) => f,
+            None => std::fs::File::options().read(true).write(true).create(true).truncate(true).open(proc_sub_temp_path())?,
+        };
+        stdin.write_all(input.as_bytes())?;
+        stdin.seek(SeekFrom::Start(0))?;
+
+        let out = Captured::open()?;
+        let err = Captured::open()?;
+        let result = self.run_in_child_shell(
+            cmd,
+            ChildStdio { stdin: Some(stdin), stdout: Some(out.writer()?), stderr: Some(err.writer()?), ..Default::default() },
+        );
+        Ok((out.read(), err.read(), result.status()))
+    }
+
     // `<(cmd)`: runs cmd to completion now, capturing its stdout into a
     // temp file, and substitutes that file's path. Real bash streams this
     // concurrently through a FIFO; see the ProcSubIn/ProcSubOut doc comment
@@ -14966,6 +15010,47 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
 // a ~63us `x=$(printf hi)` on tmpfs, and considerably worse when $TMPDIR
 // is a real disk. Falls back to the old temp file where the syscall is
 // unavailable (pre-3.17 kernels, non-Linux).
+/// One stream of a child's output, held wherever this kernel lets it be
+/// held: an anonymous file when `memfd_create` works, a named temp file
+/// when it does not. The same two-way choice `run_command_substitution`
+/// makes inline -- given a name here because a filter needs two of them
+/// and writing that dance twice more would be three copies.
+struct Captured {
+    mem: Option<std::fs::File>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl Captured {
+    fn open() -> std::io::Result<Captured> {
+        match capture_file() {
+            Some(f) => Ok(Captured { mem: Some(f), path: None }),
+            None => Ok(Captured { mem: None, path: Some(proc_sub_temp_path()) }),
+        }
+    }
+
+    /// The handle to hand the child. Separate from the one kept here,
+    /// since reading the result back needs its own cursor.
+    fn writer(&self) -> std::io::Result<std::fs::File> {
+        match (&self.mem, &self.path) {
+            (Some(f), _) => f.try_clone(),
+            (_, Some(p)) => std::fs::File::create(p),
+            _ => Err(std::io::Error::other("no capture file")),
+        }
+    }
+
+    fn read(self) -> String {
+        match (self.mem, self.path) {
+            (Some(f), _) => read_capture(f),
+            (_, Some(p)) => {
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                let _ = std::fs::remove_file(&p);
+                text
+            }
+            _ => String::new(),
+        }
+    }
+}
+
 fn capture_file() -> Option<std::fs::File> {
     unsafe extern "C" {
         fn memfd_create(name: *const u8, flags: u32) -> i32;
@@ -17051,6 +17136,44 @@ mod tests {
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"(exec /bin/true); echo "still alive: $?""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "still alive: 0\n");
+    }
+
+    // The editor's `:[range]!cmd`. The point of these is the *external*
+    // command: `sort` is the whole reason the filter exists, and an
+    // external's stdout goes to a real descriptor that `OutputSink::
+    // Capture` never sees -- which is what the sibling test above is
+    // about, and why this uses `$( )`'s machinery instead.
+    #[test]
+    fn filter_through_command_feeds_stdin_and_captures_an_externals_stdout() {
+        let mut shell = Shell::new();
+        let (out, err, status) = shell.filter_through_command("sort", "c\na\nb\n").unwrap();
+        assert_eq!((out.as_str(), err.as_str(), status), ("a\nb\nc\n", "", 0));
+
+        // A builtin works through the same door.
+        let (out, _, _) = shell.filter_through_command("cat", "x\ny\n").unwrap();
+        assert_eq!(out, "x\ny\n");
+
+        // The trailing newline is kept, unlike `$( )` -- it is what ends
+        // the last line of a buffer.
+        let (out, _, _) = shell.filter_through_command("cat", "one\n").unwrap();
+        assert_eq!(out, "one\n");
+
+        // A non-zero status comes back rather than being swallowed --
+        // vim replaces the range either way, so the caller needs it.
+        let (out, _, status) = shell.filter_through_command("false", "a\n").unwrap();
+        assert_eq!(out, "");
+        assert_ne!(status, 0);
+
+        // stderr is kept apart from stdout, so a command's complaint
+        // cannot end up spliced into the buffer between its own lines.
+        let (out, err, _) = shell.filter_through_command("cat; echo trouble >&2", "a\n").unwrap();
+        assert_eq!(out, "a\n");
+        assert_eq!(err, "trouble\n");
+
+        // Arguments, pipelines and quoting all work: this is a real
+        // shell command line, not an argv.
+        let (out, _, _) = shell.filter_through_command("sort -r | head -n 2", "a\nb\nc\n").unwrap();
+        assert_eq!(out, "c\nb\n");
     }
 
     #[test]

@@ -11862,43 +11862,14 @@ fn run_command_mode(
                     // to the shell attached to the command name, and
                     // `:!echo %` looked for a command called `!echo`.
                     match parse_bang_command(&trimmed) {
-                        Some(BangCommand::Filter) => {
-                            // Recognized and refused, rather than
-                            // dropping the range and running the command
-                            // anyway -- `:%!sort` silently behaving like
-                            // `:!sort` would eat the buffer's worth of
-                            // work it was asked to filter.
-                            show_command_mode_error(
-                                "bish: filtering lines through a command ([range]!cmd) isn't supported yet",
-                                app.term_rows,
-                                app.term_cols,
-                            );
-                            buffer.clear();
-                            continue;
-                        }
-                        Some(BangCommand::Run(rest)) => match fileeditor::expand_filename_macros(rest, tb) {
-                            Ok(expanded) if expanded.trim().is_empty() => {
-                                // vim repeats the last `:!` here. bish
-                                // has nowhere to keep one yet, so say so
-                                // rather than run an empty line.
-                                show_command_mode_error("bish: E34: No previous command", app.term_rows, app.term_cols);
-                                buffer.clear();
-                                continue;
-                            }
-                            Ok(expanded) => {
-                                // History gets what was typed, not what
-                                // it expanded to: `!ls %` recalled as
-                                // `ls sample.txt` would name whichever
-                                // file happened to be open when it ran,
-                                // in a buffer that has since moved on.
-                                if !buffer_unrecorded {
-                                    app.cmd_history.record(&trimmed, None);
-                                }
-                                buffer_unrecorded = true;
-                                // Replaces what the rest of this
-                                // function runs, so the expansion is
-                                // what reaches the lexer and the shell.
-                                buffer = expanded;
+                        Some(BangCommand::Filter { from, to, cmd }) => match filter_lines_through_command(app, session_id, tb, from, to, cmd) {
+                            Ok(output) => {
+                                app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                    command: trimmed,
+                                    output: output.clone(),
+                                    status: 0,
+                                });
+                                return CommandModeOutcome::Ran { output, status: 0 };
                             }
                             Err(e) => {
                                 show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
@@ -11906,6 +11877,31 @@ fn run_command_mode(
                                 continue;
                             }
                         },
+                        Some(BangCommand::Run(rest)) => {
+                            // History gets what was typed, not what it
+                            // expanded to: `!ls %` recalled as `ls
+                            // sample.txt` would name whichever file
+                            // happened to be open when it ran, in a
+                            // buffer that has since moved on.
+                            if !buffer_unrecorded {
+                                app.cmd_history.record(&trimmed, None);
+                            }
+                            match run_bang_command(app, session_id, tb, rest) {
+                                Ok(output) => {
+                                    app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                        command: trimmed,
+                                        output: output.clone(),
+                                        status: 0,
+                                    });
+                                    return CommandModeOutcome::Ran { output, status: 0 };
+                                }
+                                Err(e) => {
+                                    show_command_mode_error(&format!("bish: {e}"), app.term_rows, app.term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         None => {}
                     }
 
@@ -13428,11 +13424,9 @@ enum BangCommand<'a> {
     /// `:!cmd` -- run it through the shell. The `&str` is everything
     /// after the `!`, still unexpanded.
     Run(&'a str),
-    /// `:[range]!cmd` -- vim's filter, which replaces those lines with
-    /// what the command makes of them. Carries nothing because nothing
-    /// runs it yet; it exists so a range can be refused out loud rather
-    /// than quietly dropped.
-    Filter,
+    /// `:[range]!cmd` -- vim's filter: those lines go in as the
+    /// command's stdin and whatever it writes out replaces them.
+    Filter { from: LineRef, to: LineRef, cmd: &'a str },
 }
 
 /// A leading `!`, with or without a range in front of it. `:5!x` and
@@ -13451,8 +13445,15 @@ fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
     }
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0;
-    parse_range_prefix(&chars, &mut i)?;
-    (chars.get(i) == Some(&'!')).then_some(BangCommand::Filter)
+    let (from, to) = parse_range_prefix(&chars, &mut i)?;
+    if chars.get(i) != Some(&'!') {
+        return None;
+    }
+    // Byte offset, not `i`: the range that precedes the `!` is ASCII by
+    // construction (digits, `%`, `.`, `$`, `,`), so the two agree here --
+    // but slicing `trimmed` wants the byte one regardless.
+    let at = trimmed.char_indices().nth(i).map(|(at, _)| at)?;
+    Some(BangCommand::Filter { from, to, cmd: &trimmed[at + 1..] })
 }
 
 /// `None` when `trimmed` is not one of these at all, so the ordinary
@@ -13584,6 +13585,109 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
         }
         LineCommand::Normal(_) => Ok(()),
     }
+}
+
+/// `:!cmd` -- vim's "run this through the shell". The buffer is not
+/// touched; what the command wrote is shown in the same overlay every
+/// other colon command's output uses.
+///
+/// A child shell rather than the ordinary colon line, and for two
+/// reasons that point the same way. `:!make`, `:!git status`, `:!ls`
+/// are the whole point of `!`, and the colon line runs only builtins
+/// (its own escape hatch is `command NAME` -- an explicit "the external
+/// one", which is exactly what `!` says in vim's spelling). And an
+/// external's output cannot be seen by the colon line's capture sink
+/// anyway: it goes to a real descriptor, which under the editor's
+/// alternate screen means it flashes and is painted over by the next
+/// redraw. `filter_through_command` is the mechanism that catches it.
+///
+/// Its stdin is empty rather than the terminal, so `:!cat` ends at once
+/// instead of swallowing the keystrokes meant for the editor.
+fn run_bang_command(app: &mut App, session_id: SessionId, tb: &TextBuffer, cmd: &str) -> Result<String, String> {
+    let cmd = crate::fileeditor::expand_filename_macros(cmd, tb)?;
+    if cmd.trim().is_empty() {
+        // vim repeats the last `:!` here. bish keeps no such register
+        // yet, so it says so rather than running an empty line.
+        return Err("E34: No previous command".to_string());
+    }
+    let session = app.sessions.get_mut(&session_id).expect("command mode always has a live session");
+    session.shell.sync_real_state_in();
+    let ran = session.shell.filter_through_command(&cmd, "");
+    session.shell.sync_real_state_out();
+    let (output, errors, _status) = ran.map_err(|e| format!("{cmd}: {e}"))?;
+    // Both streams, in the order a terminal would have interleaved them
+    // as well as this can be reconstructed after the fact -- what the
+    // command *did* first, then what it complained about.
+    Ok(format!("{output}{errors}").trim_end().to_string())
+}
+
+/// `:[range]!cmd` -- vim's filter. The lines go in as the command's
+/// stdin, and whatever it writes to stdout replaces them.
+///
+/// vim replaces the range whatever the command's exit status was, so
+/// `:%!false` empties the buffer -- and so does this. Only replacing on
+/// success would quietly do nothing for a command that legitimately
+/// exits non-zero, and `u` is right there for the mistake.
+fn filter_lines_through_command(
+    app: &mut App,
+    session_id: SessionId,
+    tb: &mut TextBuffer,
+    from: LineRef,
+    to: LineRef,
+    cmd: &str,
+) -> Result<String, String> {
+    use crate::bishedit::motion::{MotionRange, MotionShape};
+
+    let cmd = crate::fileeditor::expand_filename_macros(cmd, tb)?;
+    if cmd.trim().is_empty() {
+        return Err("E34: No previous command".to_string());
+    }
+    let last = tb.line_count().saturating_sub(1);
+    let (a, b) = ordered(from, to, tb.cursor().0, last);
+    let input = crate::bishedit::motion::extract_text(&*tb, &MotionRange { shape: MotionShape::Linewise, from: (a, 0), to: (b, 0) });
+
+    // Not `restrict_to_builtins` and not the capture sink -- see
+    // `Shell::filter_through_command`, which explains why an external's
+    // output can only be caught the way `$( )` catches it. `sort` and
+    // `column -t` are the entire point of a filter, so this is the one
+    // colon-line command that must reach past both.
+    let session = app.sessions.get_mut(&session_id).expect("command mode always has a live session");
+    session.shell.sync_real_state_in();
+    let ran = session.shell.filter_through_command(&cmd, &input);
+    session.shell.sync_real_state_out();
+    let (output, errors, _status) = ran.map_err(|e| format!("{cmd}: {e}"))?;
+
+    replace_lines(tb, a, b, &output);
+    // stdout went into the buffer, so what is left to show is whatever
+    // the command complained about -- and a filter that worked
+    // complained about nothing, which is the empty overlay.
+    Ok(errors.trim_end().to_string())
+}
+
+/// Puts `output` in place of rows `a..=b`, the way a filter's result
+/// lands back in the buffer.
+///
+/// Its own function because the two edges here are the whole difficulty
+/// and neither needs a shell to exercise: the trailing newline every
+/// command writes is what *ends* the last line rather than starting an
+/// empty one after it, and a buffer always keeps at least one line -- so
+/// deleting every row leaves an empty one that has to be written into
+/// rather than inserted above, which is what made `:%!sort` come back a
+/// line longer than it went in.
+fn replace_lines(tb: &mut TextBuffer, a: usize, b: usize, output: &str) {
+    use crate::bishedit::motion::{MotionRange, MotionShape};
+    let whole = a == 0 && b >= tb.line_count().saturating_sub(1);
+    tb.set_cursor(a, 0);
+    tb.delete_range(&MotionRange { shape: MotionShape::Linewise, from: (a, 0), to: (b, 0) });
+    let replacement = output.strip_suffix('\n').unwrap_or(output);
+    if replacement.is_empty() {
+        // `:%!true` empties the buffer, exactly as it does in vim.
+    } else if whole {
+        tb.insert_text((0, 0), replacement);
+    } else {
+        insert_lines_at(tb, a, replacement);
+    }
+    tb.set_cursor(a.min(tb.line_count().saturating_sub(1)), 0);
 }
 
 /// Both ends of a range as 0-indexed rows, smaller first.
@@ -14989,8 +15093,15 @@ mod substitute_command_tests {
         assert!(matches!(parse_bang_command("!"), Some(BangCommand::Run(""))));
 
         for line in ["%!sort", "1,5!sort", ".!date", "$!tac", "1,$!tac"] {
-            assert!(matches!(parse_bang_command(line), Some(BangCommand::Filter)), "{line}");
+            assert!(matches!(parse_bang_command(line), Some(BangCommand::Filter { .. })), "{line}");
         }
+        // The range and the command both come back, and everything past
+        // the `!` is the command.
+        let Some(BangCommand::Filter { from, to, cmd }) = parse_bang_command("1,5!column -t") else { panic!() };
+        assert_eq!((from, to), (LineRef::Number(1), LineRef::Number(5)));
+        assert_eq!(cmd, "column -t");
+        let Some(BangCommand::Filter { from, to, .. }) = parse_bang_command("%!sort") else { panic!() };
+        assert_eq!((from, to), (LineRef::Number(1), LineRef::Last));
         // Not a range this parser reads, so not a filter either -- see
         // parse_range_prefix's own note on visual-mode marks.
         assert!(parse_bang_command("'<,'>!sort").is_none());
@@ -15000,6 +15111,42 @@ mod substitute_command_tests {
         for line in ["w", "wq", "q!", "s/a/b/", "normal dd", "1,5d", "diag", "echo hi!"] {
             assert!(parse_bang_command(line).is_none(), "{line}");
         }
+    }
+
+    // The two edges a filter's result has to land on, neither of which
+    // needs a shell to reach: the command's trailing newline, and the
+    // empty line a whole-buffer delete leaves behind. Checked against
+    // real vim, which is where the `:%!true` expectation comes from.
+    #[test]
+    fn a_filters_output_replaces_exactly_the_lines_it_was_given() {
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 0, 2, "a\nb\nc\n");
+        assert_eq!(buf.line_count(), 3, "the trailing newline ends the last line, it does not add one");
+        assert_eq!(lines_of(&buf), "a\nb\nc");
+
+        // One line in the middle, and the rest untouched.
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 1, 1, "A\n");
+        assert_eq!(lines_of(&buf), "c\nA\nb");
+
+        // Fewer lines out than in, and more.
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 0, 2, "one\n");
+        assert_eq!(lines_of(&buf), "one");
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 2, 2, "x\ny\n");
+        assert_eq!(lines_of(&buf), "c\na\nx\ny");
+
+        // `:%!true` -- no output at all empties the buffer.
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 0, 2, "");
+        assert_eq!(lines_of(&buf), "");
+
+        // A command that writes no trailing newline still gets its
+        // lines, rather than one line with an embedded newline.
+        let mut buf = buffer_of("c\na\nb");
+        replace_lines(&mut buf, 0, 2, "x\ny");
+        assert_eq!(lines_of(&buf), "x\ny");
     }
 
     #[test]
