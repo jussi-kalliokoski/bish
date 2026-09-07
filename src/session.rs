@@ -1047,7 +1047,11 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
     install_bridge(bridge);
 
     let shell = crate::exec::Shell::new();
-    crate::repl::run(shell, true);
+    // `true`: a session daemon is an interactive shell like any other,
+    // and reads the user's config like one. It did not, for as long as
+    // loading that config was the *caller's* job -- which is exactly
+    // why it is `repl::run`'s now.
+    crate::repl::run(shell, true, true);
     Ok(0)
 }
 

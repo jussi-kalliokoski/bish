@@ -210,10 +210,7 @@ fn main() {
 
     if invocation.interactive.unwrap_or_else(|| std::io::stdin().is_terminal()) {
         shell.invocation_flag = Some('i');
-        if !invocation.norc {
-            load_config(&mut shell);
-        }
-        repl::run(shell, invocation.promoted);
+        repl::run(shell, invocation.promoted, !invocation.norc);
     } else {
         shell.invocation_flag = Some('s');
         source_bash_env(&mut shell, &invocation);
@@ -475,45 +472,6 @@ fn source_bash_env(shell: &mut exec::Shell, invocation: &Invocation) {
         if let Ok(src) = std::fs::read_to_string(&path) {
             shell.run_source_here(&src, &path);
         }
-    }
-}
-
-// Runs $HOME/.config/bish/config.bash, if present, in the shell's own
-// top-level scope before the interactive prompt starts -- matching
-// bash's own ~/.bashrc: vars/functions/aliases it sets persist into the
-// session that follows (Shell::run_source_here, shared with `source`/`.`
-// -- see its own doc comment for why this needs that exact "run in
-// place" semantics rather than a subprocess). Only reached from the
-// interactive branch below, not `-c`/a script path/piped stdin -- same
-// as bash not sourcing ~/.bashrc for a non-interactive run. A missing
-// file is the common case, not an error, so it's silently skipped; a
-// real read failure or a syntax error inside it is reported (through
-// the shell's own stderr sink, same as any other script error) but
-// doesn't stop the shell from reaching its prompt -- config.bash is
-// just this entry point; anything else the user wants loaded, they
-// `source` themselves from inside it.
-fn load_config(shell: &mut exec::Shell) {
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let path = std::path::PathBuf::from(home).join(".config/bish/config.bash");
-    match std::fs::read_to_string(&path) {
-        Ok(src) => {
-            shell.run_source_here(&src, &path.display().to_string());
-            // Everything config.bash just set has to be captured into
-            // this shell's own remembered environment, or the very first
-            // `sync_real_state_in` wipes it.
-            //
-            // That snapshot is taken in `Shell::new`, which runs *before*
-            // this -- and `sync_real_state_in` (which every command goes
-            // through, so sibling windows cannot clobber each other's
-            // variables) removes every real env var the snapshot does not
-            // have. So a plain `MYVAR=x` in config.bash survived exactly
-            // until the first command ran. Aliases and functions live on
-            // the `Shell` and were never affected, which is what made
-            // this look like config.bash working.
-            shell.sync_real_state_out();
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("bish: {}: {}", path.display(), e),
     }
 }
 

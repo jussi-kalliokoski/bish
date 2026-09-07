@@ -389,7 +389,63 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
     false
 }
 
-pub fn run(mut shell: Shell, start_promoted: bool) {
+// Runs $HOME/.config/bish/config.bash, if present, in the shell's own
+// top-level scope before the interactive prompt starts -- matching
+// bash's own ~/.bashrc: vars/functions/aliases it sets persist into the
+// session that follows (Shell::run_source_here, shared with `source`/`.`
+// -- see its own doc comment for why this needs that exact "run in
+// place" semantics rather than a subprocess). Only for an interactive
+// shell, not `-c`/a script path/piped stdin -- same as bash not
+// sourcing ~/.bashrc for a non-interactive run. A missing file is the
+// common case, not an error, so it is silently skipped; a real read
+// failure or a syntax error inside it is reported (through the shell's
+// own stderr sink, same as any other script error) but does not stop
+// the shell from reaching its prompt -- config.bash is just this entry
+// point; anything else the user wants loaded, they `source` themselves
+// from inside it.
+fn load_config(shell: &mut Shell) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::PathBuf::from(home).join(".config/bish/config.bash");
+    match std::fs::read_to_string(&path) {
+        Ok(src) => load_config_source(shell, &src, &path.display().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("bish: {}: {}", path.display(), e),
+    }
+}
+
+/// `load_config` with the text already in hand -- which is what makes
+/// it testable without moving `$HOME` out from under the process.
+fn load_config_source(shell: &mut Shell, src: &str, name: &str) {
+    shell.run_source_here(src, name);
+    // Everything config.bash just set has to be captured into this
+    // shell's own remembered environment, or the very first
+    // `sync_real_state_in` wipes it.
+    //
+    // That snapshot is taken in `Shell::new`, which runs *before* this
+    // -- and `sync_real_state_in` (which every command goes through, so
+    // sibling windows cannot clobber each other's variables) removes
+    // every real env var the snapshot does not have. So a plain
+    // `MYVAR=x` in config.bash survived exactly until the first command
+    // ran. Aliases and functions live on the `Shell` and were never
+    // affected, which is what made this look like config.bash working.
+    shell.sync_real_state_out();
+}
+
+pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
+    // First, before anything else this function sets up: the config is
+    // allowed to change what the rest of it starts with.
+    //
+    // Here rather than in each caller, and that is the point. It used
+    // to be main.rs's job, done just before the one call to this it
+    // knew about -- and the session daemon, which starts an interactive
+    // shell by another route entirely, never did it. A detachable
+    // session therefore had no theme, no abbreviations and no aliases,
+    // and looked for all the world like a config that had stopped
+    // working. Every way into the interactive shell goes through here,
+    // so this is the one place it cannot be forgotten from.
+    if load_rc {
+        load_config(&mut shell);
+    }
     // The shell itself must survive Ctrl-C (bash's own top-level
     // interactive behavior); a foreground child still dies/interrupts
     // normally since exec() resets a *caught* signal like this back to
@@ -15145,5 +15201,62 @@ mod debug_adapter_tests {
         // invocation is not guessed at.
         assert_eq!(default_debug_adapter("go"), None);
         assert_eq!(default_debug_adapter("bash"), None, "bish debugs its own scripts, and not through an adapter");
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// The bug this exists for: a theme declared and activated in the
+    /// config, and `::bish hl` listing nothing at all.
+    ///
+    /// It was never the theme machinery -- that always worked from a
+    /// shell that had read the file. It was that a detachable session
+    /// never read the file, because loading it was the *caller's* job
+    /// and the session daemon was a caller nobody had told. So the test
+    /// is of the loading, and `repl::run` is now the only place that
+    /// does it.
+    #[test]
+    fn a_theme_declared_in_the_config_is_in_force_after_loading_it() {
+        let mut shell = exec::Shell::new();
+        assert!(shell.hl_colors().is_empty(), "nothing is themed before the config is read");
+
+        load_config_source(
+            &mut shell,
+            "::bish theme begin\n             bishopt --set theme paper\n             ::bish hl --set keyword \"#DDAE36, -bish-yellow\"\n             ::bish hl --set string \"#78C953, -bish-green\"\n             ::bish theme end\n             bishopt --set theme paper\n",
+            "config.bash",
+        );
+
+        let colours: HashMap<String, String> = shell.hl_colors().into_iter().collect();
+        assert_eq!(colours.get("keyword").map(String::as_str), Some("#DDAE36, -bish-yellow"));
+        assert_eq!(colours.get("string").map(String::as_str), Some("#78C953, -bish-green"));
+    }
+
+    // A config that is never read leaves exactly the state the report
+    // described: a theme registered nowhere and an empty listing. Kept
+    // as the other half of the pair, so "it loaded" and "it did not"
+    // are both pinned rather than only the happy one.
+    #[test]
+    fn without_the_config_there_is_nothing_to_list() {
+        let shell = exec::Shell::new();
+        assert!(shell.hl_colors().is_empty());
+        assert_eq!(shell.hl_color("keyword"), None);
+    }
+
+    /// Declaring a theme is not activating it -- the block only
+    /// registers, and the `bishopt --set theme` *after* it is what puts
+    /// it in force. Worth pinning because the config that prompted this
+    /// has the same line inside the block and after it, and only the
+    /// second one counts.
+    #[test]
+    fn a_theme_that_is_declared_but_not_activated_is_not_in_force() {
+        let mut shell = exec::Shell::new();
+        load_config_source(
+            &mut shell,
+            "::bish theme begin\n             bishopt --set theme paper\n             ::bish hl --set keyword \"#DDAE36, -bish-yellow\"\n             ::bish theme end\n",
+            "config.bash",
+        );
+        assert!(shell.hl_colors().is_empty(), "registered, not activated");
     }
 }
