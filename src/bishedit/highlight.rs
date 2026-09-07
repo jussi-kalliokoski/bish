@@ -559,6 +559,7 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "python" => Some(Box::new(CodeHighlighter(super::codehighlight::python))),
         "javascript" => Some(Box::new(CodeHighlighter(super::codehighlight::javascript))),
         "typescript" => Some(Box::new(CodeHighlighter(super::codehighlight::typescript))),
+        "go" | "golang" => Some(Box::new(CodeHighlighter(super::codehighlight::go))),
         "yaml" | "yml" => Some(Box::new(CodeHighlighter(super::codehighlight::yaml))),
         "css" => Some(Box::new(CodeHighlighter(super::codehighlight::css))),
         "html" | "htm" => Some(Box::new(CodeHighlighter(super::codehighlight::html))),

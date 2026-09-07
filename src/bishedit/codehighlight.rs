@@ -1007,6 +1007,139 @@ fn html_tag(s: &mut Scan) {
     }
 }
 
+// --- go ----------------------------------------------------------------
+//
+// Lexically the simplest of the C-family languages here: no
+// preprocessor, no nested comments, no string prefixes, one kind of
+// character literal. The one thing it has that none of the others do is
+// the **raw string**, delimited by backticks, which runs across lines
+// and has no escapes at all -- a `\` in one is a backslash and a `"` is
+// a quote. Reading it as an ordinary string is how a scanner ends up
+// painting the rest of a file from the first regexp literal onwards,
+// since those are exactly what raw strings are used for.
+
+const GO_KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+];
+
+/// Not keywords, and Go is precise about that -- every one of these can
+/// be shadowed by a declaration, which is why the specification calls
+/// them predeclared identifiers rather than reserved words. They read
+/// as part of the language all the same, and an editor that coloured
+/// `func` but not `string` would be describing the grammar rather than
+/// the program.
+const GO_PREDECLARED: &[&str] = &[
+    "any",
+    "append",
+    "bool",
+    "byte",
+    "cap",
+    "clear",
+    "close",
+    "comparable",
+    "complex",
+    "complex64",
+    "complex128",
+    "copy",
+    "delete",
+    "error",
+    "false",
+    "float32",
+    "float64",
+    "imag",
+    "int",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "iota",
+    "len",
+    "make",
+    "max",
+    "min",
+    "new",
+    "nil",
+    "panic",
+    "print",
+    "println",
+    "real",
+    "recover",
+    "rune",
+    "string",
+    "true",
+    "uint",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "uintptr",
+];
+
+pub fn go(text: &str) -> Spans {
+    let mut s = Scan::new(text);
+    while !s.done() {
+        if s.line_comment("//") || s.block_comment("/*", "*/", false) {
+            continue;
+        }
+        match s.here() {
+            b'"' => s.quoted(b'"', false),
+            // A rune literal. `'` is never anything else in Go -- there
+            // are no lifetimes here, which is the one place the Rust
+            // scanner has to think.
+            b'\'' => s.quoted(b'\'', false),
+            b'`' => go_raw_string(&mut s),
+            c if c.is_ascii_digit() || (c == b'.' && s.at(s.pos + 1).is_ascii_digit()) => s.number(),
+            c if ident_start(c) => {
+                let range = s.word();
+                let word = s.text(&range);
+                if GO_KEYWORDS.contains(&word) || GO_PREDECLARED.contains(&word) {
+                    s.out.push((range, HighlightKind::Keyword));
+                }
+            }
+            _ => s.pos += 1,
+        }
+    }
+    s.out
+}
+
+/// A raw string: everything to the next backtick, whatever is in
+/// between. No escapes, so a backslash cannot hide the terminator --
+/// which is the whole reason to have them, and the reason this is four
+/// lines rather than a call to `quoted`.
+fn go_raw_string(s: &mut Scan) {
+    let start = s.pos;
+    s.pos += 1;
+    while !s.done() && s.here() != b'`' {
+        s.pos += 1;
+    }
+    s.pos = (s.pos + 1).min(s.src.len());
+    s.push(start, HighlightKind::String);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,12 +1390,69 @@ mod tests {
         assert!(spans.contains(&("<!DOCTYPE html>".to_string(), HighlightKind::Keyword)), "{spans:?}");
     }
 
+    #[test]
+    fn go_comments_strings_numbers_and_keywords() {
+        let text = "// note\npackage main\n\nfunc f() int { return 0x1F_u }";
+        let spans = painted(text, go(text));
+        assert!(spans.contains(&("// note".to_string(), HighlightKind::Comment)), "{spans:?}");
+        assert!(spans.contains(&("package".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("func".to_string(), HighlightKind::Keyword)), "{spans:?}");
+        assert!(spans.contains(&("int".to_string(), HighlightKind::Keyword)), "a predeclared type reads as part of the language: {spans:?}");
+    }
+
+    // The one thing Go has that none of the others do. A raw string
+    // runs across lines and has no escapes, so a backslash cannot hide
+    // the terminator -- and reading one as an ordinary string paints
+    // the rest of the file, which is exactly what would happen to every
+    // file containing a regexp.
+    #[test]
+    fn a_go_raw_string_has_no_escapes_and_spans_lines() {
+        let text = "re := `a\\d+\n\"quoted\"`\nn := 1";
+        let spans = painted(text, go(text));
+        assert!(
+            spans.iter().any(|(t, k)| *k == HighlightKind::String && t.contains("quoted") && t.contains('\n')),
+            "the whole raw string is one span: {spans:?}"
+        );
+        assert!(spans.contains(&("1".to_string(), HighlightKind::Number)), "the scanner came back out of it: {spans:?}");
+    }
+
+    #[test]
+    fn a_backslash_does_not_end_a_go_raw_string_early() {
+        let text = "s := `ends with a backslash \\` + x";
+        let spans = painted(text, go(text));
+        let strings: Vec<&String> = spans.iter().filter(|(_, k)| *k == HighlightKind::String).map(|(t, _)| t).collect();
+        assert_eq!(strings.len(), 1, "{spans:?}");
+        assert!(strings[0].ends_with('`'), "it ended at the backtick, not before it: {strings:?}");
+    }
+
+    // `'` is always a rune literal here -- Go has no lifetimes, which is
+    // the one place the Rust scanner has to think and this one does not.
+    #[test]
+    fn a_go_rune_is_just_a_character() {
+        let text = "c := 'x'; d := '\\n'";
+        let spans = painted(text, go(text));
+        assert!(spans.contains(&("'x'".to_string(), HighlightKind::String)), "{spans:?}");
+    }
+
+    // Predeclared identifiers are not reserved words -- Go lets you
+    // shadow every one of them. They still read as part of the
+    // language, which is the call every Go editor makes.
+    #[test]
+    fn go_predeclared_names_are_coloured_even_though_they_are_not_keywords() {
+        let text = "var s string = \"x\"\nb := make([]byte, len(s))\nif b == nil { panic(true) }";
+        let spans = painted(text, go(text));
+        for word in ["string", "make", "byte", "len", "nil", "panic", "true"] {
+            assert!(spans.contains(&(word.to_string(), HighlightKind::Keyword)), "{word} is missing: {spans:?}");
+        }
+        assert!(!spans.iter().any(|(t, _)| t == "s" || t == "b"), "an ordinary name gets nothing: {spans:?}");
+    }
+
     // Every scanner has to make progress on every byte it sees, or a
     // buffer with the wrong character in it hangs the editor.
     #[test]
     fn every_scanner_terminates_on_arbitrary_bytes() {
         let text = "a\u{e9}'\"`#@${}/*//\\0 1.2e-3 0x_ r#\" \u{1f600}";
-        for scan in [rust, python, javascript, typescript, yaml, css, html] {
+        for scan in [rust, python, javascript, typescript, yaml, css, html, go] {
             let spans = scan(text);
             assert!(spans.iter().all(|(r, _)| r.start <= r.end && r.end <= text.len()));
         }

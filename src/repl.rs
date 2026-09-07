@@ -3868,13 +3868,21 @@ fn parse_launch_arguments(rest: &str) -> Option<(Option<Vec<String>>, String)> {
 ///
 /// Deliberately tiny, and deliberately not a configuration mechanism
 /// yet: `gdb` has spoken this protocol since version 14, it is on
-/// almost every machine that has a compiler, and it debugs all three of
-/// these. Anything else is named on the command line
+/// almost every machine that has a compiler, and it debugs every
+/// language on this list. Anything else is named on the command line
 /// (`:dbg launch --adapter=... PROGRAM`), which is what the registry
 /// would generalise once it is clear what people actually type.
+///
+/// **Go is not on the list, and that is the interesting entry.** It
+/// was, briefly, because gdb will load a Go binary -- but gdb does not
+/// understand goroutines, so what it shows of a running Go program is
+/// misleading rather than merely incomplete. Delve is the Go debugger
+/// and speaks this protocol itself; its exact invocation is not
+/// guessed at here, because a default nobody has run is worse than no
+/// default at all. `--adapter=` names it.
 fn default_debug_adapter(language: &str) -> Option<Vec<String>> {
     match language {
-        "c" | "cpp" | "c++" | "rust" | "go" | "zig" => Some(vec!["gdb".to_string(), "-i=dap".to_string()]),
+        "c" | "cpp" | "c++" | "rust" | "zig" => Some(vec!["gdb".to_string(), "-i=dap".to_string()]),
         _ => None,
     }
 }
@@ -15132,6 +15140,10 @@ mod debug_adapter_tests {
         assert_eq!(default_debug_adapter("c"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
         assert_eq!(default_debug_adapter("rust"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
         assert_eq!(default_debug_adapter("python"), None);
+        // Not an oversight -- see the function's own doc comment: gdb
+        // loads a Go binary and then misdescribes it, and delve's
+        // invocation is not guessed at.
+        assert_eq!(default_debug_adapter("go"), None);
         assert_eq!(default_debug_adapter("bash"), None, "bish debugs its own scripts, and not through an adapter");
     }
 }
