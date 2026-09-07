@@ -11927,13 +11927,19 @@ fn run_command_mode(
                     }
 
                     if let Some(parsed) = parse_substitute_command(&trimmed) {
-                        match parsed.and_then(|cmd| run_substitute(tb, &cmd)) {
-                            Ok((subs, lines)) => {
-                                let output = format!(
-                                    "{subs} substitution{} on {lines} line{}",
-                                    if subs == 1 { "" } else { "s" },
-                                    if lines == 1 { "" } else { "s" }
-                                );
+                        match parsed.and_then(|cmd| run_substitute(tb, &cmd).map(|counts| (cmd.count_only, counts))) {
+                            Ok((count_only, (subs, lines))) => {
+                                // `n` changed nothing, so saying it made
+                                // substitutions would be a lie.
+                                let what = if count_only { "match" } else { "substitution" };
+                                let plural = if subs == 1 {
+                                    ""
+                                } else if count_only {
+                                    "es"
+                                } else {
+                                    "s"
+                                };
+                                let output = format!("{subs} {what}{plural} on {lines} line{}", if lines == 1 { "" } else { "s" });
                                 app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                     command: trimmed,
                                     output: output.clone(),
@@ -13345,7 +13351,74 @@ struct SubstituteCmd {
     to: LineRef,
     pattern: String,
     replacement: String,
+    /// `g` -- every match on a line, not just the first.
     global: bool,
+    /// `i` / `I`. `None` is "neither was given", which leaves the choice
+    /// to `'ignorecase'`/`'smartcase'` as it was before either flag
+    /// existed here.
+    ignore_case: Option<bool>,
+    /// The count vim allows after the flags, which *replaces* the range
+    /// rather than narrowing it: `:1,2s/x/y/ 3` acts on three lines
+    /// starting at line 2 -- the range's own last line -- so it can name
+    /// lines the range never covered. Confirmed against real vim.
+    count: Option<usize>,
+    /// `n` -- report how many matches there are and change nothing.
+    count_only: bool,
+    /// `e` -- a pattern that matches nothing is not an error.
+    no_error: bool,
+}
+
+/// Everything after `:s/pat/repl/`, which is the same set of answers
+/// `SubstituteCmd` carries -- see its fields for what each one means.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SubstituteFlags {
+    global: bool,
+    ignore_case: Option<bool>,
+    count: Option<usize>,
+    count_only: bool,
+    no_error: bool,
+}
+
+/// Reads them.
+///
+/// Unknown flags are refused rather than ignored. Silently dropping them
+/// is what made `:%s/a/Z/gi` quietly do a case-*sensitive* substitution
+/// and report success -- a wrong answer, where an error would at least
+/// have been true.
+fn parse_substitute_flags(text: &str) -> Result<SubstituteFlags, String> {
+    let SubstituteFlags { mut global, mut ignore_case, mut count, mut count_only, mut no_error } = SubstituteFlags::default();
+    for c in text.chars() {
+        // A count ends the flags: everything from the first digit on is
+        // the number, and a letter after it is trailing junk.
+        if let Some(n) = count {
+            match c.to_digit(10) {
+                Some(d) => {
+                    count = Some(n.saturating_mul(10).saturating_add(d as usize));
+                    continue;
+                }
+                None => return Err(format!("E488: Trailing characters: {c}")),
+            }
+        }
+        match c {
+            'g' => global = true,
+            'i' => ignore_case = Some(true),
+            'I' => ignore_case = Some(false),
+            'n' => count_only = true,
+            'e' => no_error = true,
+            // Recognized, and refused rather than ignored: `c` steps
+            // through the matches asking about each, and command mode
+            // has nowhere to ask.
+            'c' => return Err("E:  `:s` flag `c` needs a confirmation prompt, which command mode has no way to show".to_string()),
+            ' ' | '\t' => {}
+            '0'..='9' => count = Some(c.to_digit(10).expect("matched a digit") as usize),
+            _ => return Err(format!("E488: Trailing characters: {c}")),
+        }
+    }
+    // `:s/a/b/0` is not "zero lines", it is a typo.
+    if count == Some(0) {
+        return Err("E939: Positive count required".to_string());
+    }
+    Ok(SubstituteFlags { global, ignore_case, count, count_only, no_error })
 }
 
 fn parse_one_line_ref(chars: &[char], i: &mut usize) -> Option<LineRef> {
@@ -13783,7 +13856,11 @@ fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, Strin
     }
     let replacement = scan_until_delim(&chars, &mut i, delim);
     let flags: String = chars[i..].iter().collect();
-    Some(Ok(SubstituteCmd { from, to, pattern, replacement, global: flags.contains('g') }))
+    let SubstituteFlags { global, ignore_case, count, count_only, no_error } = match parse_substitute_flags(&flags) {
+        Ok(parsed) => parsed,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(SubstituteCmd { from, to, pattern, replacement, global, ignore_case, count, count_only, no_error }))
 }
 
 // Applies `once` (the very next appended char only, `\u`/`\l`) or,
@@ -14092,7 +14169,18 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
     // that prompt would do anyway.
     let mut row = a.min(b);
     let mut end = a.max(b);
-    let re = crate::regex::Regex::compile(&cmd.pattern, tb.search_ignore_case(&cmd.pattern));
+    // A trailing count replaces the range instead of narrowing it: vim
+    // reads `:1,2s/x/y/ 3` as "three lines from line 2", which can reach
+    // past where the range ended. See `SubstituteCmd::count`.
+    if let Some(n) = cmd.count {
+        row = a.max(b);
+        end = row.saturating_add(n - 1);
+    }
+    // `i`/`I` when either was given, and only otherwise the
+    // 'ignorecase'/'smartcase' answer the buffer would have used on its
+    // own.
+    let fold = cmd.ignore_case.unwrap_or_else(|| tb.search_ignore_case(&cmd.pattern));
+    let re = crate::regex::Regex::compile(&cmd.pattern, fold);
     let mut total = 0usize;
     let mut lines_changed = 0usize;
     while row <= end && row < tb.line_count() {
@@ -14101,18 +14189,22 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<(usize, us
         if count > 0 {
             total += count;
             lines_changed += 1;
-            let line_len = original.chars().count();
-            let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, 0), to: (row, line_len) };
-            tb.delete_range(&range);
-            tb.insert_text((row, 0), &new_text);
-            let added = new_text.matches('\n').count();
-            end += added;
-            row += 1 + added;
-        } else {
-            row += 1;
+            // `n` counts and leaves the buffer alone -- the whole point
+            // of asking is to find out before deciding.
+            if !cmd.count_only {
+                let line_len = original.chars().count();
+                let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, 0), to: (row, line_len) };
+                tb.delete_range(&range);
+                tb.insert_text((row, 0), &new_text);
+                let added = new_text.matches('\n').count();
+                end += added;
+                row += 1 + added;
+                continue;
+            }
         }
+        row += 1;
     }
-    if total == 0 {
+    if total == 0 && !cmd.no_error {
         return Err(format!("E486: Pattern not found: {}", cmd.pattern));
     }
     Ok((total, lines_changed))
@@ -15292,12 +15384,95 @@ mod substitute_command_tests {
         assert!(parse_global_command("g/x/").unwrap().is_err());
     }
 
+    // Every expectation here was read off real `vim -u NONE -i NONE -N`.
+    // Before this, everything after the last delimiter was parsed and
+    // thrown away, so `:%s/a/Z/gi` did a case-*sensitive* substitution
+    // and reported success -- the wrong answer, delivered confidently.
+    #[test]
+    fn substitute_flags_are_read_rather_than_dropped() {
+        let parse = |line: &str| parse_substitute_command(line).expect("recognized as `s`");
+
+        let cmd = parse("%s/a/Z/gi").unwrap();
+        assert!(cmd.global);
+        assert_eq!(cmd.ignore_case, Some(true));
+        // `I` is not the absence of `i`: it overrides 'ignorecase' the
+        // other way, which is why this is an Option and not a bool.
+        assert_eq!(parse("%s/a/Z/I").unwrap().ignore_case, Some(false));
+        assert_eq!(parse("%s/a/Z/g").unwrap().ignore_case, None);
+
+        assert!(parse("%s/a/Z/n").unwrap().count_only);
+        assert!(parse("2s/a/Z/e").unwrap().no_error);
+        // A count, with or without the space vim allows before it, and
+        // with flags in front of it.
+        assert_eq!(parse("1,2s/A/Z/ 3").unwrap().count, Some(3));
+        assert_eq!(parse("s/A/Z/12").unwrap().count, Some(12));
+        assert_eq!(parse("s/A/Z/g 2").unwrap().count, Some(2));
+
+        // Refused, not ignored.
+        assert!(parse("%s/a/Z/gq").is_err(), "an unknown flag is an error");
+        assert!(parse("%s/a/Z/2x").is_err(), "a letter after the count is trailing junk");
+        assert!(parse("%s/a/Z/0").is_err(), "a zero count is a typo, not an empty range");
+        // Recognized specifically, so the message can say *why* rather
+        // than calling it a trailing character.
+        let Err(e) = parse("%s/a/Z/gc") else { panic!("`c` must be refused") };
+        assert!(e.contains("confirmation"), "{e}");
+    }
+
+    #[test]
+    fn i_and_capital_i_beat_the_buffers_own_ignorecase() {
+        let run = |flags: &str| {
+            let mut buf = buf_from("aAa\nbBb\naAa");
+            let cmd = parse_substitute_command(&format!("%s/a/Z/{flags}")).unwrap().unwrap();
+            let counts = run_substitute(&mut buf, &cmd);
+            (text_of(&buf), counts)
+        };
+        assert_eq!(run("gi").0, "ZZZ\nbBb\nZZZ");
+        assert_eq!(run("gI").0, "ZAZ\nbBb\nZAZ");
+        assert_eq!(run("g").0, "ZAZ\nbBb\nZAZ", "neither flag leaves the buffer's own setting in charge");
+    }
+
+    // vim's count *replaces* the range rather than narrowing it, and
+    // counts from the range's own last line -- so it can reach lines the
+    // range never named. `:1,2s/A/Z/ 3` acts on lines 2, 3 and 4.
+    #[test]
+    fn a_trailing_count_replaces_the_range_from_its_last_line() {
+        let mut buf = buf_from("aAa\nbBb\naAa\ncCc\naAa");
+        let cmd = parse_substitute_command("1,2s/A/Z/ 3").unwrap().unwrap();
+        run_substitute(&mut buf, &cmd).unwrap();
+        assert_eq!(text_of(&buf), "aAa\nbBb\naZa\ncCc\naAa", "lines 2..4, not lines 1..2");
+    }
+
+    #[test]
+    fn n_counts_without_touching_the_buffer_and_e_forgives_a_miss() {
+        let mut buf = buf_from("aAa\nbBb\naAa");
+        let cmd = parse_substitute_command("%s/a/Z/gn").unwrap().unwrap();
+        assert_eq!(run_substitute(&mut buf, &cmd).unwrap(), (4, 2));
+        assert_eq!(text_of(&buf), "aAa\nbBb\naAa", "`n` answers the question and changes nothing");
+
+        // A pattern that matches nothing is an error...
+        let mut buf = buf_from("aAa");
+        let cmd = parse_substitute_command("%s/zzz/Z/").unwrap().unwrap();
+        assert!(run_substitute(&mut buf, &cmd).is_err());
+        // ...unless `e` says it is fine.
+        let cmd = parse_substitute_command("%s/zzz/Z/e").unwrap().unwrap();
+        assert_eq!(run_substitute(&mut buf, &cmd).unwrap(), (0, 0));
+    }
+
     #[test]
     fn run_substitute_current_line_only_by_default() {
         let mut buf = buf_from("foo\nfoo\nfoo");
         buf.set_cursor(1, 0);
-        let cmd =
-            SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "foo".to_string(), replacement: "bar".to_string(), global: false };
+        let cmd = SubstituteCmd {
+            from: LineRef::Current,
+            to: LineRef::Current,
+            pattern: "foo".to_string(),
+            replacement: "bar".to_string(),
+            global: false,
+            ignore_case: None,
+            count: None,
+            count_only: false,
+            no_error: false,
+        };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!((subs, lines), (1, 1));
         assert_eq!(text_of(&buf), "foo\nbar\nfoo");
@@ -15306,8 +15481,17 @@ mod substitute_command_tests {
     #[test]
     fn run_substitute_whole_buffer_with_global_flag() {
         let mut buf = buf_from("foo foo\nfoo\nbaz");
-        let cmd =
-            SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: "foo".to_string(), replacement: "X".to_string(), global: true };
+        let cmd = SubstituteCmd {
+            from: LineRef::Number(1),
+            to: LineRef::Last,
+            pattern: "foo".to_string(),
+            replacement: "X".to_string(),
+            global: true,
+            ignore_case: None,
+            count: None,
+            count_only: false,
+            no_error: false,
+        };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!((subs, lines), (3, 2));
         assert_eq!(text_of(&buf), "X X\nX\nbaz");
@@ -15322,6 +15506,10 @@ mod substitute_command_tests {
             pattern: "(hello) (world)".to_string(),
             replacement: r"\2 \1".to_string(),
             global: false,
+            ignore_case: None,
+            count: None,
+            count_only: false,
+            no_error: false,
         };
         run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!(text_of(&buf), "world hello");
@@ -15333,8 +15521,17 @@ mod substitute_command_tests {
         // splits it into two lines via \r -- line 1 (originally "b")
         // must still be reached afterward, now at row 2.
         let mut buf = buf_from("a,a\nb");
-        let cmd =
-            SubstituteCmd { from: LineRef::Number(1), to: LineRef::Last, pattern: ",".to_string(), replacement: r"\r".to_string(), global: false };
+        let cmd = SubstituteCmd {
+            from: LineRef::Number(1),
+            to: LineRef::Last,
+            pattern: ",".to_string(),
+            replacement: r"\r".to_string(),
+            global: false,
+            ignore_case: None,
+            count: None,
+            count_only: false,
+            no_error: false,
+        };
         let (subs, lines) = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!(subs, 1);
         assert_eq!(lines, 1);
@@ -15344,8 +15541,17 @@ mod substitute_command_tests {
     #[test]
     fn run_substitute_reports_pattern_not_found() {
         let mut buf = buf_from("foo");
-        let cmd =
-            SubstituteCmd { from: LineRef::Current, to: LineRef::Current, pattern: "zzz".to_string(), replacement: "x".to_string(), global: false };
+        let cmd = SubstituteCmd {
+            from: LineRef::Current,
+            to: LineRef::Current,
+            pattern: "zzz".to_string(),
+            replacement: "x".to_string(),
+            global: false,
+            ignore_case: None,
+            count: None,
+            count_only: false,
+            no_error: false,
+        };
         assert_eq!(run_substitute(&mut buf, &cmd).unwrap_err(), "E486: Pattern not found: zzz");
     }
 
