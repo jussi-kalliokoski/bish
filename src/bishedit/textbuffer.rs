@@ -253,6 +253,16 @@ pub struct TextBuffer {
     // never an edit to invalidate a line-indexed breakpoint set against
     // in the first place.
     pub breakpoints: std::collections::BTreeSet<usize>,
+    /// Whether a debug session is attached to this buffer -- either
+    /// `:dbg`'s own, or an adapter's from `:dbg launch`.
+    ///
+    /// Only the gutter reads it, and only to keep the breakpoint column
+    /// present for the whole session. Without it that column exists
+    /// exactly while at least one breakpoint does, so setting the first
+    /// one shifts every line of the file two columns to the right and
+    /// clearing the last one shifts it back -- and there is no column
+    /// to *click* a first breakpoint into.
+    pub debug_attached: bool,
     // Set while a `:dbg` session is attached to this buffer (repl.rs) --
     // every mutating `KeyOutcome` arm in run_normal_mode_navigation
     // already gates itself on `NavBuffer::Editable(tb)` individually (no
@@ -349,6 +359,7 @@ impl TextBuffer {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            debug_attached: false,
             readonly: false,
             dirty: false,
             disk_hash: None,
@@ -497,6 +508,7 @@ impl TextBuffer {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            debug_attached: false,
             readonly: false,
             dirty: false,
             disk_hash: None,
@@ -1163,6 +1175,7 @@ mod tests {
             blame: None,
             diff: None,
             breakpoints: std::collections::BTreeSet::new(),
+            debug_attached: false,
             readonly: false,
             dirty: false,
             disk_hash: None,

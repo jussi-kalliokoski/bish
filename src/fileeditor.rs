@@ -2521,18 +2521,73 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_cha
 // char offsets into "does this line's own span intersect one" -- the
 // line-number column ignores it, same as any future column that doesn't
 // need it.
+/// Which column of the gutter this is, so a click or a hover landing in
+/// it can mean something particular. The renderers do not need it --
+/// they are told their own width and asked for their own cell -- but
+/// anything working *inwards* from a screen position does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GutterKind {
+    Breakpoint,
+    Blame,
+    Diff,
+    Diagnostic,
+    LineNumber,
+}
+
 struct GutterColumn {
+    kind: GutterKind,
     width: fn(&TextBuffer) -> usize,
     render: fn(buf: &TextBuffer, starts: &[usize], line: usize, width: usize) -> Option<String>,
 }
 
 static GUTTER_COLUMNS: &[GutterColumn] = &[
-    GutterColumn { width: breakpoint_column_width, render: render_breakpoint_cell },
-    GutterColumn { width: blame_column_width, render: render_blame_cell },
-    GutterColumn { width: diff_column_width, render: render_diff_cell },
-    GutterColumn { width: diagnostic_column_width, render: render_diagnostic_cell },
-    GutterColumn { width: line_number_width, render: render_line_number_cell },
+    GutterColumn { kind: GutterKind::Breakpoint, width: breakpoint_column_width, render: render_breakpoint_cell },
+    GutterColumn { kind: GutterKind::Blame, width: blame_column_width, render: render_blame_cell },
+    GutterColumn { kind: GutterKind::Diff, width: diff_column_width, render: render_diff_cell },
+    GutterColumn { kind: GutterKind::Diagnostic, width: diagnostic_column_width, render: render_diagnostic_cell },
+    GutterColumn { kind: GutterKind::LineNumber, width: line_number_width, render: render_line_number_cell },
 ];
+
+/// Which line and which gutter column a screen cell is in, or `None`
+/// when it is in the text (or off the buffer entirely).
+///
+/// The inverse of `render_gutter`, and it walks the same list in the
+/// same order for the same reason `position_at_screen` reproduces
+/// `build_editor_frame`'s own arithmetic: two places that disagree
+/// about where a column starts would put the pointer on the wrong one.
+///
+/// Only the first screen row of a wrapped line has a gutter -- the
+/// continuation rows are blank there, and a click on that blank is not
+/// a click on a marker that was never drawn.
+pub(crate) fn gutter_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, GutterKind)> {
+    if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
+        return None;
+    }
+    let row = row0 - rect.row;
+    if row >= editor_content_rows(rect) {
+        return None;
+    }
+    let gutter = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
+    let x = col0 - rect.col;
+    if x >= gutter {
+        return None;
+    }
+    let content_cols = rect.cols - gutter;
+    let rows = visible_rows(buf, content_cols, editor_content_rows(rect));
+    let visual = rows.get(row)?;
+    if visual.seg.start != 0 {
+        return None;
+    }
+    let mut at = 0;
+    for col in GUTTER_COLUMNS {
+        let width = (col.width)(buf);
+        if width > 0 && x < at + width {
+            return Some((visual.line, col.kind));
+        }
+        at += width;
+    }
+    None
+}
 
 fn total_gutter_width(buf: &TextBuffer) -> usize {
     GUTTER_COLUMNS.iter().map(|col| (col.width)(buf)).sum()
@@ -2940,7 +2995,9 @@ fn render_diff_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: us
 // opened buffer, which never touches it at all), same convention blame/
 // diff already use, unlike the diagnostic column's always-reserved 2.
 fn breakpoint_column_width(buf: &TextBuffer) -> usize {
-    if buf.breakpoints.is_empty() { 0 } else { 2 }
+    // Present for a whole debug session, not just while a breakpoint
+    // happens to exist -- see `TextBuffer::debug_attached`.
+    if buf.breakpoints.is_empty() && !buf.debug_attached { 0 } else { 2 }
 }
 
 // 1-based, matching how the debugger itself (and ListItem::line) numbers
@@ -2969,6 +3026,25 @@ fn line_severity(buf: &TextBuffer, starts: &[usize], line: usize) -> Option<lint
     let line_start = starts[line];
     let line_end = line_start + buf.line_len(line);
     buf.diagnostics.iter().filter(|d| d.start < line_end && d.end > line_start).map(|d| d.severity).max()
+}
+
+/// Every diagnostic whose own span touches `line`, worst first -- what
+/// the marker in the gutter is standing for.
+///
+/// Public because the gutter's marker says only "something is wrong
+/// here"; the thing that says *what* lives in repl.rs, and matching a
+/// diagnostic to a line is this file's own arithmetic (`line_severity`
+/// uses the same predicate to pick the colour).
+pub(crate) fn diagnostics_on_line(buf: &TextBuffer, line: usize) -> Vec<&lint::Diagnostic> {
+    if line >= buf.line_count() {
+        return Vec::new();
+    }
+    let starts = line_starts(buf);
+    let line_start = starts[line];
+    let line_end = line_start + buf.line_len(line);
+    let mut found: Vec<&lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.start < line_end && d.end > line_start).collect();
+    found.sort_by_key(|d| std::cmp::Reverse(d.severity));
+    found
 }
 
 fn render_diagnostic_cell(buf: &TextBuffer, starts: &[usize], line: usize, _width: usize) -> Option<String> {
@@ -4413,6 +4489,71 @@ charlie");
         let g = gutter(&b);
         // Third row of the pane, fourth character of that line.
         assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g + 3), Some((2, 3)));
+    }
+
+    // The gutter is not the text. Asking `position_at_screen` about it
+    // gets the line's first character, which is right for a click that
+    // means "put the cursor roughly there" and wrong for anything that
+    // wants to know *what* was pointed at.
+    #[test]
+    fn the_gutter_is_told_apart_from_the_text() {
+        let b = buf("alpha\nbravo\ncharlie");
+        let g = gutter(&b);
+        // The diagnostic column is always drawn (a fixed two cells,
+        // marked or blank), so it is the leftmost one here; the line
+        // numbers follow it and run to the edge of the gutter.
+        assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10), Some((2, GutterKind::Diagnostic)));
+        assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10 + g - 1), Some((2, GutterKind::LineNumber)));
+        // One past the gutter is the text, and no longer this
+        // function's business.
+        assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10 + g), None);
+        // ...which is exactly where `position_at_screen` starts
+        // answering, so between them every cell of a row is accounted
+        // for once.
+        assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g), Some((2, 0)));
+    }
+
+    #[test]
+    fn each_gutter_column_is_found_at_its_own_offset() {
+        let mut b = buf("alpha\nbravo\ncharlie");
+        b.breakpoints.insert(1);
+        b.diff = Some(std::collections::HashMap::from([(0, crate::git::DiffMark::Added)]));
+        // Left to right, in the order `GUTTER_COLUMNS` draws them.
+        // The pane starts at row 2, so its first content row is 2.
+        let mut at = 10;
+        for expected in [GutterKind::Breakpoint, GutterKind::Diff, GutterKind::Diagnostic, GutterKind::LineNumber] {
+            let width = GUTTER_COLUMNS.iter().find(|c| c.kind == expected).map(|c| (c.width)(&b)).expect("a column of that kind");
+            assert!(width > 0, "{expected:?} should be drawn for this buffer");
+            assert_eq!(gutter_at_screen(&b, rect(), 2, at), Some((0, expected)), "at column {at}");
+            assert_eq!(gutter_at_screen(&b, rect(), 2, at + width - 1), Some((0, expected)), "last cell of {expected:?}");
+            at += width;
+        }
+    }
+
+    // A column that is not being drawn cannot be pointed at -- without
+    // this, a zero-width column would swallow the first cell of
+    // whichever one actually starts there.
+    #[test]
+    fn a_column_of_no_width_is_never_the_answer() {
+        let b = buf("alpha\nbravo");
+        assert!(b.breakpoints.is_empty() && !b.debug_attached, "so the breakpoint column has no width");
+        let hit = gutter_at_screen(&b, rect(), 2, 10);
+        assert_ne!(hit.map(|(_, k)| k), Some(GutterKind::Breakpoint), "the first cell belongs to whatever is actually drawn there");
+    }
+
+    // The breakpoint column stays for a whole debug session rather than
+    // appearing with the first breakpoint and vanishing with the last
+    // -- which would shift every line of the file sideways twice.
+    #[test]
+    fn the_breakpoint_column_is_there_for_the_whole_session() {
+        let mut b = buf("alpha\nbravo");
+        assert_eq!(breakpoint_column_width(&b), 0);
+        b.debug_attached = true;
+        assert_eq!(breakpoint_column_width(&b), 2, "present before any breakpoint exists");
+        b.breakpoints.insert(1);
+        assert_eq!(breakpoint_column_width(&b), 2, "and unchanged by setting one");
+        b.debug_attached = false;
+        assert_eq!(breakpoint_column_width(&b), 2, "a breakpoint alone still earns it");
     }
 
     #[test]

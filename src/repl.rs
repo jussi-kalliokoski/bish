@@ -7160,6 +7160,22 @@ fn run_normal_mode_navigation(
                     Some(ClickTarget::Pane(_)) => {
                         let row0 = (ev.row as usize).saturating_sub(1);
                         let col0 = (ev.col as usize).saturating_sub(1);
+                        // The gutter is not the text, and a click there
+                        // used to be treated as one on the line's first
+                        // character. Each column means something of its
+                        // own instead -- see `gutter_click`.
+                        if let Some(tb) = buf.as_editable_mut()
+                            && let Some((line, column)) = fileeditor::gutter_at_screen(tb, rect, row0, col0)
+                        {
+                            let outcome = gutter_click(app, edit_frame_id, tb, line, column);
+                            last_press = None;
+                            click_streak = 0;
+                            render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                            if let Some(message) = outcome {
+                                show_command_mode_error(&message, app.term_rows, app.term_cols);
+                            }
+                            continue 'nav;
+                        }
                         let now = std::time::Instant::now();
                         let repeat = last_press.is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
                         // Caps at 3: a fourth press starts over rather
@@ -9892,6 +9908,19 @@ fn hover_popup_due(
         return None;
     }
     let (row0, col0) = ((row1 as usize).saturating_sub(1), (col1 as usize).saturating_sub(1));
+    // The gutter first: it is not text, and asking `position_at_screen`
+    // about it gets the line's first character, which is how hovering a
+    // line number used to describe whatever word happened to start that
+    // line.
+    if let Some((line, column)) = fileeditor::gutter_at_screen(tb, rect, row0, col0) {
+        *hover_at = None;
+        let lines = gutter_hover_lines(tb, line, column);
+        if lines.is_empty() {
+            return None;
+        }
+        *hover_shown = true;
+        return Some(fileeditor::render_hover_popup(&lines, row0, col0, rect));
+    }
     let Some((line, col)) = fileeditor::position_at_screen(tb, rect, row0, col0) else {
         *hover_at = None;
         return None;
@@ -9919,6 +9948,128 @@ fn hover_popup_due(
     // Anchored to the cell the pointer is on, not to the text cursor --
     // the popup belongs to what is being pointed at.
     Some(fileeditor::render_hover_popup(&lines, row0, col0, rect))
+}
+
+/// What resting the pointer on a gutter column says.
+///
+/// The other half of the division in `gutter_click`: these three
+/// columns draw a mark meaning "something is true of this line", and
+/// this is where the mark says what. The marker itself has room for one
+/// coloured bullet; the answer does not fit in it.
+///
+/// Empty for a column with nothing to add, and for a cell with no mark
+/// in it -- hovering the blank part of a gutter should be as quiet as
+/// hovering blank text.
+fn gutter_hover_lines(tb: &TextBuffer, line: usize, column: fileeditor::GutterKind) -> Vec<String> {
+    match column {
+        fileeditor::GutterKind::Diagnostic => {
+            fileeditor::diagnostics_on_line(tb, line).into_iter().map(|d| format!("{}: {}", d.label(), d.message)).collect()
+        }
+        // `git blame`'s three fields, which is the whole of what the
+        // column is drawn from -- it shows them abbreviated to fit, and
+        // this is the unabbreviated form.
+        fileeditor::GutterKind::Blame => tb
+            .blame
+            .as_ref()
+            .and_then(|b| b.get(line))
+            .and_then(|b| b.as_ref())
+            .map(|b| vec![format!("{} {}", b.short_commit, b.author), b.date.clone()])
+            .unwrap_or_default(),
+        fileeditor::GutterKind::Diff => tb
+            .diff
+            .as_ref()
+            .and_then(|d| d.get(&line))
+            .map(|mark| {
+                vec![match mark {
+                    crate::git::DiffMark::Added => "added since the version being compared".to_string(),
+                    crate::git::DiffMark::Changed => "changed since the version being compared".to_string(),
+                    crate::git::DiffMark::Removed => "lines were removed here".to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        // A breakpoint's marker already says everything a breakpoint
+        // has to say, and a line number says its own number.
+        fileeditor::GutterKind::Breakpoint | fileeditor::GutterKind::LineNumber => Vec::new(),
+    }
+}
+
+/// What clicking a gutter column does. `Some` is a line for the status
+/// row.
+///
+/// The division is that **clicking acts and hovering informs**: a
+/// column whose click would only be "tell me about this line" does not
+/// need one, because resting the pointer there already says it. So the
+/// two columns that *do* something get a click, and the three that
+/// describe something get a hover instead.
+fn gutter_click(
+    app: &mut App,
+    edit_frame_id: Option<EditFrameId>,
+    tb: &mut TextBuffer,
+    line: usize,
+    column: fileeditor::GutterKind,
+) -> Option<String> {
+    match column {
+        // The marker is the control: clicking it is how you set one and
+        // how you take it away again. Only during a debug session,
+        // which is the only time the column is there to click.
+        fileeditor::GutterKind::Breakpoint => {
+            let at = line + 1;
+            let added = match edit_frame_id {
+                Some(id) => toggle_breakpoint(app, id, tb, at),
+                // No frame means no adapter to tell, but the marker is
+                // still the user's to set.
+                None => {
+                    let added = tb.breakpoints.insert(at);
+                    if !added {
+                        tb.breakpoints.remove(&at);
+                    }
+                    added
+                }
+            };
+            Some(format!("bish: breakpoint {} at line {at}", if added { "set" } else { "cleared" }))
+        }
+        // Which is what `:N` does, and what clicking a line number
+        // means everywhere it means anything.
+        fileeditor::GutterKind::LineNumber => {
+            tb.set_cursor(line.min(tb.line_count().saturating_sub(1)), 0);
+            None
+        }
+        // These three say something rather than do something, and the
+        // pointer resting on them already says it.
+        fileeditor::GutterKind::Blame | fileeditor::GutterKind::Diff | fileeditor::GutterKind::Diagnostic => {
+            tb.set_cursor(line.min(tb.line_count().saturating_sub(1)), 0);
+            None
+        }
+    }
+}
+
+/// Adds or removes a breakpoint on `line` (1-based), and tells a live
+/// debug adapter about it.
+///
+/// Shared by `:dbg break` and by clicking the gutter, so the two cannot
+/// drift: a breakpoint set one way has to reach the adapter the same as
+/// one set the other, or a click would put a marker on screen that
+/// nothing is watching.
+fn toggle_breakpoint(app: &mut App, edit_frame_id: EditFrameId, tb: &mut TextBuffer, line: usize) -> bool {
+    let added = tb.breakpoints.insert(line);
+    if !added {
+        tb.breakpoints.remove(&line);
+    }
+    sync_breakpoints_to_adapter(app, edit_frame_id, tb);
+    added
+}
+
+/// Tells a live debug adapter what this buffer's breakpoints now are.
+///
+/// The whole set rather than the change, because that is what
+/// `setBreakpoints` takes -- it replaces a file's list outright. Called
+/// after every way of changing them, so a marker on screen and a
+/// breakpoint in the debugger cannot disagree.
+fn sync_breakpoints_to_adapter(app: &mut App, edit_frame_id: EditFrameId, tb: &TextBuffer) {
+    if let (Some(frame), Some(path)) = (app.dap_frames.get_mut(&edit_frame_id), tb.path()) {
+        let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
+        frame.session.set_breakpoints(path, &lines);
+    }
 }
 
 /// Everything this editor knows about whatever is at `(row, col)` --
@@ -12168,6 +12319,7 @@ fn run_command_mode(
                                     };
                                     app.debug_frames.insert(edit_frame_id, session);
                                     tb.set_readonly(true);
+                                    tb.debug_attached = true;
                                     let pane_id = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
                                         .unwrap_or_else(|| split_debug_run_pane(app, edit_frame_id).0);
                                     let sid = app.windows[app.current_window].pane(pane_id).owning_session();
@@ -12399,6 +12551,7 @@ fn run_command_mode(
                                         .unwrap_or_else(|| split_debug_run_pane(app, edit_frame_id).0);
                                     let sid = app.windows[app.current_window].pane(pane_id).owning_session();
                                     render_debug_run_title(&app.sessions[&sid].screen, app.term_cols, &format!("{} -- running", program));
+                                    tb.debug_attached = true;
                                     app.dap_frames.insert(
                                         edit_frame_id,
                                         DapFrame {
@@ -12509,6 +12662,7 @@ fn run_command_mode(
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
                                 "quit" | "q" if subarg.is_none() && app.dap_frames.contains_key(&edit_frame_id) => {
+                                    tb.debug_attached = false;
                                     if let Some(mut frame) = app.dap_frames.remove(&edit_frame_id) {
                                         frame.session.terminate();
                                         // One tick so the request
@@ -12559,10 +12713,8 @@ fn run_command_mode(
                                     let output = match subarg {
                                         None => {
                                             let line = tb.cursor().0 + 1;
-                                            if !tb.breakpoints.insert(line) {
-                                                tb.breakpoints.remove(&line);
-                                            }
-                                            format!("breakpoint toggled at line {line}")
+                                            let added = toggle_breakpoint(app, edit_frame_id, tb, line);
+                                            format!("breakpoint {} at line {line}", if added { "set" } else { "cleared" })
                                         }
                                         Some(rest) => {
                                             let (op, num) = match rest.split_once(' ') {
@@ -12620,14 +12772,10 @@ fn run_command_mode(
                                             }
                                         }
                                     };
-                                    // A live adapter is told at once:
-                                    // `setBreakpoints` replaces a
-                                    // file's whole set, so what it
-                                    // needs is the set, not the change.
-                                    if let (Some(frame), Some(path)) = (app.dap_frames.get_mut(&edit_frame_id), tb.path()) {
-                                        let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
-                                        frame.session.set_breakpoints(path, &lines);
-                                    }
+                                    // `break add`/`remove N` reach the
+                                    // adapter here; the bare toggle
+                                    // above has already done it.
+                                    sync_breakpoints_to_adapter(app, edit_frame_id, tb);
                                     app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
                                         output: output.clone(),
@@ -12664,6 +12812,7 @@ fn run_command_mode(
                                 "quit" | "q" if subarg.is_none() => {
                                     if app.debug_frames.remove(&edit_frame_id).is_some() {
                                         tb.set_readonly(false);
+                                        tb.debug_attached = false;
                                         if let Some(pane_id) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id) {
                                             close_pane(&mut app.windows[app.current_window], pane_id);
                                             close_orphaned_sessions(&mut app.sessions, &app.windows);
@@ -15125,6 +15274,70 @@ mod watched_file_tests {
         let mut watcher = crate::watch::Watcher::new().unwrap();
         assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
         assert!(!sync_watched_file(None, &mut buf), "and no watcher at all is not an error either");
+    }
+}
+
+#[cfg(test)]
+mod gutter_hover_tests {
+    use super::*;
+
+    fn buf() -> TextBuffer {
+        let mut tb = TextBuffer::new_unnamed(10);
+        tb.insert_text((0, 0), "alpha\nbravo\ncharlie");
+        tb
+    }
+
+    // The marker in the gutter says only "something is wrong here". The
+    // hover is where it says what -- there is no room for a message in
+    // one coloured bullet.
+    #[test]
+    fn the_diagnostic_column_says_what_the_bullet_stands_for() {
+        let mut tb = buf();
+        tb.diagnostics = vec![crate::bishedit::lint::Diagnostic {
+            start: 6,
+            end: 11,
+            severity: crate::bishedit::lint::Severity::Warning,
+            code: std::borrow::Cow::Borrowed("unquoted-expansion"),
+            source: None,
+            message: "wrap it in double quotes".to_string(),
+            fix: None,
+        }];
+        assert_eq!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Diagnostic), vec!["unquoted-expansion: wrap it in double quotes".to_string()]);
+        // A line with no diagnostic on it has nothing to say, and a
+        // popup that appeared there would be describing the line above.
+        assert!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Diagnostic).is_empty());
+    }
+
+    #[test]
+    fn the_blame_column_says_the_whole_of_what_it_abbreviates() {
+        let mut tb = buf();
+        tb.blame = Some(vec![
+            Some(crate::git::BlameLine { short_commit: "abc1234".into(), author: "Ada Lovelace".into(), date: "2026-09-07".into() }),
+            None,
+            None,
+        ]);
+        assert_eq!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Blame), vec!["abc1234 Ada Lovelace".to_string(), "2026-09-07".to_string()]);
+        assert!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Blame).is_empty(), "a line git had nothing to say about");
+    }
+
+    #[test]
+    fn the_diff_column_says_which_kind_of_change() {
+        let mut tb = buf();
+        tb.diff = Some(std::collections::HashMap::from([(1, crate::git::DiffMark::Added), (2, crate::git::DiffMark::Removed)]));
+        assert!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Diff)[0].contains("added"));
+        assert!(gutter_hover_lines(&tb, 2, fileeditor::GutterKind::Diff)[0].contains("removed"));
+        assert!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Diff).is_empty(), "an unchanged line has no marker to explain");
+    }
+
+    // These two are controls rather than descriptions: the breakpoint
+    // marker already says the whole of what a breakpoint is, and a line
+    // number says its own number. A popup on either would be noise.
+    #[test]
+    fn the_columns_that_act_do_not_also_narrate() {
+        let mut tb = buf();
+        tb.breakpoints.insert(2);
+        assert!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Breakpoint).is_empty());
+        assert!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::LineNumber).is_empty());
     }
 }
 
