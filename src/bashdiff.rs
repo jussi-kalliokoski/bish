@@ -458,6 +458,16 @@ mod tests {
         case("a-backslash-newline-between-words", "echo one \\\ntwo"),
         case("a-backslash-newline-before-a-command", "if true; then \\\necho t; fi"),
         case("a-backslash-newline-is-literal-in-single-quotes", "echo 'a\\\nb'"),
+        // The form every wrapped command in a real config file is
+        // written in: the continued line is *indented*. The lexer
+        // consumed the continuation from inside `read_word`, so the
+        // word it had started ended at the first of those spaces and
+        // came out as an extra empty argument between the two real
+        // ones -- which a `--flag=value` list quietly turns into a
+        // command with `''` in the middle of it.
+        case("a-backslash-newline-before-an-indented-word", "printf '[%s]\\n' a \\\n    b \\\n    c"),
+        case("a-backslash-newline-then-a-tab", "printf '[%s]\\n' a \\\n\tb"),
+        case("a-trailing-backslash-newline-adds-no-word", "printf '[%s]\\n' a \\\n"),
         // A status is the low byte of what was asked for: `exit -1` is
         // 255 and `exit 300` is 44. bish handed the number back whole.
         case("exit-status-is-one-byte", r#"(exit -1); echo $?; (exit 300); echo $?; (exit 256); echo $?"#),

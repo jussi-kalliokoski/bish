@@ -1219,6 +1219,22 @@ impl<'a> Lexer<'a> {
             if c == ' ' || c == '\t' {
                 self.advance();
                 skipped = true;
+            } else if c == '\\' && self.peek2() == Some('\n') {
+                // A line continuation between words is *erased*, and
+                // erasing it can leave more spaces behind it, so the
+                // loop goes round again.
+                //
+                // read_word handles the continuation too, for the
+                // `a\<newline>b` that joins one word across two lines.
+                // But it can only do that once a word has started, and
+                // a `\` reached with no word in progress started one --
+                // which the very next space then ended, as an empty
+                // word. `cmd a \<newline>    b` came out as three
+                // arguments, the middle one `''`, and every wrapped
+                // command line in a config file is written that way.
+                self.advance();
+                self.advance();
+                skipped = true;
             } else {
                 break;
             }
