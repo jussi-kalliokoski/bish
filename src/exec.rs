@@ -8653,6 +8653,16 @@ impl Shell {
                             continue;
                         }
                     };
+                    // Ignored before bish started, so not ours to change
+                    // -- see `IGNORED_AT_ENTRY`. Silently, and with a
+                    // successful status, because that is what bash does:
+                    // the request is accepted and simply has no effect,
+                    // and a script that writes `trap ... INT` defensively
+                    // should not start failing because somebody upstream
+                    // was careful.
+                    if ignored_at_entry(num) {
+                        continue;
+                    }
                     if cmd_str == "-" {
                         self.traps.remove(&num);
                         sigaction_raw(num, SIG_DFL);
@@ -14367,6 +14377,51 @@ fn sigaction_raw(signum: i32, handler: usize) {
     unsafe {
         sigaction(signum, &act, std::ptr::null_mut());
     }
+}
+
+/// What a signal's disposition currently is, asking rather than setting
+/// -- the `oldact` half of the same call.
+fn sigaction_current(signum: i32) -> Option<usize> {
+    unsafe extern "C" {
+        fn sigaction(signum: i32, act: *const SigActionRaw, oldact: *mut SigActionRaw) -> i32;
+    }
+    let mut old = SigActionRaw { sa_handler: 0, sa_mask: [0; 16], sa_flags: 0, sa_restorer: 0 };
+    let ok = unsafe { sigaction(signum, std::ptr::null(), &mut old) } == 0;
+    ok.then_some(old.sa_handler)
+}
+
+/// The signals that were already ignored when this process started.
+///
+/// POSIX: a signal ignored on entry to the shell cannot be trapped or
+/// reset. The rule exists so that immunity granted from outside survives
+/// -- a script backgrounded from another script has INT and QUIT ignored
+/// precisely so a Ctrl-C aimed at the terminal's process group does not
+/// take it down with everything else, and `nohup`'s promise about HUP
+/// works the same way. A shell that let `trap` override that would hand
+/// back the very thing the caller went out of its way to take away.
+///
+/// This module already reasons about `SIG_IGN` in the other direction --
+/// see `ignore_sigint`'s doc comment in term.rs, and the `pre_exec` reset
+/// below, both of which exist because an ignored disposition survives
+/// `exec` where a handled one does not. This is that same fact seen from
+/// the receiving end.
+static IGNORED_AT_ENTRY: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
+/// Reads them, once, before anything has had a chance to change one.
+///
+/// Called from `main` rather than from `Shell::new`: the dispositions
+/// this is about are the *process's*, so they have to be read before the
+/// first shell exists, and a `Shell` built later (a subshell, a test)
+/// must see the same answer rather than whatever is current by then.
+pub fn record_signals_ignored_at_entry() {
+    let _ = IGNORED_AT_ENTRY.set(SIGNAL_NAMES.iter().filter(|(_, num)| sigaction_current(*num) == Some(SIG_IGN)).map(|(_, num)| *num).collect());
+}
+
+/// Whether `trap` has to leave this one alone. False for every signal
+/// when nothing recorded them, which is every unit test -- those build a
+/// `Shell` directly and never go through `main`.
+fn ignored_at_entry(signum: i32) -> bool {
+    IGNORED_AT_ENTRY.get().is_some_and(|ignored| ignored.contains(&signum))
 }
 
 // SIGWINCH (terminal resize) tracking for the M9 compositor. Deliberately

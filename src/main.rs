@@ -71,6 +71,10 @@ fn main() {
     // to stand -- everything below measures its own nesting against
     // here. See stackguard's own doc comment.
     stackguard::note_base();
+    // Before anything can change one: which signals arrived already
+    // ignored decides which ones `trap` may touch for the rest of this
+    // process's life. See exec::IGNORED_AT_ENTRY.
+    exec::record_signals_ignored_at_entry();
     let args: Vec<String> = std::env::args().collect();
 
     // `bish tool <subcommand>` -- checked first, ahead of every other
