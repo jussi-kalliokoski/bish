@@ -371,7 +371,15 @@ fn capture_stream(c: &Option<Rc<Capture>>) -> Option<SinkStream> {
 /// What a virtual child is being asked to run: text that still has to
 /// be lexed and parsed, or a command that already has been.
 enum ChildBody<'a> {
+    // Text that is its own parse unit: a `$( )` or `<( )` body, which
+    // bash reads separately from the source around it.
     Source(&'a str),
+    // Text belonging to a tree the enclosing source has already read --
+    // a `( )` body. bash read it along with everything around it, so an
+    // alias defined inside must not start applying part-way through:
+    // `( alias hi=x<newline>hi )` does not expand, where the same body
+    // in a `$( )` does. See run_program_rereadable.
+    Enclosed(&'a str),
     Parsed(&'a parser::Command),
 }
 
@@ -1718,6 +1726,10 @@ pub struct Shell {
     // env for any name in this set, so child processes can see it despite
     // it living in var_scopes rather than env.
     // Copy-on-write for the same reason as `globals`.
+    // Bumped whenever the alias table changes, so run_program can tell
+    // that a statement defined or removed one and the statements after
+    // it must be read again. See aliases_mut.
+    alias_epoch: u64,
     pub(crate) exported_names: Rc<std::collections::HashSet<String>>,
     // `_` lives here rather than in `globals`, because it is written
     // once per command -- run_command_body sets it after every simple
@@ -2287,6 +2299,7 @@ impl Shell {
             // variable -- bash's rule, and what makes `env` agree with
             // `declare -p` on a fresh shell.
             exported_names: Rc::new(inherited.iter().map(|(k, _)| k.clone()).collect()),
+            alias_epoch: 0,
             parse_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
             underscore: None,
             globals: Rc::new(inherited.iter().cloned().collect()),
@@ -2651,6 +2664,7 @@ impl Shell {
             upper_names: self.upper_names.clone(),
             lower_names: self.lower_names.clone(),
             exported_names: Rc::clone(&self.exported_names),
+            alias_epoch: self.alias_epoch,
             parse_cache: Rc::clone(&self.parse_cache),
             underscore: self.underscore.clone(),
             globals: Rc::clone(&self.globals),
@@ -4691,10 +4705,49 @@ impl Shell {
         exit
     }
 
+    /// `run_program` for a top-level source, which is the one place a
+    /// statement can change how the rest of the file reads. See
+    /// run_program_rereadable.
+    pub fn run_program_of_source(&mut self, prog: &Program, src: &str) -> ExecResult {
+        self.run_program_rereadable(prog, Some((src, None)))
+    }
+
     pub fn run_program(&mut self, prog: &Program) -> ExecResult {
+        self.run_program_rereadable(prog, None)
+    }
+
+    /// `run_program`, able to read the rest of its source again.
+    ///
+    /// A statement that defines an alias changes what the statements
+    /// after it mean, and they were read before it ran. bash has no such
+    /// problem because it reads one statement at a time; bish reads the
+    /// whole source up front, which is faster and is why
+    /// `alias ll="ls -d"` on one line and `ll /` on the next did nothing
+    /// at all here. When `source` is `Some`, a statement that leaves the
+    /// alias table different from how it found it sends the remaining
+    /// text back through the lexer with the new table in hand.
+    ///
+    /// Only where a *newline* separates the two, which is exactly bash's
+    /// own granularity: it reads a whole statement before running any of
+    /// it, so `alias hi=...; hi` does not expand and
+    /// `alias hi=...<newline>hi` does. `end_line` is what tells those
+    /// apart -- see ListItem.
+    ///
+    /// The re-read runs the whole source through the lexer again rather
+    /// than a slice of it, so every line number stays the absolute one
+    /// the debugger and `$LINENO` already report, and the statements
+    /// already run are skipped by line. It costs a lexing pass, and only
+    /// on a source that really did change its own aliases.
+    fn run_program_rereadable(&mut self, prog: &Program, source: Option<(&str, Option<&str>)>) -> ExecResult {
         let mut result = ExecResult::Status(self.last_status);
         let Some(last_item) = prog.last() else { return result };
-        for item in prog {
+        // What the alias table looked like when this tree was read. Any
+        // statement may leave it different, and the difference then
+        // stands until the next newline boundary, which is where a
+        // re-read can take effect -- so this is compared against once
+        // per statement rather than being reset each time.
+        let parsed_with = source.is_some().then(|| self.alias_epoch());
+        for (index, item) in prog.iter().enumerate() {
             self.current_line = item.line;
             if let Some(exit) = self.check_pending_signals() {
                 return exit;
@@ -4775,6 +4828,24 @@ impl Shell {
             if self.opt_errexit && self.suppress_errexit == 0 && !exempt && result.status() != 0 {
                 self.run_exit_trap();
                 return ExecResult::Exit(result.status());
+            }
+            // This statement changed what the ones after it say. Read
+            // them again, and carry on at the first statement not yet
+            // run -- which is the one starting the next line, since only
+            // a newline boundary gets here.
+            if let Some((src, label)) = source
+                && let Some(parsed_with) = parsed_with
+                && parsed_with != self.alias_epoch()
+                && let Some(next) = prog.get(index + 1)
+                && next.line > item.end_line
+            {
+                let resume = next.line;
+                let reread = match self.parse_source(src, label) {
+                    Ok(prog) => prog,
+                    Err(status) => return status,
+                };
+                let rest: Program = reread.into_iter().skip_while(|i| i.line < resume).collect();
+                return self.run_program_rereadable(&rest, source);
             }
         }
         result
@@ -5120,10 +5191,25 @@ impl Shell {
     /// in a command substitution -- more than building the child shell
     /// and more than running the body.
     pub(crate) fn run_source_cached(&mut self, src: &str, label: &str) -> ExecResult {
+        self.run_source_cached_maybe_reread(src, label, true)
+    }
+
+    /// The same, for a body that is not its own parse unit and so must
+    /// not be read again part-way through. See ChildBody::Enclosed.
+    fn run_source_enclosed(&mut self, src: &str, label: &str) -> ExecResult {
+        self.run_source_cached_maybe_reread(src, label, false)
+    }
+
+    fn run_source_cached_maybe_reread(&mut self, src: &str, label: &str, reread: bool) -> ExecResult {
+        let source = reread.then_some((src, Some(label)));
         match self.cached_program(src, label) {
-            Ok(Some(prog)) => self.run_program(&prog),
-            // Not cacheable, or a parse error to report the usual way.
-            Ok(None) => self.run_source_here(src, label),
+            Ok(Some(prog)) => self.run_program_rereadable(&prog, source),
+            // Not cacheable: parse it the ordinary way, keeping the same
+            // answer about whether it may be read again.
+            Ok(None) => match self.parse_source(src, Some(label)) {
+                Ok(prog) => self.run_program_rereadable(&prog, source),
+                Err(status) => status,
+            },
             Err(status) => status,
         }
     }
@@ -5180,19 +5266,36 @@ impl Shell {
             }
             return ExecResult::Status(1);
         }
+        match self.parse_source(src, Some(label)) {
+            // The source goes along with the tree: a statement in it may
+            // define an alias, which changes how the rest of it reads.
+            // See run_program_rereadable.
+            Ok(prog) => self.run_program_rereadable(&prog, Some((src, Some(label)))),
+            Err(status) => status,
+        }
+    }
+
+    /// Text to a tree, reporting a syntax error the way every caller
+    /// wants it reported. Split out because a source is read again when
+    /// one of its own statements changes the alias table.
+    fn parse_source(&mut self, src: &str, label: Option<&str>) -> Result<Program, ExecResult> {
         match crate::lexer::Lexer::new(src).tokenize() {
             Ok(toks) => match crate::parser::Parser::new(self.expand_aliases(toks)).parse_program() {
-                Ok(prog) => self.run_program(&prog),
-                Err(e) => {
-                    sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
-                    ExecResult::Status(2)
-                }
+                Ok(prog) => Ok(prog),
+                Err(e) => Err(self.report_syntax_error(label, &e)),
             },
-            Err(e) => {
-                sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
-                ExecResult::Status(2)
-            }
+            Err(e) => Err(self.report_syntax_error(label, &e)),
         }
+    }
+
+    /// A source with a name says it; the top-level `-c`/script path
+    /// never did, and its wording is what scripts already match on.
+    fn report_syntax_error(&mut self, label: Option<&str>, e: &str) -> ExecResult {
+        match label {
+            Some(label) => sh_eprintln!(self, "bish: {}: syntax error: {}", label, e),
+            None => sh_eprintln!(self, "bish: syntax error: {}", e),
+        }
+        ExecResult::Status(2)
     }
 
     // Functions and `local` variables live only in this process's memory, so
@@ -5282,6 +5385,7 @@ impl Shell {
                 and_or: AndOr { first: Pipeline { commands: vec![def], negate: false, timed: None }, rest: Vec::new() },
                 sep: Sep::Seq,
                 line: 0,
+                end_line: 0,
             }]));
         }
         // The directory stack, traps and completion specifications --
@@ -5370,6 +5474,12 @@ impl Shell {
         self.run_body_in_child_shell(ChildBody::Source(raw), stdio)
     }
 
+    /// `run_in_child_shell` for a `( )`, whose body is not a source of
+    /// its own -- see ChildBody::Enclosed.
+    fn run_enclosed_in_child_shell(&mut self, raw: &str, stdio: ChildStdio) -> ExecResult {
+        self.run_body_in_child_shell(ChildBody::Enclosed(raw), stdio)
+    }
+
     /// `run_in_child_shell` for something that has already been parsed.
     ///
     /// A pipeline stage arrives as a `parser::Command`, not as text.
@@ -5430,7 +5540,7 @@ impl Shell {
         // them: bash fires DEBUG for each stage of `echo a | cat`, and
         // so does this. Neither does a redirected group, which is not a
         // subshell at all.
-        if matches!(body, ChildBody::Source(_)) {
+        if matches!(body, ChildBody::Source(_) | ChildBody::Enclosed(_)) {
             child.debug_trap = None;
             child.err_trap = None;
             child.return_trap = None;
@@ -5470,6 +5580,7 @@ impl Shell {
 
         let result = match body {
             ChildBody::Source(raw) => child.run_source_cached(raw, "subshell"),
+            ChildBody::Enclosed(raw) => child.run_source_enclosed(raw, "subshell"),
             ChildBody::Parsed(cmd) => crate::builtins::shell::run_command(&mut child, cmd, false),
         };
         // Real bash fires a subshell's own EXIT trap when it finishes
@@ -5563,7 +5674,7 @@ impl Shell {
     // in-process.
     fn run_subshell(&mut self, raw: &str, background: bool) -> i32 {
         if !background {
-            return self.run_in_child_shell(raw, ChildStdio::default()).status();
+            return self.run_enclosed_in_child_shell(raw, ChildStdio::default()).status();
         }
         self.spawn_background_script(raw, format!("({})", raw))
     }
@@ -7538,6 +7649,7 @@ impl Shell {
                         and_or: AndOr { first: Pipeline { commands: vec![body.clone()], negate: false, timed: None }, rest: Vec::new() },
                         sep: Sep::Seq,
                         line: self.current_line,
+                        end_line: self.current_line,
                     }],
                     Vec::new(),
                 );
@@ -7926,9 +8038,10 @@ impl Shell {
                         Some(eq) => {
                             let name = a[..eq].to_string();
                             let val = a[eq + 1..].to_string();
-                            match self.aliases.iter_mut().find(|(n, _)| *n == name) {
+                            let table = self.aliases_mut();
+                            match table.iter_mut().find(|(n, _)| *n == name) {
                                 Some(existing) => existing.1 = val,
-                                None => self.aliases.push((name, val)),
+                                None => table.push((name, val)),
                             }
                         }
                         None => match self.aliases.iter().find(|(n, _)| n == a) {
@@ -7944,14 +8057,14 @@ impl Shell {
             }
             "unalias" => {
                 if argv[1..].iter().any(|a| a == "-a") {
-                    self.aliases.clear();
+                    self.aliases_mut().clear();
                     return ExecResult::Status(0);
                 }
                 let mut status = 0;
                 for a in &argv[1..] {
                     match self.aliases.iter().position(|(n, _)| n == a) {
                         Some(pos) => {
-                            self.aliases.remove(pos);
+                            self.aliases_mut().remove(pos);
                         }
                         None => {
                             sh_eprintln!(self, "bish: unalias: {}: not found", a);
@@ -11414,6 +11527,22 @@ impl Shell {
             false => None,
         };
         self.globals.keys().chain(extra)
+    }
+
+    /// The alias table, for writing. The only way to change it, so that
+    /// nothing can alter it without the epoch noticing.
+    fn aliases_mut(&mut self) -> &mut Vec<(String, String)> {
+        self.alias_epoch += 1;
+        &mut self.aliases
+    }
+
+    /// What the next statement's reading of the source depends on: the
+    /// table itself, and whether it would be consulted at all. Compared
+    /// across a statement to decide whether the rest has to be read
+    /// again -- `shopt -s expand_aliases` alone changes nothing about
+    /// the table but everything about what the next line means.
+    fn alias_epoch(&self) -> (u64, bool) {
+        (self.alias_epoch, self.shopt_is_on("expand_aliases"))
     }
 
     pub(crate) fn raw_var_lookup(&self, name: &str) -> String {

@@ -255,6 +255,19 @@ pub struct ListItem {
     // synthetically re-serialized ListItem (declare -f's print_functions,
     // functions_preamble) that was never really parsed from source.
     pub line: usize,
+    // The line the statement *ended* on -- the last token of its and-or
+    // list, before whatever separated it from the next one. `line` and
+    // `end_line` differ for anything spanning lines, a `for ... done` or
+    // a quoted argument with a newline in it.
+    //
+    // What it answers is whether a newline separates this statement from
+    // the next, which is the granularity at which a newly defined alias
+    // starts applying: bash reads a whole statement before running any
+    // of it, so `alias hi=...; hi` does not expand while
+    // `alias hi=...<newline>hi` does. Comparing start lines cannot tell
+    // those apart -- `for ... done; hi` has the two on different start
+    // lines with no newline between them. See run_program.
+    pub end_line: usize,
 }
 
 pub type Program = Vec<ListItem>;
@@ -353,6 +366,9 @@ impl Parser {
             }
             let line = self.current_line();
             let and_or = self.parse_and_or()?;
+            // Read before the separator is consumed, so it is the last
+            // token of the statement itself.
+            let end_line = self.lines.get(self.pos.wrapping_sub(1)).copied().unwrap_or(line);
             self.list_ended_with_separator = true;
             let sep = match self.peek() {
                 Some(Tok::Amp) => {
@@ -376,7 +392,7 @@ impl Parser {
                     Sep::Seq
                 }
             };
-            items.push(ListItem { and_or, sep, line });
+            items.push(ListItem { and_or, sep, line, end_line });
             self.skip_newlines();
         }
         Ok(items)

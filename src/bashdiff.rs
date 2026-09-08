@@ -1172,6 +1172,55 @@ y
         // way, but under `-c` bash's `type` says "not found".
         case("type-of-an-alias", r#"shopt -s expand_aliases; alias ll="ls -l"; type ll; type -t ll"#),
         case("type-of-an-unexpanded-alias", r#"alias ll="ls -l"; alias -p; type -t ll; echo "rc=$?""#),
+        // An alias starts applying to the statements *after* the one
+        // that defined it, which bish could not do at all: it read a
+        // whole source before running any of it, so `alias ll="ls -d"`
+        // on one line and `ll /` on the next found no alias.
+        //
+        // The lines are written into a file and sourced rather than
+        // being newlines of the case itself, so that the case still
+        // means the same thing after the serializer round-trip test has
+        // flattened it -- which is the whole point here, since what is
+        // being tested is precisely that newlines matter. The wording of
+        // "command not found" differs between the shells, so these ask
+        // the status instead.
+        case(
+            "an-alias-applies-to-later-lines",
+            r#"shopt -s expand_aliases; printf '%s\n' 'alias hi="echo A"' 'hi' 'hi extra' 'true; hi' > al; . ./al"#,
+        ),
+        // ...but not within the statement that defined it: bash reads a
+        // whole statement before running any of it, so an alias defined
+        // in one cannot reach the rest of the same one. This one needs
+        // no file -- it is all on one line already.
+        case(
+            "an-alias-does-not-apply-within-its-own-statement",
+            r#"shopt -s expand_aliases; alias hi="echo A"; hi 2>/dev/null; echo "rc=$?"; alias ho="echo B" ; true ; ho 2>/dev/null; echo "rc=$?""#,
+        ),
+        // A statement spanning lines is still one statement, so a use on
+        // the line it *ends* on is inside it and does not expand, while
+        // the next line does. Start lines alone cannot tell those apart,
+        // which is what ListItem::end_line is for.
+        case(
+            "an-alias-defined-inside-a-multi-line-statement",
+            r#"shopt -s expand_aliases; printf '%s\n' 'for i in 1; do alias hi="echo A"' 'done; hi 2>/dev/null; echo "rc=$?"' 'hi' > al; . ./al"#,
+        ),
+        case(
+            "an-alias-defined-in-a-function-applies-after-the-call",
+            r#"shopt -s expand_aliases; printf '%s\n' 'f(){ alias hi="echo A"; }; f' 'hi' 'g(){ alias ho="echo B"; ho; }; g 2>/dev/null; echo "rc=$?"' > al; . ./al"#,
+        ),
+        // A `$( )` body is read on its own, so an alias defined in one
+        // applies to the rest of it -- while a `( )` body was read along
+        // with the source around it, and does not.
+        case(
+            "an-alias-defined-inside-a-substitution-and-inside-a-subshell",
+            r#"shopt -s expand_aliases; printf '%s\n' 'v=$(alias hi="echo A"' 'hi); echo "[$v]"' '( alias ho="echo B"' 'ho ) 2>/dev/null; echo "rc=$?"' > al; . ./al"#,
+        ),
+        // Without the option there is no expansion to be had, whichever
+        // line it is on -- and `unalias` takes it away again.
+        case(
+            "an-alias-with-expansion-off-and-an-unaliased-one",
+            r#"printf '%s\n' 'alias hi="echo A"' 'hi 2>/dev/null; echo "rc=$?"' > al; . ./al; shopt -s expand_aliases; alias ho="echo B"; unalias ho; ho 2>/dev/null; echo "rc=$?""#,
+        ),
         case("keyword-completions", r#"compgen -A keyword | sort | tr '\n' ' '; echo"#),
         // Every getopts branch that does not set OPTARG leaves it unset;
         // the argument of the *previous* option used to stay visible.
