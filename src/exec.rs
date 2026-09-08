@@ -71,10 +71,12 @@ pub(crate) enum SinkStream {
     OuterOut,
     // The enclosing sink's stderr, likewise.
     OuterErr,
-    // A file this command's own redirects opened. Two streams that end
-    // up on one destination hold the same `Rc`, and so share a write
-    // position -- `>file 2>&1` must not have them overwrite each other.
-    File(Rc<RefCell<std::fs::File>>),
+    // Where this command's own redirects put the stream. Two streams
+    // that end up on one destination hold the same `Rc`, and so share a
+    // write position -- `>file 2>&1` must not have them overwrite each
+    // other -- and, for a capture that is still only a buffer, one
+    // buffer rather than two.
+    File(Rc<Capture>),
 }
 
 // Emulates the real terminal's ONLCR postprocessing (translating outgoing
@@ -156,7 +158,7 @@ impl OutputSink {
             OutputSink::Builtin { previous, stdout, .. } => match stdout {
                 SinkStream::OuterOut => previous.write_out(s),
                 SinkStream::OuterErr => previous.write_err(s),
-                SinkStream::File(f) => note_write(write_all_parking(&mut f.borrow_mut(), s.as_bytes())),
+                SinkStream::File(c) => note_write(c.write_all(s.as_bytes())),
             },
         }
     }
@@ -173,16 +175,112 @@ impl OutputSink {
                 screen.borrow_mut().feed(onlcr(s).as_bytes());
             }
             OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
-            OutputSink::Builtin { previous, stderr, .. } => {
-                use std::io::Write;
-                match stderr {
-                    SinkStream::OuterOut => previous.write_out(s),
-                    SinkStream::OuterErr => previous.write_err(s),
-                    SinkStream::File(f) => {
-                        let _ = f.borrow_mut().write_all(s.as_bytes());
-                    }
+            OutputSink::Builtin { previous, stderr, .. } => match stderr {
+                SinkStream::OuterOut => previous.write_out(s),
+                SinkStream::OuterErr => previous.write_err(s),
+                SinkStream::File(c) => {
+                    let _ = c.write_all(s.as_bytes());
                 }
+            },
+        }
+    }
+}
+
+/// Where a construct's standard output goes.
+///
+/// A `$( )` starts here in memory and asks the kernel for a descriptor
+/// only if it turns out to need one -- which is to say only if the body
+/// spawns a process. A builtin's output goes through this shell's own
+/// sink and never near a file, so `$(pwd)`, `$(echo x)` and the rest of
+/// the substitutions a script actually runs now cost no syscalls at
+/// all. Before this they cost five: a memfd_create, a dup, an lseek, a
+/// read and a close, together about as long as running the body.
+///
+/// A real redirect (`> file`) starts in the Fd state and stays there.
+/// Once materialised a capture never goes back, so a body that mixes
+/// builtins and processes keeps their output in the order it was
+/// written.
+pub(crate) struct Capture {
+    inner: RefCell<CaptureInner>,
+    // Set only when the kernel would not give us an anonymous file and
+    // a named temporary had to stand in; removed again on drop.
+    temp: RefCell<Option<std::path::PathBuf>>,
+}
+
+enum CaptureInner {
+    Memory(Vec<u8>),
+    Fd(std::fs::File),
+}
+
+impl Capture {
+    /// A capture that has no descriptor yet and may never need one.
+    fn memory() -> Rc<Capture> {
+        Rc::new(Capture { inner: RefCell::new(CaptureInner::Memory(Vec::new())), temp: RefCell::new(None) })
+    }
+
+    /// A destination that is already a real file -- an ordinary
+    /// redirect, or a pipe some caller has built.
+    fn file(f: std::fs::File) -> Rc<Capture> {
+        Rc::new(Capture { inner: RefCell::new(CaptureInner::Fd(f)), temp: RefCell::new(None) })
+    }
+
+    /// This shell's own writes.
+    fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        match &mut *self.inner.borrow_mut() {
+            CaptureInner::Memory(buf) => {
+                buf.extend_from_slice(bytes);
+                Ok(())
             }
+            CaptureInner::Fd(f) => write_all_parking(f, bytes),
+        }
+    }
+
+    /// A descriptor for something that genuinely needs one: a spawned
+    /// process, or a `2>&1` that has to name fd 1. Materialises the
+    /// buffer into a real file first, so nothing written so far is lost
+    /// and nothing written later arrives out of order.
+    fn descriptor(&self) -> Option<std::fs::File> {
+        let mut inner = self.inner.borrow_mut();
+        if let CaptureInner::Memory(buf) = &*inner {
+            let (file, path) = match capture_file() {
+                Some(f) => (f, None),
+                // No anonymous file: fall back to a named temporary,
+                // which this Capture then owns and removes on drop.
+                None => {
+                    let p = proc_sub_temp_path();
+                    (std::fs::File::create(&p).ok()?, Some(p))
+                }
+            };
+            let mut file = file;
+            if write_all_parking(&mut file, buf).is_err() {
+                return None;
+            }
+            *self.temp.borrow_mut() = path;
+            *inner = CaptureInner::Fd(file);
+        }
+        match &*inner {
+            CaptureInner::Fd(f) => f.try_clone().ok(),
+            CaptureInner::Memory(_) => None,
+        }
+    }
+
+    /// Everything written, for the caller that asked for the capture.
+    fn take_text(&self) -> String {
+        let mut inner = self.inner.borrow_mut();
+        match &mut *inner {
+            CaptureInner::Memory(buf) => String::from_utf8_lossy(&std::mem::take(buf)).into_owned(),
+            CaptureInner::Fd(f) => match f.try_clone() {
+                Ok(f) => read_capture(f),
+                Err(_) => String::new(),
+            },
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if let Some(p) = self.temp.borrow().as_ref() {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -208,7 +306,7 @@ impl OutputSink {
 // output/input destination exactly.
 #[derive(Default)]
 struct ChildStdio {
-    stdout: Option<std::fs::File>,
+    stdout: Option<Rc<Capture>>,
     stdin: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
     // `2>&1` / `1>&2`: which stream follows the other, and what it was
@@ -243,14 +341,14 @@ impl ChildStdio {
         match self.out_follows_err {
             Some(Follows::Outer) => SinkStream::OuterErr,
             Some(Follows::OwnFile) => file_stream(&self.stderr).unwrap_or(SinkStream::OuterErr),
-            None => file_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
+            None => capture_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
         }
     }
 
     fn sink_stderr(&self) -> SinkStream {
         match self.err_follows_out {
             Some(Follows::Outer) => SinkStream::OuterOut,
-            Some(Follows::OwnFile) => file_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
+            Some(Follows::OwnFile) => capture_stream(&self.stdout).unwrap_or(SinkStream::OuterOut),
             None => file_stream(&self.stderr).unwrap_or(SinkStream::OuterErr),
         }
     }
@@ -260,7 +358,14 @@ impl ChildStdio {
 // two share one write position -- which is the point wherever both
 // streams land on one destination.
 fn file_stream(f: &Option<std::fs::File>) -> Option<SinkStream> {
-    f.as_ref()?.try_clone().ok().map(|f| SinkStream::File(Rc::new(RefCell::new(f))))
+    f.as_ref()?.try_clone().ok().map(|f| SinkStream::File(Capture::file(f)))
+}
+
+// The same for a stream that already has a capture: sharing the `Rc`
+// rather than duping keeps one write position, and keeps a capture that
+// is still only a buffer from being split into two of them.
+fn capture_stream(c: &Option<Rc<Capture>>) -> Option<SinkStream> {
+    Some(SinkStream::File(Rc::clone(c.as_ref()?)))
 }
 
 /// What a virtual child is being asked to run: text that still has to
@@ -276,7 +381,7 @@ struct StdioOverride {
     // doc comment for why this needs more than a bare File.
     stdin: Option<Rc<RefCell<SharedReaderState>>>,
     // `Some` => write here instead of the real stdout.
-    stdout: Option<std::fs::File>,
+    stdout: Option<Rc<Capture>>,
     // And the same for stderr. Without it a construct's `2>` reached
     // the builtins inside it, through the output sink, and nothing
     // else: `{ /bin/ls /nosuch; } 2>/dev/null` still printed the error,
@@ -3188,11 +3293,10 @@ impl Shell {
 
     fn spawn_stdout_stdio(&self) -> Stdio {
         match &self.stdio_override {
-            Some(o) => match &o.borrow().stdout {
-                Some(f) => match f.try_clone() {
-                    Ok(f) => Stdio::from(f),
-                    Err(_) => Stdio::inherit(),
-                },
+            // A spawned process is exactly the thing that needs a real
+            // descriptor, so this is where a memory capture becomes one.
+            Some(o) => match o.borrow().stdout.as_ref().and_then(|c| c.descriptor()) {
+                Some(f) => Stdio::from(f),
                 None => Stdio::inherit(),
             },
             None => Stdio::inherit(),
@@ -3202,12 +3306,13 @@ impl Shell {
     /// Where an *external* command inside a redirected construct should
     /// send its stderr -- the mirror of ChildStdio::sink_stderr, which
     /// answers the same question for a builtin.
-    fn effective_stderr(&self, stdio: &ChildStdio, effective_stdout: &Option<std::fs::File>) -> Option<std::fs::File> {
+    fn effective_stderr(&self, stdio: &ChildStdio, effective_stdout: &Option<Rc<Capture>>) -> Option<std::fs::File> {
         let own = match stdio.err_follows_out {
             // `2>&1` before this construct rebound fd 1: whatever fd 1
-            // is for what runs inside it.
-            Some(Follows::Outer) => effective_stdout.as_ref().and_then(|f| f.try_clone().ok()),
-            Some(Follows::OwnFile) => stdio.stdout.as_ref().and_then(|f| f.try_clone().ok()),
+            // is for what runs inside it. Naming it as a descriptor is
+            // what makes it one, if it was still only a buffer.
+            Some(Follows::Outer) => effective_stdout.as_ref().and_then(|c| c.descriptor()),
+            Some(Follows::OwnFile) => stdio.stdout.as_ref().and_then(|c| c.descriptor()),
             None => stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()),
         };
         own.or_else(|| self.stdio_override.as_ref().and_then(|o| o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok())))
@@ -5271,9 +5376,9 @@ impl Shell {
             }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
-        let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
-            Some(f) => f.try_clone().ok(),
-            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
+        let effective_stdout: Option<Rc<Capture>> = match &stdio.stdout {
+            Some(c) => Some(Rc::clone(c)),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.clone()),
         };
         let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
         child.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
@@ -5410,9 +5515,9 @@ impl Shell {
             }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
-        let effective_stdout: Option<std::fs::File> = match &stdio.stdout {
-            Some(f) => f.try_clone().ok(),
-            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.as_ref().and_then(|f| f.try_clone().ok())),
+        let effective_stdout: Option<Rc<Capture>> = match &stdio.stdout {
+            Some(c) => Some(Rc::clone(c)),
+            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.clone()),
         };
         let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
         self.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
@@ -5712,16 +5817,12 @@ impl Shell {
             self.last_subst_status = Some(0);
             return self.strip_nuls_from_substitution(text);
         }
-        // No temp file when the kernel can give an anonymous one -- see
-        // capture_file's own doc comment. `path` stays None in that case
-        // and nothing below has a name to read back or delete.
-        let mem = capture_file();
-        let path = if mem.is_some() { None } else { Some(proc_sub_temp_path()) };
-        let file = match &path {
-            None => mem.as_ref().and_then(|f| f.try_clone().ok()),
-            Some(p) => std::fs::File::create(p).ok(),
-        };
-        let Some(file) = file else { return String::new() };
+        // No file at all until one is needed. A body made only of
+        // builtins -- `$(pwd)`, `$(echo x)`, most of what scripts
+        // actually substitute -- writes through this shell's own sink
+        // and never touches the kernel; the descriptor appears only if
+        // the body spawns something. See Capture.
+        let capture = Capture::memory();
         // `set -e` does not reach inside `$( )` unless
         // `shopt -s inherit_errexit` says so -- that option exists
         // precisely because it does not. A `( )` subshell is different
@@ -5731,18 +5832,10 @@ impl Shell {
         if !self.shopt_is_on("inherit_errexit") {
             self.opt_errexit = false;
         }
-        let result = self.run_in_child_shell(raw, ChildStdio { stdout: Some(file), ..Default::default() });
+        let result = self.run_in_child_shell(raw, ChildStdio { stdout: Some(Rc::clone(&capture)), ..Default::default() });
         self.opt_errexit = errexit;
         self.last_subst_status = Some(result.status());
-        let mut s = match (&path, mem) {
-            (None, Some(f)) => read_capture(f),
-            (Some(p), _) => {
-                let text = std::fs::read_to_string(p).unwrap_or_default();
-                let _ = std::fs::remove_file(p);
-                text
-            }
-            _ => String::new(),
-        };
+        let mut s = capture.take_text();
         while s.ends_with('\n') {
             s.pop();
         }
@@ -5788,7 +5881,7 @@ impl Shell {
         let err = Captured::open()?;
         let result = self.run_in_child_shell(
             cmd,
-            ChildStdio { stdin: Some(stdin), stdout: Some(out.writer()?), stderr: Some(err.writer()?), ..Default::default() },
+            ChildStdio { stdin: Some(stdin), stdout: Some(Capture::file(out.writer()?)), stderr: Some(err.writer()?), ..Default::default() },
         );
         Ok((out.read(), err.read(), result.status()))
     }
@@ -10042,7 +10135,7 @@ impl Shell {
             // the pipe over as a redirect is what makes the sink follow
             // it, the same way `echo hello >file` already does.
             let stdio = match stdout_fd.as_ref().and_then(|fd| fd.try_clone().ok()) {
-                Some(fd) => ChildStdio { stdout: Some(std::fs::File::from(fd)), ..ChildStdio::default() },
+                Some(fd) => ChildStdio { stdout: Some(Capture::file(std::fs::File::from(fd))), ..ChildStdio::default() },
                 None => ChildStdio::default(),
             };
             // Armed for the duration: this stage runs to completion
@@ -12013,7 +12106,7 @@ impl Shell {
             // 3. Opening only the two destinations the sink needed
             // meant neither happened, and an error opening a
             // superseded path went unreported.
-            File(Rc<RefCell<std::fs::File>>),
+            File(Rc<Capture>),
             Closed,
         }
         let mut dests: Vec<Dest> = Vec::new();
@@ -12042,20 +12135,20 @@ impl Shell {
             match r {
                 Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
                     let p = self.expand_word(word);
-                    define!(1, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
+                    define!(1, Dest::File(Capture::file(self.open_out(&p, *append, *clobber)?)))
                 }
                 Redirect::Err { word, append, clobber } | Redirect::FdOut { fd: 2, word, append, clobber } => {
                     let p = self.expand_word(word);
-                    define!(2, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
+                    define!(2, Dest::File(Capture::file(self.open_out(&p, *append, *clobber)?)))
                 }
                 Redirect::FdOut { fd, word, append, clobber } => {
                     let p = self.expand_word(word);
-                    define!(*fd as i32, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, *clobber)?))))
+                    define!(*fd as i32, Dest::File(Capture::file(self.open_out(&p, *append, *clobber)?)))
                 }
                 // `&>file`: both descriptors, one open file.
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
-                    define!(1, Dest::File(Rc::new(RefCell::new(self.open_out(&p, *append, false)?))));
+                    define!(1, Dest::File(Capture::file(self.open_out(&p, *append, false)?)));
                     let id = table[&1];
                     table.insert(2, id);
                 }
@@ -12148,7 +12241,7 @@ impl Shell {
                 // not a silent fallback to stdout: `echo x >&9` reports
                 // and fails, the way it does for an external command.
                 Dest::ProcessFd(fd) => match dup_existing_fd(*fd) {
-                    Some(f) => Ok(SinkStream::File(Rc::new(RefCell::new(f)))),
+                    Some(f) => Ok(SinkStream::File(Capture::file(f))),
                     None => Err(format!("{}: Bad file descriptor", fd)),
                 },
                 Dest::Closed => Err(format!("{}: write error: Bad file descriptor", who)),
@@ -12405,7 +12498,7 @@ impl Shell {
             }
         }
         if let Some((p, append, clobber)) = &stdout_target {
-            stdio.stdout = Some(self.open_out(p, *append, *clobber)?);
+            stdio.stdout = Some(Capture::file(self.open_out(p, *append, *clobber)?));
         }
         // A stream that follows the other one opens nothing of its own
         // -- and a `2>file` the dup came *after* named a descriptor that
@@ -17770,7 +17863,7 @@ mod tests {
         let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
         shell.set_sink_grid(screen.clone());
         assert!(shell.sink_grid().is_some());
-        let file = Rc::new(RefCell::new(std::fs::File::create("/dev/null").unwrap()));
+        let file = Capture::file(std::fs::File::create("/dev/null").unwrap());
         shell.sink = OutputSink::Builtin {
             previous: Box::new(std::mem::replace(&mut shell.sink, OutputSink::Real)),
             stdout: SinkStream::File(file),
