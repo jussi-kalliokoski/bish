@@ -6621,9 +6621,22 @@ impl Shell {
                     let text = word_atoms.iter().map(|w| self.expand_word(w)).collect::<Vec<_>>();
                     return Err(format!("syntax error in conditional expression: unexpected token `{}'", text[3]));
                 }
+                let text = word_atoms.iter().map(|w| self.expand_word(w)).collect::<Vec<_>>();
+                if let Some(e) = Self::conditional_shape_error(&text) {
+                    return Err(e);
+                }
                 Ok(self.eval_simple_test(&word_atoms))
             }
-            other => Err(format!("syntax error near {:?}", other)),
+            // Nothing where an expression should be. The one that
+            // reaches here is `[[ ]]` itself; anything else is a `]]`
+            // arriving before its expression did, which reads the same
+            // way to whoever typed it.
+            None => Err("syntax error near `]]'".to_string()),
+            // `&&`, `||` or `!` with no left-hand side -- `[[ && a ]]`.
+            // Named rather than `{:?}`-ed: a `Debug` rendering of an
+            // internal enum is not a sentence, and `syntax error near
+            // None` is what this used to say out loud.
+            Some(atom) => Err(format!("unexpected token `{}' in conditional command", Self::test_atom_name(atom))),
         }
     }
 
@@ -6698,6 +6711,46 @@ impl Shell {
         match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|index| (base, index))) {
             Some((base, index)) => self.array_element_is_set(base, index),
             None => self.var_is_set(name) || !self.array_all(name).is_empty(),
+        }
+    }
+
+    /// What a `[[ ]]` says when its words do not make an expression.
+    ///
+    /// bash distinguishes three shapes and so does this, because the three
+    /// say genuinely different things about what the writer left out. Each
+    /// message and each case was read off `bash -c` rather than recalled --
+    /// `[[ -a -z ]]` in particular is *not* an error, it asks whether a file
+    /// named `-z` is there, which is why "the operand looks like an
+    /// operator" cannot be the test.
+    fn conditional_shape_error(text: &[String]) -> Option<String> {
+        match text {
+            // `[[ -z ]]` -- a unary operator that never got its operand.
+            [op] if crate::builtins::is_unary_op(op) => Some("unexpected argument `]]' to conditional unary operator".to_string()),
+            // `[[ a -eq ]]` -- a binary operator that never got its right
+            // side. Checked on the second word rather than the first, which
+            // is what tells it from the case below.
+            [_, op] if crate::builtins::is_binary_op(op) => Some("unexpected argument `]]' to conditional binary operator".to_string()),
+            // `[[ a b ]]`, `[[ = a ]]`, `[[ -eq a ]]` -- two words with
+            // nothing between them that could join them. bash names the
+            // *second* word here, since that is the one that arrived where
+            // an operator was due.
+            [first, second] if !crate::builtins::is_unary_op(first) => {
+                Some(format!("unexpected token `{second}', conditional binary operator expected"))
+            }
+            _ => None,
+        }
+    }
+
+    /// A name for an atom that is not a word, for an error message. The
+    /// alternative is `{:?}` on the enum, which is how `syntax error near
+    /// None` reached a user.
+    fn test_atom_name(atom: &parser::TestAtom) -> &'static str {
+        match atom {
+            parser::TestAtom::And => "&&",
+            parser::TestAtom::Or => "||",
+            parser::TestAtom::Not => "!",
+            parser::TestAtom::Group(_) => "(",
+            parser::TestAtom::Word(_) => "word",
         }
     }
 

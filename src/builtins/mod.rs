@@ -229,9 +229,11 @@ fn eval_simple(args: &[String], use_glob: bool, facts: &ShellFacts<'_>) -> Resul
 
 /// Whether a word is an operator that takes something on both sides.
 ///
-/// Only used to tell `[ ( x ) ]` from `[ "(" = ")" ]`, where the same
-/// three words mean different things depending on the middle one.
-fn is_binary_op(op: &str) -> bool {
+/// Tells `[ ( x ) ]` from `[ "(" = ")" ]`, where the same three words
+/// mean different things depending on the middle one -- and tells
+/// `[[ a -eq ]]` that it is missing its right-hand side, which is the
+/// other thing knowing this answers.
+pub(crate) fn is_binary_op(op: &str) -> bool {
     matches!(op, "=" | "==" | "!=" | "<" | ">" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-nt" | "-ot" | "-ef")
 }
 
@@ -258,7 +260,15 @@ fn binary_checked(a: &str, op: &str, b: &str, use_glob: bool) -> Result<bool, St
 /// y ]` is "x: unary operator expected" with status 2 in bash, where
 /// bish used to answer 1 -- which is the reading that lets a typo'd
 /// `-q` pass for a failed test forever.
-const UNARY_OPS: &[&str] = &["-e", "-f", "-d", "-r", "-w", "-x", "-z", "-n", "-s", "-L", "-h", "-p", "-S", "-b", "-c", "-v", "-o"];
+// bash's own set, and the whole of it: a word here is what tells
+// `[[ -a X ]]` (does that file exist) from `[ x -a y ]` (and), so a
+// missing entry does not degrade gracefully -- it turns one into the
+// other. `-a` is the pair that makes the point; arity is what
+// disambiguates them, exactly as in bash.
+const UNARY_OPS: &[&str] = &[
+    "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-p", "-r", "-s", "-t", "-u", "-w", "-x", "-z", "-n", "-G", "-L", "-N", "-O", "-R", "-S",
+    "-v", "-o",
+];
 
 pub(crate) fn is_unary_op(op: &str) -> bool {
     UNARY_OPS.contains(&op)
@@ -267,11 +277,21 @@ pub(crate) fn is_unary_op(op: &str) -> bool {
 pub(crate) fn unary(op: &str, a: &str) -> bool {
     let path = std::path::Path::new(a);
     match op {
-        "-e" => path.exists(),
+        // `-a` is `-e` with a second life as `[ x -a y ]`'s `and`.
+        // Which one it is depends on how many words are around it, and
+        // that is the caller's question, not this one's.
+        "-e" | "-a" => path.exists(),
         "-f" => path.is_file(),
         "-d" => path.is_dir(),
-        "-r" | "-w" => std::fs::metadata(a).is_ok(),
-        "-x" => is_executable(a),
+        // Asked of the kernel rather than worked out from the mode
+        // bits, because the answer depends on who is asking: root, the
+        // owner, a group member and everyone else get different ones
+        // from the same file, and `access(2)` is the call that knows.
+        // These used to answer "does it exist", which said a read-only
+        // file was writable.
+        "-r" => accessible(a, R_OK),
+        "-w" => accessible(a, W_OK),
+        "-x" => accessible(a, X_OK),
         "-z" => a.is_empty(),
         "-n" => !a.is_empty(),
         "-s" => std::fs::metadata(a).map(|m| m.len() > 0).unwrap_or(false),
@@ -280,8 +300,93 @@ pub(crate) fn unary(op: &str, a: &str) -> bool {
         "-S" => file_type_is(a, |ft| ft.is_socket()),
         "-b" => file_type_is(a, |ft| ft.is_block_device()),
         "-c" => file_type_is(a, |ft| ft.is_char_device()),
+        "-g" => mode_has(a, 0o2000),
+        "-u" => mode_has(a, 0o4000),
+        "-k" => mode_has(a, 0o1000),
+        "-O" => owned_by(a, Owner::User),
+        "-G" => owned_by(a, Owner::Group),
+        // Modified since it was last read. False for a file never read,
+        // which is what an mtime not after an atime says.
+        "-N" => std::fs::metadata(a).map(|m| newer_than(&m)).unwrap_or(false),
+        // A name that is a reference to another name. bish has no
+        // namerefs, so nothing is one -- false rather than absent,
+        // because "no" is the true answer here and an error is not.
+        "-R" => false,
+        // `-t FD`: is that descriptor a terminal. The operand is a
+        // number, not a path.
+        "-t" => a.trim().parse::<i32>().map(|fd| unsafe { isatty(fd) } == 1).unwrap_or(false),
         _ => false,
     }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn geteuid() -> u32;
+    fn getegid() -> u32;
+    fn isatty(fd: i32) -> i32;
+}
+
+#[cfg(unix)]
+const R_OK: i32 = 4;
+#[cfg(unix)]
+const W_OK: i32 = 2;
+#[cfg(unix)]
+const X_OK: i32 = 1;
+
+/// `access(2)`, which answers for the *effective* user -- see the `-r`
+/// arm above for why that is the question.
+#[cfg(unix)]
+fn accessible(a: &str, mode: i32) -> bool {
+    let Ok(path) = std::ffi::CString::new(a) else { return false };
+    unsafe { access(path.as_ptr(), mode) == 0 }
+}
+#[cfg(not(unix))]
+fn accessible(a: &str, _mode: i32) -> bool {
+    std::fs::metadata(a).is_ok()
+}
+
+#[cfg(unix)]
+fn mode_has(a: &str, bits: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(a).map(|m| m.permissions().mode() & bits != 0).unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn mode_has(_a: &str, _bits: u32) -> bool {
+    false
+}
+
+/// Which of the two ownerships `-O` and `-G` ask about.
+enum Owner {
+    User,
+    Group,
+}
+
+/// Against the *effective* id, not the real one -- the same reason
+/// `accessible` uses `access(2)`: what counts is who this process is
+/// acting as right now.
+#[cfg(unix)]
+fn owned_by(a: &str, which: Owner) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(a) else { return false };
+    match which {
+        Owner::User => m.uid() == unsafe { geteuid() },
+        Owner::Group => m.gid() == unsafe { getegid() },
+    }
+}
+#[cfg(not(unix))]
+fn owned_by(_a: &str, _which: Owner) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn newer_than(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.mtime() > m.atime() || (m.mtime() == m.atime() && m.mtime_nsec() > m.atime_nsec())
+}
+#[cfg(not(unix))]
+fn newer_than(_m: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -291,17 +396,6 @@ fn file_type_is(a: &str, pred: impl Fn(&std::fs::FileType) -> bool) -> bool {
 #[cfg(not(unix))]
 fn file_type_is(_a: &str, _pred: impl Fn(&std::fs::FileType) -> bool) -> bool {
     false
-}
-
-#[cfg(unix)]
-fn is_executable(a: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(a).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(a: &str) -> bool {
-    std::fs::metadata(a).is_ok()
 }
 
 pub(crate) fn binary(a: &str, op: &str, b: &str, use_glob: bool) -> bool {

@@ -1004,6 +1004,28 @@ y
         // input; bish rejects it when the condition runs. Sourced, so
         // both are an ordinary non-zero status the script can see.
         case("dbracket-rejects-a-fourth-operand", "printf '[[ a == b == c ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        // An operator with nothing to operate on. Every one of these
+        // used to be answered rather than refused -- `[[ -z ]]` was
+        // "the string `-z` is not empty, so true", which is a wrong
+        // answer wearing a right one's clothes. Sourced, same as the
+        // case above, so the status is something the script can see.
+        case("dbracket-unary-with-no-operand", "printf '[[ -z ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("dbracket-binary-with-no-right-side", "printf '[[ a -eq ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("dbracket-two-words-and-no-operator", "printf '[[ a b ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        case("dbracket-with-nothing-in-it", "printf '[[ ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
+        // `-a` is the one word that is both a unary operator and a
+        // binary one, and only the count of words around it says which.
+        // Two words is the file test, three is the `and`.
+        case(
+            "dash-a-is-a-file-test-or-an-and-depending-on-arity",
+            r#"[[ -a /etc/passwd ]] && echo exists; [ x -a y ] && echo both; [[ -a /nope ]] || echo gone"#,
+        ),
+        // These answered "does it exist" rather than "may I", so a
+        // read-only file read as writable.
+        case(
+            "permission-tests-ask-the-kernel",
+            r#"[ -r /etc/passwd ] && echo r; [ -w / ] || echo "not w"; [ -x /bin/sh ] && echo x; [ -w /etc/passwd ] || echo "passwd not w""#,
+        ),
         case(
             "nocasematch-covers-case",
             r#"shopt -s nocasematch; case AB in ab) echo ci;; esac; [[ ABC == abc ]] && echo dbracket; [ ABC = abc ] || echo literal"#,
