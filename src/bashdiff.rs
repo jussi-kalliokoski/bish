@@ -1277,6 +1277,28 @@ y
             "character-classes-in-a-glob",
             r#"case "a b" in *[[:space:]]*) echo s;; esac; case a] in [[:alpha:]]]) echo bracket;; esac; x="a b c"; echo "${x//[[:space:]]/_}""#,
         ),
+        // Quoting decides whether a metacharacter in a `${v/pat}`
+        // pattern is syntax or text, exactly as it does on the right of
+        // `[[ x == pat ]]`. Expanding the pattern to a plain `String`
+        // first threw that away, so `${x//\*/Y}` globbed.
+        case(
+            "quoting-in-a-parameter-expansion-pattern",
+            r#"x="a*b"; echo "${x//\*/Y}" "${x//"*"/Y}" "${x#a\*}" "${x%\*b}" "${x#"a*"}"; y=axb; echo "${y#a\*}" "${y//\?/Y}""#,
+        ),
+        // ...including inside a bracket expression, where `]`, `^` and
+        // `-` are the class's own syntax rather than the matcher's.
+        // `&` in a replacement stands for the matched text unless it was
+        // quoted -- and the array and positional-parameter paths were
+        // expanding the replacement without preserving that, where the
+        // scalar path already did.
+        case(
+            "an-escaped-ampersand-in-a-replacement-is-literal",
+            r#"a=(abc); echo "${a[@]//b/\&}" "${a[0]//b/\&}" "${a[@]//b/[&]}"; set -- abc; echo "${1//b/\&}" "${@//b/\&}"; r="&"; echo "${a[@]//b/$r}""#,
+        ),
+        case(
+            "escaped-characters-inside-a-pattern-bracket",
+            r#"x=a^b; echo "${x//[\^]/X}"; y=aqz; echo "${y//[a\-z]/X}"; z="a]b"; echo "${z//[\]]/X}"; w=a-b; echo "${w//[\-]/X}""#,
+        ),
         // `kill -0` is not a signal but the "is it still there" probe,
         // and `-s`/`-n` name the signal in the next argument.
         case("kill-signal-zero", r#"kill -0 $$ && echo alive; kill -s 0 $$ && echo alive2; kill -n 0 $$ && echo alive3"#),

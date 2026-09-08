@@ -10693,6 +10693,22 @@ impl Shell {
         self.expand_word(&Word { chunks, globbable: false })
     }
 
+    /// `expand_raw` for the *pattern* half of `${v#pat}`, `${v%pat}`,
+    /// `${v/pat/repl}` and `${v^pat}`, where quoting decides whether a
+    /// metacharacter is syntax or text: `${x//\*/Y}` replaces a literal
+    /// asterisk, `${x//*/Y}` replaces everything.
+    ///
+    /// Plain `expand_raw` performs quote removal and hands back a
+    /// `String` that can no longer tell the two apart, so an escaped `*`
+    /// still globbed. Going through the chunks instead is the same trick
+    /// `expand_glob_pattern_operand` already plays for `[[ x == pat ]]`
+    /// -- and it is literally that function, since a pattern operand is
+    /// a pattern operand wherever it was written.
+    fn expand_glob_pattern_raw(&mut self, raw: &str) -> String {
+        let chunks = crate::lexer::parse_expansion_word(raw);
+        self.expand_glob_pattern_operand(&Word { chunks, globbable: false })
+    }
+
     /// `expand_raw` for a `${v/pat/repl}` replacement, which has one
     /// character of syntax left after expansion: `&` stands for the
     /// matched text.
@@ -10773,15 +10789,15 @@ impl Shell {
                 if set_enough { self.expand_raw(word) } else { String::new() }
             }
             VarOp::RemovePrefix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_prefix_glob(&cur, &pattern, *longest)
             }
             VarOp::RemoveSuffix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_suffix_glob(&cur, &pattern, *longest)
             }
             VarOp::CaseConvert { pattern, upper, all } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
@@ -10795,7 +10811,7 @@ impl Shell {
                 substring_expand(&cur, off, len)
             }
             VarOp::Replace { pattern, repl, global, anchor } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 let repl = self.expand_replacement_operand(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
@@ -10909,20 +10925,20 @@ impl Shell {
     fn apply_string_var_op(&mut self, cur: &str, op: &VarOp) -> String {
         match op {
             VarOp::RemovePrefix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_prefix_glob(cur, &pattern, *longest)
             }
             VarOp::RemoveSuffix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_suffix_glob(cur, &pattern, *longest)
             }
             VarOp::CaseConvert { pattern, upper, all } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 apply_case_convert(cur, &pattern, *upper, *all)
             }
             VarOp::Replace { pattern, repl, global, anchor } => {
-                let pattern = self.expand_raw(pattern);
-                let repl = self.expand_raw(repl);
+                let pattern = self.expand_glob_pattern_raw(pattern);
+                let repl = self.expand_replacement_operand(repl);
                 glob_replace(cur, &pattern, &repl, *global, *anchor)
             }
             _ => cur.to_string(),
@@ -10991,15 +11007,15 @@ impl Shell {
                 if set_enough { self.expand_raw(word) } else { String::new() }
             }
             VarOp::RemovePrefix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_prefix_glob(&cur, &pattern, *longest)
             }
             VarOp::RemoveSuffix { pattern, longest } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 strip_suffix_glob(&cur, &pattern, *longest)
             }
             VarOp::CaseConvert { pattern, upper, all } => {
-                let pattern = self.expand_raw(pattern);
+                let pattern = self.expand_glob_pattern_raw(pattern);
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
@@ -11013,8 +11029,8 @@ impl Shell {
                 substring_expand(&cur, off, len)
             }
             VarOp::Replace { pattern, repl, global, anchor } => {
-                let pattern = self.expand_raw(pattern);
-                let repl = self.expand_raw(repl);
+                let pattern = self.expand_glob_pattern_raw(pattern);
+                let repl = self.expand_replacement_operand(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
             VarOp::Transform(kind) => match kind {
@@ -15596,8 +15612,8 @@ fn append_parts(fields: &mut Vec<String>, current: &mut Option<String>, parts: &
 
 // Pairs append_splittable's field-boundary logic with a second, escaped
 // copy of the same value for glob-pattern purposes (see expand_word_split).
-// glob::escape only ever inserts backslashes before `*?[\@!+(`, none of
-// which are whitespace, so splitting the escaped copy on the same IFS
+// glob::escape only ever inserts backslashes before `*?[]\@!+(^-`, none
+// of which are whitespace, so splitting the escaped copy on the same IFS
 // lands on the same boundaries as splitting `v` itself -- except in the
 // pathological case of an IFS that itself contains one of those
 // characters, an accepted, exceedingly rare edge case.

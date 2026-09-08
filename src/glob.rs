@@ -69,6 +69,12 @@ pub fn fixed_width(pattern: &str) -> Option<usize> {
                     j += 1;
                 }
                 while j < chars.len() && chars[j] != ']' {
+                    // An escaped `]` is a member of the class, not its
+                    // end.
+                    if chars[j] == '\\' && j + 1 < chars.len() {
+                        j += 2;
+                        continue;
+                    }
                     // `[:space:]`, `[.coll.]`, `[=equiv=]` -- each holds
                     // a `]` that does not close the class around it.
                     // Reading one as the end is how `[[:space:]]` came
@@ -259,6 +265,16 @@ pub(crate) fn posix_class_at(pat: &[u8]) -> Option<(&[u8], usize)> {
     Some((&pat[2..i], i + 2))
 }
 
+// One member of a bracket expression, starting at `k`: `\c` is the literal
+// `c`, so an escaped `-`, `]`, `^` or `\` is an ordinary member rather than
+// the class's own syntax. Returns the character and the index after it.
+fn class_member(class: &[u8], k: usize) -> (u8, usize) {
+    match class[k] == b'\\' && k + 1 < class.len() {
+        true => (class[k + 1], k + 2),
+        false => (class[k], k + 1),
+    }
+}
+
 // pat[0] == b'['. Returns (did `c` match the class, remaining pattern after
 // the closing ']'), or None if the bracket expression is malformed (no
 // closing ']'), in which case '[' should be treated as a literal char.
@@ -274,8 +290,14 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
         j += 1;
     }
     while j < pat.len() && pat[j] != b']' {
+        // An escaped `]` is a member, not the end: `[\]]` is a class
+        // holding a `]`.
+        if pat[j] == b'\\' && j + 1 < pat.len() {
+            j += 2;
+            continue;
+        }
         // A `[:name:]` carries its own `]`, which is not this
-        // bracket's.
+        // bracket's either.
         if let Some((_, len)) = posix_class_at(&pat[j..]) {
             j += len;
             continue;
@@ -297,16 +319,21 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
             k += len;
             continue;
         }
-        if k + 2 < class.len() && class[k + 1] == b'-' {
-            if c >= class[k] && c <= class[k + 2] {
+        let (lo, next) = class_member(class, k);
+        // A range needs a bare `-` with a member on either side. An
+        // escaped one is just a hyphen in the set, which is what
+        // `[a\-z]` means (a, `-`, z) as against `[a-z]`.
+        if next < class.len() && class[next] == b'-' && next + 1 < class.len() {
+            let (hi, after) = class_member(class, next + 1);
+            if c >= lo && c <= hi {
                 matched = true;
             }
-            k += 3;
+            k = after;
         } else {
-            if class[k] == c {
+            if lo == c {
                 matched = true;
             }
-            k += 1;
+            k = next;
         }
     }
     if negate {
@@ -386,10 +413,16 @@ fn closing_bracket(pat: &[u8]) -> Option<usize> {
 // chunks as inert literal text within an otherwise-real glob pattern built
 // from the word's unquoted chunks, the same per-chunk approach already
 // used for `[[ =~ ]]`'s regex operand (see regex::escape).
+//
+// `]`, `^` and `-` are in the set because a quoted chunk can land *inside*
+// a bracket expression the surrounding unquoted chunks opened -- `[\^]`
+// arrives as `[` + a literal `^` + `]` -- where they are the class's own
+// syntax rather than match_here's. Escaping them outside a class costs
+// nothing, since `\c` is a literal `c` wherever it appears.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if "*?[\\@!+(".contains(c) {
+        if "*?[]\\@!+(^-".contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -594,6 +627,49 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A quoted chunk can land inside a bracket expression the unquoted
+    // chunks around it opened, so the class's own syntax -- `]`, `^`,
+    // `-` -- has to be escapable there too.
+    #[test]
+    fn a_bracket_expression_honours_backslash_escapes() {
+        assert!(matches("[\\^]", "^"));
+        assert!(!matches("[\\^]", "a"));
+        assert!(matches("[\\]]", "]"));
+        assert!(!matches("[\\]]", "a"));
+        // `[a\-z]` is the three characters a, `-` and z, not the range.
+        assert!(matches("[a\\-z]", "-"));
+        assert!(matches("[a\\-z]", "a"));
+        assert!(matches("[a\\-z]", "z"));
+        assert!(!matches("[a\\-z]", "q"));
+        // ...where the unescaped spelling still is the range.
+        assert!(matches("[a-z]", "q"));
+        // A negated class still negates, and still escapes.
+        assert!(!matches("[^\\^]", "^"));
+        assert!(matches("[^\\^]", "a"));
+    }
+
+    // Everything escape() emits has to be inert, including the three
+    // characters that are only special inside a bracket.
+    #[test]
+    fn escaped_text_matches_only_itself() {
+        for s in ["a*b", "a?b", "a[b", "a]b", "a^b", "a-b", "a\\b", "a@(b", "[^a-z]"] {
+            assert!(matches(&escape(s), s), "{s} should match its own escaping");
+        }
+        assert!(!matches(&escape("a*b"), "axb"));
+    }
+
+    // Widths feed the replacement fast path, so an escaped `]` that does
+    // not close its class must not be read as the one that does.
+    #[test]
+    fn escapes_do_not_confuse_the_fixed_width_scan() {
+        assert_eq!(fixed_width("[\\]]"), Some(1));
+        assert_eq!(fixed_width("[\\^]"), Some(1));
+        assert_eq!(fixed_width("a[\\]]b"), Some(3));
+        assert_eq!(fixed_width("\\*"), Some(1));
+        assert_eq!(fixed_width("[[:space:]]"), Some(1));
+        assert_eq!(fixed_width("*"), None);
+    }
 
     // The check that keeps `[ ... ]` off the filesystem. Every `true`
     // here costs a directory scan at the call site, so the interesting
