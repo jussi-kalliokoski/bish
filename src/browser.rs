@@ -842,14 +842,22 @@ impl Browser {
         let (pieces, used) = fit_marked(&label, positions, name_width);
 
         let mut out = String::new();
-        if focused {
-            out.push_str("\x1b[7m");
-        }
         out.push_str(&color_for(entry, self.colors.as_ref()));
         // On top of the type colour rather than instead of it: it is
         // still a directory or an executable, it is just also ignored.
         if entry.is_ignored {
             out.push_str("\x1b[2m");
+        }
+        // After the colour, never before it. A themed colour is a whole
+        // SGR run that begins with a reset (vt100::sgr_codes), so a `7`
+        // set ahead of it was turned straight back off again -- and the
+        // cursor became invisible on every entry that has a colour of
+        // its own: directories, symlinks, archives, executables. A plain
+        // file kept its highlight, because its colour is a bare
+        // `\x1b[39m` with no reset in it, which is what made this look
+        // like the browser refusing to select a directory.
+        if focused {
+            out.push_str("\x1b[7m");
         }
         out.push(if selected { '\u{2022}' } else { ' ' });
         out.push(icon_for(entry));
@@ -1532,6 +1540,52 @@ mod tests {
         b.handle_key(Key::Char('/'), r);
         assert_eq!(b.handle_key(Key::Escape, r), Outcome::Continue);
         assert_eq!(b.handle_key(Key::Escape, r), Outcome::Cancelled);
+    }
+
+    // Whether reverse video is still in effect by the time the entry's
+    // own text starts -- which is what makes the row under the cursor
+    // look like the row under the cursor.
+    fn reverse_survives(prefix: &str) -> bool {
+        let mut on = false;
+        for esc in prefix.split('\u{1b}').skip(1) {
+            let Some(body) = esc.strip_prefix('[').and_then(|b| b.split('m').next()) else { continue };
+            for code in body.split(';') {
+                match code {
+                    "0" | "" => on = false,
+                    "7" => on = true,
+                    "27" => on = false,
+                    _ => {}
+                }
+            }
+        }
+        on
+    }
+
+    /// The cursor has to be visible on every kind of entry, not just on
+    /// the ones without a colour of their own.
+    ///
+    /// A themed colour is a full SGR run starting with a reset, so
+    /// setting reverse *before* it turned reverse off again: with the
+    /// cursor on a directory the row looked exactly like a row without
+    /// it, which reads as the browser refusing to select directories.
+    #[test]
+    fn the_cursor_is_visible_on_an_entry_that_has_its_own_colour() {
+        let t = Tmp::new("cursorcolour");
+        t.dir("adir");
+        t.file("plain.txt", "");
+        t.file("run.sh", "");
+        let exec = t.0.join("run.sh");
+        std::os::unix::fs::symlink(&exec, t.0.join("link")).unwrap();
+        fs::set_permissions(&exec, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut b = Browser::open(&t.0).unwrap();
+        let r = rect(10, 80);
+        for name in ["adir", "plain.txt", "run.sh", "link"] {
+            b.focus_name(name);
+            let painted = b.render(r, 10, 80);
+            let at = painted.find(name).expect("the entry is on screen");
+            let row_start = painted[..at].rfind('H').map(|i| i + 1).unwrap_or(0);
+            assert!(reverse_survives(&painted[row_start..at]), "the cursor is invisible on {name}: {:?}", &painted[row_start..at]);
+        }
     }
 
     #[test]
