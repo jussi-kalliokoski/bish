@@ -1,4 +1,5 @@
 use crate::lexer::{Chunk, Lexer, Quoting, Tok, VarFdKind, keyword_text};
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct Word {
@@ -94,6 +95,18 @@ pub struct SimpleCommand {
     pub index_assigns: Vec<(String, String, AssignMode, Word)>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
+    // `$BASH_COMMAND`'s text for this command, worked out the first time
+    // anything asks and kept thereafter.
+    //
+    // It has to be *this*: bash's own answer is the command written back
+    // out from its tree, not a slice of the source -- `echo    a     b`
+    // reads back as `echo a b`, and a line continuation disappears --
+    // while quoting survives, `echo "a  b"` staying as it was written. A
+    // span into the source could not produce that, so serialize.rs does,
+    // and the only thing wrong with it was doing it again on every
+    // execution of the same command. A loop body is the same node each
+    // time round, and serializing it says the same thing each time.
+    pub rendered: std::cell::OnceCell<Rc<str>>,
 }
 
 // Compound commands carry their own trailing redirects (e.g. `done < file`,
@@ -1135,7 +1148,7 @@ impl Parser {
         if assigns.is_empty() && array_assigns.is_empty() && index_assigns.is_empty() && words.is_empty() && redirects.is_empty() {
             return Err("expected command".to_string());
         }
-        Ok(SimpleCommand { assigns, array_assigns, array_word_assigns, index_assigns, words, redirects })
+        Ok(SimpleCommand { assigns, array_assigns, array_word_assigns, index_assigns, words, redirects, rendered: std::cell::OnceCell::new() })
     }
 
     // Shared by parse_simple_command's prefix-assignment path and its

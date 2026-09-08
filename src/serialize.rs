@@ -1,3 +1,4 @@
+use std::rc::Rc;
 // Reconstructs valid bish source text from parsed AST -- used to forward
 // currently-defined functions into a self-exec'd child process for command
 // substitution / subshells (see exec.rs), since those run as a fresh `bish
@@ -254,6 +255,17 @@ fn serialize_test_atoms(atoms: &[crate::parser::TestAtom]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `serialize_simple`, memoised on the command itself.
+///
+/// Every simple command sets `$BASH_COMMAND` before it runs, whether or
+/// not anything will ever read it, and writing the command back out
+/// costs a String and a walk of its words. In a loop that is the same
+/// answer over and over for the same node, so it is worked out once and
+/// handed back by refcount after that.
+pub(crate) fn rendered_command(sc: &SimpleCommand) -> Rc<str> {
+    Rc::clone(sc.rendered.get_or_init(|| Rc::from(serialize_simple(sc).into_boxed_str())))
 }
 
 pub(crate) fn serialize_simple(sc: &SimpleCommand) -> String {

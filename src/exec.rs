@@ -1820,7 +1820,10 @@ pub struct Shell {
     // `function-body-formatting` divergence describes -- so this is the
     // command with its words expanded. It differs from bash only where
     // the command contained an expansion, and is identical otherwise.
-    bash_command: String,
+    // An `Rc<str>` because it is replaced before every simple command:
+    // the text belongs to the command's own node, and this only points
+    // at it. See serialize::rendered_command.
+    bash_command: Rc<str>,
     // The subshell nesting depth the EXIT trap was set at. It fires for
     // the exit of the shell that armed it and for no other -- see
     // run_exit_trap.
@@ -2297,7 +2300,7 @@ impl Shell {
             proc_sub_pipes: Vec::new(),
             proc_sub_children: Vec::new(),
             traps: std::collections::HashMap::new(),
-            bash_command: String::new(),
+            bash_command: Rc::from(""),
             exit_trap: None,
             exit_trap_depth: 0,
             debug_trap: None,
@@ -2661,7 +2664,7 @@ impl Shell {
             proc_sub_pipes: Vec::new(),
             proc_sub_children: Vec::new(),
             traps: self.traps.clone(),
-            bash_command: self.bash_command.clone(),
+            bash_command: Rc::clone(&self.bash_command),
             exit_trap: self.exit_trap.clone(),
             exit_trap_depth: self.exit_trap_depth,
             debug_trap: self.debug_trap.clone(),
@@ -6527,7 +6530,7 @@ impl Shell {
         if self.debug_trap.is_none() || self.in_trap {
             return;
         }
-        self.bash_command = header.to_string();
+        self.bash_command = Rc::from(header);
         self.run_pseudo_trap(PseudoTrap::Debug);
     }
 
@@ -7236,7 +7239,7 @@ impl Shell {
                     format!("{}{}{}", name, op, crate::serialize::serialize_word(val))
                 })
                 .collect();
-            self.bash_command = named.join(" ");
+            self.bash_command = Rc::from(named.join(" ").into_boxed_str());
             // An assignment-only command has no last word, and bash
             // duly empties `$_` rather than leaving the previous one:
             // `x=1; echo "$_"` prints nothing.
@@ -7357,7 +7360,7 @@ impl Shell {
         // of commands too. Saving it around the trap does not help --
         // the body both overwrites and reads it from the inside.
         if !self.in_trap {
-            self.bash_command = crate::serialize::serialize_simple(cmd);
+            self.bash_command = crate::serialize::rendered_command(cmd);
         }
         // And the DEBUG trap fires here for the same reason: bash runs
         // it before the command's expansions, so a `$( )` in the
@@ -9713,7 +9716,7 @@ impl Shell {
                 if let parser::Command::Simple(sc) = cmd
                     && !sc.words.is_empty()
                 {
-                    self.bash_command = crate::serialize::serialize_simple(sc);
+                    self.bash_command = crate::serialize::rendered_command(sc);
                     self.run_pseudo_trap(PseudoTrap::Debug);
                 }
             }
@@ -11651,7 +11654,7 @@ impl Shell {
                     // not a process -- see run_in_child_shell.
                     "BASHPID" => unsafe { getpid_raw() }.to_string(),
                     "BASH_SUBSHELL" => self.subshell_depth.to_string(),
-                    "BASH_COMMAND" => self.bash_command.clone(),
+                    "BASH_COMMAND" => self.bash_command.to_string(),
                     // The `set -o` and `shopt` options currently on,
                     // colon-separated and sorted, which is how a script
                     // asks `[[ $SHELLOPTS == *errexit* ]]` without
