@@ -1368,7 +1368,20 @@ impl<'a> Lexer<'a> {
                 Some('#') if literal_ws || !buf.is_empty() || !chunks.is_empty() => {
                     buf.push(self.advance().unwrap());
                 }
-                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') => break,
+                // A metacharacter ends a word -- except inside a
+                // `${...}` operator, where there is no word to end.
+                // That body was already scanned to its matching brace
+                // (`capture_var_expansion_body`), so a `|` in
+                // `${s//:/|}` is text and not a pipe, and breaking on it
+                // silently truncated both the pattern and the
+                // replacement: `${s//:/a|b}` replaced with `a`, and
+                // `${s//|/x}` searched for the empty string and so
+                // matched everywhere.
+                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') if !literal_ws => break,
+                Some(c @ ('|' | '&' | ';' | '<' | '>' | '(' | ')')) => {
+                    self.advance();
+                    buf.push(c);
+                }
                 Some('\'') => {
                     plain = false;
                     self.advance();

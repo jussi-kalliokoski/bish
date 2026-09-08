@@ -34,6 +34,76 @@ pub fn matches_path(pattern: &str, text: &str) -> bool {
     pat.len() == txt.len() && pat.iter().zip(txt.iter()).all(|(p, t)| matches(p, t))
 }
 
+/// How many characters a pattern must match, when that is knowable --
+/// `None` when it contains a `*` or an extglob group, either of which
+/// can match any number.
+///
+/// Worth knowing because `${v//pat/repl}` otherwise has to try every
+/// possible end position for a match at every start, which is quadratic.
+/// A pattern with no `*` matches exactly this many characters or none,
+/// so there is one end to try rather than n -- and `${s//a/b}`,
+/// `${s//:/|}`, `${path//\//_}` are all of that shape.
+pub fn fixed_width(pattern: &str) -> Option<usize> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut width = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => return None,
+            // An extglob group repeats or alternates, so its width is
+            // not fixed -- and `?(...)`/`+(...)` can match nothing at
+            // all.
+            '@' | '!' | '+' | '?' if chars.get(i + 1) == Some(&'(') => return None,
+            '\\' => {
+                i += 1;
+                width += 1;
+            }
+            '[' => {
+                // To the closing bracket, minding that `[]]` and `[^]]`
+                // put a literal `]` first where it cannot end the class.
+                let mut j = i + 1;
+                if matches!(chars.get(j), Some('!') | Some('^')) {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&']') {
+                    j += 1;
+                }
+                while j < chars.len() && chars[j] != ']' {
+                    // `[:space:]`, `[.coll.]`, `[=equiv=]` -- each holds
+                    // a `]` that does not close the class around it.
+                    // Reading one as the end is how `[[:space:]]` came
+                    // out two characters wide instead of one, and made
+                    // the replacement match a space *and* whatever
+                    // followed it.
+                    if chars[j] == '[' && matches!(chars.get(j + 1), Some(':') | Some('.') | Some('=')) {
+                        let kind = chars[j + 1];
+                        let mut k = j + 2;
+                        while k + 1 < chars.len() && !(chars[k] == kind && chars[k + 1] == ']') {
+                            k += 1;
+                        }
+                        // Unterminated: leave `j` where it was and let
+                        // the ordinary scan below deal with it.
+                        if k + 1 < chars.len() {
+                            j = k + 1;
+                        }
+                    }
+                    j += 1;
+                }
+                // Unterminated: the `[` is a literal, and so is the rest.
+                if j >= chars.len() {
+                    width += chars.len() - i;
+                    return Some(width);
+                }
+                i = j;
+                width += 1;
+            }
+            _ => width += 1,
+        }
+        i += 1;
+    }
+    Some(width)
+}
+
 fn match_here(pat: &[u8], text: &[u8]) -> bool {
     if pat.is_empty() {
         return text.is_empty();

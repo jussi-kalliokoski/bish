@@ -1009,6 +1009,23 @@ y
         // "the string `-z` is not empty, so true", which is a wrong
         // answer wearing a right one's clothes. Sourced, same as the
         // case above, so the status is something the script can see.
+        // Inside `${...}` there is no word to end, so a metacharacter
+        // is text -- the body was already scanned to its matching brace.
+        // Breaking on one truncated both halves: `${s//:/a|b}` replaced
+        // with `a`, and `${s//|/x}` searched for the empty string and so
+        // matched everywhere.
+        case(
+            "expansion-operands-keep-shell-metacharacters",
+            r#"s=a:b; echo "${s//:/|}" "${s//:/a|b}" "${s//:/;}" "${s//:/>}" "${s//:/(}" "${s//|/x}" "${s:-x|y}""#,
+        ),
+        // `&` in a replacement is the matched text, and `\&` is an
+        // ampersand. The difference has to survive quote removal, which
+        // is why it is decided on the chunks and not on the string.
+        case(
+            "ampersand-in-a-replacement-is-the-match",
+            r#"s=aXb; echo "${s//X/&}" "${s//X/[&]}" "${s//X/&&}" "${s//X/\&}" "${s//X/\\&}" "${s/#a/&&}""#,
+        ),
+        case("an-ampersand-from-a-variable-is-still-the-match", r#"s=aXb; r="&"; q="\&"; echo "${s//X/$r}" "${s//X/$q}""#),
         case("dbracket-unary-with-no-operand", "printf '[[ -z ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("dbracket-binary-with-no-right-side", "printf '[[ a -eq ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("dbracket-two-words-and-no-operator", "printf '[[ a b ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),

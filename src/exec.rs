@@ -10693,6 +10693,42 @@ impl Shell {
         self.expand_word(&Word { chunks, globbable: false })
     }
 
+    /// `expand_raw` for a `${v/pat/repl}` replacement, which has one
+    /// character of syntax left after expansion: `&` stands for the
+    /// matched text.
+    ///
+    /// So the difference between an `&` the user typed and one that
+    /// arrived inside a variable has to survive quote removal, and by
+    /// then a plain `String` cannot say which it was. The chunks still
+    /// can -- an escaped or quoted `&` is a `LiteralStr`, a bare one is
+    /// a `Str` -- so this re-escapes the literal ones on the way out and
+    /// `expand_replacement` unescapes them at the very end. It is the
+    /// same trick, and for the same reason, as
+    /// `expand_glob_pattern_operand` does for glob metacharacters.
+    fn expand_replacement_operand(&mut self, raw: &str) -> String {
+        let chunks = crate::lexer::parse_expansion_word(raw);
+        let mut out = String::new();
+        for chunk in &chunks {
+            match chunk {
+                // Typed with a backslash or inside quotes: whatever it
+                // is, it is text.
+                crate::lexer::Chunk::LiteralStr(t, _) => {
+                    for c in t.chars() {
+                        if c == '&' || c == '\\' {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                    }
+                }
+                // Everything else -- bare text, and the result of any
+                // expansion -- keeps its `&` special, which is what
+                // `r='&'; ${s//X/$r}` relies on.
+                other => out.push_str(&self.expand_word(&Word { chunks: vec![other.clone()], globbable: false })),
+            }
+        }
+        out
+    }
+
     fn eval_var_op(&mut self, name: &str, op: &VarOp) -> String {
         let cur = self.lookup_var(name);
         match op {
@@ -10760,7 +10796,7 @@ impl Shell {
             }
             VarOp::Replace { pattern, repl, global, anchor } => {
                 let pattern = self.expand_raw(pattern);
-                let repl = self.expand_raw(repl);
+                let repl = self.expand_replacement_operand(repl);
                 glob_replace(&cur, &pattern, &repl, *global, *anchor)
             }
             VarOp::Transform(kind) => match kind {
@@ -15667,28 +15703,42 @@ fn substring_expand(s: &str, offset: i64, length: Option<i64>) -> String {
 // after `start_from`, honoring `anchor` (Start/End restrict the search to
 // that specific boundary, matching how `#`/`%` pattern-stripping anchors
 // its own search). Returns the matched (start, end) character range.
-fn find_glob_match(chars: &[char], start_from: usize, pattern: &str, anchor: ReplaceAnchor) -> Option<(usize, usize)> {
-    let n = chars.len();
+/// Where in `text` the pattern matches, in *character* indices -- which
+/// is what the caller splices by, even though the matching itself is
+/// done on the string.
+///
+/// `bounds` is the byte offset of each character, one longer than the
+/// character count so the end of the string has an entry too. It exists
+/// so a candidate substring is a *slice* of `text` rather than a
+/// freshly built `String`: this walks O(n^2) candidates, and collecting
+/// each one made the loop copy O(n^3) bytes. A profile of
+/// `${s//a/b}` on a 256-character string put 71% of all cycles in the
+/// one `String::extend` that did it, with another tenth in the
+/// allocator underneath -- and made a 1024-character string take longer
+/// than anyone would wait for. Slicing costs nothing at all.
+fn find_glob_match(text: &str, bounds: &[usize], start_from: usize, pattern: &str, anchor: ReplaceAnchor) -> Option<(usize, usize)> {
+    let n = bounds.len() - 1;
+    let slice = |a: usize, b: usize| &text[bounds[a]..bounds[b]];
     match anchor {
         ReplaceAnchor::Start => {
             if start_from > 0 {
                 return None;
             }
-            (start_from..=n).rev().find_map(|end| {
-                let candidate: String = chars[start_from..end].iter().collect();
-                glob::matches(pattern, &candidate).then_some((start_from, end))
-            })
+            (start_from..=n).rev().find_map(|end| glob::matches(pattern, slice(start_from, end)).then_some((start_from, end)))
         }
-        ReplaceAnchor::End => (start_from..=n).find_map(|s| {
-            let candidate: String = chars[s..n].iter().collect();
-            glob::matches(pattern, &candidate).then_some((s, n))
-        }),
+        ReplaceAnchor::End => (start_from..=n).find_map(|s| glob::matches(pattern, slice(s, n)).then_some((s, n))),
         ReplaceAnchor::None => {
+            // A pattern with no `*` matches a known number of
+            // characters, so there is exactly one end worth trying at
+            // each start rather than every one to the end of the
+            // string. That is the difference between linear and
+            // quadratic, and it is the shape almost every real
+            // replacement has: `${s//a/b}`, `${path//\//_}`.
+            if let Some(width) = glob::fixed_width(pattern) {
+                return (start_from..=n.saturating_sub(width)).find(|&s| glob::matches(pattern, slice(s, s + width))).map(|s| (s, s + width));
+            }
             for s in start_from..=n {
-                if let Some((s0, e0)) = (s..=n).rev().find_map(|end| {
-                    let candidate: String = chars[s..end].iter().collect();
-                    glob::matches(pattern, &candidate).then_some((s, end))
-                }) {
+                if let Some((s0, e0)) = (s..=n).rev().find_map(|end| glob::matches(pattern, slice(s, end)).then_some((s, end))) {
                     return Some((s0, e0));
                 }
             }
@@ -15697,17 +15747,61 @@ fn find_glob_match(chars: &[char], start_from: usize, pattern: &str, anchor: Rep
     }
 }
 
+/// The byte offset of every character in `s`, plus one past the last --
+/// so `bounds[i]..bounds[j]` is the substring from character `i` to
+/// character `j`. Built once per replacement rather than per candidate.
+fn char_bounds(s: &str) -> Vec<usize> {
+    let mut bounds: Vec<usize> = s.char_indices().map(|(at, _)| at).collect();
+    bounds.push(s.len());
+    bounds
+}
+
 // `${V/pat/repl}` (first match), `${V//pat/repl}` (all matches),
 // `${V/#pat/repl}` / `${V/%pat/repl}` (anchored -- always a single check,
 // `global` doesn't apply to them since an anchored match can only occur
 // once).
+/// The replacement text for one match, with `&` standing for whatever
+/// was matched and `\&` for a literal ampersand -- `sed`'s convention,
+/// which bash follows here.
+///
+/// Done on the *expanded* replacement, so `r='&'; ${s//X/$r}` puts the
+/// match in as well. That is bash's behaviour, checked rather than
+/// assumed, and it is why this cannot be folded into the earlier
+/// quote-removal pass: by then there would be nothing left to tell an
+/// escaped ampersand from a bare one.
+fn expand_replacement(repl: &str, matched: &str) -> String {
+    let mut out = String::new();
+    let mut chars = repl.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '&' => out.push_str(matched),
+            // The two escapes `expand_replacement_operand` writes,
+            // undone here: a literal `&`, and a literal backslash.
+            // Any other backslash arrived from an expansion rather
+            // than from the source, and is ordinary text.
+            '\\' => match chars.next() {
+                Some('&') => out.push('&'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: ReplaceAnchor) -> String {
     let chars: Vec<char> = s.chars().collect();
+    let bounds = char_bounds(s);
     if matches!(anchor, ReplaceAnchor::Start | ReplaceAnchor::End) {
-        return match find_glob_match(&chars, 0, pattern, anchor) {
+        return match find_glob_match(s, &bounds, 0, pattern, anchor) {
             Some((s0, e0)) => {
                 let mut out: String = chars[..s0].iter().collect();
-                out.push_str(repl);
+                out.push_str(&expand_replacement(repl, &chars[s0..e0].iter().collect::<String>()));
                 out.extend(&chars[e0..]);
                 out
             }
@@ -15717,10 +15811,10 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
     let mut out = String::new();
     let mut pos = 0;
     loop {
-        match find_glob_match(&chars, pos, pattern, ReplaceAnchor::None) {
+        match find_glob_match(s, &bounds, pos, pattern, ReplaceAnchor::None) {
             Some((s0, e0)) => {
                 out.extend(&chars[pos..s0]);
-                out.push_str(repl);
+                out.push_str(&expand_replacement(repl, &chars[s0..e0].iter().collect::<String>()));
                 // An empty match (a pattern like a bare "*" can't produce
                 // one here since matching is greedy-longest, but stay
                 // defensive) must still advance, or this loops forever.
