@@ -383,6 +383,33 @@ enum ChildBody<'a> {
     Parsed(&'a parser::Command),
 }
 
+/// Process-global state a construct has disturbed, and what it was
+/// before -- filled in by whatever does the disturbing.
+///
+/// The working directory, the umask and fds 0/1/2 belong to the
+/// *process*, not to a `Shell`. A `( )` or `$( )` is a Shell of its own
+/// but not a process of its own, so it has to put them back on the way
+/// out, and used to do that by snapshotting all three on the way *in*:
+/// a `getcwd`, two `umask(2)` calls and three `dup(2)`, on every
+/// subshell, whether or not the body went near any of them. Measured,
+/// that snapshot and the restore that matches it were about 9 of the 10
+/// microseconds a `( true )` cost more than ksh93's.
+///
+/// Almost no subshell body changes any of the three, so the cost now
+/// falls where the change does: `cd`, `umask` and a bare `exec` each
+/// record the old value the first time they run, and a construct puts
+/// back only what it is told was moved. A body that changes nothing
+/// pays nothing to put nothing back.
+///
+/// The first time only -- the value to restore is the one from before
+/// the construct began, not the one from before the most recent change.
+#[derive(Default)]
+struct ProcessRestore {
+    cwd: Option<std::path::PathBuf>,
+    umask: Option<u32>,
+    fd012: Option<[i32; 3]>,
+}
+
 struct StdioOverride {
     // `Some` => read from here (a real, shared, sequentially-consumed
     // reader) instead of the real stdin -- see SharedReaderState's own
@@ -1726,6 +1753,9 @@ pub struct Shell {
     // env for any name in this set, so child processes can see it despite
     // it living in var_scopes rather than env.
     // Copy-on-write for the same reason as `globals`.
+    // What this shell has changed about the *process* it shares with
+    // everyone, and what it was before. See ProcessRestore.
+    process_restore: ProcessRestore,
     // Bumped whenever the alias table changes, so run_program can tell
     // that a statement defined or removed one and the statements after
     // it must be read again. See aliases_mut.
@@ -2300,6 +2330,7 @@ impl Shell {
             // `declare -p` on a fresh shell.
             exported_names: Rc::new(inherited.iter().map(|(k, _)| k.clone()).collect()),
             alias_epoch: 0,
+            process_restore: ProcessRestore::default(),
             parse_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
             underscore: None,
             globals: Rc::new(inherited.iter().cloned().collect()),
@@ -2665,6 +2696,8 @@ impl Shell {
             lower_names: self.lower_names.clone(),
             exported_names: Rc::clone(&self.exported_names),
             alias_epoch: self.alias_epoch,
+            // Fresh: what the parent moved is the parent's to put back.
+            process_restore: ProcessRestore::default(),
             parse_cache: Rc::clone(&self.parse_cache),
             underscore: self.underscore.clone(),
             globals: Rc::clone(&self.globals),
@@ -4528,6 +4561,7 @@ impl Shell {
         // point, and on a path that has been rearranged underneath the
         // shell that can name somewhere that no longer exists.
         let logical = logical_path(&self.cwd, target);
+        self.note_cwd_change();
         match std::env::set_current_dir(&logical) {
             Ok(()) => self.cwd = logical,
             Err(_) => {
@@ -5549,8 +5583,19 @@ impl Shell {
         // The real OS cwd is process-wide, shared with the real parent,
         // even though `child` is otherwise a fully independent Shell -- a
         // `cd` inside this construct (`$(cd /tmp && pwd)`) must not leak
-        // back out to the real shell once this call returns.
-        let real_cwd_before = std::env::current_dir().ok();
+        // back out to the real shell once this call returns. Same for the
+        // umask, and for fd 0/1/2 against a bare `exec > file` (no
+        // command word, so it applies its redirect to *this process*
+        // rather than spawning anything -- see the "exec" arm's own doc
+        // comment); `(exec > file; echo hi)` otherwise left everything
+        // printed after that subshell redirected into `file` too,
+        // confirmed the hard way.
+        //
+        // None of the three is read here any more. Snapshotting all of
+        // them up front cost a getcwd, two umask(2) and three dup(2) on
+        // every subshell, and almost no body touches any of them; each
+        // is now recorded by whatever moves it, and only what moved is
+        // put back. See ProcessRestore.
         // Variables need nothing here any more, and the absence is
         // deliberate. A plain `x=2` inside this construct used to write
         // straight to the real process environment, which is shared
@@ -5561,22 +5606,6 @@ impl Shell {
         // than reading `environ` (see `Shell::command`), so the
         // isolation is now a property of the data rather than something
         // reconstructed around every construct.
-        // Same reasoning, for `umask` (a real process-wide syscall, not
-        // Shell-owned state either -- see current_umask's own doc
-        // comment).
-        let umask_before = current_umask();
-        // Same reasoning again, for fd 0/1/2 -- a bare `exec > file`/
-        // `exec 2>&1`/`exec < file` (no command word, applies its
-        // redirect persistently to *this process's own* fds rather than
-        // spawning anything -- see the "exec" builtin arm's own doc
-        // comment) used to be safely contained by the old re-exec'd
-        // design (a real separate process, discarded along with whatever
-        // it did to its own fds once it exited); in-process, it would
-        // otherwise silently repoint the real shell's own stdin/stdout/
-        // stderr forever, confirmed the hard way: `(exec > file; echo hi)`
-        // left *everything* printed after that subshell -- including in
-        // the real parent script -- redirected into `file` too.
-        let saved_fd012 = save_fd012();
 
         let result = match body {
             ChildBody::Source(raw) => child.run_source_cached(raw, "subshell"),
@@ -5595,11 +5624,19 @@ impl Shell {
             child.run_exit_trap();
         }
 
-        if let Some(d) = real_cwd_before {
+        // Whatever the body said it moved, and nothing else. Taken
+        // after the exit trap, which is part of the body and can move
+        // things too.
+        let moved = std::mem::take(&mut child.process_restore);
+        if let Some(d) = moved.cwd {
             let _ = std::env::set_current_dir(d);
         }
-        unsafe { umask(umask_before) };
-        restore_fd012(saved_fd012);
+        if let Some(m) = moved.umask {
+            unsafe { umask(m) };
+        }
+        if let Some(fds) = moved.fd012 {
+            restore_fd012(fds);
+        }
 
         match result {
             // A subshell's own `exit`/`set -e`/`set -u` must not kill the
@@ -9174,6 +9211,12 @@ impl Shell {
                 // pre_exec hook -- CommandExt::exec below is a direct
                 // execve of *this* process, no fork, so there is no
                 // child to install a pre_exec closure into.
+                // Moot if the execve below succeeds -- there is no
+                // "after" to restore in a process that has been replaced
+                // -- but it does not always succeed, and a shell that
+                // carried on past a failed `exec prog >file` would carry
+                // on with the redirect still applied.
+                self.note_fd012_change();
                 if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
@@ -9215,6 +9258,9 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
+                // The one thing that repoints this process's own fd
+                // 0/1/2 in place, so the one thing that has to say so.
+                self.note_fd012_change();
                 if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
@@ -11543,6 +11589,27 @@ impl Shell {
     /// the table but everything about what the next line means.
     fn alias_epoch(&self) -> (u64, bool) {
         (self.alias_epoch, self.shopt_is_on("expand_aliases"))
+    }
+
+    /// Called by whatever is about to move the process's working
+    /// directory, umask or fds 0/1/2, so that the construct this shell
+    /// is running under can put them back. See ProcessRestore.
+    fn note_cwd_change(&mut self) {
+        if self.process_restore.cwd.is_none() {
+            self.process_restore.cwd = std::env::current_dir().ok();
+        }
+    }
+
+    pub(crate) fn note_umask_change(&mut self) {
+        if self.process_restore.umask.is_none() {
+            self.process_restore.umask = Some(current_umask());
+        }
+    }
+
+    fn note_fd012_change(&mut self) {
+        if self.process_restore.fd012.is_none() {
+            self.process_restore.fd012 = Some(save_fd012());
+        }
     }
 
     pub(crate) fn raw_var_lookup(&self, name: &str) -> String {

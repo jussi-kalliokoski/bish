@@ -256,6 +256,7 @@ pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
         Some(s) => match u32::from_str_radix(s, 8) {
             Ok(m) => {
                 unsafe {
+                    sh.note_umask_change();
                     umask(m);
                 }
                 // Keep this session's own remembered umask in lockstep

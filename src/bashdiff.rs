@@ -1468,6 +1468,37 @@ y
         // `umask -p` prints the command that would set it again, which
         // is the whole point of the flag.
         case("umask-p-is-re-readable", r#"umask 022; umask -p; umask -S; umask -pS"#),
+        // The working directory and the umask belong to the *process*,
+        // which a `( )` or `$( )` shares with the shell around it -- it
+        // is a Shell of its own but not a process of its own. So each
+        // has to be put back on the way out, nested and at one level.
+        //
+        // Load-bearing beyond the behaviour: the restore is no longer a
+        // snapshot taken on the way in, but a note made by whatever does
+        // the moving (see ProcessRestore). A `cd` or `umask` that forgot
+        // to leave the note would leak out of every subshell, and these
+        // are what would say so. Fd 0/1/2 is the third of the three and
+        // is pinned in tests/, for the reason given there.
+        //
+        // Builtins throughout, deliberately: an external command inside
+        // a `( )` loses its output when the shell is a pane, which is a
+        // separate defect and not what these are about.
+        case(
+            "a-cd-inside-a-subshell-does-not-escape",
+            r#"mkdir -p a b; cd a; ( cd ../b ); echo "${PWD##*/}"; v=$(cd ../b && echo "${PWD##*/}"); echo "$v ${PWD##*/}""#,
+        ),
+        case(
+            "a-cd-inside-a-nested-subshell-does-not-escape",
+            r#"mkdir -p a b c; cd a; ( cd ../b; ( cd ../c; echo "${PWD##*/}" ); echo "${PWD##*/}" ); echo "${PWD##*/}""#,
+        ),
+        case("a-umask-inside-a-subshell-does-not-escape", r#"umask 022; ( umask 077 ); umask; v=$(umask 077; umask); echo "$v $(umask)""#),
+        case("a-umask-inside-a-nested-subshell-does-not-escape", r#"umask 022; ( umask 077; ( umask 002; umask ); umask ); umask"#),
+        // ...and the shell that changed nothing has nothing to put back,
+        // which is the case the whole arrangement exists for.
+        case(
+            "a-subshell-that-moves-nothing-leaves-everything",
+            r#"mkdir -p a; cd a; umask 022; ( : ); v=$(:); echo "${PWD##*/}"; umask; echo "[$v]after""#,
+        ),
         // `printf -v 'arr[0]'` writes an array element -- the way a
         // loop fills an array without a subshell.
         case(
