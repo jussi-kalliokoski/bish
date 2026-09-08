@@ -1285,6 +1285,20 @@ y
             "quoting-in-a-parameter-expansion-pattern",
             r#"x="a*b"; echo "${x//\*/Y}" "${x//"*"/Y}" "${x#a\*}" "${x%\*b}" "${x#"a*"}"; y=axb; echo "${y#a\*}" "${y//\?/Y}""#,
         ),
+        // ...including inside a bracket expression, where `]`, `^` and
+        // `-` are the class's own syntax rather than the matcher's.
+        case(
+            "escaped-characters-inside-a-pattern-bracket",
+            r#"x=a^b; echo "${x//[\^]/X}"; y=aqz; echo "${y//[a\-z]/X}"; z="a]b"; echo "${z//[\]]/X}"; w=a-b; echo "${w//[\-]/X}""#,
+        ),
+        // `&` in a replacement stands for the matched text unless it was
+        // quoted -- and the array and positional-parameter paths were
+        // expanding the replacement without preserving that, where the
+        // scalar path already did.
+        case(
+            "an-escaped-ampersand-in-a-replacement-is-literal",
+            r#"a=(abc); echo "${a[@]//b/\&}" "${a[0]//b/\&}" "${a[@]//b/[&]}"; set -- abc; echo "${1//b/\&}" "${@//b/\&}"; r="&"; echo "${a[@]//b/$r}""#,
+        ),
         // A match that reaches the end of the string ends the walk --
         // bash's own loop is `while (*s)`. Without that, `${s//*/Z}`
         // matched all of "abc" and then matched empty at the end, and
@@ -1301,19 +1315,12 @@ y
             "an-empty-replacement-pattern-matches-nothing",
             r#"s=abc; echo "${s//""/Z}" "${s/""/Z}" "${s/#""/Z}" "${s/%""/Z}"; e=; echo "${s//$e/Z}""#,
         ),
-        // ...including inside a bracket expression, where `]`, `^` and
-        // `-` are the class's own syntax rather than the matcher's.
-        // `&` in a replacement stands for the matched text unless it was
-        // quoted -- and the array and positional-parameter paths were
-        // expanding the replacement without preserving that, where the
-        // scalar path already did.
+        // A fixed-width pattern wider than the string cannot match. The
+        // fast path that knows the width used to slice that many
+        // characters out anyway and panic.
         case(
-            "an-escaped-ampersand-in-a-replacement-is-literal",
-            r#"a=(abc); echo "${a[@]//b/\&}" "${a[0]//b/\&}" "${a[@]//b/[&]}"; set -- abc; echo "${1//b/\&}" "${@//b/\&}"; r="&"; echo "${a[@]//b/$r}""#,
-        ),
-        case(
-            "escaped-characters-inside-a-pattern-bracket",
-            r#"x=a^b; echo "${x//[\^]/X}"; y=aqz; echo "${y//[a\-z]/X}"; z="a]b"; echo "${z//[\]]/X}"; w=a-b; echo "${w//[\-]/X}""#,
+            "a-replacement-pattern-longer-than-the-string",
+            r#"s=ab; echo "[${s//abc/Z}]" "[${s//[ab]c/Z}]"; e=; echo "[${e//?/Z}]" "[${e//[a]/Z}]" "[${e//a/Z}]""#,
         ),
         // `kill -0` is not a signal but the "is it still there" probe,
         // and `-s`/`-n` name the signal in the next argument.

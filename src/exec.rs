@@ -15751,7 +15751,15 @@ fn find_glob_match(text: &str, bounds: &[usize], start_from: usize, pattern: &st
             // quadratic, and it is the shape almost every real
             // replacement has: `${s//a/b}`, `${path//\//_}`.
             if let Some(width) = glob::fixed_width(pattern) {
-                return (start_from..=n.saturating_sub(width)).find(|&s| glob::matches(pattern, slice(s, s + width))).map(|s| (s, s + width));
+                // Wider than the whole string: nothing to try. The
+                // saturating subtraction this replaces still yielded the
+                // range `0..=0`, and slicing `width` characters out of a
+                // shorter string panicked -- `${s//abc/Z}` on "ab" was
+                // enough to do it.
+                if width > n {
+                    return None;
+                }
+                return (start_from..=n - width).find(|&s| glob::matches(pattern, slice(s, s + width))).map(|s| (s, s + width));
             }
             for s in start_from..=n {
                 if let Some((s0, e0)) = (s..=n).rev().find_map(|end| glob::matches(pattern, slice(s, end)).then_some((s, end))) {
@@ -16897,6 +16905,17 @@ mod replacement_tests {
         assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::None), "abc");
         assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::Start), "Zabc");
         assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::End), "abcZ");
+    }
+
+    // The fixed-width fast path knows how many characters the pattern
+    // takes; when that is more than the string has, there is nothing to
+    // try. Slicing it out anyway panicked.
+    #[test]
+    fn a_pattern_wider_than_the_string_does_not_match() {
+        assert_eq!(glob_replace("ab", "abc", "Z", true, ReplaceAnchor::None), "ab");
+        assert_eq!(glob_replace("x", "[ab]c", "Z", true, ReplaceAnchor::None), "x");
+        assert_eq!(glob_replace("", "?", "Z", true, ReplaceAnchor::None), "");
+        assert_eq!(glob_replace("", "[a]", "Z", true, ReplaceAnchor::None), "");
     }
 }
 
