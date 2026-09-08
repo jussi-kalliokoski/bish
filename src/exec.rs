@@ -4948,6 +4948,22 @@ impl Shell {
     /// find out whether `cmd` failed -- which is the entire reason it
     /// exists, and the reason `$?` alone is not enough.
     fn set_pipestatus(&mut self, codes: &[i32]) {
+        // Every command sets this, pipeline or not, and almost every
+        // command is one stage long -- so the overwhelmingly common
+        // call replaces one status with one status. Building a fresh
+        // name, map and value string to say that cost three allocations
+        // per command; writing over the ones already there costs none.
+        // The keys are 0..n in both, so equal lengths line up.
+        if let Some(existing) = self.arrays.get_mut("PIPESTATUS")
+            && existing.len() == codes.len()
+        {
+            use std::fmt::Write;
+            for (slot, code) in existing.values_mut().zip(codes) {
+                slot.clear();
+                let _ = write!(slot, "{code}");
+            }
+            return;
+        }
         let map: std::collections::BTreeMap<usize, String> = codes.iter().enumerate().map(|(i, c)| (i, c.to_string())).collect();
         self.arrays.insert("PIPESTATUS".to_string(), map);
     }
