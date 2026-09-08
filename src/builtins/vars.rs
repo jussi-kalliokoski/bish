@@ -210,7 +210,7 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                 sh.lower_names.insert(name.clone());
             }
             if export_flag {
-                sh.exported_names.insert(name.clone());
+                std::rc::Rc::make_mut(&mut sh.exported_names).insert(name.clone());
             }
             if readonly_flag {
                 sh.readonly_names.insert(name.clone());
@@ -253,7 +253,7 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
             sh.lower_names.insert(name.clone());
         }
         if export_flag {
-            sh.exported_names.insert(name.clone());
+            std::rc::Rc::make_mut(&mut sh.exported_names).insert(name.clone());
         }
         if nameref_flag {
             sh.nameref_names.insert(name.clone());

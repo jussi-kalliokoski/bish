@@ -1612,7 +1612,33 @@ pub struct Shell {
     // local -- assign_var additionally mirrors the value into the process
     // env for any name in this set, so child processes can see it despite
     // it living in var_scopes rather than env.
-    pub(crate) exported_names: std::collections::HashSet<String>,
+    // Copy-on-write for the same reason as `globals`.
+    pub(crate) exported_names: Rc<std::collections::HashSet<String>>,
+    // `_` lives here rather than in `globals`, because it is written
+    // once per command -- run_command_body sets it after every simple
+    // command -- and `globals` is a copy-on-write map whose write cost
+    // is the size of the whole environment. Inside a `$( )` or `( )`,
+    // where the map is shared with the parent, that one write was
+    // copying all of it: 39% of the cost of a command substitution went
+    // on setting a variable almost nothing ever reads.
+    //
+    // Nothing else knows: global_get, global_set, global_remove and
+    // global_names are the only places aware that `_` is kept apart,
+    // and every reader goes through them.
+    underscore: Option<String>,
+    // Parsed bodies of constructs that arrive as source text and are run
+    // over and over: `$( )`, `( )`, `<( )`. Shared with virtual children
+    // (that is who does the parsing), so a substitution inside a loop
+    // pays to lex and parse its body once rather than once per turn.
+    //
+    // Keyed by the text, which is sound only because lexing and parsing
+    // read no shell state -- with the single exception of alias
+    // expansion, which sits between them. Rather than track when an
+    // alias changes and hope no future edit forgets to, the cache
+    // declines to store anything while alias expansion could apply at
+    // all (see cached_program); a shell with live aliases simply parses
+    // as it did before.
+    parse_cache: Rc<RefCell<std::collections::HashMap<String, Rc<parser::Program>>>>,
     // Every proc-sub temp file created for the command currently being
     // built, deleted once it finishes (drain_proc_subs).
     proc_sub_cleanup: Vec<String>,
@@ -2013,7 +2039,11 @@ pub struct Shell {
     // only while it is in `exported_names` (see raw_var_write), which
     // is also what a spawned child inherits. BTreeMap so `declare -p`
     // and `compgen -v` enumerate in a stable order.
-    globals: std::collections::BTreeMap<String, String>,
+    // Behind an `Rc` so a virtual child inherits it by refcount rather
+    // than by copying every entry. A `$( )` or `( )` that assigns pays
+    // for the copy at the moment it assigns (`Rc::make_mut`); the great
+    // majority never do. See new_virtual_child.
+    globals: Rc<std::collections::BTreeMap<String, String>>,
     // A monotonic count of *effects*: every builtin or external command
     // that ran, every assignment that was performed, every read of a
     // deliberately-volatile variable ($RANDOM, $SECONDS, $EPOCH*).
@@ -2033,6 +2063,10 @@ pub struct Shell {
 // and for new_virtual_child's child (which deliberately does NOT inherit
 // the parent's current rng_state, so sibling sessions don't produce
 // correlated $RANDOM sequences).
+// The name `_` as an owned String, so global_names and the pipeline
+// environment can hand out a `&String` for the value kept beside the map.
+static UNDERSCORE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "_".to_string());
+
 fn fresh_rng_seed() -> u64 {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x2545F4914F6CDD1D)
         ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
@@ -2138,8 +2172,10 @@ impl Shell {
             // A variable inherited from the environment is an exported
             // variable -- bash's rule, and what makes `env` agree with
             // `declare -p` on a fresh shell.
-            exported_names: inherited.iter().map(|(k, _)| k.clone()).collect(),
-            globals: inherited.iter().cloned().collect(),
+            exported_names: Rc::new(inherited.iter().map(|(k, _)| k.clone()).collect()),
+            parse_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            underscore: None,
+            globals: Rc::new(inherited.iter().cloned().collect()),
             effects: 0,
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -2500,8 +2536,10 @@ impl Shell {
             integer_names: self.integer_names.clone(),
             upper_names: self.upper_names.clone(),
             lower_names: self.lower_names.clone(),
-            exported_names: self.exported_names.clone(),
-            globals: self.globals.clone(),
+            exported_names: Rc::clone(&self.exported_names),
+            parse_cache: Rc::clone(&self.parse_cache),
+            underscore: self.underscore.clone(),
+            globals: Rc::clone(&self.globals),
             effects: self.effects,
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(),
@@ -3139,7 +3177,7 @@ impl Shell {
                 return value.as_deref();
             }
         }
-        self.globals.get(name).map(String::as_str)
+        self.global_get(name).map(String::as_str)
     }
 
     fn spawn_stdout_stdio(&self) -> Stdio {
@@ -4023,7 +4061,7 @@ impl Shell {
     // this only needs the names, not the whole compgen::ActionContext
     // shape.
     fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> = self.globals.keys().cloned().collect();
+        let mut names: std::collections::BTreeSet<String> = self.global_names().cloned().collect();
         for scope in &self.var_scopes {
             names.extend(scope.keys().cloned());
         }
@@ -4048,7 +4086,7 @@ impl Shell {
     pub(crate) fn action_context(&self) -> compgen::ActionContext {
         let mut arrays: Vec<String> = self.arrays.keys().cloned().collect();
         arrays.extend(self.assoc_arrays.keys().cloned());
-        let mut variables: Vec<String> = self.globals.keys().cloned().collect();
+        let mut variables: Vec<String> = self.global_names().cloned().collect();
         for scope in &self.var_scopes {
             variables.extend(scope.keys().cloned());
         }
@@ -4376,10 +4414,12 @@ impl Shell {
         // ...and into the variable table, which is what `$PWD` actually
         // reads now. Both are exported in bash, so they stay in the
         // real environment too, above.
-        self.globals.insert("OLDPWD".to_string(), old.clone());
-        self.globals.insert("PWD".to_string(), new.clone());
-        self.exported_names.insert("OLDPWD".to_string());
-        self.exported_names.insert("PWD".to_string());
+        let globals = Rc::make_mut(&mut self.globals);
+        globals.insert("OLDPWD".to_string(), old.clone());
+        globals.insert("PWD".to_string(), new.clone());
+        let exported = Rc::make_mut(&mut self.exported_names);
+        exported.insert("OLDPWD".to_string());
+        exported.insert("PWD".to_string());
         {}
         // ...and into this session's own remembered environment, not
         // just the real one. `sync_real_state_in` reapplies that
@@ -4942,6 +4982,60 @@ impl Shell {
     // private: main.rs lives in a sibling module and needs this exact
     // "read then run in place" semantics for $HOME/.config/bish/
     // config.bash, not a subprocess.
+    /// `run_source_here` for a construct whose body is re-run: the
+    /// subshell forms, which keep their body as source text and so used
+    /// to re-tokenise and re-parse it on every single execution. In
+    /// `while ...; do v=$(true); done` that is one full lex and parse of
+    /// "true" per turn of the loop, and it was the largest single cost
+    /// in a command substitution -- more than building the child shell
+    /// and more than running the body.
+    pub(crate) fn run_source_cached(&mut self, src: &str, label: &str) -> ExecResult {
+        match self.cached_program(src, label) {
+            Ok(Some(prog)) => self.run_program(&prog),
+            // Not cacheable, or a parse error to report the usual way.
+            Ok(None) => self.run_source_here(src, label),
+            Err(status) => status,
+        }
+    }
+
+    /// The cache lookup behind `run_source_cached`. `Ok(None)` means
+    /// "not cacheable, parse it the ordinary way"; `Err` carries the
+    /// status of a body that failed to parse.
+    fn cached_program(&mut self, src: &str, label: &str) -> Result<Option<Rc<parser::Program>>, ExecResult> {
+        // Alias expansion is the one part of turning text into a tree
+        // that reads shell state, so a cached tree is only sound while
+        // it cannot apply. This is the same condition expand_aliases
+        // itself short-circuits on.
+        if self.shopt_is_on("expand_aliases") && !self.aliases.is_empty() {
+            return Ok(None);
+        }
+        if let Some(hit) = self.parse_cache.borrow().get(src) {
+            return Ok(Some(Rc::clone(hit)));
+        }
+        let prog = match crate::lexer::Lexer::new(src).tokenize() {
+            Ok(toks) => match crate::parser::Parser::new(toks).parse_program() {
+                Ok(prog) => Rc::new(prog),
+                Err(e) => {
+                    sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
+                    return Err(ExecResult::Status(2));
+                }
+            },
+            Err(e) => {
+                sh_eprintln!(self, "bish: {}: syntax error: {}", label, e);
+                return Err(ExecResult::Status(2));
+            }
+        };
+        // A script has a handful of distinct subshell bodies, not
+        // thousands; the cap is only so that a generated one cannot grow
+        // this without bound.
+        let mut cache = self.parse_cache.borrow_mut();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(src.to_string(), Rc::clone(&prog));
+        Ok(Some(prog))
+    }
+
     pub(crate) fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
         // A file that sources itself is the same crash as a function
         // that calls itself, reached without ever making a function
@@ -4987,7 +5081,7 @@ impl Shell {
         // used to travel that way too, before variables stopped living
         // in the environment (see the `globals` field) -- without this
         // a pipeline stage started with none of them.
-        for (k, v) in &self.globals {
+        for (k, v) in self.globals.iter().chain(self.underscore.as_ref().map(|v| (&*UNDERSCORE, v))) {
             if !self.exported_names.contains(k) {
                 flattened.insert(k.as_str(), v.as_str());
             }
@@ -5245,7 +5339,7 @@ impl Shell {
         let saved_fd012 = save_fd012();
 
         let result = match body {
-            ChildBody::Source(raw) => child.run_source_here(raw, "subshell"),
+            ChildBody::Source(raw) => child.run_source_cached(raw, "subshell"),
             ChildBody::Parsed(cmd) => crate::builtins::shell::run_command(&mut child, cmd, false),
         };
         // Real bash fires a subshell's own EXIT trap when it finishes
@@ -5771,7 +5865,7 @@ impl Shell {
                         // returned: the loop spun inside a single
                         // resume with the whole thread in it.
                         arm_broken_pipe();
-                        child.run_source_here(&body, "process substitution");
+                        child.run_source_cached(&body, "process substitution");
                         child.run_exit_trap();
                         disarm_broken_pipe();
                     },
@@ -5916,7 +6010,7 @@ impl Shell {
                         // returned: the loop spun inside a single
                         // resume with the whole thread in it.
                         arm_broken_pipe();
-                        child.run_source_here(&body, "process substitution");
+                        child.run_source_cached(&body, "process substitution");
                         child.run_exit_trap();
                         disarm_broken_pipe();
                     },
@@ -7819,7 +7913,7 @@ impl Shell {
                 // variable into one and lose its value entirely.
                 if argv.get(1).map(String::as_str) == Some("-n") {
                     for name in &argv[2..] {
-                        self.exported_names.remove(name);
+                        Rc::make_mut(&mut self.exported_names).remove(name);
                     }
                     return ExecResult::Status(0);
                 }
@@ -8012,7 +8106,7 @@ impl Shell {
                             (integer_flag, &mut self.integer_names),
                             (upper_flag, &mut self.upper_names),
                             (lower_flag, &mut self.lower_names),
-                            (export_flag, &mut self.exported_names),
+                            (export_flag, Rc::make_mut(&mut self.exported_names)),
                             (readonly_flag, &mut self.readonly_names),
                         ] {
                             if set {
@@ -8042,7 +8136,7 @@ impl Shell {
                         self.lower_names.insert(n.clone());
                     }
                     if export_flag {
-                        self.exported_names.insert(n.clone());
+                        Rc::make_mut(&mut self.exported_names).insert(n.clone());
                     }
                     match array_mode {
                         // The bare `local -a x` form declares without
@@ -8083,7 +8177,7 @@ impl Shell {
                                 v
                             };
                             if export_flag {
-                                self.exported_names.insert(n.clone());
+                                Rc::make_mut(&mut self.exported_names).insert(n.clone());
                                 self.export_to_environment(&n, &v);
                             }
                             if readonly_flag {
@@ -11161,13 +11255,56 @@ impl Shell {
     // Reads a name's own raw stored value, bypassing nameref redirection --
     // used to read a nameref's target-name string, and internally by
     // resolve_nameref while following a chain.
+    /// A global's value. `_` is kept outside the map (see the field);
+    /// a copy inherited from the real environment may still be sitting
+    /// in `globals` under that name, so the field wins when it is set.
+    fn global_get(&self, name: &str) -> Option<&String> {
+        match name == "_" && self.underscore.is_some() {
+            true => self.underscore.as_ref(),
+            false => self.globals.get(name),
+        }
+    }
+
+    /// Writing one. Only this and `global_remove` may touch `globals`
+    /// by name.
+    fn global_set(&mut self, name: &str, value: String) {
+        match name == "_" {
+            true => self.underscore = Some(value),
+            false => {
+                Rc::make_mut(&mut self.globals).insert(name.to_string(), value);
+            }
+        }
+    }
+
+    fn global_remove(&mut self, name: &str) {
+        if name == "_" {
+            self.underscore = None;
+        }
+        // An inherited `_` can still be in the map even once the field
+        // has taken over, so both go.
+        if self.globals.contains_key(name) {
+            self.global_remove(name);
+        }
+    }
+
+    /// Every global name, for the listings (`declare -p`, `set`,
+    /// `compgen -v`). `_` is added only when the map does not already
+    /// carry an inherited one, so it cannot appear twice.
+    fn global_names(&self) -> impl Iterator<Item = &String> {
+        let extra = match self.underscore.is_some() && !self.globals.contains_key("_") {
+            true => Some(&*UNDERSCORE),
+            false => None,
+        };
+        self.globals.keys().chain(extra)
+    }
+
     pub(crate) fn raw_var_lookup(&self, name: &str) -> String {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return v.clone().unwrap_or_default();
             }
         }
-        if let Some(v) = self.globals.get(name) {
+        if let Some(v) = self.global_get(name) {
             return v.clone();
         }
         // The real environment is still consulted last, for a name
@@ -11187,7 +11324,7 @@ impl Shell {
                 return;
             }
         }
-        self.globals.insert(name.to_string(), value.clone());
+        self.global_set(name, value.clone());
         self.export_to_environment(name, &value);
     }
 
@@ -11231,7 +11368,7 @@ impl Shell {
                 return;
             }
         }
-        self.globals.remove(name);
+        Rc::make_mut(&mut self.globals).remove(name);
     }
 
     // Whatever the real environment says about `name` -- unless this
@@ -11358,7 +11495,7 @@ impl Shell {
                         return v.clone().unwrap_or_default();
                     }
                 }
-                if let Some(v) = self.globals.get(name) {
+                if let Some(v) = self.global_get(name) {
                     return v.clone();
                 }
                 // A bare `$a` on an array is `${a[0]}`, for every array
@@ -11445,7 +11582,7 @@ impl Shell {
                 map.iter().map(|(k, v)| format!("[{}]={}", k, crate::serialize::quote_literal(v))).collect::<Vec<_>>().join(" ")
             ));
         }
-        self.globals.get(name).cloned().or_else(|| self.inherited_var(name))
+        self.global_get(name).cloned().or_else(|| self.inherited_var(name))
     }
 
     // pub: debugger.rs (a separate module -- see DebugHook's own doc
@@ -11537,13 +11674,13 @@ impl Shell {
         // program the session went on to run.
         if !term.is_empty() {
             self.assign_var("TERM", term.to_string());
-            self.exported_names.insert("TERM".to_string());
+            Rc::make_mut(&mut self.exported_names).insert("TERM".to_string());
         }
         if colorterm.is_empty() {
-            self.globals.remove("COLORTERM");
+            self.global_remove("COLORTERM");
         } else {
             self.assign_var("COLORTERM", colorterm.to_string());
-            self.exported_names.insert("COLORTERM".to_string());
+            Rc::make_mut(&mut self.exported_names).insert("COLORTERM".to_string());
         }
     }
 
@@ -11696,7 +11833,7 @@ impl Shell {
                 return v.is_some();
             }
         }
-        self.globals.contains_key(name) || self.inherited_var(name).is_some()
+        self.global_get(name).is_some() || self.inherited_var(name).is_some()
     }
 
     // Plain assignment targets the global (process-env) variable, unless it
@@ -11729,7 +11866,7 @@ impl Shell {
     /// Assigns and marks exported, the way `export NAME=value` does --
     /// without going through the lexer and parser to say so.
     pub fn export_var(&mut self, name: &str, value: String) {
-        self.exported_names.insert(name.to_string());
+        Rc::make_mut(&mut self.exported_names).insert(name.to_string());
         self.assign_var(name, value.clone());
         self.export_to_environment(name, &value);
     }
@@ -11811,7 +11948,7 @@ impl Shell {
         if force_global {
             // Bypass any local shadow entirely -- raw_var_write would
             // just update that shadow instead, same as plain assignment.
-            self.globals.insert(name.to_string(), value.clone());
+            self.global_set(name, value.clone());
             self.export_to_environment(name, &value);
             return true;
         }
