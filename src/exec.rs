@@ -15824,6 +15824,22 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
             None => s.to_string(),
         };
     }
+    // An *empty* pattern matches nothing when unanchored -- bash's
+    // pat_subst returns the string untouched rather than splicing the
+    // replacement between every character, so `${s//""/Z}` is a no-op.
+    // A pattern that merely *can* match empty, like `@()`, is not this
+    // case and does splice; only the empty string itself bails, and the
+    // anchored `${s/#}`/`${s/%}` handled above still fire.
+    //
+    // bash draws one further line this does not: on an *empty* string it
+    // replaces for `*`, `**` and `*()` but not for `@()`, `?()` or
+    // `@(*)`, though its own matcher says all six match the empty string
+    // (`[[ "" == @() ]]` is true). Nothing in its documentation accounts
+    // for the split, so bish replaces whenever the pattern matches --
+    // a rule that can at least be written down.
+    if pattern.is_empty() {
+        return s.to_string();
+    }
     let mut out = String::new();
     let mut pos = 0;
     loop {
@@ -15831,11 +15847,24 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
             Some((s0, e0)) => {
                 out.extend(&chars[pos..s0]);
                 out.push_str(&expand_replacement(repl, &chars[s0..e0].iter().collect::<String>()));
-                // An empty match (a pattern like a bare "*" can't produce
-                // one here since matching is greedy-longest, but stay
-                // defensive) must still advance, or this loops forever.
-                pos = if e0 > s0 { e0 } else { e0 + 1 };
-                if !global || pos > chars.len() {
+                pos = if e0 > s0 {
+                    e0
+                } else {
+                    // An empty match -- `@()` and `?()` both match
+                    // nothing -- must still advance, or this loops
+                    // forever. The character it steps over is copied
+                    // through rather than eaten: `${s//@()/Z}` on "abc"
+                    // is `ZaZbZc`.
+                    if e0 < chars.len() {
+                        out.push(chars[e0]);
+                    }
+                    e0 + 1
+                };
+                // Reaching the end ends the walk -- bash's own loop is
+                // `while (*s)`. Without this, `${s//*/Z}` matched all of
+                // "abc", then matched empty at the end and replaced
+                // twice, giving `ZZ` where bash gives `Z`.
+                if !global || pos >= chars.len() {
                     if pos <= chars.len() {
                         out.extend(&chars[pos..]);
                     }
@@ -16832,6 +16861,42 @@ mod spawn_guard {
             }
         }
         assert!(problems.is_empty(), "\n  - {}", problems.join("\n  - "));
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::{ReplaceAnchor, glob_replace};
+
+    // Reachable only through extglob, which bash has off by default and
+    // bish cannot turn off, so the bashdiff corpus cannot ask for it:
+    // `@()` matches the empty string at every position, and the
+    // character each empty match steps over has to be copied through
+    // rather than eaten. Checked against `bash -O extglob`.
+    #[test]
+    fn an_empty_match_copies_the_character_it_steps_over() {
+        assert_eq!(glob_replace("abc", "@()", "Z", true, ReplaceAnchor::None), "ZaZbZc");
+        assert_eq!(glob_replace("abc", "?()", "Z", true, ReplaceAnchor::None), "ZaZbZc");
+        assert_eq!(glob_replace("abc", "@()", "Z", false, ReplaceAnchor::None), "Zabc");
+    }
+
+    // The walk ends when a match reaches the end of the string, so a
+    // pattern that swallows the rest cannot then match empty after it.
+    #[test]
+    fn a_match_reaching_the_end_ends_the_walk() {
+        assert_eq!(glob_replace("abc", "*", "Z", true, ReplaceAnchor::None), "Z");
+        assert_eq!(glob_replace("abc", "c*", "Z", true, ReplaceAnchor::None), "abZ");
+        assert_eq!(glob_replace("abab", "a", "Z", true, ReplaceAnchor::None), "ZbZb");
+    }
+
+    // An empty *pattern* is the other case: it matches nothing at all
+    // unanchored, but both anchors still fire.
+    #[test]
+    fn an_empty_pattern_matches_nothing_unanchored() {
+        assert_eq!(glob_replace("abc", "", "Z", true, ReplaceAnchor::None), "abc");
+        assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::None), "abc");
+        assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::Start), "Zabc");
+        assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::End), "abcZ");
     }
 }
 

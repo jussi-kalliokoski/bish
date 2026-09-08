@@ -1285,6 +1285,22 @@ y
             "quoting-in-a-parameter-expansion-pattern",
             r#"x="a*b"; echo "${x//\*/Y}" "${x//"*"/Y}" "${x#a\*}" "${x%\*b}" "${x#"a*"}"; y=axb; echo "${y#a\*}" "${y//\?/Y}""#,
         ),
+        // A match that reaches the end of the string ends the walk --
+        // bash's own loop is `while (*s)`. Without that, `${s//*/Z}`
+        // matched all of "abc" and then matched empty at the end, and
+        // replaced twice.
+        case(
+            "a-replacement-match-that-reaches-the-end-of-the-string",
+            r#"s=abc; echo "${s//*/Z}" "${s//c*/Z}" "${s//b*/Z}" "${s//?*/Z}"; t=abab; echo "${t//a/Z}"; u=aa; echo "${u//a*/Z}""#,
+        ),
+        // An *empty* pattern matches nothing at all when unanchored,
+        // though `/#` and `/%` still fire. (A pattern that merely *can*
+        // match empty, like `@()`, is a different case and does splice;
+        // it needs extglob, so it lives in a unit test.)
+        case(
+            "an-empty-replacement-pattern-matches-nothing",
+            r#"s=abc; echo "${s//""/Z}" "${s/""/Z}" "${s/#""/Z}" "${s/%""/Z}"; e=; echo "${s//$e/Z}""#,
+        ),
         // ...including inside a bracket expression, where `]`, `^` and
         // `-` are the class's own syntax rather than the matcher's.
         // `&` in a replacement stands for the matched text unless it was
