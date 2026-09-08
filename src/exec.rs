@@ -2067,9 +2067,15 @@ pub struct Shell {
 // environment can hand out a `&String` for the value kept beside the map.
 static UNDERSCORE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "_".to_string());
 
-fn fresh_rng_seed() -> u64 {
+/// `pid` is passed in rather than read here, because this runs once per
+/// subshell and `std::process::id()` is a real `getpid` -- 0.38us of the
+/// 2.1us it took to enter a `$( )`, spent seeding a `$RANDOM` the child
+/// will almost certainly never read. The caller always has the value
+/// already, and within a process it is a constant either way, so the
+/// seed is no worse for it.
+fn fresh_rng_seed(pid: u32) -> u64 {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x2545F4914F6CDD1D)
-        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        ^ (pid as u64).wrapping_mul(0x9E3779B97F4A7C15);
     if seed == 0 { 0x2545F4914F6CDD1D } else { seed }
 }
 
@@ -2109,7 +2115,7 @@ impl Shell {
         // become an ordinary exported variable -- visible to `env`,
         // and inherited by a *new* `bish -c` further down, which would
         // then report its parent's `$$` instead of its own.
-        let shell_pid = inherited_shell_pid();
+        let shell_pid = inherited_shell_pid().unwrap_or_else(std::process::id);
         let mut inherited: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k != REEXEC_SHELL_PID).collect();
         // `PS4` is a real variable with a default, not a fallback used
         // when it is missing. The difference shows the moment a script
@@ -2156,7 +2162,7 @@ impl Shell {
             nameref_local_stack: Vec::new(),
             dir_stack: Vec::new(),
             shopt_options: std::collections::HashMap::new(),
-            shell_pid: shell_pid.unwrap_or_else(std::process::id),
+            shell_pid,
             bishopts: std::collections::HashMap::new(),
             themes: std::collections::HashMap::new(),
             hl: std::collections::HashMap::new(),
@@ -2178,7 +2184,7 @@ impl Shell {
             globals: Rc::new(inherited.iter().cloned().collect()),
             effects: 0,
             proc_sub_cleanup: Vec::new(),
-            rng_state: fresh_rng_seed(),
+            rng_state: fresh_rng_seed(shell_pid),
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             jobs: Rc::new(RefCell::new(JobTable::new())),
@@ -2542,7 +2548,7 @@ impl Shell {
             globals: Rc::clone(&self.globals),
             effects: self.effects,
             proc_sub_cleanup: Vec::new(),
-            rng_state: fresh_rng_seed(),
+            rng_state: fresh_rng_seed(self.shell_pid),
             shell_start: std::time::Instant::now(),
             seconds_offset: 0,
             jobs: self.jobs.clone(),
