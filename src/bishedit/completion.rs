@@ -634,7 +634,24 @@ impl<'a> ShellCompletionProvider<'a> {
         let ctx = self.action_ctx.unwrap_or(&default_ctx);
         let cwd = self.cwd.unwrap_or_else(|| Path::new("."));
         let preamble = self.functions_preamble.unwrap_or("");
-        let names = compgen::resolve_spec(spec, prefix, ctx, cwd, preamble);
+        let mut names = compgen::resolve_spec(spec, prefix, ctx, cwd, preamble);
+        // Alphabetical unless the spec says otherwise, which is bash's
+        // rule read from the other side: `-o nosort` is documented as
+        // "tell readline not to sort the list of possible completions
+        // alphabetically", so sorting is what happens without it. bish
+        // took `nosort` as a valid name and then sorted nothing, which
+        // is the same as having it always on -- a spec's candidates came
+        // out in whatever order it produced them, so `abc` offered
+        // `abcdef` ahead of `abcd` whenever the wordlist happened to be
+        // written that way, and a `-F` function's COMPREPLY came out in
+        // its own build order.
+        //
+        // Sorting only. The entries themselves are still left exactly as
+        // the spec produced them -- see as_unranked_candidates for why
+        // filtering them here would be wrong.
+        if !spec.opts.iter().any(|o| o == "nosort") {
+            names.sort();
+        }
         Some(as_unranked_candidates(prefix, names))
     }
 
@@ -1335,6 +1352,46 @@ mod tests {
         let line = "ech";
         let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
+    }
+
+    /// A registered spec's candidates come out alphabetically, because
+    /// that is what bash does: `-o nosort` is documented as telling
+    /// readline *not* to sort them, so sorted is the default. bish
+    /// accepted the name and sorted nothing either way, which meant a
+    /// wordlist -- or a `-F` function's COMPREPLY -- was offered in
+    /// whatever order it was built, and `abc` reached `abcdef` before
+    /// `abcd`.
+    #[test]
+    fn a_registered_specs_candidates_are_sorted_unless_it_says_nosort() {
+        let ordered = |spec: compgen::CompgenSpec| {
+            let mut completions = HashMap::new();
+            completions.insert("cmd".to_string(), spec);
+            let provider = ShellCompletionProvider {
+                cwd: None,
+                known_functions: None,
+                completions: Some(&completions),
+                default_completion: None,
+                action_ctx: None,
+                functions_preamble: None,
+                honor_gitignore: false,
+                fignore: Vec::new(),
+                force_fignore: true,
+                hl_names: Vec::new(),
+            };
+            let line = "cmd abc";
+            display_names(provider.complete(CompletionRequest { line, cursor: line.chars().count() }).candidates)
+        };
+        let words = "abcdef abcd abcde abc";
+        assert_eq!(
+            ordered(compgen::CompgenSpec { wordlist: Some(words.to_string()), ..Default::default() }),
+            vec!["abc".to_string(), "abcd".to_string(), "abcde".to_string(), "abcdef".to_string()],
+            "the shorter completion is the one reached first"
+        );
+        // ...and the spec that asks to keep its own order keeps it.
+        assert_eq!(
+            ordered(compgen::CompgenSpec { wordlist: Some(words.to_string()), opts: vec!["nosort".to_string()], ..Default::default() }),
+            vec!["abcdef".to_string(), "abcd".to_string(), "abcde".to_string(), "abc".to_string()],
+        );
     }
 
     #[test]

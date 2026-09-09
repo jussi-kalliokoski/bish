@@ -360,11 +360,12 @@ pub struct CompgenSpec {
     pub filterpat: Option<String>,
     pub prefix: String,
     pub suffix: String,
-    // -o names, in the order first given -- kept around purely for -p
-    // reconstruction (sorted there, matching real bash's own -p output
-    // order) and compopt's -o/+o toggling; never consulted by
-    // resolve_spec itself (see O_OPTIONS' own doc comment on why they're
-    // inert for generated text).
+    // -o names, in the order first given -- for -p reconstruction
+    // (sorted there, matching real bash's own -p output order) and
+    // compopt's -o/+o toggling. Never consulted by `resolve_spec`, which
+    // only generates text; `nosort` is read by the completion UI, which
+    // is the thing that has an order to leave alone (see
+    // ShellCompletionProvider::registered_spec_candidates).
     pub opts: Vec<String>,
 }
 
