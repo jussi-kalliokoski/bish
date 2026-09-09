@@ -552,6 +552,36 @@ mod tests {
         case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),
         case("redir-fd", r#"exec 3> three; echo x >&3; exec 3>&-; cat three"#),
+        // A bare `exec` moves this *process's* descriptors, and the
+        // shell has to write through them afterwards. It does not do so
+        // directly -- a builtin writes to its own sink, a spawned
+        // command is handed its own stdio -- and at the top level those
+        // amount to the same thing, so this only ever went wrong where
+        // something else answered first: inside a `$( )`, whose sink is
+        // the capture, and in a pane. `v=$(exec > f; echo hi)` put `hi`
+        // in `v` where bash puts it in the file.
+        //
+        // The builtin and the spawned command have to share a write
+        // position too, or the second one starts at nothing and
+        // overwrites the first.
+        case("a-bare-exec-redirect-catches-what-the-shell-prints-next", r#"exec > out; echo builtin; /bin/echo external; exec 1>&2; cat out"#),
+        case("a-bare-exec-redirect-inside-a-substitution", r#"v=$(exec > out; echo builtin; /bin/echo external); echo "[$v]"; cat out"#),
+        case("a-bare-exec-redirect-inside-a-subshell", r#"( exec > out; echo builtin; /bin/echo external ); echo after; cat out"#),
+        case("a-bare-exec-redirect-of-stderr", r#"( exec 2> err; echo e >&2; /bin/ls /nosuch ); echo after; wc -l < err"#),
+        // The last command of a subshell is the one allowed to hand a
+        // pty-backed job off to be driven elsewhere -- and inside a
+        // subshell there is nowhere to drive it from, so in a pane its
+        // output was dropped and its status came back 0. Only in a pane,
+        // and only for the last one: `( /bin/echo a; /bin/echo b )`
+        // printed just `a`.
+        case(
+            "a-subshells-last-command-is-waited-for",
+            r#"( /bin/echo one ); ( /bin/echo a; /bin/echo b ); ( /bin/false ); echo "rc=$?"; ( /bin/sh -c 'exit 7' ); echo "rc=$?""#,
+        ),
+        case(
+            "a-subshells-last-command-decides-a-condition",
+            r#"if ( /bin/false ); then echo t; else echo f; fi; if ( /bin/true ); then echo t; else echo f; fi"#,
+        ),
         // -- pipelines and subshells ----------------------------------
         case("pipeline", r#"printf 'b\na\n' | sort | head -1"#),
         // A half-line from a builtin has to reach fd 1 before the child

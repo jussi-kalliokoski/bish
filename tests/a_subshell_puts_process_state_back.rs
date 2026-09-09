@@ -10,12 +10,11 @@
 //! recorded by whatever moves it, and only what moved is put back.
 //!
 //! **The cwd and umask halves live in `bashdiff.rs`**, where they are
-//! checked against real bash. The fd half is here instead: it turns on a
-//! bare `exec > file` repointing the *process's own* descriptors, and a
-//! pane deliberately does not use those -- a builtin there writes to the
-//! pane's grid, so the corpus's pane pass would be measuring something
-//! else. Running the binary directly is the situation the behaviour is
-//! about.
+//! checked against real bash, and so does most of the fd half. What is
+//! here is the part a corpus case cannot easily say: these assert the
+//! exact bytes of the file afterwards, and one of them asserts that a
+//! top-level `exec > file` goes on applying -- which leaves the script
+//! with no stdout left to report on itself with.
 
 use std::process::Command;
 

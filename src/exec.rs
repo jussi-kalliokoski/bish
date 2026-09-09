@@ -1756,6 +1756,14 @@ pub struct Shell {
     // What this shell has changed about the *process* it shares with
     // everyone, and what it was before. See ProcessRestore.
     process_restore: ProcessRestore,
+    // Left by a bare `exec` naming the descriptors it moved, and taken
+    // by dispatch_builtin_or_external once that command's own redirect
+    // sink has been popped. The follow belongs on the sink that
+    // *survives* the command: while the arm runs, the sink is the one
+    // installed for that command's duration, and popping takes off one
+    // layer -- so a layer added there is the layer removed again. See
+    // follow_moved_descriptors.
+    descriptors_to_follow: Option<Vec<i32>>,
     // Bumped whenever the alias table changes, so run_program can tell
     // that a statement defined or removed one and the statements after
     // it must be read again. See aliases_mut.
@@ -2331,6 +2339,7 @@ impl Shell {
             exported_names: Rc::new(inherited.iter().map(|(k, _)| k.clone()).collect()),
             alias_epoch: 0,
             process_restore: ProcessRestore::default(),
+            descriptors_to_follow: None,
             parse_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
             underscore: None,
             globals: Rc::new(inherited.iter().cloned().collect()),
@@ -2698,6 +2707,7 @@ impl Shell {
             alias_epoch: self.alias_epoch,
             // Fresh: what the parent moved is the parent's to put back.
             process_restore: ProcessRestore::default(),
+            descriptors_to_follow: None,
             parse_cache: Rc::clone(&self.parse_cache),
             underscore: self.underscore.clone(),
             globals: Rc::clone(&self.globals),
@@ -5612,6 +5622,21 @@ impl Shell {
             ChildBody::Enclosed(raw) => child.run_source_enclosed(raw, "subshell"),
             ChildBody::Parsed(cmd) => crate::builtins::shell::run_command(&mut child, cmd, false),
         };
+        // A pty-backed job may be handed back rather than waited for, so
+        // that repl.rs's compositor can drive it while staying responsive
+        // (see ExecResult::Fg). Nothing can drive this one: it belongs to
+        // `child`, which is about to be dropped, and the escape only
+        // reaches here at all because a program's *last* statement is
+        // allowed to make it -- which the last statement of a subshell
+        // body is.
+        //
+        // So it was dropped, taking the job and everything it had to say
+        // with it, and `ExecResult::Fg` answers 0 when asked for a
+        // status. In a pane, `( /bin/false )` was a success and
+        // `( /bin/echo hi )` printed nothing; with two commands in the
+        // subshell only the last one vanished, because only the last one
+        // is allowed to hand itself off.
+        let result = child.settle_fg(result);
         // Real bash fires a subshell's own EXIT trap when it finishes
         // normally too, not just on an explicit `exit`/errexit (confirmed:
         // `(trap "echo bye" EXIT; echo hi)` prints both). The re-exec'd
@@ -7828,6 +7853,11 @@ impl Shell {
         if pushed {
             self.pop_builtin_output_sink();
         }
+        // With that command's own redirect sink off again, a bare `exec`
+        // can say where this shell's output goes from here.
+        if let Some(moved) = self.descriptors_to_follow.take() {
+            self.follow_moved_descriptors(&moved);
+        }
         result
     }
 
@@ -9261,10 +9291,12 @@ impl Shell {
                 // The one thing that repoints this process's own fd
                 // 0/1/2 in place, so the one thing that has to say so.
                 self.note_fd012_change();
+                let moved: Vec<i32> = redirs.actions.iter().map(FdAction::target).collect();
                 if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
+                self.descriptors_to_follow = Some(moved);
                 return ExecResult::Status(0);
             }
             _ => {}
@@ -11591,6 +11623,65 @@ impl Shell {
         (self.alias_epoch, self.shopt_is_on("expand_aliases"))
     }
 
+    /// Point this shell's own output at the descriptors a bare `exec`
+    /// has just repointed.
+    ///
+    /// `exec > file` moves the *process's* descriptors, and this shell
+    /// does not write through those: a builtin writes to `self.sink`,
+    /// and a spawned command is handed `self.stdio_override`. At the top
+    /// level neither is set and the two amount to the same thing --
+    /// which is why `exec > f; echo hi` always worked -- but inside a
+    /// `$( )` the sink is the substitution's capture, and in a pane the
+    /// pane's own plumbing answers first, and the redirect was ignored
+    /// by everything the shell printed. `v=$(exec > f; echo hi)` put
+    /// `hi` in `v` where bash puts it in the file and leaves `v` empty.
+    ///
+    /// Said by duplicating the descriptor rather than by clearing the
+    /// override, because "nothing overrides this" is not what happened:
+    /// a spawn asks whether stdout is already spoken for before handing
+    /// a command a pane's pty, and after this it very much is. One
+    /// `Capture` per stream, shared by the sink and the override, so
+    /// that what a builtin prints and what a spawned command prints
+    /// still share a write position and so still land in order.
+    ///
+    /// This shell's for good, not one command's -- that is what "bare
+    /// `exec`" means -- and discarded with the shell, so a subshell
+    /// doing it does not reach the one outside.
+    fn follow_moved_descriptors(&mut self, moved: &[i32]) {
+        let out = moved.contains(&1).then(|| dup_fd_as_file(1)).flatten().map(Capture::file);
+        let err = moved.contains(&2).then(|| dup_fd_as_file(2)).flatten().map(Capture::file);
+        if out.is_none() && err.is_none() && !moved.contains(&0) {
+            return;
+        }
+        if out.is_some() || err.is_some() {
+            let previous = std::mem::replace(&mut self.sink, OutputSink::Real);
+            self.sink = OutputSink::Builtin {
+                previous: Box::new(previous),
+                stdout: match &out {
+                    Some(c) => SinkStream::File(Rc::clone(c)),
+                    None => SinkStream::OuterOut,
+                },
+                stderr: match &err {
+                    Some(c) => SinkStream::File(Rc::clone(c)),
+                    None => SinkStream::OuterErr,
+                },
+            };
+        }
+        // Rebuilt rather than mutated: the override is shared with
+        // whatever handed it down, and this shell's `exec` is not
+        // theirs.
+        let kept = self.stdio_override.as_ref().map(|o| {
+            let o = o.borrow();
+            (o.stdin.clone(), o.stdout.clone(), o.stderr.as_ref().and_then(|f| f.try_clone().ok()))
+        });
+        let (stdin, stdout, stderr) = kept.unwrap_or((None, None, None));
+        self.stdio_override = Some(Rc::new(RefCell::new(StdioOverride {
+            stdin: if moved.contains(&0) { None } else { stdin },
+            stdout: out.or(stdout),
+            stderr: err.and_then(|c| c.descriptor()).or(stderr),
+        })));
+    }
+
     /// Called by whatever is about to move the process's working
     /// directory, umask or fds 0/1/2, so that the construct this shell
     /// is running under can put them back. See ProcessRestore.
@@ -12958,6 +13049,15 @@ enum FdAction {
     Open { fd: i32, file: std::fs::File },
     Dup { fd: i32, source: i32 },
     Close(i32),
+}
+
+impl FdAction {
+    // The descriptor this action moves.
+    fn target(&self) -> i32 {
+        match self {
+            FdAction::Open { fd, .. } | FdAction::Dup { fd, .. } | FdAction::Close(fd) => *fd,
+        }
+    }
 }
 
 // Associative-array storage (`declare -A`). Iterates in insertion order --
@@ -14855,6 +14955,19 @@ pub(crate) fn save_fd012_for_scheduler() -> [i32; 3] {
 
 pub(crate) fn restore_fd012_for_scheduler(saved: [i32; 3]) {
     restore_fd012(saved);
+}
+
+// A `File` holding a duplicate of `fd` as it stands now -- the way this
+// shell names "wherever a bare `exec` just pointed this stream".
+fn dup_fd_as_file(fd: i32) -> Option<std::fs::File> {
+    unsafe extern "C" {
+        fn dup(oldfd: i32) -> i32;
+    }
+    use std::os::fd::FromRawFd;
+    match unsafe { dup(fd) } {
+        d if d < 0 => None,
+        d => Some(unsafe { std::fs::File::from_raw_fd(d) }),
+    }
 }
 
 fn save_fd012() -> [i32; 3] {
