@@ -419,15 +419,32 @@ fn closing_bracket(pat: &[u8]) -> Option<usize> {
 // arrives as `[` + a literal `^` + `]` -- where they are the class's own
 // syntax rather than match_here's. Escaping them outside a class costs
 // nothing, since `\c` is a literal `c` wherever it appears.
-pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "*?[]\\@!+(^-".contains(c) {
-            out.push('\\');
+pub fn escape(s: &str) -> std::borrow::Cow<'_, str> {
+    // Borrowed when there is nothing to escape, which is the answer for
+    // most text: a quoted word is escaped on the way into a pattern
+    // whether or not it holds anything that needed it, so the common
+    // call is one that copies a string to change nothing about it. The
+    // return type is where that belongs -- a caller writing
+    // `push_str(&escape(x))` reads the same either way.
+    match s.bytes().any(is_pattern_syntax) {
+        false => std::borrow::Cow::Borrowed(s),
+        true => {
+            let mut out = String::with_capacity(s.len() + 4);
+            for c in s.chars() {
+                if c.is_ascii() && is_pattern_syntax(c as u8) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            std::borrow::Cow::Owned(out)
         }
-        out.push(c);
     }
-    out
+}
+
+/// One list, so the "is there anything to do" test and the loop that
+/// does it cannot drift apart.
+fn is_pattern_syntax(b: u8) -> bool {
+    matches!(b, b'*' | b'?' | b'[' | b']' | b'\\' | b'@' | b'!' | b'+' | b'(' | b'^' | b'-')
 }
 
 // Expands a glob pattern against the filesystem. Only the final path

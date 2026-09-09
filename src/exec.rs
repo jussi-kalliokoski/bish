@@ -7317,16 +7317,16 @@ impl Shell {
                     let name = name.clone();
                     self.check_nounset(&name);
                     let v = self.lookup_var(&name);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::Sub { raw, quoted, .. } => {
                     let v = self.run_command_substitution(raw);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::Arith { raw, quoted } => match self.eval_arith(raw) {
                     Ok(v) => {
                         let v = v.to_string();
-                        out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                        out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                     }
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", raw, e);
@@ -7342,13 +7342,13 @@ impl Shell {
                         Some(sliced) => self.joined_slice(sliced),
                         None => self.eval_var_op(&name, &op),
                     };
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::ArrayVar { name, index, quoted } => {
                     let name = name.clone();
                     let index = index.clone();
                     let v = self.array_element(&name, &index);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::ArrayLength { name, index } => {
                     let name = name.clone();
@@ -7363,23 +7363,23 @@ impl Shell {
                         Some(sliced) => self.joined_slice(sliced),
                         None => self.eval_array_var_op(&name, &index, &op),
                     };
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::Indirect { name, quoted } => {
                     let v = self.indirect_var(name);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::ArrayKeys { name, quoted } => {
                     let name = name.clone();
                     let sep = self.ifs_join_char();
                     let v = self.array_keys(&name).join(&sep);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::VarNamesMatchingPrefix { prefix, quoted, .. } => {
                     let prefix = prefix.clone();
                     let sep = self.ifs_join_char();
                     let v = self.var_names_with_prefix(&prefix).join(&sep);
-                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v });
+                    out.push_str(&if *quoted { crate::glob::escape(&v) } else { v.into() });
                 }
                 Chunk::ProcSubIn { raw } => {
                     let raw = raw.clone();
@@ -8254,15 +8254,19 @@ impl Shell {
             // a plain command name, so it never reaches this dispatch --
             // only bracket-style `[ ... ]` (the `test` alias) does.
             "[" => {
-                let mut a = argv[1..].to_vec();
-                if a.last().map(|s| s.as_str()) == Some("]") {
-                    a.pop();
-                } else {
-                    sh_eprintln!(self, "bish: [: missing closing ]");
-                    return ExecResult::Status(2);
-                }
-                let (vars, opts) = self.shell_test_answers(&a);
-                let outcome = builtins::test(&a, false, &builtins::ShellFacts { var_is_set: &vars, option_on: &opts });
+                // The closing `]` is punctuation, not an operand, so it
+                // is dropped by not looking at it -- rather than by
+                // copying every argument into a vector of its own to
+                // pop one off the end.
+                let args = match argv[1..].split_last() {
+                    Some((last, rest)) if last == "]" => rest,
+                    _ => {
+                        sh_eprintln!(self, "bish: [: missing closing ]");
+                        return ExecResult::Status(2);
+                    }
+                };
+                let (vars, opts) = self.shell_test_answers(args);
+                let outcome = builtins::test(args, false, &builtins::ShellFacts { var_is_set: &vars, option_on: &opts });
                 return ExecResult::Status(match outcome {
                     Ok(status) => status,
                     Err(e) => {
@@ -16214,7 +16218,7 @@ fn append_splittable_glob(
     ifs: &str,
 ) {
     append_splittable(fields, current, v, quoted, ifs);
-    let p = if quoted { crate::glob::escape(v) } else { v.to_string() };
+    let p = if quoted { crate::glob::escape(v) } else { v.into() };
     append_splittable(patterns, pattern_current, &p, quoted, ifs);
 }
 
@@ -16230,7 +16234,7 @@ fn append_parts_glob(
     parts: &[String],
 ) {
     append_parts(fields, current, parts);
-    let escaped: Vec<String> = parts.iter().map(|p| crate::glob::escape(p)).collect();
+    let escaped: Vec<String> = parts.iter().map(|p| crate::glob::escape(p).into_owned()).collect();
     append_parts(patterns, pattern_current, &escaped);
 }
 
