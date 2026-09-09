@@ -11092,6 +11092,9 @@ impl Shell {
     }
 
     fn expand_raw(&mut self, raw: &str) -> String {
+        if expands_to_itself(raw) {
+            return raw.to_string();
+        }
         let chunks = crate::lexer::parse_expansion_word(raw);
         self.expand_word(&Word { chunks, globbable: false })
     }
@@ -11108,6 +11111,9 @@ impl Shell {
     /// -- and it is literally that function, since a pattern operand is
     /// a pattern operand wherever it was written.
     fn expand_glob_pattern_raw(&mut self, raw: &str) -> String {
+        if expands_to_itself(raw) {
+            return raw.to_string();
+        }
         let chunks = crate::lexer::parse_expansion_word(raw);
         self.expand_glob_pattern_operand(&Word { chunks, globbable: false })
     }
@@ -11125,6 +11131,9 @@ impl Shell {
     /// same trick, and for the same reason, as
     /// `expand_glob_pattern_operand` does for glob metacharacters.
     fn expand_replacement_operand(&mut self, raw: &str) -> String {
+        if expands_to_itself(raw) {
+            return raw.to_string();
+        }
         let chunks = crate::lexer::parse_expansion_word(raw);
         let mut out = String::new();
         for chunk in &chunks {
@@ -16396,6 +16405,26 @@ fn expand_replacement(repl: &str, matched: &str) -> String {
     out
 }
 
+/// Whether a `${...}` operand can expand to anything but itself.
+///
+/// Very often it cannot. The operands scripts actually write are a
+/// literal character or two -- `${p//\//_}`, `${s#a}`, `${line%%:*}` --
+/// and lexing one into chunks only to walk them back into a `String`
+/// spends its time arriving at the text it started from. Twice per
+/// substitution, because the replacement half is expanded the same way,
+/// and again on every turn of a loop containing it.
+///
+/// Only a byte that can begin an expansion, quote something or escape
+/// something can make the answer differ from the input. The list is
+/// deliberately over-broad: a byte named here that would in fact have
+/// expanded to itself costs nothing but the slow path, while one missing
+/// from it would be a wrong answer. What keeps that honest is
+/// `the_shortcut_agrees_with_the_lexer`, which runs both paths over
+/// every operand shape it can think of and compares them.
+fn expands_to_itself(raw: &str) -> bool {
+    !raw.bytes().any(|b| matches!(b, b'$' | b'`' | b'\'' | b'"' | b'\\' | b'~'))
+}
+
 fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: ReplaceAnchor) -> String {
     let chars: Vec<char> = s.chars().collect();
     let bounds = char_bounds(s);
@@ -17452,7 +17481,118 @@ mod spawn_guard {
 
 #[cfg(test)]
 mod replacement_tests {
-    use super::{ReplaceAnchor, glob_replace};
+    use super::{ReplaceAnchor, expands_to_itself, glob_replace};
+
+    /// The shortcut is a claim about the lexer, so it is checked against
+    /// the lexer rather than argued about.
+    ///
+    /// For every operand shape below: if `expands_to_itself` says the
+    /// text is its own expansion, then all three slow paths -- the plain
+    /// one, the pattern one that preserves quoting, and the replacement
+    /// one that preserves `&` -- must hand back exactly the input. A
+    /// byte the predicate wrongly waved through would show up here.
+    #[test]
+    fn the_shortcut_agrees_with_the_lexer() {
+        let operands = [
+            // what real scripts write
+            "",
+            ":",
+            "/",
+            ".",
+            "-",
+            "a",
+            "abc",
+            "hello ",
+            " ",
+            "\t",
+            "\n",
+            "a b c",
+            // glob syntax, which is not expansion syntax
+            "*",
+            "?",
+            "[a-z]",
+            "[[:space:]]",
+            "[^abc]",
+            "a*b",
+            "*.txt",
+            "@(a|b)",
+            "!(x)",
+            "+(y)",
+            "?(z)",
+            // punctuation that means something somewhere else
+            "&",
+            "&&",
+            "#",
+            "##",
+            "%",
+            "%%",
+            "^",
+            "^^",
+            ",",
+            ",,",
+            "!",
+            ";",
+            "|",
+            "(",
+            ")",
+            "{",
+            "}",
+            "=",
+            "+",
+            "<",
+            ">",
+            "[",
+            "]",
+            "a=b",
+            "x;y",
+            "a|b",
+            "{a,b}",
+            "a-b",
+            "1..3",
+            // non-ASCII
+            "\u{e4}\u{f6}",
+            "\u{1f600}",
+            "caf\u{e9}",
+            "a\u{300}b",
+            // and the ones the guard must refuse
+            "$v",
+            "${v}",
+            "$(cmd)",
+            "`cmd`",
+            "'q'",
+            "\"q\"",
+            "\\*",
+            "~",
+            "~/x",
+            "a$b",
+            "a~b",
+            "a\\b",
+            "a'b",
+            "a\"b",
+            "a`b",
+        ];
+        let mut shell = super::Shell::new();
+        for raw in operands {
+            if !expands_to_itself(raw) {
+                continue;
+            }
+            assert_eq!(shell.expand_raw(raw), raw, "expand_raw disagreed on {raw:?}");
+            assert_eq!(shell.expand_glob_pattern_raw(raw), raw, "expand_glob_pattern_raw disagreed on {raw:?}");
+            assert_eq!(shell.expand_replacement_operand(raw), raw, "expand_replacement_operand disagreed on {raw:?}");
+        }
+    }
+
+    /// ...and it refuses what it has to, or it is costing everyone the
+    /// lexer for nothing.
+    #[test]
+    fn the_shortcut_refuses_only_what_it_has_to() {
+        for raw in ["$v", "${v}", "$(echo x)", "`echo x`", "'q'", "\"q\"", "\\*", "~"] {
+            assert!(!expands_to_itself(raw), "{raw:?} must take the slow path");
+        }
+        for raw in ["*", "[[:space:]]", "&", "a b", "#", "%%", "@(a|b)"] {
+            assert!(expands_to_itself(raw), "{raw:?} is its own expansion and should not pay for the lexer");
+        }
+    }
 
     // Reachable only through extglob, which bash has off by default and
     // bish cannot turn off, so the bashdiff corpus cannot ask for it:
