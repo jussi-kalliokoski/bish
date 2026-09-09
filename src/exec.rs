@@ -11518,6 +11518,20 @@ impl Shell {
 
     fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
         let mut out = Vec::new();
+        // Once for the whole command, not once per field. Each of the
+        // three options is a miss in the shopt override table falling
+        // through to a linear walk of the 119 names and their defaults,
+        // and asking inside the loop meant paying for all three on every
+        // field of every command -- whether or not the field was a
+        // pattern at all, since this is an argument and so is evaluated
+        // before the call that would have ignored it.
+        //
+        // Safe to read once: nothing expanded here can change the
+        // answer. `shopt` inside a `$( )` runs in a virtual child with
+        // its own table (see new_virtual_child), which is exactly why
+        // `echo $(shopt -s nullglob) *` does not change how the `*`
+        // beside it behaves -- in bash either, for the same reason.
+        let opts = self.glob_options();
         for w in words {
             if w.globbable {
                 // globbable implies no quoting/expansion at all in the word
@@ -11525,7 +11539,7 @@ impl Shell {
                 // glob-check the single literal value as before.
                 let s = self.expand_word(w);
                 if !self.opt_noglob
-                    && let Some(matches) = glob::expand(&s, self.glob_options(), &self.cwd)
+                    && let Some(matches) = glob::expand(&s, opts, &self.cwd)
                 {
                     let kept = self.apply_globignore(matches);
                     // Everything the pattern found was ignored, so it
@@ -11546,7 +11560,7 @@ impl Shell {
                     out.extend(fields);
                 } else {
                     for (field, pattern) in fields.into_iter().zip(patterns.into_iter()) {
-                        match glob::expand(&pattern, self.glob_options(), &self.cwd).map(|m| self.apply_globignore(m)) {
+                        match glob::expand(&pattern, opts, &self.cwd).map(|m| self.apply_globignore(m)) {
                             Some(matches) if !matches.is_empty() => out.extend(matches),
                             // A pattern that matched nothing. Not the
                             // same as a word that was never a pattern,
