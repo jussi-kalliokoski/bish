@@ -1324,7 +1324,30 @@ fn split_row(content: &Content, columns: Option<usize>) -> Vec<Content> {
             while e > s && chars[e - 1].is_whitespace() {
                 e -= 1;
             }
-            Content { chars: chars[s..e].to_vec(), offsets: content.offsets[s..e].to_vec() }
+            // GFM's one table-level escape: `\|` is a literal pipe in a
+            // cell. The spec applies it here, before inline parsing --
+            // "including inside other inline spans" -- which is the
+            // whole point of it: a code span is the one place a pipe
+            // cannot be written any other way, and a backslash left in
+            // would be shown rather than consumed. Only `\|`; every
+            // other escape is the inline parser's business.
+            //
+            // A `|` inside a cell is always exactly this case. The scan
+            // above steps over a backslash and whatever follows it, so
+            // an unescaped `|` would have ended the cell, and a `\\`
+            // pairs with itself and leaves the `|` after it a delimiter.
+            let mut cell = Content { chars: Vec::new(), offsets: Vec::new() };
+            let mut i = s;
+            while i < e {
+                if chars[i] == '\\' && chars.get(i + 1) == Some(&'|') {
+                    i += 1;
+                    continue;
+                }
+                cell.chars.push(chars[i]);
+                cell.offsets.push(content.offsets[i]);
+                i += 1;
+            }
+            cell
         })
         .collect();
     // `None` while counting the header's own columns; `Some` once that

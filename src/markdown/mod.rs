@@ -512,6 +512,46 @@ mod tests {
         assert_tree("~~gone~~ and ~one~\n", "p: ~~gone~~ and ~~one~~\n");
     }
 
+    /// `\|` is a literal pipe in a table cell, and the only way to
+    /// write one -- which is why GFM applies the escape at the table
+    /// level, before inline parsing, "including inside other inline
+    /// spans". A code span is exactly the case that needs it: there is
+    /// no other spelling of a pipe inside backticks, and the backslash
+    /// used to survive into the output and be shown.
+    ///
+    /// The middle row is GFM's own example for this, whose cell is
+    /// `b <code>|</code> az`.
+    #[test]
+    fn an_escaped_pipe_is_a_pipe_even_inside_a_code_span() {
+        let doc = parse("| f\\|oo |\n| ------ |\n| b `\\|` az |\n| `${s/:/\\|}` |\n");
+        let Block::Table(table) = &doc.blocks[0] else { panic!("expected a table, got {:?}", doc.blocks[0]) };
+        assert_eq!(table.head.len(), 1, "an escaped pipe must not open a second column");
+        assert_eq!(table.rows.len(), 2);
+        let text = |cell: &Vec<Inline>| -> String {
+            cell.iter()
+                .map(|i| match i {
+                    Inline::Text { text, .. } => text.clone(),
+                    Inline::Code { text, .. } => format!("`{text}`"),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(text(&table.head[0]), "f|oo");
+        // The backslash is gone before the code span is parsed, so the
+        // span holds the pipe itself rather than an escape of one.
+        let code = |cell: &Vec<Inline>| -> String {
+            cell.iter()
+                .filter_map(|i| match i {
+                    Inline::Code { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(code(&table.rows[0][0]), "|", "GFM's own example: b `|` az");
+        assert_eq!(code(&table.rows[1][0]), "${s/:/|}");
+        assert_eq!(table.rows[0].len(), 1, "still one cell, not two");
+    }
+
     #[test]
     fn gfm_tables_with_alignment() {
         assert_tree(
