@@ -154,6 +154,20 @@ struct ClipboardTool {
 // e.g. wl-clipboard under WSLg or xclip installed via XQuartz on macOS,
 // which a `cfg(target_os)` gate would miss.
 fn detect_clipboard_tool() -> Option<ClipboardTool> {
+    // Never during a test run. `new_for_test` is the deliberate way to
+    // opt one `Registers` out, but it only covers the tests that
+    // remember to ask, and anything that builds a real one some other
+    // way -- an `App`, a `HexSession` before `attach_registers` reaches
+    // it -- talks to the machine's actual clipboard. That clobbers
+    // whatever the developer had copied, and worse: `wl-copy`
+    // daemonizes to serve the selection and keeps the stdout it
+    // inherited, so `cargo test | anything` never sees EOF and hangs
+    // after every test has already passed. Nothing in a test run has
+    // any business reaching the real clipboard, so there is nothing on
+    // PATH to find.
+    if cfg!(test) {
+        return None;
+    }
     let candidates: [ClipboardTool; 4] = [
         ClipboardTool { copy: ("pbcopy", &[]), paste: ("pbpaste", &[]) },
         ClipboardTool { copy: ("xclip", &["-selection", "clipboard"]), paste: ("xclip", &["-selection", "clipboard", "-o"]) },
@@ -646,6 +660,18 @@ mod tests {
         regs.set_last_insert("original".to_string());
         regs.write(Some('.'), char_val("should not stick"));
         assert_eq!(regs.read(Some('.')).text, "original");
+    }
+
+    // Vacuous on a machine with no clipboard tool installed, which is
+    // exactly the machine where this never went wrong. On one that has
+    // `wl-copy`, it is the difference between a test suite that leaves
+    // the developer's clipboard and a stray daemon behind and one that
+    // does not.
+    #[test]
+    fn a_test_run_never_reaches_the_real_clipboard() {
+        assert!(detect_clipboard_tool().is_none(), "a test found a clipboard tool on PATH and would have used it");
+        let registers = Registers::new();
+        assert!(registers.unnamed.tool.is_none(), "...and so would an ordinary Registers built inside a test");
     }
 
     #[test]
