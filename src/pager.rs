@@ -30,6 +30,15 @@ pub struct Pager {
     lines: Vec<String>,
     // First visible line.
     top: usize,
+    // First visible *column*, for a document wider than the pane --
+    // which a table is, whenever `table_wrap` is off. Prose never needs
+    // it (it was wrapped to fit), so this is 0 for the whole life of
+    // most documents.
+    left: usize,
+    // The widest line's display width, measured once. What decides how
+    // far `left` may go, and asking it of every line on every keystroke
+    // would be a scan of the whole document per press.
+    widest: usize,
     rows: usize,
     cols: usize,
     // The last search and where the matches are, so `n`/`N` can step
@@ -54,12 +63,20 @@ pub enum Outcome {
     Click(crate::editor::MouseEvent),
 }
 
+// How far one press moves sideways. A column at a time is too slow to
+// cross a table with and a screen at a time loses the columns you were
+// comparing; eight is about a cell.
+const SIDE_STEP: usize = 8;
+
 impl Pager {
     pub fn new(title: &str, lines: Vec<String>, rows: usize, cols: usize) -> Pager {
+        let widest = lines.iter().map(|l| strip_sgr(l).chars().map(char_width).sum::<usize>()).max().unwrap_or(0);
         Pager {
             title: title.to_string(),
             lines,
             top: 0,
+            left: 0,
+            widest,
             // One row for the title, one for the status bar.
             rows: rows.saturating_sub(2).max(1),
             cols,
@@ -86,17 +103,40 @@ impl Pager {
 
     // The largest `top` that still shows content: scrolling stops with
     // the last line on screen rather than running off into blank rows.
+    // Which column is at the left, so a re-render at a new width can
+    // come back to it -- the same reason `top_line` exists.
+    pub fn left_column(&self) -> usize {
+        self.left
+    }
+
+    pub fn scroll_columns_to(&mut self, column: usize) {
+        self.left = column.min(self.max_left());
+    }
+
     fn max_top(&self) -> usize {
         self.lines.len().saturating_sub(self.rows)
     }
 
+    // Never past the last column that has anything on it: scrolling into
+    // empty space would leave the reader looking at a blank pane with no
+    // clue which way is back.
+    fn max_left(&self) -> usize {
+        self.widest.saturating_sub(self.cols)
+    }
+
     fn clamp(&mut self) {
         self.top = self.top.min(self.max_top());
+        self.left = self.left.min(self.max_left());
     }
 
     fn scroll_by(&mut self, delta: isize) {
         let next = self.top as isize + delta;
         self.top = next.clamp(0, self.max_top() as isize) as usize;
+    }
+
+    fn scroll_sideways_by(&mut self, delta: isize) {
+        let next = self.left as isize + delta;
+        self.left = next.clamp(0, self.max_left() as isize) as usize;
     }
 
     // Puts `line` on screen, roughly a third from the top when it isn't
@@ -162,6 +202,21 @@ impl Pager {
             }
             Key::CtrlB | Key::PageUp => {
                 self.scroll_by(-(self.rows as isize));
+                Outcome::Continue
+            }
+            Key::Char('l') | Key::Right => {
+                self.scroll_sideways_by(SIDE_STEP as isize);
+                Outcome::Continue
+            }
+            Key::Char('h') | Key::Left => {
+                self.scroll_sideways_by(-(SIDE_STEP as isize));
+                Outcome::Continue
+            }
+            // Back to the left edge, vim's own `0`. There is no `$` to
+            // go with it: the right edge of the widest line is not where
+            // any particular line ends, so landing there means nothing.
+            Key::Char('0') => {
+                self.left = 0;
                 Outcome::Continue
             }
             Key::Char('g') | Key::Home => {
@@ -265,7 +320,7 @@ impl Pager {
         for row in 0..self.rows {
             out.push_str(&at(row + 1));
             let line = self.lines.get(self.top + row).map(String::as_str).unwrap_or("");
-            out.push_str(&pad_to_width(line, self.cols));
+            out.push_str(&window_to_width(line, self.left, self.cols));
         }
         // The status row is this pane's own last row, never the
         // terminal's -- with a split above or below, those are different
@@ -296,16 +351,32 @@ impl Pager {
             (Some(i), n) if n > 0 => format!("  match {}/{}", i + 1, n),
             _ => String::new(),
         };
-        format!("{}-{} of {}  {}{}   j/k \u{2191}\u{2193} scroll  / search  q quit", self.top + 1, last, self.lines.len(), position, found)
+        // The sideways half of the vocabulary is only mentioned when
+        // there is something off to the side to reach -- which for a
+        // document of prose there never is.
+        let keys = if self.max_left() > 0 { "j/k h/l scroll" } else { "j/k \u{2191}\u{2193} scroll" };
+        format!("{}-{} of {}  {}{}   {keys}  / search  q quit", self.top + 1, last, self.lines.len(), position, found)
     }
 }
 
-// Pads (or truncates) to exactly `cols` columns, measuring what the line
-// draws rather than how many bytes it holds and keeping every SGR
-// sequence it passes -- dropping one would leave the rest of the screen
-// in whatever style happened to be active.
+// Pads (or truncates) to exactly `cols` columns, from the left edge --
+// what the title and status rows want, which never scroll.
 fn pad_to_width(line: &str, cols: usize) -> String {
+    window_to_width(line, 0, cols)
+}
+
+// The `cols` columns of `line` starting at column `left`, padded to
+// exactly that width. Measures what the line draws rather than how many
+// bytes it holds, and keeps every SGR sequence it passes -- including
+// the ones belonging to characters scrolled off to the left, since the
+// style at the left edge is whatever they last said, and dropping one
+// would leave the rest of the screen in whatever style happened to be
+// active.
+fn window_to_width(line: &str, left: usize, cols: usize) -> String {
     let mut out = String::new();
+    // Where we are in the line, and how much of the window is filled --
+    // the same number only when `left` is 0.
+    let mut col = 0;
     let mut width = 0;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
@@ -320,12 +391,19 @@ fn pad_to_width(line: &str, cols: usize) -> String {
             }
             continue;
         }
-        let w = char_width(c);
-        if width + w > cols {
+        let start = col;
+        col += char_width(c);
+        if col <= left {
+            continue;
+        }
+        // A wide glyph straddling the left edge has no half to draw, so
+        // the columns of it that are on screen are blank.
+        let (text, drawn) = if start < left { (" ".repeat(col - left), col - left) } else { (c.to_string(), col - start) };
+        if width + drawn > cols {
             break;
         }
-        width += w;
-        out.push(c);
+        width += drawn;
+        out.push_str(&text);
     }
     // The reset matters: a line that ended mid-style would otherwise
     // paint the padding, and the row below it, in that style.
@@ -470,6 +548,65 @@ mod tests {
 
     fn visible_width(s: &str) -> usize {
         strip_sgr(s).chars().map(char_width).sum()
+    }
+
+    // With `table_wrap` off a table keeps its own width and runs off the
+    // side, so the view has to be able to go and get the rest of it.
+    #[test]
+    fn a_document_wider_than_the_pane_scrolls_sideways() {
+        let wide: String = ('a'..='z').chain('A'..='Z').collect();
+        let mut p = Pager::new("t", vec!["short".to_string(), wide.clone()], 6, 20);
+        assert_eq!(visible_row(&p, 1), "abcdefghijklmnopqrst");
+
+        p.handle_key(Key::Char('l'));
+        assert_eq!(visible_row(&p, 1), "ijklmnopqrstuvwxyzAB", "one step is SIDE_STEP columns");
+        // ...and the line that ran out is blank rather than repeating
+        // its last character.
+        assert_eq!(visible_row(&p, 0), " ".repeat(20));
+
+        p.handle_key(Key::Char('h'));
+        assert_eq!(visible_row(&p, 1), "abcdefghijklmnopqrst");
+        // `h` at the left edge stays there rather than wrapping around.
+        p.handle_key(Key::Char('h'));
+        assert_eq!(p.left_column(), 0);
+
+        p.handle_key(Key::Char('l'));
+        p.handle_key(Key::Char('0'));
+        assert_eq!(p.left_column(), 0, "0 comes straight back to the left edge");
+    }
+
+    // Never into empty space: the last column that has anything on it is
+    // as far right as there is anything to see.
+    #[test]
+    fn scrolling_sideways_stops_at_the_widest_line() {
+        let mut p = Pager::new("t", vec!["x".repeat(30)], 6, 20);
+        for _ in 0..20 {
+            p.handle_key(Key::Right);
+        }
+        assert_eq!(p.left_column(), 10, "30 columns of line, 20 of pane");
+        assert_eq!(visible_row(&p, 0), "x".repeat(20));
+        // A document narrower than the pane has nowhere to go at all.
+        let mut narrow = Pager::new("t", vec!["x".to_string()], 6, 20);
+        narrow.handle_key(Key::Right);
+        assert_eq!(narrow.left_column(), 0);
+    }
+
+    // Every row is still exactly the pane's width once scrolled, and the
+    // style that applied to the characters now off to the left still
+    // applies to what replaced them -- the escape sequences are kept
+    // even where the text they styled was dropped.
+    #[test]
+    fn a_scrolled_row_keeps_its_width_and_its_styling() {
+        let line = format!("\x1b[1m{}\x1b[0m", "x".repeat(30));
+        assert_eq!(visible_width(&window_to_width(&line, 8, 20)), 20);
+        assert!(window_to_width(&line, 8, 20).starts_with("\x1b[1m"), "the style survives the columns it was applied to");
+        // A wide glyph cut in half by the left edge draws as the blank
+        // columns of it that are on screen, not as itself.
+        assert_eq!(strip_sgr(&window_to_width("\u{65e5}\u{672c}", 1, 4)), " \u{672c} ");
+    }
+
+    fn visible_row(p: &Pager, row: usize) -> String {
+        strip_sgr(&window_to_width(&p.lines[p.top + row], p.left, p.cols))
     }
 
     // A resize re-renders the whole *document* (the wrap width changed,

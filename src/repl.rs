@@ -11307,9 +11307,10 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
             last_size = (app.term_rows, app.term_cols);
             rect = app.focused_pane_rect();
             compositor_redraw(app);
-            let top_line = view.top_line();
+            let (top_line, left_column) = (view.top_line(), view.left_column());
             view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
             view.scroll_to(top_line);
+            view.scroll_columns_to(left_column);
         }
         match view.handle_key(key) {
             crate::pager::Outcome::Quit => break,
