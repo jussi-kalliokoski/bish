@@ -45,6 +45,12 @@ pub struct HighlightContext<'a> {
     // typed as a command -- treating it as "valid" here would be
     // actively misleading.
     pub known_functions: Option<&'a HashSet<String>>,
+    // Command names the *line* has that the shell does not -- the
+    // editor's colon line, where `:preview` and `:diag` are real
+    // commands and live nowhere on PATH, so checking PATH for them
+    // paints a working command as an error. `None` at the ordinary
+    // prompt, whose vocabulary is the shell's and nothing more.
+    pub line_commands: Option<&'a [&'a str]>,
     // Unlike cwd/known_functions above, never read by the highlight_into
     // recursion itself (that step only ever produces a HighlightKind, not
     // a color) -- carried on this same bundle purely because every real
@@ -1119,14 +1125,17 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "printf",
 ];
 
-// A command name is valid if it's a known builtin, one of the session's
-// own defined functions, a directly executable file (for a name
-// containing '/'), or resolvable on PATH otherwise. Deliberately does NOT
-// check aliases -- see HighlightContext::known_functions's own doc
-// comment on why an alias name isn't actually safe to call "valid" in
-// this shell.
+// A command name is valid if it's a known builtin, one of the line's own
+// commands, one of the session's own defined functions, a directly
+// executable file (for a name containing '/'), or resolvable on PATH
+// otherwise. Deliberately does NOT check aliases -- see
+// HighlightContext::known_functions's own doc comment on why an alias
+// name isn't actually safe to call "valid" in this shell.
 fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
     if KNOWN_BUILTINS.contains(&name) {
+        return true;
+    }
+    if ctx.line_commands.is_some_and(|c| c.contains(&name)) {
         return true;
     }
     if ctx.known_functions.is_some_and(|f| f.contains(name)) {
@@ -2276,9 +2285,24 @@ mod tests {
     fn is_valid_command_name_recognizes_a_known_function() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None, hyperlinks: false };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), ..HighlightContext::default() };
         assert!(is_valid_command_name("my_func", &ctx));
         assert!(!is_valid_command_name("other_func", &ctx));
+    }
+
+    // The editor's colon line: `:preview` is a real command that no
+    // PATH scan will ever find, and painting it as an error says the
+    // opposite of the truth. The same line still has to be honest about
+    // a name that really is nothing.
+    #[test]
+    fn is_valid_command_name_recognizes_one_of_the_lines_own_commands() {
+        let commands = ["preview", "diag"];
+        let ctx = HighlightContext { line_commands: Some(&commands), ..HighlightContext::default() };
+        assert!(is_valid_command_name("preview", &ctx));
+        assert!(!is_valid_command_name("bish-definitely-not-a-real-command-xyz", &ctx));
+        // ...and they belong to that line alone: the ordinary prompt has
+        // no `preview` to run.
+        assert!(!is_valid_command_name("preview", &HighlightContext::default()));
     }
 
     #[test]
@@ -2365,7 +2389,7 @@ mod tests {
     fn a_call_to_a_known_function_is_not_flagged_invalid() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), color_overrides: None, hyperlinks: false };
+        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), ..HighlightContext::default() };
         let spans = BashHighlighter.highlight("my_func arg", ctx);
         assert!(!spans.iter().any(|s| s.kind == HighlightKind::InvalidCommand), "{spans:?}");
     }

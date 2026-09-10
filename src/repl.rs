@@ -730,6 +730,9 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             known_functions: Some(&known_functions),
             color_overrides: Some(&color_overrides),
             hyperlinks,
+            // The shell prompt is the shell's whole vocabulary -- the
+            // editor's colon commands are the colon line's own.
+            line_commands: None,
         };
         // Same owned-snapshot pattern as cwd_snapshot/known_functions above
         // -- registered `complete NAME` specs, the contextual shell data
@@ -11760,6 +11763,55 @@ enum CommandModeOutcome {
 // off the same way, or left as-is when this function returns (the
 // caller's own compositor_redraw, wherever it ends up happening, clears
 // it).
+// The editor's own colon-line vocabulary: the command names the match
+// below answers to that are the editor's rather than the shell's.
+//
+// A copy of what that match spells out, and the only honest way to have
+// one -- a `match` arm is not a registry that can be read back, the way
+// `bishopt`'s own completion reads the option registry. What keeps the
+// copy honest is a test: every `:name` the help screen documents has to
+// appear here, which is exactly the gap that let `:preview` be a
+// documented command the colon line painted as an error.
+//
+// Two things need it, and would each have grown a list of their own
+// otherwise. The highlighter, so a real command is not shown red for
+// being absent from PATH -- it *is* absent from PATH, and so is every
+// other command on this line. And completion, so `:prev<Tab>` finishes
+// the word, which is the other half of the same question.
+pub(crate) const COLON_COMMANDS: &[&str] = &[
+    "dbg",
+    "debug",
+    "diag",
+    "diagnose",
+    "diff",
+    "e!",
+    "edit!",
+    "fmt",
+    "format",
+    "git",
+    "h",
+    "help",
+    "noh",
+    "nohl",
+    "nohlsearch",
+    "norm",
+    "normal",
+    "prev",
+    "preview",
+    "q",
+    "q!",
+    "rename",
+    "rn",
+    "sym",
+    "symbols",
+    "w",
+    "w!",
+    "wq",
+    "write",
+    "write!",
+    "x",
+];
+
 fn run_command_mode(
     app: &mut App,
     session_id: SessionId,
@@ -11810,6 +11862,7 @@ fn run_command_mode(
         let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
         let builtin_completion = crate::bishedit::completion::BuiltinCompletionProvider {
             hl_names: app.sessions.get(&session_id).map(|s| s.shell.hl_colors().into_iter().map(|(name, _)| name).collect()).unwrap_or_default(),
+            commands: COLON_COMMANDS,
         };
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
@@ -11820,10 +11873,13 @@ fn run_command_mode(
         // reports: true -- command mode gives Ctrl-L its own meaning
         // (toggling the transcript view, below) rather than the
         // ordinary shell prompt's "clear the real screen."
-        // HighlightContext::default() (cwd/known_functions both None) --
-        // no single clearly-current session at this call site, and command
+        // The highlight context is `default()` but for one field: no
+        // single clearly-current session at this call site, and command
         // mode types window-management subcommands, not shell command
-        // lines. cwd being None skips file/dir Link detection entirely;
+        // lines. The exception is `line_commands` -- this line answers to
+        // the editor's own commands as well as the shell's, and without
+        // them every one of those shows red for not being on PATH.
+        // cwd being None skips file/dir Link detection entirely;
         // known_functions being None doesn't skip command-validity
         // checking (that still runs against builtins/PATH), it just can't
         // recognize a session-specific function as valid there -- a minor,
@@ -11840,7 +11896,10 @@ fn run_command_mode(
         // *while* looking at the buffer it changes. Which is also why it
         // gets the one snapshot it cannot do without: `::bish hl`'s
         // namespace is open, so what is *set* is knowable only from the
-        // session. menu_capable: false
+        // session. It also gets `COLON_COMMANDS`, the other half of the
+        // same fix the highlight context above gets them for: a command
+        // that cannot be completed is one you have to have memorised.
+        // menu_capable: false
         // -- this colon line has no row of its own to draw a menu into,
         // so Tab cycles by splicing, which is what a one-line prompt
         // wants anyway.
@@ -11861,7 +11920,10 @@ fn run_command_mode(
                 pending_initial.take(),
                 0,
                 app.term_cols,
-                HighlightContext::default(),
+                // Not `default()` outright: this line's commands are the
+                // editor's own, and nothing else about the context is
+                // knowable here (see the note above on why).
+                HighlightContext { line_commands: Some(COLON_COMMANDS), ..HighlightContext::default() },
                 Some(&builtin_completion),
                 None,
                 false,
@@ -15691,6 +15753,37 @@ mod substitute_command_tests {
         assert_eq!(parse_line_command("d"), Some(Delete { from: LineRef::Current, to: LineRef::Current }));
         for other in ["w", "wq", "q!", "set number", "diag", "2dd", "2x", "1m", "normal"] {
             assert_eq!(parse_line_command(other), None, "{other:?}");
+        }
+    }
+
+    // `:preview` was a documented command that the colon line painted
+    // red and would not complete, because COLON_COMMANDS is a copy of a
+    // `match` and copies drift. This is what stops the next one:
+    // everything the help screen tells you to type has to be a name the
+    // line knows.
+    #[test]
+    fn every_documented_colon_command_is_one_the_line_knows() {
+        // The two documented entries that are not command *words*:
+        // `:!CMD` runs a shell command, and `:s/PAT/REPL/` reaches its
+        // own parser before the dispatch ever splits a word off.
+        let not_words = ["!CMD", "s"];
+        let chars: Vec<char> = EDITOR_HELP_MARKDOWN.chars().collect();
+        let mut documented = Vec::new();
+        for i in 0..chars.len().saturating_sub(1) {
+            if chars[i] != '`' || chars[i + 1] != ':' {
+                continue;
+            }
+            let name: String = chars[i + 2..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == '!').collect();
+            if !name.is_empty() {
+                documented.push(name);
+            }
+        }
+        assert!(documented.len() > 5, "the help screen's colon table should have been found: {documented:?}");
+        for name in documented {
+            if not_words.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(COLON_COMMANDS.contains(&name.as_str()), "`:{name}` is documented but the colon line does not know it");
         }
     }
 

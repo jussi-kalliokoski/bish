@@ -447,6 +447,11 @@ pub struct BuiltinCompletionProvider {
     /// it, and changing a colour is something you do while looking at
     /// the buffer it changes, so this one snapshot is worth carrying.
     pub hl_names: Vec<String>,
+    /// The command names this line has of its own -- the editor's colon
+    /// commands (`repl::COLON_COMMANDS`), which no PATH scan would ever
+    /// turn up because they are the editor's, not the system's. Empty
+    /// for a caller whose line has no vocabulary beyond the shell's.
+    pub commands: &'static [&'static str],
 }
 
 impl CompletionProvider for BuiltinCompletionProvider {
@@ -457,7 +462,10 @@ impl CompletionProvider for BuiltinCompletionProvider {
         let prefix: String = chars[word_start..cursor].iter().collect();
         let prefix_text: String = chars[..word_start].iter().collect();
         let role = classify_word_role(&prefix_text);
-        let candidates = builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names).unwrap_or_default();
+        let candidates = match role {
+            CmdRole::Command => rank(&prefix, self.commands.iter().map(|c| c.to_string()).collect()),
+            CmdRole::Argument { .. } => builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names).unwrap_or_default(),
+        };
         CompletionResult { word_start, candidates }
     }
 }
@@ -1409,7 +1417,7 @@ mod tests {
 
     fn bishopt_at(line: &str) -> Vec<String> {
         let cursor = line.chars().count();
-        BuiltinCompletionProvider { hl_names: Vec::new() }
+        BuiltinCompletionProvider { hl_names: Vec::new(), commands: &[] }
             .complete(CompletionRequest { line, cursor })
             .candidates
             .into_iter()
@@ -1516,9 +1524,22 @@ mod tests {
         // provider, which is the one place it had to be threaded rather
         // than read.
         let line = "::bish hl --unset ";
-        let colon = BuiltinCompletionProvider { hl_names: strs(&["colonLineOnly"]) };
+        let colon = BuiltinCompletionProvider { hl_names: strs(&["colonLineOnly"]), commands: &[] };
         let found = colon.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert_eq!(display_names(found.candidates), strs(&["colonLineOnly"]));
+    }
+
+    // A line with a vocabulary of its own completes it in command
+    // position, and only there -- an argument still belongs to whatever
+    // command it follows.
+    #[test]
+    fn the_lines_own_commands_complete_in_command_position() {
+        let provider = BuiltinCompletionProvider { hl_names: Vec::new(), commands: &["preview", "prev", "diag"] };
+        let at = |line: &str| display_names(provider.complete(CompletionRequest { line, cursor: line.chars().count() }).candidates);
+        assert_eq!(at("prev"), strs(&["prev", "preview"]));
+        assert_eq!(at("di"), strs(&["diag"]));
+        // Nothing to offer for a word that is an argument, not a command.
+        assert_eq!(at("diag prev"), Vec::<String>::new());
     }
 
     // Ordered by `rank` like every other candidate list here, which for
