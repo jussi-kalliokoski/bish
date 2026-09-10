@@ -17010,6 +17010,18 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // (bishedit::tabular::style says which have one), so matching
     // everything means "wherever this is implemented, use it".
     ("tabular", BishOptDefault::Str("*")),
+    // The other place columns have to line up, and the one where the
+    // text is bish's rather than the file's: a table in a rendered
+    // markdown document (`:preview`, `:help`). On, a table too wide for
+    // the pane is fitted to it -- the columns give up width in
+    // proportion to what they asked for and the cells wrap inside them,
+    // so the whole table is on screen at the cost of taller rows. Off,
+    // every column keeps the width its widest cell wants and the table
+    // runs off the side, to be read by scrolling the pager sideways --
+    // which is what a table of numbers usually wants, since a wrapped
+    // cell is harder to compare down a column than an off-screen one is
+    // to scroll to.
+    ("table_wrap", BishOptDefault::Bool(true)),
     // Whether bish pays attention to `.gitignore` at all. On, the file
     // browser leaves ignored files out of its listing until `i` asks
     // for them; off, there is no such thing as an ignored file anywhere
@@ -17208,6 +17220,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("extends", "Shown in the last column when a line continues off the right edge."),
     ("precedes", "Shown in the first column when a line continues off the left edge."),
     ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
+    ("table_wrap", "Fit a rendered markdown table to the pane by wrapping its cells. Off, it keeps its full width and the pager scrolls sideways."),
     ("gitignore", "Honour `.gitignore`: the browser and completion leave ignored files out."),
     ("lsp", "Use the language servers registered with `::bish lsp add`."),
     ("lsp_timeout_ms", "How long to wait for a language server to answer a question like hover."),

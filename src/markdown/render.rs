@@ -16,7 +16,7 @@
 // angle brackets, and a `<script>` can be dropped whole instead of
 // having its source printed.
 
-use crate::bishedit::unicode_width::str_width;
+use crate::bishedit::unicode_width::{char_width, str_width};
 use crate::html::{self, NodeData};
 
 use super::{Align, Block, Document, Inline, List, Table};
@@ -67,11 +67,17 @@ pub struct Options {
     // This session's resolved `ui_col_*` colours. `None` renders the
     // defaults, which is what a plain-text render wants anyway.
     pub colors: Option<crate::theme::UiColors>,
+    // The `table_wrap` bishopt: whether a table too wide for `width` is
+    // fitted to it by narrowing its columns and wrapping the cells
+    // inside them, or keeps the width its cells want and runs off the
+    // side for the view to scroll. Only tables -- prose wraps either
+    // way, since a paragraph has no columns to keep.
+    pub wrap_tables: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { width: 80, highlight_code: true, hyperlinks: false, base_dir: None, colors: None }
+        Options { width: 80, highlight_code: true, hyperlinks: false, base_dir: None, colors: None, wrap_tables: true }
     }
 }
 
@@ -189,31 +195,36 @@ fn render_list(list: &List, opts: &Options, indent: usize, out: &mut Vec<String>
 
 fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<String>) {
     let columns = table.align.len();
-    let cell = |cells: &[Vec<Inline>], i: usize| -> (String, usize) {
-        match cells.get(i) {
-            Some(inlines) => {
-                let runs = inline_runs(inlines, opts);
-                let styled: String = runs.iter().map(|r| r.styled()).collect();
-                let width: usize = runs.iter().map(|r| str_width(&r.text)).sum();
-                (styled, width)
-            }
-            None => (String::new(), 0),
-        }
-    };
-    // Every column is as wide as its widest cell, capped so a wide table
-    // still fits the pane.
+    let cell = |cells: &[Vec<Inline>], i: usize| -> Vec<Run> { cells.get(i).map(|inlines| inline_runs(inlines, opts)).unwrap_or_default() };
+    let natural = |runs: &[Run]| -> usize { runs.iter().map(|r| str_width(&r.text)).sum() };
     let mut widths = vec![0usize; columns];
     for (i, width) in widths.iter_mut().enumerate() {
-        *width = (*width).max(cell(&table.head, i).1);
+        *width = (*width).max(natural(&cell(&table.head, i)));
         for row in &table.rows {
-            *width = (*width).max(cell(row, i).1);
+            *width = (*width).max(natural(&cell(row, i)));
         }
     }
+    // Every column is as wide as its widest cell -- until the table as a
+    // whole does not fit the pane, and something has to give. Each
+    // column keeps a floor and gives up a share of what is left in
+    // proportion to what it asked for, so the prose column is the one
+    // that yields and a column of numbers is not squeezed to nothing.
+    // Sized to fit exactly: the floors plus every share can only add up
+    // to what was available, so the frame lands where the rule does.
+    //
+    // Unless `table_wrap` is off, which is the other answer to the same
+    // question: keep every column the width its cells want, let the
+    // table run off the side, and leave reading the rest to the view
+    // that scrolls. Either way the rows and the rules agree on a width,
+    // which is the part that is not negotiable.
     let available = opts.width.saturating_sub(indent + 3 * columns + 1);
     let total: usize = widths.iter().sum();
-    if total > available && total > 0 {
+    if opts.wrap_tables && total > available {
+        const FLOOR: usize = 3;
+        let slack = available.saturating_sub(FLOOR * columns);
+        let over: usize = widths.iter().map(|w| w.saturating_sub(FLOOR)).sum();
         for w in widths.iter_mut() {
-            *w = (*w * available / total).max(3);
+            *w = FLOOR + w.saturating_sub(FLOOR) * slack / over.max(1);
         }
     }
     let pad = " ".repeat(indent);
@@ -226,25 +237,37 @@ fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<Stri
         s.push_str(RESET);
         s
     };
-    let row_line = |cells: &[Vec<Inline>]| {
-        let mut s = format!("{pad}{DIM}\u{2502}{RESET}");
-        for (i, column) in widths.iter().enumerate() {
-            let (styled, w) = cell(cells, i);
-            let space = column.saturating_sub(w);
-            let (before, after) = match table.align[i] {
-                Align::Right => (space, 0),
-                Align::Center => (space / 2, space - space / 2),
-                _ => (0, space),
-            };
-            s.push_str(&format!(" {}{}{} {DIM}\u{2502}{RESET}", " ".repeat(before), styled, " ".repeat(after)));
-        }
-        s
+    // A row is as tall as its tallest cell. What does not fit a column
+    // wraps within it rather than running past the frame -- which is
+    // what it used to do, and one long cell taking every row after it
+    // out of alignment is a worse answer than a two-line row. With the
+    // columns left at their natural width there is nothing to wrap, so
+    // this is one line a row and the `true` below never fires.
+    let row_lines = |cells: &[Vec<Inline>]| -> Vec<String> {
+        let wrapped: Vec<Vec<(String, usize)>> = widths.iter().enumerate().map(|(i, w)| wrap_runs(&cell(cells, i), *w, true)).collect();
+        let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+        (0..height)
+            .map(|line| {
+                let mut s = format!("{pad}{DIM}\u{2502}{RESET}");
+                for (i, column) in widths.iter().enumerate() {
+                    let (styled, w) = wrapped[i].get(line).cloned().unwrap_or_default();
+                    let space = column.saturating_sub(w);
+                    let (before, after) = match table.align[i] {
+                        Align::Right => (space, 0),
+                        Align::Center => (space / 2, space - space / 2),
+                        _ => (0, space),
+                    };
+                    s.push_str(&format!(" {}{}{} {DIM}\u{2502}{RESET}", " ".repeat(before), styled, " ".repeat(after)));
+                }
+                s
+            })
+            .collect()
     };
     out.push(rule("\u{250c}", "\u{252c}", "\u{2510}"));
-    out.push(row_line(&table.head));
+    out.extend(row_lines(&table.head));
     out.push(rule("\u{251c}", "\u{253c}", "\u{2524}"));
     for row in &table.rows {
-        out.push(row_line(row));
+        out.extend(row_lines(row));
     }
     out.push(rule("\u{2514}", "\u{2534}", "\u{2518}"));
 }
@@ -477,17 +500,29 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
 }
 
 // Greedy wrapping on whitespace, measuring display width rather than
-// characters so a wide glyph counts for what it draws. A word longer
-// than the whole width is left to overflow rather than broken -- a URL
-// or an identifier is more useful whole.
+// characters so a wide glyph counts for what it draws.
 fn wrap(runs: &[Run], width: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
+    wrap_runs(runs, width, false).into_iter().map(|(line, _)| line).collect()
+}
+
+// The same, and how wide each line came out. Prose has no use for that
+// -- it is drawn flush left and ends where it ends -- but a table cell
+// is padded to its column, and the styled string it gets back has
+// escape sequences in it, so measuring it afterwards is not something
+// the caller can do.
+//
+// `break_words` is the other thing a cell needs and prose does not. A
+// word longer than the whole width is normally left to overflow, since
+// a URL or an identifier is more useful whole; in a column, overflowing
+// is the very thing being avoided, so there it breaks.
+fn wrap_runs(runs: &[Run], width: usize, break_words: bool) -> Vec<(String, usize)> {
+    let mut lines: Vec<(String, usize)> = Vec::new();
     let mut line = String::new();
     let mut used = 0;
     let mut pending_space = false;
     for run in runs {
         if run.break_after && run.text.is_empty() {
-            lines.push(std::mem::take(&mut line));
+            lines.push((std::mem::take(&mut line), used));
             used = 0;
             pending_space = false;
             continue;
@@ -499,29 +534,57 @@ fn wrap(runs: &[Run], width: usize) -> Vec<String> {
             if word.is_empty() {
                 continue;
             }
-            let w = str_width(word);
-            let space = usize::from(pending_space && used > 0);
-            if used > 0 && used + space + w > width {
-                lines.push(std::mem::take(&mut line));
-                used = 0;
-            } else if space > 0 {
-                line.push(' ');
-                used += 1;
+            for piece in split_to_width(word, width, break_words) {
+                let w = str_width(&piece);
+                let space = usize::from(pending_space && used > 0);
+                if used > 0 && used + space + w > width {
+                    lines.push((std::mem::take(&mut line), used));
+                    used = 0;
+                } else if space > 0 {
+                    line.push(' ');
+                    used += 1;
+                }
+                pending_space = false;
+                line.push_str(&Run { text: piece, style: run.style.clone(), break_after: false }.styled());
+                used += w;
             }
-            pending_space = false;
-            line.push_str(&Run { text: word.to_string(), style: run.style.clone(), break_after: false }.styled());
-            used += w;
         }
         if run.break_after {
-            lines.push(std::mem::take(&mut line));
+            lines.push((std::mem::take(&mut line), used));
             used = 0;
             pending_space = false;
         }
     }
     if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
+        lines.push((line, used));
     }
     lines
+}
+
+// One word in pieces no wider than `width` -- the word itself, unless
+// the caller asked for it to be broken and it does not fit. By display
+// width, so a run of wide glyphs breaks where it draws rather than
+// where it counts.
+fn split_to_width(word: &str, width: usize, break_words: bool) -> Vec<String> {
+    if !break_words || width == 0 || str_width(word) <= width {
+        return vec![word.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut piece = String::new();
+    let mut used = 0;
+    for c in word.chars() {
+        let w = char_width(c);
+        if used > 0 && used + w > width {
+            out.push(std::mem::take(&mut piece));
+            used = 0;
+        }
+        piece.push(c);
+        used += w;
+    }
+    if !piece.is_empty() {
+        out.push(piece);
+    }
+    out
 }
 
 // A code block's own line, run through whichever highlighter its info
@@ -704,6 +767,57 @@ to need wrapping at this width",
 │ 1 │ 2 │
 └───┴───┘",
         );
+    }
+
+    // A table wider than the pane used to draw its rules at one width
+    // and its rows at another, because the columns were narrowed and
+    // the cells written into them at full length anyway. Every line of
+    // a table is the same width as its own frame, or it is not a table.
+    #[test]
+    fn a_table_too_wide_for_the_pane_wraps_inside_its_columns() {
+        let src =
+            "| operation | measured | verdict |\n|---|---:|---|\n| penalty for a bracket test | 2.30 \u{b5}s | slower than bash by a good margin |\n";
+        let lines = plain(src, 40);
+        let widths: Vec<usize> = lines.lines().map(str_width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "every line squares up with the frame: {widths:?}");
+        assert!(widths[0] <= 40, "and fits the pane: {}", widths[0]);
+        // Nothing is dropped to get there -- the cell wraps, and both
+        // halves are still on the page.
+        let text: String = lines.lines().collect::<Vec<_>>().join(" ");
+        for word in ["penalty", "bracket", "test", "slower", "margin"] {
+            assert!(text.contains(word), "{word} survived the wrap:\n{lines}");
+        }
+    }
+
+    // `table_wrap` off: the columns keep the width their cells want and
+    // the table runs off the side, for the view to scroll to. Still a
+    // table, though -- every line agrees on a width, which is the part
+    // the old overflow bug got wrong.
+    #[test]
+    fn a_wide_table_keeps_its_columns_when_table_wrap_is_off() {
+        let src =
+            "| operation | measured | verdict |\n|---|---:|---|\n| penalty for a bracket test | 2.30 \u{b5}s | slower than bash by a good margin |\n";
+        let doc = parse(src);
+        let opts = Options { width: 40, highlight_code: false, wrap_tables: false, ..Options::default() };
+        let lines: Vec<String> = to_lines(&doc, &opts).iter().map(|l| strip_sgr(l)).collect();
+        let widths: Vec<usize> = lines.iter().map(|l| str_width(l)).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "the rows and the rules still agree: {widths:?}");
+        assert!(widths[0] > 40, "and the table is wider than the pane, to be scrolled to: {}", widths[0]);
+        // Each cell on one line, whole, as it was written.
+        assert!(lines.iter().any(|l| l.contains("penalty for a bracket test")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("slower than bash by a good margin")), "{lines:?}");
+    }
+
+    // A word with nowhere to wrap is left whole in prose, where running
+    // long costs nothing, and broken in a column, where running long is
+    // the whole problem.
+    #[test]
+    fn a_word_wider_than_its_column_breaks_in_a_table_and_not_in_prose() {
+        let table = plain("| a |\n|---|\n| supercalifragilistic |\n", 20);
+        let widths: Vec<usize> = table.lines().map(str_width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
+        assert!(table.contains("superc"), "{table}");
+        assert_eq!(plain("supercalifragilistic\n", 10), "supercalifragilistic\n");
     }
 
     #[test]

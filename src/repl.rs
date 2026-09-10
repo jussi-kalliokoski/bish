@@ -8033,10 +8033,11 @@ fn run_normal_mode_navigation(
                                         PagerSource {
                                             language: "roff".to_string(),
                                             source,
-                                            links: LinkOptions {
+                                            render: RenderOptions {
                                                 hyperlinks: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
                                                 base_dir: None,
                                                 colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                                wrap_tables: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("table_wrap")),
                                             },
                                         },
                                     );
@@ -11187,14 +11188,15 @@ fn hooks_help() -> String {
 // than a special case. Rendered on demand rather than once: the width is
 // the terminal's, and a table has to be laid out for the width it will
 // actually occupy.
-fn render_markdown_document(source: &str, term_cols: usize, links: &LinkOptions) -> Vec<String> {
+fn render_markdown_document(source: &str, term_cols: usize, render: &RenderOptions) -> Vec<String> {
     let doc = crate::markdown::parse(source);
     let opts = crate::markdown::render::Options {
         width: term_cols.saturating_sub(1).max(20),
         highlight_code: true,
-        hyperlinks: links.hyperlinks,
-        base_dir: links.base_dir.clone(),
-        colors: links.colors.clone(),
+        hyperlinks: render.hyperlinks,
+        base_dir: render.base_dir.clone(),
+        colors: render.colors.clone(),
+        wrap_tables: render.wrap_tables,
     };
     crate::markdown::render::to_lines(&doc, &opts)
 }
@@ -11202,10 +11204,10 @@ fn render_markdown_document(source: &str, term_cols: usize, links: &LinkOptions)
 // `:preview`'s own dispatch: which languages have something to render,
 // and how. `None` for a language that has no rendered form -- which is
 // what the command reports rather than guessing at one.
-fn preview_document(language: &str, source: &str, term_cols: usize, links: &LinkOptions) -> Option<Vec<String>> {
+fn preview_document(language: &str, source: &str, term_cols: usize, render: &RenderOptions) -> Option<Vec<String>> {
     let width = term_cols.saturating_sub(1).max(20);
     match language {
-        "markdown" => Some(render_markdown_document(source, term_cols, links)),
+        "markdown" => Some(render_markdown_document(source, term_cols, render)),
         "roff" => {
             let doc = crate::roff::parse(source);
             Some(crate::roff::render::to_lines(&doc, &crate::roff::render::Options { width }))
@@ -11229,29 +11231,37 @@ fn preview_document(language: &str, source: &str, term_cols: usize, links: &Link
 // What the pager is showing, so a resize can re-render it at the new
 // width -- which is not optional, since a table's layout and every
 // wrapped line depend on it.
-// Whether a rendered document's links are emitted as real terminal
-// hyperlinks, and what a relative one is relative to. Carried rather
-// than read where it's needed, because neither the pager nor the
+// Everything a rendered document needs that it cannot go and read for
+// itself: whether links are emitted as real terminal hyperlinks and
+// what a relative one is relative to, this session's `ui_col_*`
+// colours, and whether a wide table is fitted to the pane. Carried
+// rather than read where it's needed, because neither the pager nor the
 // markdown renderer has a Shell to ask or a buffer to look at.
-#[derive(Debug, Clone, Default)]
-struct LinkOptions {
+#[derive(Debug, Clone)]
+struct RenderOptions {
     hyperlinks: bool,
     base_dir: Option<std::path::PathBuf>,
-    // ...and this session's `ui_col_*` colours, carried the same way and
-    // for the same reason: the pager and the markdown renderer have no
-    // Shell to ask.
     colors: Option<crate::theme::UiColors>,
+    // The `table_wrap` bishopt. `true` in `Default`, matching both the
+    // option's own default and the renderer's.
+    wrap_tables: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        RenderOptions { hyperlinks: false, base_dir: None, colors: None, wrap_tables: true }
+    }
 }
 
 struct PagerSource {
     language: String,
     source: String,
-    links: LinkOptions,
+    render: RenderOptions,
 }
 
 impl PagerSource {
     fn lines(&self, term_cols: usize) -> Vec<String> {
-        preview_document(&self.language, &self.source, term_cols, &self.links).unwrap_or_default()
+        preview_document(&self.language, &self.source, term_cols, &self.render).unwrap_or_default()
     }
 }
 
@@ -13271,10 +13281,11 @@ fn run_command_mode(
                                     // resolve against -- which is fine,
                                     // since the help page's own links
                                     // are all absolute or none.
-                                    links: LinkOptions {
+                                    render: RenderOptions {
                                         hyperlinks: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
                                         base_dir: None,
                                         colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                        wrap_tables: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("table_wrap")),
                                     },
                                 },
                             );
@@ -13294,12 +13305,13 @@ fn run_command_mode(
                             // The buffer's own directory, so a link to a
                             // sibling document in a README resolves the
                             // same way it does in the editor itself.
-                            let links = LinkOptions {
+                            let render = RenderOptions {
                                 hyperlinks: tb.hyperlinks,
                                 base_dir: tb.path().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
                                 colors: app.sessions.get(&session_id).map(|s| ui_colors(&s.shell)),
+                                wrap_tables: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("table_wrap")),
                             };
-                            if preview_document(&language, &source, app.term_cols, &links).is_none() {
+                            if preview_document(&language, &source, app.term_cols, &render).is_none() {
                                 show_command_mode_error(
                                     &format!("bish: preview: nothing to render for a {language} file (markdown and roff have previews)"),
                                     app.term_rows,
@@ -13313,7 +13325,7 @@ fn run_command_mode(
                                 .and_then(|p| p.file_name())
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "preview".to_string());
-                            run_pager(app, &format!("{name}  (q to close)"), PagerSource { language, source, links });
+                            run_pager(app, &format!("{name}  (q to close)"), PagerSource { language, source, render });
                             return CommandModeOutcome::Cancelled;
                         }
                         "help" | "h" | "?" => {
