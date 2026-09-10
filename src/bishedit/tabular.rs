@@ -21,6 +21,23 @@ use super::unicode_width::char_width;
 pub struct Style {
     pub delimiter: char,
     pub kind: Kind,
+    pub escape: Escape,
+}
+
+// How a delimiter that is content rather than a boundary is written.
+// Every tabular form needs an answer, because without one a row that
+// carries a delimiter of its own reads as having more columns than it
+// has, and the whole table lines up against a column that isn't there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    // RFC 4180: a field that opens with `"` runs to its closing quote,
+    // and `""` inside it is an escaped quote.
+    Quotes,
+    // Markdown: a backslash makes whatever follows it content. `\|` is
+    // the *only* way to write a pipe in a cell -- the table resolves it
+    // before anything else looks at the line -- so a table that needs a
+    // pipe has no alternative for this to miss.
+    Backslash,
 }
 
 // What the delimiter *is* to the row, which is what decides where
@@ -66,14 +83,14 @@ impl Kind {
 // nothing here knows about is simply left alone.
 pub fn style(language: &str) -> Option<Style> {
     match language {
-        "csv" => Some(Style { delimiter: ',', kind: Kind::Terminated }),
+        "csv" => Some(Style { delimiter: ',', kind: Kind::Terminated, escape: Escape::Quotes }),
         // A real `.tsv` holds literal tabs, which this editor's
         // one-character-per-column rendering can't place correctly in
         // the first place (see run_insert_mode's own Tab handling) --
         // alignment here is only as good as that already is.
-        "tsv" | "tab" => Some(Style { delimiter: '\t', kind: Kind::Terminated }),
-        "psv" => Some(Style { delimiter: '|', kind: Kind::Terminated }),
-        "markdown" => Some(Style { delimiter: '|', kind: Kind::Framed }),
+        "tsv" | "tab" => Some(Style { delimiter: '\t', kind: Kind::Terminated, escape: Escape::Quotes }),
+        "psv" => Some(Style { delimiter: '|', kind: Kind::Terminated, escape: Escape::Quotes }),
+        "markdown" => Some(Style { delimiter: '|', kind: Kind::Framed, escape: Escape::Backslash }),
         _ => None,
     }
 }
@@ -140,7 +157,7 @@ pub fn measure_regions(lines: &[&[char]], style: Style, regions: &[std::ops::Ran
             if style.kind.rule_rows() && is_rule_row(line) {
                 continue;
             }
-            for (i, field) in fields(line, style.delimiter).into_iter().enumerate() {
+            for (i, field) in fields(line, style).into_iter().enumerate() {
                 if i >= MAX_COLUMNS {
                     break;
                 }
@@ -162,19 +179,27 @@ pub struct Field {
     pub end: usize,
 }
 
-// One line's fields, as character ranges. RFC 4180 quoting is honoured:
-// a field that opens with `"` runs to its closing quote, `""` inside it
-// is an escaped quote, and a delimiter inside quotes does not split.
-// That matters for display exactly as much as it matters for parsing --
-// a quoted address containing a comma is one column, and aligning it as
-// two would misrepresent the file.
-pub fn fields(line: &[char], delimiter: char) -> Vec<Field> {
+// One line's fields, as character ranges, with the style's escape
+// honoured so that a delimiter the row means as content does not split
+// it. That matters for display exactly as much as it matters for
+// parsing -- a quoted address containing a comma is one column, and
+// aligning it as two would misrepresent the file.
+pub fn fields(line: &[char], style: Style) -> Vec<Field> {
+    let delimiter = style.delimiter;
     let mut out = Vec::new();
     let mut start = 0;
     let mut i = 0;
     let mut quoted = false;
     while i < line.len() {
         let c = line[i];
+        // Whatever follows a backslash is content, delimiter included.
+        // A second backslash is content too, which is the point: it
+        // pairs with this one and leaves a delimiter after it a
+        // delimiter again.
+        if style.escape == Escape::Backslash && c == '\\' {
+            i += 2;
+            continue;
+        }
         if quoted {
             if c == '"' {
                 // A doubled quote is an escaped one and stays inside.
@@ -187,7 +212,7 @@ pub fn fields(line: &[char], delimiter: char) -> Vec<Field> {
             i += 1;
             continue;
         }
-        if c == '"' && i == start {
+        if style.escape == Escape::Quotes && c == '"' && i == start {
             quoted = true;
             i += 1;
             continue;
@@ -241,7 +266,7 @@ pub fn row(line: &[char], line_number: usize, layout: &Layout) -> Row {
     // anything at all in a file whose language has no tabular form -- is
     // drawn exactly as it is.
     let Some(widths) = layout.widths_for(line_number) else { return Row::plain(line) };
-    let fields = fields(line, layout.style.delimiter);
+    let fields = fields(line, layout.style);
     let mut cells = Vec::with_capacity(line.len());
     let mut source_at: Vec<Option<usize>> = Vec::with_capacity(line.len());
     let mut cell_of = vec![0usize; line.len() + 1];
@@ -294,9 +319,9 @@ mod tests {
         s.chars().collect()
     }
 
-    fn split(line: &str, delimiter: char) -> Vec<String> {
+    fn split(line: &str, style: Style) -> Vec<String> {
         let cs = chars(line);
-        fields(&cs, delimiter).iter().map(|f| cs[f.start..f.end].iter().collect()).collect()
+        fields(&cs, style).iter().map(|f| cs[f.start..f.end].iter().collect()).collect()
     }
 
     #[test]
@@ -317,29 +342,56 @@ mod tests {
 
     #[test]
     fn fields_split_on_the_delimiter() {
-        assert_eq!(split("a,b,c", ','), vec!["a", "b", "c"]);
-        assert_eq!(split("a,,c", ','), vec!["a", "", "c"]);
-        assert_eq!(split("", ','), vec![""]);
-        assert_eq!(split("solo", ','), vec!["solo"]);
+        assert_eq!(split("a,b,c", csv()), vec!["a", "b", "c"]);
+        assert_eq!(split("a,,c", csv()), vec!["a", "", "c"]);
+        assert_eq!(split("", csv()), vec![""]);
+        assert_eq!(split("solo", csv()), vec!["solo"]);
     }
 
     // A quoted field holding a delimiter is one column. Aligning it as
     // two would misrepresent the file.
     #[test]
     fn a_delimiter_inside_quotes_does_not_split() {
-        assert_eq!(split("a,\"b,c\",d", ','), vec!["a", "\"b,c\"", "d"]);
-        assert_eq!(split("\"one, two\"", ','), vec!["\"one, two\""]);
+        assert_eq!(split("a,\"b,c\",d", csv()), vec!["a", "\"b,c\"", "d"]);
+        assert_eq!(split("\"one, two\"", csv()), vec!["\"one, two\""]);
     }
 
     #[test]
     fn a_doubled_quote_is_an_escaped_quote_and_stays_inside() {
-        assert_eq!(split("\"say \"\"hi\"\", ok\",next", ','), vec!["\"say \"\"hi\"\", ok\"", "next"]);
+        assert_eq!(split("\"say \"\"hi\"\", ok\",next", csv()), vec!["\"say \"\"hi\"\", ok\"", "next"]);
     }
 
     // A quote that isn't at the start of a field is just a character.
     #[test]
     fn a_quote_mid_field_does_not_open_a_quoted_field() {
-        assert_eq!(split("a\"b,c", ','), vec!["a\"b", "c"]);
+        assert_eq!(split("a\"b,c", csv()), vec!["a\"b", "c"]);
+    }
+
+    // Markdown's own escape, and the reason it exists: `\|` is the only
+    // way to write a pipe in a cell, so a row that uses one has fewer
+    // columns than its pipes suggest. Reading it as a delimiter puts a
+    // column boundary in the middle of a cell and drags the rest of the
+    // table along with it.
+    #[test]
+    fn an_escaped_pipe_does_not_split_a_markdown_row() {
+        assert_eq!(split(r"| a \| b | c |", md()), vec!["", r" a \| b ", " c ", ""]);
+        assert_eq!(split(r"| one `${s/:/\|}` | 2.13 |", md()), vec!["", r" one `${s/:/\|}` ", " 2.13 ", ""]);
+    }
+
+    // A backslash escapes a backslash, so the pipe after a pair is a
+    // delimiter again.
+    #[test]
+    fn a_doubled_backslash_leaves_the_pipe_after_it_a_delimiter() {
+        assert_eq!(split(r"| a \\| b |", md()), vec!["", r" a \\", " b ", ""]);
+    }
+
+    // The two escapes are not interchangeable. A CSV has no backslash
+    // escape -- RFC 4180 says quotes -- and markdown has no quoting,
+    // where a `"` opening a cell is just the first character of it.
+    #[test]
+    fn each_style_has_only_its_own_escape() {
+        assert_eq!(split(r"a\,b", csv()), vec![r"a\", "b"]);
+        assert_eq!(split("|\"a | b\"|", md()), vec!["", "\"a ", " b\"", ""]);
     }
 
     fn csv() -> Style {
@@ -440,6 +492,16 @@ mod tests {
         assert_eq!(
             rendered_regions(&["| Key | Does |", "|---|:--|", "| gg | goes to the top |", "| G | end |"], md(), &[0..4],),
             vec!["| Key | Does            |", "|---  |:--              |", "| gg  | goes to the top |", "| G   | end             |",]
+        );
+    }
+
+    // ...and the layout follows: the cell holding the pipe is one cell,
+    // so the column after it is the column after it.
+    #[test]
+    fn an_escaped_pipe_lines_up_as_one_cell() {
+        assert_eq!(
+            rendered_regions(&[r"| substr 1 echo \| cut | 854 |", "| substr 1 builtin | 358,092 |"], md(), &[0..2]),
+            vec![r"| substr 1 echo \| cut | 854     |", "| substr 1 builtin     | 358,092 |"]
         );
     }
 
