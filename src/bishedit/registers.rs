@@ -168,6 +168,15 @@ fn detect_clipboard_tool() -> Option<ClipboardTool> {
     if cfg!(test) {
         return None;
     }
+    // ...and for a bish that something else is driving and must not have
+    // the machine's clipboard written under it. `cfg!(test)` cannot
+    // reach that case: `vimdiff`'s corpus runs a *real* `bish tool edit`
+    // through a pty, built without it, and half its cases start with
+    // `dd`. Whoever spawns such a bish is the only one who knows, so
+    // they say so.
+    if std::env::var_os("BISH_NO_CLIPBOARD").is_some() {
+        return None;
+    }
     let candidates: [ClipboardTool; 4] = [
         ClipboardTool { copy: ("pbcopy", &[]), paste: ("pbpaste", &[]) },
         ClipboardTool { copy: ("xclip", &["-selection", "clipboard"]), paste: ("xclip", &["-selection", "clipboard", "-o"]) },

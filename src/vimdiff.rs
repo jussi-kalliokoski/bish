@@ -334,6 +334,14 @@ mod tests {
         // No config of either editor's: this measures the editors, not
         // the machine they are on.
         cmd.env_remove("VIMINIT");
+        // Nor its clipboard, which is the machine at its most global. A
+        // corpus whose cases open with `dd` would otherwise write the
+        // developer's clipboard several hundred times a run, and each
+        // `wl-copy` daemonizes holding the stdout it inherited, so
+        // `cargo test` piped anywhere never reaches EOF. vim leaves the
+        // system clipboard alone by default; bish's unnamed register is
+        // it, so bish is the one that has to be told.
+        cmd.env("BISH_NO_CLIPBOARD", "1");
         let Ok(mut child) = crate::pty::spawn_attached(cmd, &pty.slave_path) else {
             return Err("could not be started");
         };
