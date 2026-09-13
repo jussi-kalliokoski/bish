@@ -9139,7 +9139,30 @@ impl Shell {
                     sh_eprintln!(self, "bish: {}: {}: restricted", name, path);
                     return ExecResult::Status(1);
                 }
-                match std::fs::read_to_string(self.resolve_path(&path)) {
+                // `. /dev/stdin <<< "..."` names *this command's* stdin,
+                // which is not the process's whenever a redirect or an
+                // enclosing construct supplies it -- opening the path
+                // read the real fd 0 instead, a terminal or nothing, and
+                // sourced nothing without a word. So stdin, by any of
+                // its names, is read the way `read` reads it.
+                let names_stdin = matches!(path.as_str(), "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0");
+                let stdin_redirected = cmd.redirects.iter().any(|r| {
+                    matches!(
+                        r,
+                        Redirect::In(_)
+                            | Redirect::HereString(_)
+                            | Redirect::HereDoc(..)
+                            | Redirect::FdDup { fd: 0, .. }
+                            | Redirect::FdDupWord { fd: 0, .. }
+                    )
+                }) || self.stdio_override.as_ref().is_some_and(|o| o.borrow().stdin.is_some());
+                let text = if names_stdin && stdin_redirected {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut self.read_input_source(cmd), &mut text).map(|_| text)
+                } else {
+                    std::fs::read_to_string(self.resolve_path(&path))
+                };
+                match text {
                     Ok(src) => {
                         // For the duration, this file *is* the script:
                         // a function defined here records it, and a

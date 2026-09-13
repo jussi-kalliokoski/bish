@@ -495,6 +495,8 @@ mod tests {
             "a-numbered-fd-redirect-is-put-back-afterwards",
             r#"exec 4>g; { echo a >&4; } 4>f; echo b >&4; cat g f; exec 3>h; { echo in >&3; } 3>&- 2>/dev/null; echo out >&3; cat h"#,
         ),
+        // `. /dev/stdin` reads this command's stdin, wherever that is.
+        case("source-reads-a-here-string-through-dev-stdin", r#". /dev/stdin <<< 'echo sourced'; { . /dev/stdin; } <<< 'echo grouped'"#),
         // The shell itself, a command substitution and a process
         // substitution all put back what a group, loop, `if` or builtin
         // redirected before the EXIT trap runs. `"$BASH" -c` is the shell
