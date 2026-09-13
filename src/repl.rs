@@ -11544,7 +11544,11 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
         title => title.to_string(),
     };
     let rect = app.focused_pane_rect();
-    let Some(review) = run_review(app, crate::review::Review::new(&title, old, new, rect.rows, rect.cols)) else {
+    let language = fileeditor::language_of_path(&request.path);
+    // In the colours of the session the review opens over.
+    let colors = syntax_color_overrides(&app.sessions[&app.window().owning_session()].shell);
+    let view = crate::review::Review::new(&title, old, new, &language, rect.rows, rect.cols).highlighted(Some(&colors));
+    let Some(review) = run_review(app, view) else {
         return mcp::ReviewOutcome::Rejected;
     };
     if !review.accepted_any() {
@@ -11573,7 +11577,13 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
 // it changed, each as it was in the parent beside what the commit made it.
 // Opens at `path`'s own section when the commit touched that file. From
 // the directory `path` is in, or the working directory without one.
-fn git_show_view(path: Option<&Path>, rev: &str, rows: usize, cols: usize) -> Result<crate::review::Review, String> {
+fn git_show_view(
+    path: Option<&Path>,
+    rev: &str,
+    colors: Option<&highlight::ColorOverrides>,
+    rows: usize,
+    cols: usize,
+) -> Result<crate::review::Review, String> {
     let dir = match path.and_then(Path::parent).filter(|d| !d.as_os_str().is_empty()) {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -11612,7 +11622,13 @@ fn git_show_view(path: Option<&Path>, rev: &str, rows: usize, cols: usize) -> Re
         if start.is_none() && touches_here {
             start = Some(files.len());
         }
+        let language = changed
+            .new_path
+            .as_ref()
+            .or(changed.old_path.as_ref())
+            .map_or_else(|| "text".to_string(), |p| fileeditor::language_of_path(Path::new(p)));
         files.push(crate::review::FileDiff {
+            language,
             label,
             old: if binary { Vec::new() } else { text(&old) },
             new: if binary { Vec::new() } else { text(&new) },
@@ -11620,7 +11636,7 @@ fn git_show_view(path: Option<&Path>, rev: &str, rows: usize, cols: usize) -> Re
         });
     }
     let short = &commit.hash[..commit.hash.len().min(12)];
-    Ok(crate::review::Review::reading(&format!("git show {short}"), header, files, start, rows, cols))
+    Ok(crate::review::Review::reading(&format!("git show {short}"), header, files, start, rows, cols).highlighted(colors))
 }
 
 // What git itself goes by: a NUL in the first 8000 bytes. A UTF-16 file
@@ -11889,12 +11905,12 @@ mod git_show_tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "all of it"]);
 
-        let view = git_show_view(Some(&dir.join("b.txt")), "HEAD", 30, 60).unwrap();
+        let view = git_show_view(Some(&dir.join("b.txt")), "HEAD", None, 30, 60).unwrap();
         let frame = view.render(crate::window::Rect { row: 0, col: 0, rows: 30, cols: 60 });
         assert!(frame.contains("file 2 of 3: b.txt (new)"), "opened at b.txt: {frame:?}");
         assert!(frame.contains("binary file, not shown"), "{frame:?}");
 
-        let from_nowhere = git_show_view(Some(&dir.join("elsewhere.txt")), "HEAD", 30, 60).unwrap();
+        let from_nowhere = git_show_view(Some(&dir.join("elsewhere.txt")), "HEAD", None, 30, 60).unwrap();
         let frame = from_nowhere.render(crate::window::Rect { row: 0, col: 0, rows: 30, cols: 60 });
         assert!(frame.contains("all of it"), "an untouched file opens at the top, header first: {frame:?}");
 
@@ -12982,7 +12998,10 @@ fn run_command_mode(
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| "review".to_string());
                                 let rect = app.focused_pane_rect();
-                                let Some(review) = run_review(app, crate::review::Review::new(&name, old, new, rect.rows, rect.cols)) else {
+                                let colors = syntax_color_overrides(&app.sessions[&session_id].shell);
+                                let view = crate::review::Review::new(&name, old, new, &fileeditor::language_of(tb), rect.rows, rect.cols)
+                                    .highlighted(Some(&colors));
+                                let Some(review) = run_review(app, view) else {
                                     return CommandModeOutcome::Cancelled;
                                 };
                                 let reverts = review.reverts();
@@ -13926,7 +13945,8 @@ fn run_command_mode(
                                 // file when the commit touched it.
                                 "show" => {
                                     let rect = app.focused_pane_rect();
-                                    match git_show_view(tb.path(), subarg.unwrap_or("HEAD"), rect.rows, rect.cols) {
+                                    let colors = syntax_color_overrides(&app.sessions[&session_id].shell);
+                                    match git_show_view(tb.path(), subarg.unwrap_or("HEAD"), Some(&colors), rect.rows, rect.cols) {
                                         Ok(view) => {
                                             run_review(app, view);
                                             return CommandModeOutcome::Cancelled;

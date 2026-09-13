@@ -3382,7 +3382,15 @@ const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn language_of(buf: &TextBuffer) -> String {
-    let Some(path) = buf.path() else { return "text".to_string() };
+    match buf.path() {
+        Some(path) => language_of_path(path),
+        None => "text".to_string(),
+    }
+}
+
+// What a file at `path` is written in, from its name alone -- for text
+// that is not in a buffer, such as either side of a diff.
+pub(crate) fn language_of_path(path: &std::path::Path) -> String {
     // `.gz` says how the bytes are stored, not what they are -- what a
     // `notes.json.gz` buffer holds is JSON, and it should highlight like
     // it. The extension underneath is the answer for every purpose here,

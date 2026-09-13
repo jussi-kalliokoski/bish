@@ -15,8 +15,10 @@
 // between, so every rule here can be a unit test. Shaped after pager.rs,
 // which is the same arrangement for text that is not a diff.
 
+use crate::bishedit::highlight::{self, ColorOverrides, HighlightContext, StyledSpan};
 use crate::bishedit::unicode_width::char_width;
 use crate::editor::Key;
+use crate::vt100::{Cell, CellAttrs, Color};
 use crate::window::Rect;
 use std::ops::Range;
 
@@ -107,6 +109,10 @@ pub struct FileDiff {
     pub new: Vec<String>,
     /// Either side is not text. Said so, and not diffed.
     pub binary: bool,
+    /// What it is written in, for its colours -- a name
+    /// `highlight::highlighter_for_language` knows, or anything else for
+    /// none.
+    pub language: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,12 +169,16 @@ pub struct Review {
     top: usize,
     height: usize,
     cols: usize,
+    // Each file's syntax colours, old side and new, one list of spans per
+    // line. Empty until `highlighted`, and for a language with no
+    // highlighter.
+    paint: Vec<[Vec<Vec<StyledSpan>>; 2]>,
 }
 
 impl Review {
     /// A view to decide on the changes from `old` to `new`, one file.
-    pub fn new(title: &str, old: Vec<String>, new: Vec<String>, rows: usize, cols: usize) -> Review {
-        let file = FileDiff { label: String::new(), old, new, binary: false };
+    pub fn new(title: &str, old: Vec<String>, new: Vec<String>, language: &str, rows: usize, cols: usize) -> Review {
+        let file = FileDiff { label: String::new(), old, new, binary: false, language: language.to_string() };
         let mut review = Review::build(title, Mode::Deciding, Vec::new(), vec![file], rows, cols);
         review.reveal_current();
         review
@@ -206,7 +216,25 @@ impl Review {
             // One row for the title, one for the status bar.
             height: rows.saturating_sub(2).max(1),
             cols,
+            paint: Vec::new(),
         }
+    }
+
+    /// The view with its lines in their language's colours, `overrides`
+    /// being `::bish hl`'s. Each side of each file is highlighted whole,
+    /// as the editor does a buffer, so a line inside a comment or string
+    /// that started above it is coloured as what it is, not as what it
+    /// would be on its own.
+    pub fn highlighted(mut self, overrides: Option<&ColorOverrides>) -> Review {
+        self.paint = self
+            .files
+            .iter()
+            .map(|file| match file.binary {
+                true => [Vec::new(), Vec::new()],
+                false => [paint(&file.language, &file.old, overrides), paint(&file.language, &file.new, overrides)],
+            })
+            .collect();
+        self
     }
 
     /// The pane changed size. Where the reader was stays put.
@@ -402,7 +430,7 @@ impl Review {
             Row::File(f) => ("1", self.files[f].label.clone()),
             Row::Binary(_) => ("2", "  binary file, not shown".to_string()),
             Row::Unchanged(_) => ("2", "  nothing in it changed".to_string()),
-            Row::Context { file, new, .. } => ("", format!("  {}", self.files[file].new[new])),
+            Row::Context { file, new, .. } => return self.render_line(file, 1, new, "  ", Color::Default, false),
             Row::Skipped(n) => ("2", format!("  \u{22ef} {n} unchanged line{}", if n == 1 { "" } else { "s" })),
             Row::Header(hunk) => {
                 let h = &self.hunks[hunk].1;
@@ -415,14 +443,47 @@ impl Review {
                 (if hunk == self.current { "1;7" } else { "36" }, text)
             }
             Row::Removed { file, line, hunk } => {
-                (if verdict(hunk) == Verdict::Accepted { "31;2;9" } else { "31" }, format!("- {}", self.files[file].old[line]))
+                return self.render_line(file, 0, line, "- ", Color::Indexed(1), verdict(hunk) == Verdict::Accepted);
             }
             Row::Added { file, line, hunk } => {
-                (if verdict(hunk) == Verdict::Rejected { "32;2;9" } else { "32" }, format!("+ {}", self.files[file].new[line]))
+                return self.render_line(file, 1, line, "+ ", Color::Indexed(2), verdict(hunk) == Verdict::Rejected);
             }
         };
         let fitted = fit(&text, self.cols);
         if sgr.is_empty() { fitted } else { format!("\x1b[{sgr}m{fitted}\x1b[0m") }
+    }
+
+    // A line of a file, `side` 0 for its old text and 1 for its new, after
+    // `marker`. The marker and whatever the language leaves uncoloured are
+    // in `base` -- red for a removed line, green for an added one -- so
+    // which is which still reads at a glance with the syntax coloured
+    // in. `gone` is a line the verdicts leave out: dimmed and struck
+    // through, whatever colour it is.
+    fn render_line(&self, file: usize, side: usize, line: usize, marker: &str, base: Color, gone: bool) -> String {
+        let text = if side == 0 { &self.files[file].old[line] } else { &self.files[file].new[line] };
+        let chars: Vec<char> = marker.chars().chain(text.chars()).collect();
+        let offset = marker.chars().count();
+        let whole = [StyledSpan { start: 0, end: chars.len(), fg: base, attrs: CellAttrs::default() }];
+        let syntax: Vec<StyledSpan> = self
+            .paint
+            .get(file)
+            .and_then(|sides| sides[side].get(line))
+            .into_iter()
+            .flatten()
+            .map(|s| StyledSpan {
+                start: s.start + offset,
+                end: s.end + offset,
+                fg: if s.fg == Color::Default { base } else { s.fg },
+                attrs: s.attrs,
+            })
+            .collect();
+        let mut cells = highlight::compose(&chars, &[&whole, &syntax]);
+        if gone {
+            let struck = CellAttrs { dim: true, strikethrough: true, ..CellAttrs::default() };
+            let end = cells.len();
+            highlight::compose_attrs(&mut cells, &[StyledSpan { start: 0, end, fg: base, attrs: struck }]);
+        }
+        highlight::render_styled(&fit_cells(&cells, self.cols))
     }
 
     fn status(&self) -> String {
@@ -496,6 +557,52 @@ fn layout(mode: Mode, header: &[String], files: &[FileDiff], hunks: &[(usize, Hu
     rows
 }
 
+// One side of a file's syntax colours, a list of spans per line, in
+// character offsets from the start of that line. A span that runs over
+// several lines -- a block comment, a string with a newline in it -- is
+// cut into a piece on each.
+fn paint(language: &str, lines: &[String], overrides: Option<&ColorOverrides>) -> Vec<Vec<StyledSpan>> {
+    let mut out = vec![Vec::new(); lines.len()];
+    let Some(highlighter) = highlight::highlighter_for_language(language) else { return out };
+    let lengths: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    for len in &lengths {
+        starts.push(at);
+        at += len + 1;
+    }
+    for span in highlighter.highlight(&lines.join("\n"), HighlightContext::default()) {
+        let (fg, attrs) = highlight::resolve_style(span.kind, overrides);
+        let mut line = starts.partition_point(|&start| start <= span.start).saturating_sub(1);
+        while line < lines.len() && starts[line] < span.end {
+            let start = span.start.saturating_sub(starts[line]).min(lengths[line]);
+            let end = (span.end - starts[line]).min(lengths[line]);
+            if start < end {
+                out[line].push(StyledSpan { start, end, fg, attrs });
+            }
+            line += 1;
+        }
+    }
+    out
+}
+
+// `fit`, for cells already styled: a tab is four spaces in the style of
+// the tab, and the row is padded out in the terminal's own colours.
+fn fit_cells(cells: &[Cell], cols: usize) -> Vec<Cell> {
+    let mut out = Vec::new();
+    let mut width = 0;
+    for cell in cells.iter().flat_map(|c| if c.ch == '\t' { vec![Cell { ch: ' ', ..*c }; 4] } else { vec![*c] }) {
+        let w = char_width(cell.ch);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        out.push(cell);
+    }
+    out.extend(std::iter::repeat_n(Cell::default(), cols - width));
+    out
+}
+
 // Exactly `cols` columns of `text`: cut at the last whole character that
 // fits, then padded. Tabs become spaces first -- a tab's width depends on
 // where it lands, and here every line starts after a two-column marker.
@@ -544,7 +651,7 @@ mod tests {
     }
 
     fn file(label: &str, old: &str, new: &str) -> FileDiff {
-        FileDiff { label: label.to_string(), old: lines(old), new: lines(new), binary: false }
+        FileDiff { label: label.to_string(), old: lines(old), new: lines(new), binary: false, language: "text".to_string() }
     }
 
     #[test]
@@ -572,7 +679,7 @@ mod tests {
     fn reverts_put_back_the_refused_changes_last_first() {
         let old = lines("a\nb\nc\nd");
         let new = lines("a\nB\nB2\nc\nD");
-        let mut review = Review::new("t", old.clone(), new.clone(), 20, 40);
+        let mut review = Review::new("t", old.clone(), new.clone(), "text", 20, 40);
         review.handle_key(Key::Char('r'));
         review.handle_key(Key::Char('r'));
         let reverts = review.reverts();
@@ -589,7 +696,7 @@ mod tests {
         let old: Vec<String> = (0..20).map(|i| i.to_string()).collect();
         let mut new = old.clone();
         new[10] = "ten".to_string();
-        let review = Review::new("t", old, new, 40, 40);
+        let review = Review::new("t", old, new, "text", 40, 40);
         assert_eq!(
             shown(&review),
             vec![
@@ -612,7 +719,7 @@ mod tests {
     fn deciding_moves_on_to_the_next_undecided_change() {
         let old = lines("a\nb\nc\nd\ne");
         let new = lines("A\nb\nC\nd\nE");
-        let mut review = Review::new("t", old, new, 40, 40);
+        let mut review = Review::new("t", old, new, "text", 40, 40);
         assert_eq!(review.handle_key(Key::Char('a')), Outcome::Continue);
         assert_eq!(review.current, 1);
         review.handle_key(Key::Char('n'));
@@ -631,14 +738,14 @@ mod tests {
         let mut new = old.clone();
         new[5] = "five".to_string();
         new[150] = "one fifty".to_string();
-        let mut review = Review::new("t", old, new, 12, 40);
+        let mut review = Review::new("t", old, new, "text", 12, 40);
         review.handle_key(Key::Char('n'));
         assert!(shown(&review).iter().any(|row| row == "+ one fifty"), "{:?}", shown(&review));
     }
 
     #[test]
     fn the_frame_says_where_you_are_and_what_is_left() {
-        let review = Review::new("file.rs", lines("a\nb"), lines("a\nc"), 10, 120);
+        let review = Review::new("file.rs", lines("a\nb"), lines("a\nc"), "text", 10, 120);
         let frame = plain(&review.render(Rect { row: 0, col: 0, rows: 10, cols: 120 }));
         assert!(frame.contains("file.rs  change 1 of 1"), "{frame}");
         assert!(frame.contains("0 accepted, 0 rejected, 1 to go"), "{frame}");
@@ -648,7 +755,7 @@ mod tests {
     fn a_reading_view_shows_the_header_then_every_file_under_its_own_heading() {
         let files = vec![
             file("src/a.rs", "one\ntwo", "one\nTWO"),
-            FileDiff { label: "logo.png".to_string(), old: Vec::new(), new: Vec::new(), binary: true },
+            FileDiff { label: "logo.png".to_string(), old: Vec::new(), new: Vec::new(), binary: true, language: "text".to_string() },
             file("docs/b.md -> docs/c.md", "same", "same"),
         ];
         let review = Review::reading("git show abc", lines("commit abc\nAuthor: x"), files, None, 40, 60);
@@ -700,5 +807,32 @@ mod tests {
         assert_eq!(shown(&review)[0], "second");
         let frame = plain(&review.render(Rect { row: 0, col: 0, rows: 8, cols: 60 }));
         assert!(frame.contains("file 2 of 3: second"), "{frame}");
+    }
+
+    #[test]
+    fn a_line_is_in_its_language_s_colours_even_when_what_colours_it_started_above() {
+        let old = lines("/* a comment\nstill it\n*/\nfn main() {}");
+        let new = lines("/* a comment\nstill it, changed\n*/\nfn main() { let x = 1; }");
+        let review = Review::new("t.rs", old, new, "rust", 40, 80).highlighted(None);
+        let row = |wanted: &str| {
+            let row = review.rows.iter().find(|r| plain(&review.render_row(**r)).trim_end() == wanted).unwrap_or_else(|| panic!("no row {wanted:?}"));
+            review.render_row(*row)
+        };
+        let (comment, _) = highlight::default_style(highlight::HighlightKind::Comment);
+        let (keyword, _) = highlight::default_style(highlight::HighlightKind::Keyword);
+        let sgr = |fg: Color| {
+            crate::vt100::sgr_codes(fg, Color::Default, CellAttrs::default()).trim_end_matches('m').rsplit(';').next().unwrap().to_string()
+        };
+        assert!(
+            row("+ still it, changed").contains(&format!("{}m", sgr(comment))),
+            "inside the comment opened above: {:?}",
+            row("+ still it, changed")
+        );
+        let added = row("+ fn main() { let x = 1; }");
+        assert!(added.contains(&format!("{}mfn", sgr(keyword))), "the keyword in its own colour: {added:?}");
+        assert!(added.starts_with("\x1b[0;32m+ "), "the marker still says it was added: {added:?}");
+        let plain_review = Review::new("t", lines("a"), lines("b"), "text", 10, 40).highlighted(None);
+        let removed = plain_review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
+        assert!(removed.starts_with("\x1b[0;31m- a"), "no language, the whole line red as before: {removed:?}");
     }
 }
