@@ -482,6 +482,34 @@ mod tests {
         // The EXIT trap sees the status being left with, not the one
         // the command before `exit` left behind.
         case("the-exit-trap-sees-the-status-being-left-with", r#"trap 'echo "rc=$?"' EXIT; true; exit 4"#),
+        // A numbered-descriptor redirect on a construct used to send the
+        // whole construct to a separate bish, and everything it did to
+        // the shell went with it: assignments, `cd`, and `exit` itself.
+        case(
+            "a-construct-with-a-numbered-fd-redirect-runs-in-this-shell",
+            r#"{ x=1; } 3>f; while :; do y=2; break; done 3>g; f(){ z=3; }; f 4>h; mkdir -p d; { cd d; } 3>f2; echo "$x$y$z $(basename "$PWD")"; { exit 3; } 3>f; echo not-reached"#,
+        ),
+        // ...and what the construct moved is put back as it was, open or
+        // closed.
+        case(
+            "a-numbered-fd-redirect-is-put-back-afterwards",
+            r#"exec 4>g; { echo a >&4; } 4>f; echo b >&4; cat g f; exec 3>h; { echo in >&3; } 3>&- 2>/dev/null; echo out >&3; cat h"#,
+        ),
+        // The shell itself, a command substitution and a process
+        // substitution all put back what a group, loop, `if` or builtin
+        // redirected before the EXIT trap runs. `"$BASH" -c` is the shell
+        // itself, whichever shell this is, with a trap whose output can be
+        // read back afterwards.
+        case(
+            "the-exit-trap-runs-once-the-shells-redirects-are-undone",
+            r#""$BASH" -c 'trap "echo bye rc=\$?" EXIT; { echo in; exit 4; } > f'; "$BASH" -c 'trap "echo bye" EXIT; eval exit > g'; x=$(trap 'echo sub' EXIT; { exit; } > h); cat <(trap 'echo psub' EXIT; { exit; } > p); echo "f=[$(cat f)] g=[$(cat g)] h=[$(cat h)] p=[$(cat p)] x=[$x]""#,
+        ),
+        // ...but a subshell bash would fork puts nothing back, and neither
+        // does an `exit` from inside a function, wherever the redirect is.
+        case(
+            "a-forked-subshell-or-a-function-leaves-every-redirect-in-place",
+            r#"( trap 'echo bye1' EXIT; { exit; } > g1 ); { trap 'echo bye2' EXIT; { exit; } > g2; } | cat; "$BASH" -c 'trap "echo bye3" EXIT; f(){ { exit; } > g3; }; f'; "$BASH" -c 'trap "echo bye4" EXIT; h(){ exit; }; { h; } > g4'; echo "g1=[$(cat g1)] g2=[$(cat g2)] g3=[$(cat g3)] g4=[$(cat g4)]""#,
+        ),
         // `-c` alone is not a login shell, so `logout` refuses and the
         // script carries on. The login side is LOGIN_CASES.
         case("logout-outside-a-login-shell", r#"logout 2>/dev/null; echo "rc=$?"; logout 5 2>/dev/null; echo "rc=$?"; shopt login_shell"#),
@@ -1691,22 +1719,6 @@ y
             "regex-submatch-of-an-ambiguous-empty-branch",
             "`(|a)(a|)` against `a` fills the first group in bash and the second here; the whole match agrees",
         ),
-        // Found by `logout`'s corpus, and true of `exit` just the same.
-        // The EXIT trap runs where `exit` is, which inside `{ } > f` is
-        // with stdout still on `f`. bash undoes a group's redirects
-        // before the trap -- though not a function's, `g > f` keeps
-        // its `f` -- and matching that means deferring the trap past
-        // exactly the frames bash unwinds, rather than running it at
-        // the site, which every exit path here currently relies on.
-        (
-            "the-exit-trap-runs-inside-a-redirected-group",
-            "`{ exit; } > f` runs the EXIT trap with stdout still on `f`; bash undoes the group's redirects first",
-        ),
-        // A group with a numbered-fd redirect has no in-process model
-        // (see compound_redirects_are_simple) and runs as a separate
-        // bish, so `exit` there leaves that process and the script
-        // carries on. `logout` inherits the same hole.
-        ("exit-in-a-group-with-a-numbered-fd-redirect-leaves-only-the-group", "`{ exit 3; } 3>f; echo after` prints `after`; bash leaves with 3"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -1717,8 +1729,6 @@ y
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         case("regex-submatch-of-an-ambiguous-empty-branch", r#"re='(|a)(a|)'; [[ a =~ $re ]]; echo "[${BASH_REMATCH[1]}][${BASH_REMATCH[2]}]""#),
-        case("the-exit-trap-runs-inside-a-redirected-group", r#"trap 'cat f 2>/dev/null; echo bye' EXIT; { echo in; exit; } > f"#),
-        case("exit-in-a-group-with-a-numbered-fd-redirect-leaves-only-the-group", r#"{ exit 3; } 3>f; echo after"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
         // signal this shell was *started* with ignored is reported by

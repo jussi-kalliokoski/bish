@@ -2112,6 +2112,20 @@ pub struct Shell {
     // doesn't cover -- e.g. a `for`/`case`/arithmetic list). Not shared
     // via Rc: each Shell (including a new_virtual_child) gets its own.
     pending_exit: Option<i32>,
+    // How many redirect scopes of the kind bash undoes before running
+    // its EXIT trap are open around whatever is running now: a
+    // redirected group, loop or `if`, and a builtin's own `> f`. Not a
+    // function call's -- bash keeps those. See `run_exit_trap`.
+    redirect_scopes: u32,
+    // The EXIT trap came due inside one of those scopes, and waits for
+    // the last of them to close and put its descriptors back.
+    exit_trap_deferred: bool,
+    // Whether this is one of the subshells bash leaves without putting
+    // anything back -- a `( )`, a pipeline stage, a background job -- as
+    // opposed to the shell itself, a command substitution or a process
+    // substitution, which all undo what their groups and builtins
+    // redirected before the EXIT trap runs. See `run_exit_trap`.
+    forked_subshell: bool,
     // Whether a human is typing at this shell. Set once by repl.rs at
     // interactive startup (see enable_monitor_mode) and inherited by
     // every virtual child. The one thing it gates is which errors are
@@ -2401,6 +2415,12 @@ impl Shell {
             pending_fg: None,
             pending_edit: None,
             pending_exit: None,
+            redirect_scopes: 0,
+            exit_trap_deferred: false,
+            // A continuation of some other shell -- a background job, a
+            // pipeline stage, anything else re-executed -- is told that
+            // shell's `$$`, which is how it can tell it is one.
+            forked_subshell: shell_pid != std::process::id(),
             interactive: false,
             started_as_login: false,
             login_shell: false,
@@ -2775,6 +2795,9 @@ impl Shell {
             pending_fg: None,
             pending_edit: None,
             pending_exit: None,
+            redirect_scopes: 0,
+            exit_trap_deferred: false,
+            forked_subshell: false,
             interactive: self.interactive,
             started_as_login: self.started_as_login,
             login_shell: self.login_shell,
@@ -2841,6 +2864,25 @@ impl Shell {
         // and then again at every `( )`, every pipeline stage, and once
         // more at the real exit.
         if self.subshell_depth != self.exit_trap_depth {
+            return;
+        }
+        // Inside a redirected group, loop, `if` or builtin, the trap
+        // waits for those redirects to be put back: bash undoes them
+        // before it runs, so `{ exit; } > f` says goodbye on the
+        // terminal, not into `f`. The last scope to close runs it (see
+        // `leave_redirect_scope`).
+        //
+        // Unless a function is running. Then bash undoes nothing at all
+        // -- not the function's redirects, and not a group's inside or
+        // around it: `f(){ { exit; } > g; }; f` and `{ f; } > g` both
+        // say goodbye into `g`. So the trap runs right here, with every
+        // descriptor exactly where the `exit` found it.
+        //
+        // And only in the shell itself, or a command or process
+        // substitution. The other subshells -- `( )`, a pipeline stage, a
+        // background job -- also leave every redirect where it is.
+        if self.redirect_scopes > 0 && self.function_depth == 0 && !self.forked_subshell {
+            self.exit_trap_deferred |= self.exit_trap.is_some();
             return;
         }
         if let Some(cmd) = self.exit_trap.take() {
@@ -5610,6 +5652,9 @@ impl Shell {
         // sees. `x=$(logout 3)` leaves with 3; `( logout 3 )` refuses.
         if matches!(body, ChildBody::Enclosed(_) | ChildBody::Parsed(_)) {
             child.login_shell = false;
+            // ...and one bash forks, which leaves with its redirects
+            // where they are (see `run_exit_trap`).
+            child.forked_subshell = true;
         }
 
         // The real OS cwd is process-wide, shared with the real parent,
@@ -5876,15 +5921,116 @@ impl Shell {
     // compound), or a *backgrounded* run, which needs to keep going after
     // this call returns (nothing in this single-threaded interpreter can
     // do that in-process).
+    // A numbered-descriptor redirect this process can make on itself and
+    // put back afterwards: one naming only descriptors 3 and up, so
+    // nothing the shell's own stdin, stdout and stderr handling relies
+    // on moves under it.
+    fn stays_in_process(r: &Redirect) -> bool {
+        match r {
+            Redirect::FdOut { fd, .. } | Redirect::FdIn { fd, .. } | Redirect::FdInOut { fd, .. } | Redirect::FdClose { fd } => *fd >= 3,
+            Redirect::FdDup { fd, target } => *fd >= 3 && *target >= 3,
+            _ => false,
+        }
+    }
+
+    // A compound command with numbered-descriptor redirects, run in this
+    // shell. The descriptors are moved on the process itself -- where
+    // every builtin and every command started inside finds them -- and
+    // put back exactly as they were when the body is done, open or
+    // closed. The 0/1/2 redirects beside them go the ordinary in-process
+    // way.
+    //
+    // It used to run in a separate bish, since there was no in-process
+    // model for these at all. That lost everything a body does to the
+    // shell: `{ x=1; } 3>f` left `x` unset, `{ cd /; } 3>f` stayed put,
+    // and `{ exit 3; } 3>f` left only the group, so the script carried on.
+    fn run_with_numbered_fds(&mut self, cmd: &parser::Command, numbered: &[Redirect], simple: &[Redirect]) -> ExecResult {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+            fn dup2(oldfd: i32, newfd: i32) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+        const F_DUPFD_CLOEXEC: i32 = 1030;
+        // Each target as it was: a close-on-exec copy of it when open, so
+        // nothing started inside inherits the spare, or -1 when closed.
+        fn save(targets: impl Iterator<Item = i32>) -> Vec<(i32, i32)> {
+            let mut saved: Vec<(i32, i32)> = Vec::new();
+            for fd in targets {
+                if !saved.iter().any(|(target, _)| *target == fd) {
+                    saved.push((fd, unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 10) }));
+                }
+            }
+            saved
+        }
+        fn restore(saved: Vec<(i32, i32)>) {
+            for (fd, copy) in saved.into_iter().rev() {
+                unsafe {
+                    if copy >= 0 {
+                        dup2(copy, fd);
+                        close(copy);
+                    } else {
+                        close(fd);
+                    }
+                }
+            }
+        }
+        let redirs = match self.resolve_redirect_list(numbered) {
+            Ok(r) => r,
+            Err(e) => {
+                sh_eprintln!(self, "bish: {}", e);
+                return ExecResult::Status(1);
+            }
+        };
+        let saved = save(redirs.actions.iter().map(FdAction::target));
+        if let Err(e) = apply_fds_to_self(redirs.actions) {
+            restore(saved);
+            sh_eprintln!(self, "bish: {}", e);
+            return ExecResult::Status(1);
+        }
+        let result = match self.resolve_simple_redirects_for_compound(simple) {
+            Ok(stdio) => self.run_with_redirected_stdio(cmd, stdio),
+            Err(e) => {
+                sh_eprintln!(self, "bish: {}", e);
+                ExecResult::Status(1)
+            }
+        };
+        restore(saved);
+        result
+    }
+
+    // Closes one of the redirect scopes `run_exit_trap` waits on. When it
+    // was the last one open, and what ran inside is the shell leaving,
+    // the trap that came due in there runs now -- with every redirect
+    // that bash would have undone first already put back.
+    fn leave_redirect_scope(&mut self, result: &ExecResult) {
+        self.redirect_scopes = self.redirect_scopes.saturating_sub(1);
+        if self.redirect_scopes == 0 && std::mem::take(&mut self.exit_trap_deferred) && matches!(result, ExecResult::Exit(_)) {
+            self.run_exit_trap();
+        }
+    }
+
     pub(crate) fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
+        // Both in-process ways of running one are a redirect scope in the
+        // sense `run_exit_trap` means. The separate-process fallback below
+        // is not: an `exit` there leaves only that process.
         if !background && Self::compound_redirects_are_simple(redirects) {
-            return match self.resolve_simple_redirects_for_compound(redirects) {
+            self.redirect_scopes += 1;
+            let result = match self.resolve_simple_redirects_for_compound(redirects) {
                 Ok(stdio) => self.run_with_redirected_stdio(cmd, stdio),
                 Err(e) => {
                     sh_eprintln!(self, "bish: {}", e);
                     ExecResult::Status(1)
                 }
             };
+            self.leave_redirect_scope(&result);
+            return result;
+        }
+        if !background && redirects.iter().all(|r| Self::stays_in_process(r) || Self::compound_redirects_are_simple(std::slice::from_ref(r))) {
+            let (numbered, simple): (Vec<Redirect>, Vec<Redirect>) = redirects.iter().cloned().partition(Self::stays_in_process);
+            self.redirect_scopes += 1;
+            let result = self.run_with_numbered_fds(cmd, &numbered, &simple);
+            self.leave_redirect_scope(&result);
+            return result;
         }
         let redirs = match self.resolve_redirect_list(redirects) {
             Ok(r) => r,
@@ -7871,9 +8017,16 @@ impl Shell {
         } else {
             false
         };
+        // A builtin's own redirects are a scope `run_exit_trap` waits on
+        // too: `exit > f`, `eval exit > f` and `. file > f` all put the
+        // descriptor back before bash says goodbye.
+        if pushed {
+            self.redirect_scopes += 1;
+        }
         let result = self.dispatch_builtin_or_external_impl(argv, name, cmd, background, builtin_only, array_literal_args);
         if pushed {
             self.pop_builtin_output_sink();
+            self.leave_redirect_scope(&result);
         }
         // With that command's own redirect sink off again, a bare `exec`
         // can say where this shell's output goes from here.
@@ -9834,6 +9987,9 @@ impl Shell {
             // A stage is a subshell, and so not the login shell -- see
             // run_body_in_child_shell.
             child.login_shell = false;
+            // ...and one bash forks, which leaves with its redirects
+            // where they are (see `run_exit_trap`).
+            child.forked_subshell = true;
             // No DEBUG trap inside this stage, in the two cases where
             // bash has none either. A simple stage was already named
             // and traced by `run_multi` before any stage started; a
