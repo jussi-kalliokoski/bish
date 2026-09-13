@@ -188,6 +188,97 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
     Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
+// One `git` call from `dir`, its stdout on success and the first line of
+// what it said on failure.
+fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git").args(args).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
+    if !output.status.success() {
+        return Err(first_stderr_line(&output.stderr, "git failed"));
+    }
+    Ok(output.stdout)
+}
+
+/// One file a commit touched. A rename or copy has both paths; an added
+/// file has only a new one and a deleted file only an old one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangedFile {
+    /// git's own letter for what happened: `M`, `A`, `D`, `R`, `C`, `T`.
+    pub status: char,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+}
+
+/// A commit, as much of it as `:git show` puts on screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Commit {
+    /// The repository's top level, which every path below is relative to.
+    pub root: std::path::PathBuf,
+    pub hash: String,
+    /// What the diff is against: the first parent, or none for a root
+    /// commit, whose every file is new.
+    pub parent: Option<String>,
+    pub merge: bool,
+    /// Hash, author, date and message, laid out the way `git show` does.
+    pub header: Vec<String>,
+    pub files: Vec<ChangedFile>,
+}
+
+/// What `rev` is, from anywhere inside the repository at `dir`: its
+/// header, its parent, and the files it changed against that parent.
+///
+/// A merge is shown against its first parent -- one diff rather than
+/// git's combined one, which has no single "before" to put beside
+/// "after" -- and `merge` says so. Renames are followed (`-M`), so a
+/// moved file is one entry rather than a deletion and an addition.
+pub fn show(dir: &Path, rev: &str) -> Result<Commit, String> {
+    let root = std::path::PathBuf::from(String::from_utf8_lossy(&git(dir, &["rev-parse", "--show-toplevel"])?).trim());
+    let hash = git(&root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")])
+        .map_err(|_| format!("unknown revision '{rev}'"))?;
+    let hash = String::from_utf8_lossy(&hash).trim().to_string();
+    let parents: Vec<String> =
+        String::from_utf8_lossy(&git(&root, &["rev-list", "--parents", "-n", "1", &hash])?).split_whitespace().skip(1).map(str::to_string).collect();
+    let header = String::from_utf8_lossy(&git(&root, &["show", "-s", "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%w(0,4,4)%B", &hash])?)
+        .trim_end()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let listing = match parents.first() {
+        Some(parent) => git(&root, &["diff-tree", "-r", "-M", "-z", "--no-commit-id", "--name-status", parent, &hash])?,
+        None => git(&root, &["diff-tree", "-r", "-M", "-z", "--root", "--no-commit-id", "--name-status", &hash])?,
+    };
+    Ok(Commit { root, hash, merge: parents.len() > 1, parent: parents.into_iter().next(), header, files: parse_name_status_z(&listing) })
+}
+
+/// The bytes of `path` (relative to the repository's top level) at `rev`.
+pub fn blob(root: &Path, rev: &str, path: &str) -> Result<Vec<u8>, String> {
+    git(root, &["cat-file", "blob", &format!("{rev}:{path}")])
+}
+
+// `git diff-tree --name-status -z`: a status, then one path, or two for a
+// rename or copy, every field ended by a NUL. The NULs are what let a
+// path hold a tab or a newline without being misread.
+pub(crate) fn parse_name_status_z(bytes: &[u8]) -> Vec<ChangedFile> {
+    let fields: Vec<String> = bytes.split(|b| *b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        let status = fields[i].chars().next().unwrap_or('M');
+        let path = |k: usize| Some(fields[i + k].clone());
+        match status {
+            'R' | 'C' if i + 2 < fields.len() => {
+                out.push(ChangedFile { status, old_path: path(1), new_path: path(2) });
+                i += 3;
+                continue;
+            }
+            'A' => out.push(ChangedFile { status, old_path: None, new_path: path(1) }),
+            'D' => out.push(ChangedFile { status, old_path: path(1), new_path: None }),
+            _ => out.push(ChangedFile { status, old_path: path(1), new_path: path(1) }),
+        }
+        i += 2;
+    }
+    out
+}
+
 // Lines up per-line results computed against `old` with the buffer's own
 // `new` lines, by diffing the two: entry `i` of the result is whatever
 // `old`-side line buffer line `i` came from, or `None` for a line that
@@ -331,6 +422,81 @@ fn format_unix_date(epoch_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_status_listing_reads_renames_as_one_entry_and_paths_as_they_are() {
+        let listing = b"M\0src/a.rs\0R087\0old name\0new\tname\0A\0added\0D\0gone\0";
+        let files = parse_name_status_z(listing);
+        let entry = |status, old: Option<&str>, new: Option<&str>| ChangedFile {
+            status,
+            old_path: old.map(str::to_string),
+            new_path: new.map(str::to_string),
+        };
+        assert_eq!(
+            files,
+            vec![
+                entry('M', Some("src/a.rs"), Some("src/a.rs")),
+                entry('R', Some("old name"), Some("new\tname")),
+                entry('A', None, Some("added")),
+                entry('D', Some("gone"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn show_lists_what_a_commit_changed_against_its_parent_or_nothing_for_a_root() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-show-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&dir).stdout(Stdio::null()).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("keep.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("moved.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(dir.join("keep.txt"), "one\nTWO\n").unwrap();
+        run(&["add", "keep.txt"]);
+        run(&["mv", "moved.txt", "sub/moved.txt"]);
+        run(&["rm", "-q", "gone.txt"]);
+        run(&["commit", "-q", "-m", "second\n\nwith a body"]);
+
+        let commit = show(&dir.join("sub"), "HEAD").unwrap();
+        assert_eq!(commit.header[0], format!("commit {}", commit.hash));
+        assert_eq!(commit.header[1], "Author: Test User <test@example.com>");
+        assert!(commit.header.iter().any(|l| l == "    with a body"), "{:?}", commit.header);
+        assert!(!commit.merge);
+        let parent = commit.parent.clone().unwrap();
+        let mut statuses: Vec<(char, Option<String>, Option<String>)> =
+            commit.files.iter().map(|f| (f.status, f.old_path.clone(), f.new_path.clone())).collect();
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec![
+                ('D', Some("gone.txt".to_string()), None),
+                ('M', Some("keep.txt".to_string()), Some("keep.txt".to_string())),
+                ('R', Some("moved.txt".to_string()), Some("sub/moved.txt".to_string())),
+            ]
+        );
+        assert_eq!(blob(&commit.root, &parent, "keep.txt").unwrap(), b"one\ntwo\n");
+        assert_eq!(blob(&commit.root, &commit.hash, "keep.txt").unwrap(), b"one\nTWO\n");
+
+        let root = show(&dir, "HEAD~1").unwrap();
+        assert_eq!(root.parent, None);
+        assert_eq!(root.files.len(), 3, "a root commit adds everything in it");
+        assert!(root.files.iter().all(|f| f.status == 'A'));
+
+        assert_eq!(show(&dir, "no-such-rev").unwrap_err(), "unknown revision 'no-such-rev'");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     // The three deletion-attachment points (start/middle/end of file),
     // each checked against a real `git diff --no-color -U0` run first

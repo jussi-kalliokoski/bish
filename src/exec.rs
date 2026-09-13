@@ -17754,8 +17754,8 @@ mod spawn_guard {
         ("src/exec.rs", 1, "`Shell::command` itself, the one place that builds a child's environment"),
         (
             "src/git.rs",
-            7,
-            "runs `git` to answer questions the prompt and the editor ask about the repository -- bish's own tooling, inheriting bish's own environment as any of its subprocesses does",
+            8,
+            "runs `git` to answer questions the prompt and the editor ask about the repository, and to read a commit for `:git show` -- bish's own tooling, inheriting bish's own environment as any of its subprocesses does",
         ),
         ("src/lspclient.rs", 1, "starts a language server for the editor, which is bish's, not the script's"),
         (

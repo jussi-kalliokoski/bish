@@ -1,14 +1,19 @@
-// A diff to decide on, one change at a time.
+// A diff to read, or to decide on one change at a time.
 //
-// Two versions of one text -- what it was and what it would become --
-// shown as one unified view with every change marked, and a verdict on
-// each: taken, refused, or not decided yet. `reverts` turns the verdicts
-// into the edits that undo the refused changes in a buffer already
-// holding the new version.
+// Two versions of some text -- what it was and what it would become --
+// shown as one unified view with every change marked. It has two uses,
+// which differ only in what a key does to a change:
 //
-// Keys in, a frame out, and nothing about terminals or editors in
+// - Deciding (`:review`, `openDiff`): one file, and a verdict on each
+//   change -- taken, refused, or not decided yet. `reverts` turns the
+//   verdicts into the edits that undo the refused ones in a buffer
+//   already holding the new version.
+// - Reading (`:git show`): a commit's header and every file it touched,
+//   each under a heading of its own, with nothing to decide.
+//
+// Keys in, a frame out, and nothing about terminals, editors or git in
 // between, so every rule here can be a unit test. Shaped after pager.rs,
-// which is the same arrangement for reading rather than deciding.
+// which is the same arrangement for text that is not a diff.
 
 use crate::bishedit::unicode_width::char_width;
 use crate::editor::Key;
@@ -93,25 +98,53 @@ pub fn resolve(old: &[String], new: &[String], hunks: &[Hunk], verdicts: &[Verdi
     out
 }
 
+/// One file's two versions, for a view of several.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    /// What its heading says: a path, or how it was renamed.
+    pub label: String,
+    pub old: Vec<String>,
+    pub new: Vec<String>,
+    /// Either side is not text. Said so, and not diffed.
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Deciding,
+    Reading,
+}
+
 // Unchanged lines kept either side of a change. `diff -u`'s own number.
 const CONTEXT: usize = 3;
 
-// One row of the unified view.
+// One row of the unified view. `file` is an index into the view's files,
+// `hunk` into its hunks, which run on across files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
+    // A line of the header a reading view opens with -- a commit's hash,
+    // author, date and message.
+    Message(usize),
+    Blank,
+    // A file's heading.
+    File(usize),
+    // A file that is not text, or whose contents did not change (a mode
+    // change, a rename and nothing more).
+    Binary(usize),
+    Unchanged(usize),
     // An unchanged line: its index in the old text and in the new.
-    Context { old: usize, new: usize },
+    Context { file: usize, old: usize, new: usize },
     // A run of unchanged lines too far from any change to be worth showing.
     Skipped(usize),
     Header(usize),
-    Removed { line: usize, hunk: usize },
-    Added { line: usize, hunk: usize },
+    Removed { file: usize, line: usize, hunk: usize },
+    Added { file: usize, line: usize, hunk: usize },
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Continue,
-    /// Finished: the verdicts stand.
+    /// Finished: the verdicts stand. For a reading view, just closed.
     Done,
     /// Walked away from: nothing decided here should happen.
     Cancel,
@@ -119,9 +152,11 @@ pub enum Outcome {
 
 pub struct Review {
     title: String,
-    old: Vec<String>,
-    new: Vec<String>,
-    hunks: Vec<Hunk>,
+    mode: Mode,
+    header: Vec<String>,
+    files: Vec<FileDiff>,
+    // Every change in every file, in order, with the file it is in.
+    hunks: Vec<(usize, Hunk)>,
     verdicts: Vec<Verdict>,
     rows: Vec<Row>,
     current: usize,
@@ -131,25 +166,47 @@ pub struct Review {
 }
 
 impl Review {
+    /// A view to decide on the changes from `old` to `new`, one file.
     pub fn new(title: &str, old: Vec<String>, new: Vec<String>, rows: usize, cols: usize) -> Review {
-        let hunks = hunks(&old, &new);
-        let layout = layout(&hunks, old.len());
-        let verdicts = vec![Verdict::Undecided; hunks.len()];
-        let mut review = Review {
+        let file = FileDiff { label: String::new(), old, new, binary: false };
+        let mut review = Review::build(title, Mode::Deciding, Vec::new(), vec![file], rows, cols);
+        review.reveal_current();
+        review
+    }
+
+    /// A view to read: `header` above every file in `files`, each under a
+    /// heading. `start` is the file to open at; with none it opens at the
+    /// top, so the header is the first thing on screen.
+    pub fn reading(title: &str, header: Vec<String>, files: Vec<FileDiff>, start: Option<usize>, rows: usize, cols: usize) -> Review {
+        let mut review = Review::build(title, Mode::Reading, header, files, rows, cols);
+        if let Some(file) = start {
+            review.go_to_file(file);
+        }
+        review
+    }
+
+    fn build(title: &str, mode: Mode, header: Vec<String>, files: Vec<FileDiff>, rows: usize, cols: usize) -> Review {
+        let mut hunks_all = Vec::new();
+        for (f, file) in files.iter().enumerate() {
+            if !file.binary {
+                hunks_all.extend(hunks(&file.old, &file.new).into_iter().map(|h| (f, h)));
+            }
+        }
+        let rows_all = layout(mode, &header, &files, &hunks_all);
+        Review {
             title: title.to_string(),
-            old,
-            new,
-            hunks,
-            verdicts,
-            rows: layout,
+            mode,
+            header,
+            verdicts: vec![Verdict::Undecided; hunks_all.len()],
+            files,
+            hunks: hunks_all,
+            rows: rows_all,
             current: 0,
             top: 0,
             // One row for the title, one for the status bar.
             height: rows.saturating_sub(2).max(1),
             cols,
-        };
-        review.reveal_current();
-        review
+        }
     }
 
     /// The pane changed size. Where the reader was stays put.
@@ -159,10 +216,19 @@ impl Review {
         self.top = self.top.min(self.max_top());
     }
 
+    // The one file a deciding view is about, its hunks and their
+    // verdicts.
+    fn decided(&self) -> (&FileDiff, Vec<Hunk>, Vec<Verdict>) {
+        let hunks = self.hunks.iter().filter(|(f, _)| *f == 0).map(|(_, h)| h.clone()).collect();
+        let verdicts = self.hunks.iter().zip(&self.verdicts).filter(|((f, _), _)| *f == 0).map(|(_, v)| *v).collect();
+        (&self.files[0], hunks, verdicts)
+    }
+
     /// The text the verdicts add up to, with `undecided` saying which way
     /// a change nobody ruled on goes -- see `resolve`.
     pub fn resolved(&self, undecided: Verdict) -> Vec<String> {
-        resolve(&self.old, &self.new, &self.hunks, &self.verdicts, undecided)
+        let (file, hunks, verdicts) = self.decided();
+        resolve(&file.old, &file.new, &hunks, &verdicts, undecided)
     }
 
     /// Whether anything at all was taken.
@@ -175,12 +241,13 @@ impl Review {
     /// change first, so applying them in order never moves a line a later
     /// one still refers to.
     pub fn reverts(&self) -> Vec<(Range<usize>, Vec<String>)> {
-        self.hunks
+        let (file, hunks, verdicts) = self.decided();
+        hunks
             .iter()
-            .zip(&self.verdicts)
+            .zip(&verdicts)
             .rev()
             .filter(|(_, v)| **v == Verdict::Rejected)
-            .map(|(h, _)| (h.new.clone(), self.old[h.old.clone()].to_vec()))
+            .map(|(h, _)| (h.new.clone(), file.old[h.old.clone()].to_vec()))
             .collect()
     }
 
@@ -218,6 +285,27 @@ impl Review {
         }
     }
 
+    // A file's heading at the top of the screen, and its first change the
+    // current one, so `n` carries on from there.
+    fn go_to_file(&mut self, file: usize) {
+        // Not held to `max_top`: the last file's heading goes to the top
+        // like any other, with blank rows under it, so which file is on
+        // screen is never in doubt. The next scroll pulls it back.
+        let Some(row) = self.rows.iter().position(|r| *r == Row::File(file)) else { return };
+        self.top = row;
+        if let Some(hunk) = self.hunks.iter().position(|(f, _)| *f == file) {
+            self.current = hunk;
+        }
+    }
+
+    // The file whose heading is nearest above the top of the screen.
+    fn file_on_screen(&self) -> Option<usize> {
+        self.rows.iter().take(self.top + 1).rev().find_map(|r| match r {
+            Row::File(f) => Some(*f),
+            _ => None,
+        })
+    }
+
     // After a verdict: on to the next change still waiting for one,
     // wrapping round, or stay put when there is none.
     fn decide(&mut self, verdict: Verdict) {
@@ -253,6 +341,23 @@ impl Review {
                     self.go_to(self.current - 1);
                 }
             }
+            Key::Char('}') if self.mode == Mode::Reading => {
+                let next = self.file_on_screen().map_or(0, |f| f + 1);
+                self.go_to_file(next);
+            }
+            Key::Char('{') if self.mode == Mode::Reading => {
+                // Back to this file's own heading first, when it has
+                // scrolled off; from the heading, to the file before.
+                match self.file_on_screen() {
+                    Some(f) if self.rows.get(self.top) == Some(&Row::File(f)) && f > 0 => self.go_to_file(f - 1),
+                    Some(f) => self.go_to_file(f),
+                    None => self.top = 0,
+                }
+            }
+            Key::Char('q') | Key::Enter => return Outcome::Done,
+            Key::Escape if self.mode == Mode::Reading => return Outcome::Done,
+            Key::Escape => return Outcome::Cancel,
+            _ if self.mode == Mode::Reading => {}
             Key::Char('a') | Key::Char('y') => self.decide(Verdict::Accepted),
             Key::Char('r') | Key::Char('x') => self.decide(Verdict::Rejected),
             Key::Char('u') => {
@@ -262,8 +367,6 @@ impl Review {
             }
             Key::Char('A') => self.decide_rest(Verdict::Accepted),
             Key::Char('R') => self.decide_rest(Verdict::Rejected),
-            Key::Char('q') | Key::Enter => return Outcome::Done,
-            Key::Escape => return Outcome::Cancel,
             _ => {}
         }
         Outcome::Continue
@@ -294,10 +397,15 @@ impl Review {
     fn render_row(&self, row: Row) -> String {
         let verdict = |hunk: usize| self.verdicts[hunk];
         let (sgr, text) = match row {
-            Row::Context { new, .. } => ("", format!("  {}", self.new[new])),
+            Row::Message(i) => (if i == 0 { "33" } else { "" }, self.header[i].clone()),
+            Row::Blank => ("", String::new()),
+            Row::File(f) => ("1", self.files[f].label.clone()),
+            Row::Binary(_) => ("2", "  binary file, not shown".to_string()),
+            Row::Unchanged(_) => ("2", "  nothing in it changed".to_string()),
+            Row::Context { file, new, .. } => ("", format!("  {}", self.files[file].new[new])),
             Row::Skipped(n) => ("2", format!("  \u{22ef} {n} unchanged line{}", if n == 1 { "" } else { "s" })),
             Row::Header(hunk) => {
-                let h = &self.hunks[hunk];
+                let h = &self.hunks[hunk].1;
                 let label = match verdict(hunk) {
                     Verdict::Undecided => "",
                     Verdict::Accepted => "  accepted",
@@ -306,14 +414,25 @@ impl Review {
                 let text = format!("@@ -{},{} +{},{} @@{label}", h.old.start + 1, h.old.len(), h.new.start + 1, h.new.len());
                 (if hunk == self.current { "1;7" } else { "36" }, text)
             }
-            Row::Removed { line, hunk } => (if verdict(hunk) == Verdict::Accepted { "31;2;9" } else { "31" }, format!("- {}", self.old[line])),
-            Row::Added { line, hunk } => (if verdict(hunk) == Verdict::Rejected { "32;2;9" } else { "32" }, format!("+ {}", self.new[line])),
+            Row::Removed { file, line, hunk } => {
+                (if verdict(hunk) == Verdict::Accepted { "31;2;9" } else { "31" }, format!("- {}", self.files[file].old[line]))
+            }
+            Row::Added { file, line, hunk } => {
+                (if verdict(hunk) == Verdict::Rejected { "32;2;9" } else { "32" }, format!("+ {}", self.files[file].new[line]))
+            }
         };
         let fitted = fit(&text, self.cols);
         if sgr.is_empty() { fitted } else { format!("\x1b[{sgr}m{fitted}\x1b[0m") }
     }
 
     fn status(&self) -> String {
+        if self.mode == Mode::Reading {
+            let file = match self.file_on_screen() {
+                Some(f) => format!("file {} of {}: {}   ", f + 1, self.files.len(), self.files[f].label),
+                None => format!("{} file{}   ", self.files.len(), if self.files.len() == 1 { "" } else { "s" }),
+            };
+            return format!("{file}j/k scroll  n/N change  {{/}} file  q close");
+        }
         let count = |v: Verdict| self.verdicts.iter().filter(|x| **x == v).count();
         format!(
             "{} accepted, {} rejected, {} to go   a accept  r reject  A/R the rest  n/N change  q done  Esc cancel",
@@ -324,37 +443,55 @@ impl Review {
     }
 }
 
-// The rows of the unified view: every change with `CONTEXT` unchanged
-// lines either side of it, and whatever unchanged run is longer than
-// that folded into one row saying how long.
-fn layout(hunks: &[Hunk], old_len: usize) -> Vec<Row> {
-    let mut rows = Vec::new();
-    // Where the unchanged run before the next change starts, in both
-    // texts. The two only ever differ by how much the changes so far
-    // added or removed.
-    let (mut old_at, mut new_at) = (0, 0);
-    let unchanged = |rows: &mut Vec<Row>, old_at: usize, new_at: usize, len: usize, first: bool, last: bool| {
+// The rows of the unified view. A reading view starts with its header
+// and puts each file under a heading; a deciding view is one file and
+// needs neither. In both, every change gets `CONTEXT` unchanged lines
+// either side of it, and whatever unchanged run is longer than that is
+// folded into one row saying how long.
+fn layout(mode: Mode, header: &[String], files: &[FileDiff], hunks: &[(usize, Hunk)]) -> Vec<Row> {
+    let mut rows: Vec<Row> = (0..header.len()).map(Row::Message).collect();
+    let unchanged = |rows: &mut Vec<Row>, file: usize, old_at: usize, new_at: usize, len: usize, first: bool, last: bool| {
         let head = if first { 0 } else { len.min(CONTEXT) };
         let tail = if last { 0 } else { len.saturating_sub(head).min(CONTEXT) };
         for k in 0..head {
-            rows.push(Row::Context { old: old_at + k, new: new_at + k });
+            rows.push(Row::Context { file, old: old_at + k, new: new_at + k });
         }
         if len > head + tail {
             rows.push(Row::Skipped(len - head - tail));
         }
         for k in len - tail..len {
-            rows.push(Row::Context { old: old_at + k, new: new_at + k });
+            rows.push(Row::Context { file, old: old_at + k, new: new_at + k });
         }
     };
-    for (i, hunk) in hunks.iter().enumerate() {
-        unchanged(&mut rows, old_at, new_at, hunk.old.start - old_at, i == 0, false);
-        rows.push(Row::Header(i));
-        rows.extend(hunk.old.clone().map(|line| Row::Removed { line, hunk: i }));
-        rows.extend(hunk.new.clone().map(|line| Row::Added { line, hunk: i }));
-        (old_at, new_at) = (hunk.old.end, hunk.new.end);
-    }
-    if !hunks.is_empty() {
-        unchanged(&mut rows, old_at, new_at, old_len - old_at, false, true);
+    for (f, file) in files.iter().enumerate() {
+        if mode == Mode::Reading {
+            if !rows.is_empty() {
+                rows.push(Row::Blank);
+            }
+            rows.push(Row::File(f));
+        }
+        if file.binary {
+            rows.push(Row::Binary(f));
+            continue;
+        }
+        // Where the unchanged run before the next change starts, in both
+        // texts. The two only ever differ by how much the changes so far
+        // added or removed.
+        let (mut old_at, mut new_at) = (0, 0);
+        let mut any = false;
+        for (i, (_, hunk)) in hunks.iter().enumerate().filter(|(_, (hf, _))| *hf == f) {
+            unchanged(&mut rows, f, old_at, new_at, hunk.old.start - old_at, !any, false);
+            rows.push(Row::Header(i));
+            rows.extend(hunk.old.clone().map(|line| Row::Removed { file: f, line, hunk: i }));
+            rows.extend(hunk.new.clone().map(|line| Row::Added { file: f, line, hunk: i }));
+            (old_at, new_at) = (hunk.old.end, hunk.new.end);
+            any = true;
+        }
+        if any {
+            unchanged(&mut rows, f, old_at, new_at, file.old.len() - old_at, false, true);
+        } else if mode == Mode::Reading {
+            rows.push(Row::Unchanged(f));
+        }
     }
     rows
 }
@@ -404,6 +541,10 @@ mod tests {
 
     fn shown(review: &Review) -> Vec<String> {
         (0..review.height).filter_map(|r| review.rows.get(review.top + r)).map(|row| plain(&review.render_row(*row)).trim_end().to_string()).collect()
+    }
+
+    fn file(label: &str, old: &str, new: &str) -> FileDiff {
+        FileDiff { label: label.to_string(), old: lines(old), new: lines(new), binary: false }
     }
 
     #[test]
@@ -501,5 +642,63 @@ mod tests {
         let frame = plain(&review.render(Rect { row: 0, col: 0, rows: 10, cols: 120 }));
         assert!(frame.contains("file.rs  change 1 of 1"), "{frame}");
         assert!(frame.contains("0 accepted, 0 rejected, 1 to go"), "{frame}");
+    }
+
+    #[test]
+    fn a_reading_view_shows_the_header_then_every_file_under_its_own_heading() {
+        let files = vec![
+            file("src/a.rs", "one\ntwo", "one\nTWO"),
+            FileDiff { label: "logo.png".to_string(), old: Vec::new(), new: Vec::new(), binary: true },
+            file("docs/b.md -> docs/c.md", "same", "same"),
+        ];
+        let review = Review::reading("git show abc", lines("commit abc\nAuthor: x"), files, None, 40, 60);
+        assert_eq!(
+            shown(&review),
+            vec![
+                "commit abc",
+                "Author: x",
+                "",
+                "src/a.rs",
+                "  one",
+                "@@ -2,1 +2,1 @@",
+                "- two",
+                "+ TWO",
+                "",
+                "logo.png",
+                "  binary file, not shown",
+                "",
+                "docs/b.md -> docs/c.md",
+                "  nothing in it changed"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reading_view_steps_through_changes_across_files_and_decides_nothing() {
+        let files = vec![file("a", "1\n2", "1\nX"), file("b", "3\n4", "Y\n4")];
+        let mut review = Review::reading("t", Vec::new(), files, None, 40, 40);
+        assert_eq!(review.current, 0);
+        review.handle_key(Key::Char('n'));
+        assert_eq!(review.current, 1, "on into the next file's change");
+        assert_eq!(review.hunks[1].0, 1);
+        review.handle_key(Key::Char('a'));
+        review.handle_key(Key::Char('r'));
+        assert!(review.verdicts.iter().all(|v| *v == Verdict::Undecided), "nothing here to decide");
+        assert_eq!(review.handle_key(Key::Escape), Outcome::Done, "Escape closes it too; there is nothing to cancel");
+    }
+
+    #[test]
+    fn a_reading_view_opens_at_the_file_asked_for_and_jumps_between_files() {
+        let many = |n: usize| (0..n).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let files = vec![file("first", &many(30), &(many(30) + "\nmore")), file("second", "x", "y"), file("third", "p", "q")];
+        let mut review = Review::reading("t", lines("commit abc"), files, Some(1), 8, 40);
+        assert_eq!(shown(&review)[0], "second", "its heading at the top");
+        assert_eq!(review.current, 1, "and its first change the current one");
+        review.handle_key(Key::Char('}'));
+        assert_eq!(shown(&review)[0], "third");
+        review.handle_key(Key::Char('{'));
+        assert_eq!(shown(&review)[0], "second");
+        let frame = plain(&review.render(Rect { row: 0, col: 0, rows: 8, cols: 60 }));
+        assert!(frame.contains("file 2 of 3: second"), "{frame}");
     }
 }

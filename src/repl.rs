@@ -11305,6 +11305,7 @@ its decompressed text.
 | `:w [FILE]` | write (`:wq`/`:x` write+quit, `:q`, `:q!`) |
 | `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
 | `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
+| `:git show [REV]` | the commit (`HEAD` by default), opened at this file |
 | `:diff` | +/~/- vs. what's on disk, no git needed |
 | `:review [git [REV]]` | go through those changes one by one, keeping or putting back each |
 | `:fold` | fold this line, or a range before it (`:foldopen[!]`, `:foldclose[!]`) |
@@ -11542,7 +11543,8 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
         "" => request.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "review".to_string()),
         title => title.to_string(),
     };
-    let Some(review) = run_review(app, &title, old, new) else {
+    let rect = app.focused_pane_rect();
+    let Some(review) = run_review(app, crate::review::Review::new(&title, old, new, rect.rows, rect.cols)) else {
         return mcp::ReviewOutcome::Rejected;
     };
     if !review.accepted_any() {
@@ -11567,16 +11569,78 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
     mcp::ReviewOutcome::Saved(text)
 }
 
+// `:git show REV` as a view to read: the commit's header, then every file
+// it changed, each as it was in the parent beside what the commit made it.
+// Opens at `path`'s own section when the commit touched that file. From
+// the directory `path` is in, or the working directory without one.
+fn git_show_view(path: Option<&Path>, rev: &str, rows: usize, cols: usize) -> Result<crate::review::Review, String> {
+    let dir = match path.and_then(Path::parent).filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let commit = crate::git::show(&dir, rev)?;
+    let mut header = commit.header.clone();
+    if commit.merge {
+        header.push(String::new());
+        header.push("(a merge: shown against its first parent)".to_string());
+    }
+    let here = path.and_then(|p| std::fs::canonicalize(p).ok());
+    let mut start = None;
+    let mut files = Vec::new();
+    for changed in &commit.files {
+        // A side the file is not on -- before it was added, after it was
+        // deleted -- is empty.
+        let side = |rev: Option<&str>, path: &Option<String>| match (rev, path) {
+            (Some(rev), Some(path)) => crate::git::blob(&commit.root, rev, path),
+            _ => Ok(Vec::new()),
+        };
+        let old = side(commit.parent.as_deref(), &changed.old_path)?;
+        let new = side(Some(&commit.hash), &changed.new_path)?;
+        let binary = looks_binary(&old) || looks_binary(&new);
+        let text = |bytes: &[u8]| crate::encoding::decode(bytes).text.lines().map(str::to_string).collect::<Vec<_>>();
+        let label = match (&changed.old_path, &changed.new_path) {
+            (Some(old), Some(new)) if old != new => format!("{old} \u{2192} {new}"),
+            (None, Some(new)) => format!("{new} (new)"),
+            (Some(old), None) => format!("{old} (deleted)"),
+            (Some(path), Some(_)) => path.clone(),
+            (None, None) => continue,
+        };
+        let touches_here = [&changed.new_path, &changed.old_path]
+            .into_iter()
+            .flatten()
+            .any(|p| here.is_some() && std::fs::canonicalize(commit.root.join(p)).ok() == here);
+        if start.is_none() && touches_here {
+            start = Some(files.len());
+        }
+        files.push(crate::review::FileDiff {
+            label,
+            old: if binary { Vec::new() } else { text(&old) },
+            new: if binary { Vec::new() } else { text(&new) },
+            binary,
+        });
+    }
+    let short = &commit.hash[..commit.hash.len().min(12)];
+    Ok(crate::review::Review::reading(&format!("git show {short}"), header, files, start, rows, cols))
+}
+
+// What git itself goes by: a NUL in the first 8000 bytes. A UTF-16 file
+// is full of them and is still text, so its byte-order mark says so first.
+fn looks_binary(bytes: &[u8]) -> bool {
+    !bytes.starts_with(&[0xff, 0xfe]) && !bytes.starts_with(&[0xfe, 0xff]) && bytes[..bytes.len().min(8000)].contains(&0)
+}
+
 // `:review`'s loop -- `run_pager`'s arrangement, for a view that decides
 // rather than reads. The review comes back when it was finished, so its
 // verdicts can be acted on, and not when it was walked away from.
-fn run_review(app: &mut App, title: &str, old: Vec<String>, new: Vec<String>) -> Option<crate::review::Review> {
+// `view` is made by the caller, sized to `focused_pane_rect`, so the same
+// loop serves one that reads, too.
+fn run_review(app: &mut App, mut view: crate::review::Review) -> Option<crate::review::Review> {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
     // What capture reports while this is open -- see `OVERLAYS`.
     let _overlay = OverlayOpen::new();
     let mut rect = app.focused_pane_rect();
     compositor_redraw(app);
-    let mut view = crate::review::Review::new(title, old, new, rect.rows, rect.cols);
+    view.resize(rect.rows, rect.cols);
     let mut last_size = (app.term_rows, app.term_cols);
     let outcome = loop {
         let frame = view.render(rect);
@@ -11798,6 +11862,44 @@ fn expand_tabs(text: &str) -> String {
         column += crate::bishedit::unicode_width::char_width(c);
     }
     out
+}
+
+#[cfg(test)]
+mod git_show_tests {
+    use super::*;
+
+    #[test]
+    fn git_show_opens_at_the_file_being_edited_and_says_what_is_not_text() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-repl-git-show-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(&dir).stdout(std::process::Stdio::null()).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        std::fs::write(dir.join("c.bin"), b"\0\x01").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "all of it"]);
+
+        let view = git_show_view(Some(&dir.join("b.txt")), "HEAD", 30, 60).unwrap();
+        let frame = view.render(crate::window::Rect { row: 0, col: 0, rows: 30, cols: 60 });
+        assert!(frame.contains("file 2 of 3: b.txt (new)"), "opened at b.txt: {frame:?}");
+        assert!(frame.contains("binary file, not shown"), "{frame:?}");
+
+        let from_nowhere = git_show_view(Some(&dir.join("elsewhere.txt")), "HEAD", 30, 60).unwrap();
+        let frame = from_nowhere.render(crate::window::Rect { row: 0, col: 0, rows: 30, cols: 60 });
+        assert!(frame.contains("all of it"), "an untouched file opens at the top, header first: {frame:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -12879,7 +12981,8 @@ fn run_command_mode(
                                     .and_then(|p| p.file_name())
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| "review".to_string());
-                                let Some(review) = run_review(app, &name, old, new) else {
+                                let rect = app.focused_pane_rect();
+                                let Some(review) = run_review(app, crate::review::Review::new(&name, old, new, rect.rows, rect.cols)) else {
                                     return CommandModeOutcome::Cancelled;
                                 };
                                 let reverts = review.reverts();
@@ -13746,7 +13849,11 @@ fn run_command_mode(
                                     None => (a, None),
                                 },
                                 None => {
-                                    show_command_mode_error("bish: git: missing subcommand (expected: blame, diff)", app.term_rows, app.term_cols);
+                                    show_command_mode_error(
+                                        "bish: git: missing subcommand (expected: blame, diff, show)",
+                                        app.term_rows,
+                                        app.term_cols,
+                                    );
                                     buffer.clear();
                                     continue;
                                 }
@@ -13814,9 +13921,26 @@ fn run_command_mode(
                                         continue;
                                     }
                                 },
+                                // `show [REV]`: the whole commit in the
+                                // diff view, read-only, opened at this
+                                // file when the commit touched it.
+                                "show" => {
+                                    let rect = app.focused_pane_rect();
+                                    match git_show_view(tb.path(), subarg.unwrap_or("HEAD"), rect.rows, rect.cols) {
+                                        Ok(view) => {
+                                            run_review(app, view);
+                                            return CommandModeOutcome::Cancelled;
+                                        }
+                                        Err(e) => {
+                                            show_command_mode_error(&format!("bish: git: show: {e}"), app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    }
+                                }
                                 other => {
                                     show_command_mode_error(
-                                        &format!("bish: git: unknown subcommand '{}' (expected: blame, diff)", other),
+                                        &format!("bish: git: unknown subcommand '{}' (expected: blame, diff, show)", other),
                                         app.term_rows,
                                         app.term_cols,
                                     );
