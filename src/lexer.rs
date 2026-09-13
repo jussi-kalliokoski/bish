@@ -257,7 +257,9 @@ pub enum Tok {
     RedirVarFd { var: String, kind: VarFdKind },
     RedirFdIn { fd: u32 },
     RedirFdInOut { fd: u32 },
-    RedirFdDup { fd: u32, target: u32 },
+    // `input` is whether it was written `<&` rather than `>&`. The two do
+    // the same dup2, but `declare -f` writes back what was written.
+    RedirFdDup { fd: u32, target: u32, input: bool },
     // `[N]>&WORD` / `[N]<&WORD` where WORD isn't a bare literal digit
     // sequence -- e.g. `>&"$fd"`, needed for anything using a dynamically-
     // obtained fd (like a coproc's array entries) rather than a fixed
@@ -267,7 +269,7 @@ pub enum Tok {
     // `fd` is the source side (1 for a bare `>&`, 0 for a bare `<&`, or the
     // explicit leading digit for `N>&`/`N<&`); the target word is expanded
     // and parsed as the target fd number at redirect-resolution time.
-    RedirDupWord { fd: u32 },
+    RedirDupWord { fd: u32, input: bool },
     // `[N]>&-` / `[N]<&-`: closes fd N (1/0 if no leading digit).
     RedirFdClose { fd: u32 },
     HereString,
@@ -630,7 +632,7 @@ impl<'a> Lexer<'a> {
                     }
                     if self.chars.peek().copied() == Some('&') {
                         self.advance();
-                        push_tok!(self.lex_dup_target(1));
+                        push_tok!(self.lex_dup_target(1, false));
                         continue;
                     }
                     let append = self.chars.peek().copied() == Some('>');
@@ -655,7 +657,7 @@ impl<'a> Lexer<'a> {
                     }
                     if self.chars.peek().copied() == Some('&') {
                         self.advance();
-                        push_tok!(self.lex_dup_target(0));
+                        push_tok!(self.lex_dup_target(0, true));
                         continue;
                     }
                     if self.chars.peek().copied() == Some('>') {
@@ -698,7 +700,7 @@ impl<'a> Lexer<'a> {
                         // used to fall through to `RedirErr`, leaving
                         // the `&` for the parser to trip over.
                         self.advance(); // '&'
-                        push_tok!(self.lex_dup_target(2));
+                        push_tok!(self.lex_dup_target(2, false));
                     } else {
                         let append = self.chars.peek().copied() == Some('>');
                         if append {
@@ -728,7 +730,7 @@ impl<'a> Lexer<'a> {
                         Some('>') => {
                             if self.chars.peek().copied() == Some('&') {
                                 self.advance();
-                                push_tok!(self.lex_dup_target(fd));
+                                push_tok!(self.lex_dup_target(fd, false));
                             } else {
                                 let append = self.chars.peek().copied() == Some('>');
                                 if append {
@@ -744,7 +746,7 @@ impl<'a> Lexer<'a> {
                         Some('<') => {
                             if self.chars.peek().copied() == Some('&') {
                                 self.advance();
-                                push_tok!(self.lex_dup_target(fd));
+                                push_tok!(self.lex_dup_target(fd, true));
                             } else if self.chars.peek().copied() == Some('>') {
                                 self.advance();
                                 push_tok!(Tok::RedirFdInOut { fd });
@@ -816,14 +818,14 @@ impl<'a> Lexer<'a> {
     // already-well-tested case); otherwise pushes the word-based token and
     // leaves the target itself to be lexed as an ordinary following word,
     // same as every other redirect operator's target.
-    fn lex_dup_target(&mut self, fd: u32) -> Tok {
+    fn lex_dup_target(&mut self, fd: u32, input: bool) -> Tok {
         if self.chars.peek().copied() == Some('-') {
             self.advance();
             Tok::RedirFdClose { fd }
         } else if self.chars.peek().copied().is_some_and(|c| c.is_ascii_digit()) {
-            Tok::RedirFdDup { fd, target: self.read_fd_number() }
+            Tok::RedirFdDup { fd, target: self.read_fd_number(), input }
         } else {
-            Tok::RedirDupWord { fd }
+            Tok::RedirDupWord { fd, input }
         }
     }
 
@@ -2003,7 +2005,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                 }
                 if lexer.chars.peek().copied() == Some('&') {
                     lexer.advance();
-                    let tok = lexer.lex_dup_target(1);
+                    let tok = lexer.lex_dup_target(1, false);
                     items.push(SpannedItem::Tok(tok, start..lexer.pos));
                     continue;
                 }
@@ -2032,7 +2034,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                 }
                 if lexer.chars.peek().copied() == Some('&') {
                     lexer.advance();
-                    let tok = lexer.lex_dup_target(0);
+                    let tok = lexer.lex_dup_target(0, true);
                     items.push(SpannedItem::Tok(tok, start..lexer.pos));
                     continue;
                 }
@@ -2068,7 +2070,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     items.push(SpannedItem::Tok(Tok::DupErrToOut, start..lexer.pos));
                 } else if lexer.chars.peek().copied() == Some('&') {
                     lexer.advance(); // '&'
-                    let tok = lexer.lex_dup_target(2);
+                    let tok = lexer.lex_dup_target(2, false);
                     items.push(SpannedItem::Tok(tok, start..lexer.pos));
                 } else {
                     let append = lexer.chars.peek().copied() == Some('>');
@@ -2091,7 +2093,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     Some('>') => {
                         if lexer.chars.peek().copied() == Some('&') {
                             lexer.advance();
-                            let tok = lexer.lex_dup_target(fd);
+                            let tok = lexer.lex_dup_target(fd, false);
                             items.push(SpannedItem::Tok(tok, start..lexer.pos));
                         } else {
                             let append = lexer.chars.peek().copied() == Some('>');
@@ -2108,7 +2110,7 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                     Some('<') => {
                         if lexer.chars.peek().copied() == Some('&') {
                             lexer.advance();
-                            let tok = lexer.lex_dup_target(fd);
+                            let tok = lexer.lex_dup_target(fd, true);
                             items.push(SpannedItem::Tok(tok, start..lexer.pos));
                         } else if lexer.chars.peek().copied() == Some('>') {
                             lexer.advance();

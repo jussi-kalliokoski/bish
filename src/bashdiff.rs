@@ -563,6 +563,15 @@ mod tests {
         case("declare-f-keeps-a-tab-stripping-heredoc", "f() { cat <<-T\n\tx\nT\n}; declare -f f"),
         case("declare-f-a-heredoc-with-a-command-after-it", "f() { cat <<EOF\nhi\nEOF\necho after; }; declare -f f"),
         case("declare-f-a-heredoc-in-a-pipeline", "f() { cat <<EOF | wc -l\na\nEOF\n}; declare -f f"),
+        // A dup comes back with the operator it was written with -- `<&`
+        // stays `<&`, where every dup used to come back as `>&` -- the
+        // descriptor always in front of a number, and in front of a
+        // variable only when it is not the one the operator means anyway.
+        // A close is `>&-` whichever way it was written, as bash has it.
+        case(
+            "declare-f-writes-a-dup-back-the-way-it-was-written",
+            r#"f() { read a <&3; cat 3<&0; echo x >&2; echo y 4>&1; read b <&-; echo z 3>&-; fd=3; read c <&$fd; echo w >&$fd; cat 3<&$fd; echo v 4>&$fd; read d 0<&$fd; }; declare -f f"#,
+        ),
         // A heredoc on a group, or on the function itself, keeps its body
         // too -- only a simple command's used to, so these printed a
         // `<<EOF` with no document under it.

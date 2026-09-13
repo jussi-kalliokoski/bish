@@ -5244,10 +5244,10 @@ impl Shell {
                 // `exec 3<file`, and it is a real process fd, so the
                 // builtin can read it directly. Without this the
                 // redirect was ignored and `read` took the terminal.
-                Redirect::FdDup { fd: 0, target } => {
+                Redirect::FdDup { fd: 0, target, .. } => {
                     return Box::new(UnbufferedFd::new(*target as i32));
                 }
-                Redirect::FdDupWord { fd: 0, word } => {
+                Redirect::FdDupWord { fd: 0, word, .. } => {
                     let target = self.expand_word(word);
                     return match target.trim().parse::<i32>() {
                         Ok(n) => Box::new(UnbufferedFd::new(n)),
@@ -5940,7 +5940,7 @@ impl Shell {
             | Redirect::FdClose { fd }
             | Redirect::FdHereString { fd, .. }
             | Redirect::FdHereDoc { fd, .. } => *fd >= 3,
-            Redirect::FdDup { fd, target } => *fd >= 3 && *target >= 3,
+            Redirect::FdDup { fd, target, .. } => *fd >= 3 && *target >= 3,
             _ => false,
         }
     }
@@ -12734,7 +12734,7 @@ impl Shell {
                     let id = id_of!(1);
                     table.insert(2, id);
                 }
-                Redirect::FdDup { fd, target } => {
+                Redirect::FdDup { fd, target, .. } => {
                     let id = id_of!(*target as i32);
                     table.insert(*fd as i32, id);
                 }
@@ -12744,7 +12744,7 @@ impl Shell {
                 // builtin wrote to stdout; an external command in the
                 // same position worked, which is what made it look like
                 // the co-process's descriptors were wrong.
-                Redirect::FdDupWord { fd, word } => {
+                Redirect::FdDupWord { fd, word, .. } => {
                     let text = self.expand_word(word);
                     let Ok(target) = text.trim().parse::<i32>() else {
                         return Err(format!("{}: ambiguous redirect", text));
@@ -13017,8 +13017,8 @@ impl Shell {
                     | Redirect::DupErrToOut
                     | Redirect::FdOut { fd: 1, .. }
                     | Redirect::FdOut { fd: 2, .. }
-                    | Redirect::FdDup { fd: 2, target: 1 }
-                    | Redirect::FdDup { fd: 1, target: 2 }
+                    | Redirect::FdDup { fd: 2, target: 1, .. }
+                    | Redirect::FdDup { fd: 1, target: 2, .. }
             )
         })
     }
@@ -13066,10 +13066,10 @@ impl Shell {
                     stdio.out_follows_err = None;
                     stdio.err_follows_out = Some(Follows::OwnFile);
                 }
-                Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1 } => {
+                Redirect::DupErrToOut | Redirect::FdDup { fd: 2, target: 1, .. } => {
                     stdio.err_follows_out = Some(if stdout_target.is_some() { Follows::OwnFile } else { Follows::Outer });
                 }
-                Redirect::FdDup { fd: 1, target: 2 } => {
+                Redirect::FdDup { fd: 1, target: 2, .. } => {
                     stdio.out_follows_err = Some(if stderr_target.is_some() { Follows::OwnFile } else { Follows::Outer });
                 }
                 _ => unreachable!("compound_redirects_are_simple already filtered these out"),
@@ -13208,10 +13208,10 @@ impl Shell {
                     let file = self.open_in_out(&p)?;
                     actions.push(FdAction::Open { fd: *fd as i32, file });
                 }
-                Redirect::FdDup { fd, target } => {
+                Redirect::FdDup { fd, target, .. } => {
                     actions.push(FdAction::Dup { fd: *fd as i32, source: *target as i32 });
                 }
-                Redirect::FdDupWord { fd, word } => {
+                Redirect::FdDupWord { fd, word, .. } => {
                     let target_str = self.expand_word(word);
                     match target_str.trim().parse::<i32>() {
                         Ok(source) => actions.push(FdAction::Dup { fd: *fd as i32, source }),

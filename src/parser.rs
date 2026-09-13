@@ -42,11 +42,13 @@ pub enum Redirect {
     // can't be both a request-writer and a response-reader at once in
     // any useful way without a second fd to reach it by.
     FdInOut { fd: u32, word: Word },
-    FdDup { fd: u32, target: u32 },
+    // `input`: written `<&` rather than `>&` -- the same dup2 either way,
+    // kept so it can be written back the way it was written.
+    FdDup { fd: u32, target: u32, input: bool },
     // `[N]>&WORD` / `[N]<&WORD` with a non-literal target (e.g. a variable
     // holding an fd number, like a coproc's array entries) -- word is
     // expanded and parsed as the target fd at redirect-resolution time.
-    FdDupWord { fd: u32, word: Word },
+    FdDupWord { fd: u32, word: Word, input: bool },
     // `[N]>&-` / `[N]<&-`: closes fd N.
     FdClose { fd: u32 },
 }
@@ -954,16 +956,16 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdInOut { fd, word });
                 }
-                Some(Tok::RedirFdDup { fd, target }) => {
-                    let (fd, target) = (*fd, *target);
+                Some(Tok::RedirFdDup { fd, target, input }) => {
+                    let (fd, target, input) = (*fd, *target, *input);
                     self.advance();
-                    redirects.push(Redirect::FdDup { fd, target });
+                    redirects.push(Redirect::FdDup { fd, target, input });
                 }
-                Some(Tok::RedirDupWord { fd }) => {
-                    let fd = *fd;
+                Some(Tok::RedirDupWord { fd, input }) => {
+                    let (fd, input) = (*fd, *input);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::FdDupWord { fd, word });
+                    redirects.push(Redirect::FdDupWord { fd, word, input });
                 }
                 Some(Tok::RedirFdClose { fd }) => {
                     let fd = *fd;
@@ -1151,16 +1153,16 @@ impl Parser {
                     let word = self.expect_word()?;
                     redirects.push(Redirect::FdInOut { fd, word });
                 }
-                Some(Tok::RedirFdDup { fd, target }) => {
-                    let (fd, target) = (*fd, *target);
+                Some(Tok::RedirFdDup { fd, target, input }) => {
+                    let (fd, target, input) = (*fd, *target, *input);
                     self.advance();
-                    redirects.push(Redirect::FdDup { fd, target });
+                    redirects.push(Redirect::FdDup { fd, target, input });
                 }
-                Some(Tok::RedirDupWord { fd }) => {
-                    let fd = *fd;
+                Some(Tok::RedirDupWord { fd, input }) => {
+                    let (fd, input) = (*fd, *input);
                     self.advance();
                     let word = self.expect_word()?;
-                    redirects.push(Redirect::FdDupWord { fd, word });
+                    redirects.push(Redirect::FdDupWord { fd, word, input });
                 }
                 Some(Tok::RedirFdClose { fd }) => {
                     let fd = *fd;
@@ -1297,8 +1299,8 @@ fn describe_token(tok: &Tok) -> String {
         Tok::RedirFdOut { fd, append, .. } => format!("{fd}{}", if *append { ">>" } else { ">" }),
         Tok::RedirFdIn { fd } => format!("{fd}<"),
         Tok::RedirFdInOut { fd } => format!("{fd}<>"),
-        Tok::RedirFdDup { fd, target } => format!("{fd}>&{target}"),
-        Tok::RedirDupWord { fd } => format!("{fd}>&"),
+        Tok::RedirFdDup { fd, target, input } => format!("{fd}{}&{target}", if *input { "<" } else { ">" }),
+        Tok::RedirDupWord { fd, input } => format!("{fd}{}&", if *input { "<" } else { ">" }),
         Tok::RedirFdClose { fd } => format!("{fd}>&-"),
         Tok::HereString => "<<<".to_string(),
         Tok::HereDoc(..) => "<<".to_string(),

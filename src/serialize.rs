@@ -412,6 +412,19 @@ fn redirect_target(w: &Word) -> String {
     format!(" {}", serialize_word(w))
 }
 
+/// The operator a dup was written with. The same dup2 either way; bash
+/// writes back whichever it was.
+fn dup_op(input: bool) -> &'static str {
+    if input { "<" } else { ">" }
+}
+
+/// The descriptor in front of a dup onto a variable's descriptor, as bash
+/// writes it: left out when it is the one the operator means anyway --
+/// `<&$fd` rather than `0<&$fd` -- and written otherwise.
+fn dup_word_fd(fd: u32, input: bool) -> String {
+    if fd == u32::from(!input) { String::new() } else { fd.to_string() }
+}
+
 pub fn serialize_redirect(r: &Redirect) -> String {
     match r {
         Redirect::In(w) => format!("<{}", redirect_target(w)),
@@ -451,8 +464,8 @@ pub fn serialize_redirect(r: &Redirect) -> String {
         }
         Redirect::FdIn { fd, word } => format!("{}<{}", fd, redirect_target(word)),
         Redirect::FdInOut { fd, word } => format!("{}<>{}", fd, redirect_target(word)),
-        Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
-        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, redirect_target(word)),
+        Redirect::FdDup { fd, target, input } => format!("{}{}&{}", fd, dup_op(*input), target),
+        Redirect::FdDupWord { fd, word, input } => format!("{}{}&{}", dup_word_fd(*fd, *input), dup_op(*input), redirect_target(word)),
         Redirect::FdClose { fd } => format!("{}>&-", fd),
     }
 }
@@ -1090,8 +1103,8 @@ fn format_redirect(r: &Redirect) -> String {
         Redirect::FdOut { fd, word, append, clobber } => format!("{}{} {}", fd, redirect_op(*append, *clobber), serialize_word(word)),
         Redirect::FdIn { fd, word } => format!("{}< {}", fd, serialize_word(word)),
         Redirect::FdInOut { fd, word } => format!("{}<> {}", fd, serialize_word(word)),
-        Redirect::FdDup { fd, target } => format!("{}>&{}", fd, target),
-        Redirect::FdDupWord { fd, word } => format!("{}>&{}", fd, serialize_word(word)),
+        Redirect::FdDup { fd, target, input } => format!("{}{}&{}", fd, dup_op(*input), target),
+        Redirect::FdDupWord { fd, word, input } => format!("{}{}&{}", dup_word_fd(*fd, *input), dup_op(*input), serialize_word(word)),
         Redirect::FdClose { fd } => format!("{}>&-", fd),
         // Written as the heredoc it was, which is what the body
         // emitted after this line completes. `<<-` and a quoted
