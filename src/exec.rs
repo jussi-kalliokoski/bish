@@ -9650,6 +9650,16 @@ impl Shell {
                 {
                     actions.push(FdAction::Open { fd: 2, file: err });
                 }
+                // And stdin, for the same reason: `{ cat; } < file` in a
+                // pane handed `cat` the pty instead of the file, and it
+                // sat there reading a terminal nothing would ever type
+                // into. Heredocs on a group or a function hung the same
+                // way.
+                if let Some(o) = self.stdio_override.as_ref()
+                    && let Some(input) = o.borrow().stdin.as_ref().and_then(|r| r.borrow().file.try_clone().ok())
+                {
+                    actions.push(FdAction::Open { fd: 0, file: input });
+                }
                 actions.extend(redirs.actions);
                 apply_fd_redirects(&mut command, actions);
                 return match command.spawn() {

@@ -563,6 +563,17 @@ mod tests {
         case("declare-f-keeps-a-tab-stripping-heredoc", "f() { cat <<-T\n\tx\nT\n}; declare -f f"),
         case("declare-f-a-heredoc-with-a-command-after-it", "f() { cat <<EOF\nhi\nEOF\necho after; }; declare -f f"),
         case("declare-f-a-heredoc-in-a-pipeline", "f() { cat <<EOF | wc -l\na\nEOF\n}; declare -f f"),
+        // A heredoc on a group, or on the function itself, keeps its body
+        // too -- only a simple command's used to, so these printed a
+        // `<<EOF` with no document under it.
+        case(
+            "declare-f-keeps-a-heredoc-on-a-group-and-on-a-function",
+            "f() { { cat; } <<EOF\nhi\nEOF\n}\nh() { cat; } <<EOF\nx\nEOF\nf; h; declare -f f h",
+        ),
+        // A command inside a redirected group or function reads that
+        // redirect -- which in a pane it did not, getting the pane's own
+        // terminal instead and waiting on it for ever.
+        case("a-group-hands-its-stdin-redirect-to-the-command-inside", "echo data > f; { cat; } < f; k() { cat; } < f; k"),
         case("declare-f-two-heredocs-on-one-command", "f() { cat <<A <<B\n1\nA\n2\nB\n}; declare -f f"),
         case("declare-f-a-heredoc-inside-a-branch", "f() { if :; then cat <<E\nb\nE\nfi; }; declare -f f"),
         // The idiom this output exists for.
