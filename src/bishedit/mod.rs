@@ -6,6 +6,7 @@
 
 pub mod codehighlight;
 pub mod completion;
+pub mod fold;
 pub mod format;
 pub mod fuzzy;
 pub mod grapheme;
@@ -144,6 +145,23 @@ pub trait Buffer {
     /// URL, say) and making it impossible to select in one motion.
     fn line_wraps(&self, _line: usize) -> bool {
         false
+    }
+
+    /// This buffer's folds, for an implementor that has any -- the file
+    /// editor's. Asked of the buffer for the same reason `word_chars` is:
+    /// `j` is handed a buffer and a count, and has to step over a closed
+    /// fold as one line.
+    fn folds(&self) -> Option<&fold::Folds> {
+        None
+    }
+    fn folds_mut(&mut self) -> Option<&mut fold::Folds> {
+        None
+    }
+
+    /// The lines drawn as the one row `line` is on: just `line`, unless
+    /// a closed fold hides it.
+    fn fold_span(&self, line: usize) -> (usize, usize) {
+        self.folds().map_or((line, line), |f| f.span(line))
     }
 }
 

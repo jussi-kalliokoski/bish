@@ -220,7 +220,11 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     let margin = buf.wrap.scrolloff.min(height.saturating_sub(1) / 2);
     let top = buf.viewport_top();
     let highest = buf.line_count().saturating_sub(height);
-    if line < top + margin {
+    if buf.folds.any_closed() {
+        // Once a fold is closed, a difference of line numbers is no
+        // longer a number of rows, so the rows are counted instead.
+        scroll_rows_to(buf, line, 0, content_cols);
+    } else if line < top + margin {
         buf.set_viewport_top(line.saturating_sub(margin));
     } else if line + margin >= top + height {
         buf.set_viewport_top((line + margin + 1 - height).min(highest));
@@ -303,8 +307,20 @@ pub(crate) fn scroll_horizontally(buf: &mut TextBuffer, columns: isize, content_
 fn scroll_wrapped(buf: &mut TextBuffer, content_cols: usize) {
     buf.set_viewport_left(0);
     let (line, col) = buf.cursor();
+    // A closed fold is drawn as one row, whatever its first line's width.
+    let seg = match buf.folds.closed_at(line) {
+        Some(_) => 0,
+        None => crate::bishedit::wrap::segment_of(&line_segments(buf, line, content_cols), col),
+    };
+    scroll_rows_to(buf, line, seg, content_cols);
+}
+
+// Moves the window just enough to show visual row `seg` of `line`, with
+// `scrolloff` rows around it -- counted by walking the rows the screen
+// actually draws, so a wrapped line and a closed fold are both measured
+// by what they take up.
+fn scroll_rows_to(buf: &mut TextBuffer, line: usize, seg: usize, content_cols: usize) {
     let height = buf.viewport_height().max(1);
-    let seg = crate::bishedit::wrap::segment_of(&line_segments(buf, line, content_cols), col);
 
     // `scrolloff`, counted in *visual* rows here rather than lines: with
     // wrapping on, "two lines below the cursor" and "two rows below the
@@ -366,7 +382,12 @@ fn rows_between(buf: &TextBuffer, from: (usize, usize), to: (usize, usize), limi
     limit
 }
 
+// Both walk the rows `visible_rows` draws, so a closed fold is one row
+// here too and scrolling cannot disagree with the screen about it.
 fn next_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
+    if let Some((_, end)) = buf.folds.closed_at(line) {
+        return (end + 1, 0);
+    }
     if sub + 1 < line_segments(buf, line, content_cols).len() { (line, sub + 1) } else { (line + 1, 0) }
 }
 
@@ -377,7 +398,11 @@ fn previous_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usi
     if line == 0 {
         return (0, 0);
     }
-    (line - 1, line_segments(buf, line - 1, content_cols).len().saturating_sub(1))
+    let above = line - 1;
+    if let Some((start, _)) = buf.folds.closed_at(above) {
+        return (start, 0);
+    }
+    (above, line_segments(buf, above, content_cols).len().saturating_sub(1))
 }
 
 // How many columns are actually left for `buf`'s own text after its
@@ -596,8 +621,7 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
-    let (row, _) = buf.cursor();
-    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let (row, last) = motion::line_span(&*buf, count);
     let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) };
     buf.delete_range(&range);
 }
@@ -619,8 +643,7 @@ pub(crate) fn change_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
-    let (row, _) = buf.cursor();
-    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let (row, last) = motion::line_span(&*buf, count);
     let indent = autoindent_for(buf, row);
     // Everything from the start of the first line to the end of the
     // last, as an inclusive character range: that empties the lines and
@@ -753,16 +776,14 @@ pub(crate) fn outdent_operator_motion(buf: &mut TextBuffer, m: motion::Motion, c
 // not one line by three, matching real vim.
 pub(crate) fn indent_lines(buf: &mut TextBuffer, count: Option<usize>) {
     let count = count.unwrap_or(1).max(1);
-    let (row, _) = buf.cursor();
-    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let (row, last) = motion::line_span(&*buf, count);
     indent_rows(buf, row, last);
     buf.set_cursor(row, 0);
 }
 
 pub(crate) fn outdent_lines(buf: &mut TextBuffer, count: Option<usize>) {
     let count = count.unwrap_or(1).max(1);
-    let (row, _) = buf.cursor();
-    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let (row, last) = motion::line_span(&*buf, count);
     outdent_rows(buf, row, last);
     buf.set_cursor(row, 0);
 }
@@ -975,7 +996,7 @@ pub(crate) fn case_kind_for_op(op: Op) -> motion::CaseKind {
         Op::Lowercase => motion::CaseKind::Lower,
         Op::Uppercase => motion::CaseKind::Upper,
         Op::CaseToggle => motion::CaseKind::Toggle,
-        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent => {
+        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent | Op::Fold => {
             unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle")
         }
     }
@@ -1042,8 +1063,7 @@ pub(crate) fn case_operator_motion(buf: &mut TextBuffer, m: motion::Motion, coun
 
 pub(crate) fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, kind: motion::CaseKind) {
     let count = count.unwrap_or(1).max(1);
-    let (row, _) = buf.cursor();
-    let last = (row + count - 1).min(buf.line_count().saturating_sub(1));
+    let (row, last) = motion::line_span(&*buf, count);
     let range = motion::MotionRange { shape: motion::MotionShape::Linewise, from: (row, 0), to: (last, 0) };
     case_operator_range(buf, &range, kind);
 }
@@ -1085,15 +1105,18 @@ pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool,
     let (row, col) = buf.cursor();
     let repeated: String = value.text.repeat(count);
     match value.shape {
+        // Whole lines go above or below a closed fold, never into it --
+        // the same rule `o` and `O` follow (see `open_line`).
         RegisterShape::Line => {
             let body = repeated.strip_suffix('\n').unwrap_or(&repeated);
+            let (first, last) = buf.fold_span(row);
             if before {
-                buf.insert_text((row, 0), &format!("{body}\n"));
-                buf.set_cursor(row, 0);
+                buf.insert_text((first, 0), &format!("{body}\n"));
+                buf.set_cursor(first, 0);
             } else {
-                let end = buf.line_len(row);
-                buf.insert_text((row, end), &format!("\n{body}"));
-                buf.set_cursor(row + 1, 0);
+                let end = buf.line_len(last);
+                buf.insert_text((last, end), &format!("\n{body}"));
+                buf.set_cursor(last + 1, 0);
             }
         }
         RegisterShape::Char => {
@@ -1168,7 +1191,11 @@ pub(crate) fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion:
 // pushed-down line, not the new blank one -- so this repositions
 // explicitly for that case.
 pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
-    let (row, _) = buf.cursor();
+    // On a closed fold, above the whole of it or below the whole of it:
+    // opening a line *inside* a fold nobody can see would put the typing
+    // somewhere hidden.
+    let (first, last) = buf.fold_span(buf.cursor().0);
+    let row = if above { first } else { last };
     let indent = autoindent_for(buf, row);
     if above {
         buf.insert_text((row, 0), "\n");
@@ -1519,6 +1546,12 @@ pub(crate) fn run_insert_mode(
     // is still scrolled right. Both were reported; both are this one
     // missing call, because the loop below has always scrolled *after*
     // a key and never before the first.
+    //
+    // Typing happens on a line you can see: vim never keeps the folds
+    // around the cursor's line closed in Insert mode, and a closed fold
+    // here would be a row that cannot show what is being typed into it.
+    let line = buf.cursor().0;
+    buf.folds.open_all(line);
     buf.set_viewport_height(editor_content_rows(rect));
     scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
@@ -2981,12 +3014,14 @@ fn to_window(display: &crate::bishedit::tabular::Row, start_cell: usize, avail: 
 }
 
 // One screen row: which buffer line, which slice of it, and whether it
-// opens that line.
+// opens that line. `fold` is the last line of the closed fold this row
+// stands for, when it stands for one rather than showing `line` itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisualRow {
     pub(crate) line: usize,
     pub(crate) first: bool,
     pub(crate) seg: crate::bishedit::wrap::Segment,
+    pub(crate) fold: Option<usize>,
 }
 
 // How a buffer line is broken across screen rows. With wrapping off
@@ -3002,9 +3037,19 @@ pub(crate) fn line_segments(buf: &TextBuffer, line: usize, content_cols: usize) 
 // none of the three can disagree about what is on screen.
 pub(crate) fn visible_rows(buf: &TextBuffer, content_cols: usize, content_rows: usize) -> Vec<VisualRow> {
     let mut rows = Vec::with_capacity(content_rows);
-    let mut line = buf.viewport_top();
-    let mut skip = buf.viewport_sub();
+    // A top line some closed fold hides is drawn from that fold's own row.
+    let mut line = buf.fold_span(buf.viewport_top()).0;
+    let mut skip = if line == buf.viewport_top() { buf.viewport_sub() } else { 0 };
     while rows.len() < content_rows && line < buf.line_count() {
+        // One row, however long the fold, and however long its first
+        // line: the row shows what the fold is, not what it holds.
+        if let Some((_, end)) = buf.folds.closed_at(line) {
+            let seg = crate::bishedit::wrap::Segment { start: 0, end: buf.line_len(line), indent: 0 };
+            rows.push(VisualRow { line, first: true, seg, fold: Some(end) });
+            skip = 0;
+            line = end + 1;
+            continue;
+        }
         for (i, seg) in line_segments(buf, line, content_cols).into_iter().enumerate() {
             if i < skip {
                 continue;
@@ -3012,7 +3057,7 @@ pub(crate) fn visible_rows(buf: &TextBuffer, content_cols: usize, content_rows: 
             if rows.len() >= content_rows {
                 break;
             }
-            rows.push(VisualRow { line, first: i == 0, seg });
+            rows.push(VisualRow { line, first: i == 0, seg, fold: None });
         }
         skip = 0;
         line += 1;
@@ -3197,6 +3242,19 @@ fn line_number_text(buf: &TextBuffer, line: usize) -> String {
     let (cursor, _) = buf.cursor();
     if !buf.relativenumber || line == cursor {
         return (line + 1).to_string();
+    }
+    // A closed fold is one row, so it counts as one: the number has to be
+    // what `3j` will do, not how many lines lie in between.
+    if buf.folds.any_closed() {
+        let (low, high) = (line.min(cursor), line.max(cursor));
+        let target = buf.fold_span(high).0;
+        let mut at = buf.fold_span(low).0;
+        let mut rows = 0;
+        while at < target {
+            at = buf.fold_span(at).1 + 1;
+            rows += 1;
+        }
+        return rows.to_string();
     }
     line.abs_diff(cursor).to_string()
 }
@@ -4296,6 +4354,28 @@ fn active_search_pattern(vk: &VimKeys, buf: &TextBuffer) -> Option<String> {
     }
 }
 
+// What a closed fold's row shows: vim's fold text, filled out to the
+// pane with the dashes vim fills it with. In the line-number colour, so
+// it reads as the editor's own rather than as a line of the file.
+fn fold_row(buf: &TextBuffer, line: usize, end: usize, width: usize) -> String {
+    let level = buf.folds.level(line, end);
+    let first: String = buf.line_chars(line).into_iter().map(|c| if c == '\t' { ' ' } else { c }).collect();
+    let text = crate::bishedit::fold::fold_text(level, end - line + 1, &first);
+    let mut shown = String::new();
+    let mut cols = 0;
+    for ch in text.chars() {
+        let w = crate::bishedit::unicode_width::char_width(ch);
+        if cols + w > width {
+            break;
+        }
+        cols += w;
+        shown.push(ch);
+    }
+    shown.push_str(&"-".repeat(width - cols));
+    let sgr = crate::theme::sgr(crate::theme::Ui::LineNumber, buf.colors.as_ref());
+    format!("{sgr}{shown}\x1b[0m")
+}
+
 pub fn build_editor_frame(
     buf: &TextBuffer,
     vk: &VimKeys,
@@ -4351,6 +4431,10 @@ pub fn build_editor_frame(
         };
         let line = row.line;
         render_gutter(&mut out, buf, &starts, line, row.first);
+        if let Some(end) = row.fold {
+            out.push_str(&fold_row(buf, line, end, content_cols));
+            continue;
+        }
         {
             // The char index render_row's own window will start
             // rendering from for *this* row -- see selection_columns_
@@ -4485,6 +4569,9 @@ pub fn build_editor_frame(
         } else {
             cursor_abs.saturating_sub(hoffset).min(content_cols.saturating_sub(1))
         };
+    // On a closed fold's row there is no character to stand on, so the
+    // cursor stands at the start of the row, as it does in vim.
+    let screen_col = if rows.get(screen_row).is_some_and(|row| row.fold.is_some()) { gutter_width } else { screen_col };
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out.push_str(cursor_shape(buf, mode, vk));
     out
@@ -6948,6 +7035,44 @@ mod pre_save_hook_tests {
             rows.push(text);
         }
         rows.into_iter().map(|row| row.chars().skip(gutter).collect::<String>().trim_end().to_string()).filter(|row| !row.is_empty()).collect()
+    }
+
+    fn folded_buf(text: &str, start: usize, end: usize) -> TextBuffer {
+        let mut buf = TextBuffer::open(std::path::Path::new("/tmp/bish-fold-render-test.txt"), 10).unwrap();
+        buf.insert_text((0, 0), text);
+        buf.set_cursor(0, 0);
+        buf.folds.create(start, end);
+        buf
+    }
+
+    #[test]
+    fn a_closed_fold_draws_as_one_row_saying_what_it_holds() {
+        let buf = folded_buf("fn main() {\n    body\n}\ntail", 0, 2);
+        let rows = drawn(&buf, 40);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("+--  3 lines: fn main() {--"), "{rows:?}");
+        assert_eq!(rows[1], "tail");
+    }
+
+    #[test]
+    fn a_closed_fold_is_one_row_to_scrolling_too() {
+        let text: String = (0..30).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let mut buf = folded_buf(&text, 1, 20);
+        buf.wrap.scrolloff = 0;
+        buf.set_viewport_height(10);
+        buf.set_cursor(25, 0);
+        scroll_to_show_cursor(&mut buf, 40);
+        assert_eq!(buf.viewport_top(), 0, "line 25 is only the seventh row");
+        buf.set_cursor(29, 0);
+        scroll_to_show_cursor(&mut buf, 40);
+        assert_eq!(buf.viewport_top(), 1, "the fold's row, then lines 21 to 29, fill the ten rows");
+    }
+
+    #[test]
+    fn relative_numbers_count_a_closed_fold_as_one() {
+        let mut buf = folded_buf("0\n1\n2\n3\n4", 1, 3);
+        buf.relativenumber = true;
+        assert_eq!(line_number_text(&buf, 4), "2", "`2j` from line 0 reaches line 4");
     }
 
     #[test]

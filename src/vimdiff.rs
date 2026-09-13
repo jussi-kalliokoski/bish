@@ -262,6 +262,37 @@ mod tests {
         // next may be looking for it.
         case_raw("utf8-bom-survives-an-edit", b"\xef\xbb\xbfone\ntwo\n", "jx"),
         case_raw("utf16-file-keeps-its-encoding", b"\xff\xfeo\x00n\x00e\x00\n\x00t\x00w\x00o\x00\n\x00", "jx"),
+        // -- folds -----------------------------------------------------
+        // Only the file is compared, so a fold has to show itself by
+        // what an edit does to it: a closed fold is one line to `j`,
+        // `k`, `dd` and a count, and every line of it to the operator.
+        // `vim -u NONE` has manual folding and a `foldlevel` of 0, so a
+        // new fold starts closed there, as it does here.
+        case("fold-dd-deletes-a-closed-fold", "1\n2\n3\n4\n", "zfjdd"),
+        case("fold-j-steps-over-a-closed-fold", "1\n2\n3\n4\n", "zfjjdd"),
+        case("fold-k-steps-over-a-closed-fold", "1\n2\n3\n4\n", "jzfjGkkdd"),
+        case("fold-a-count-counts-a-fold-as-one-line", "1\n2\n3\n4\n5\n", "zfj2dd"),
+        case("fold-dj-takes-the-fold-and-the-line-after", "1\n2\n3\n4\n", "zfjdj"),
+        case("fold-dl-deletes-the-whole-fold", "ab\ncd\nef\n", "zfjdl"),
+        case("fold-yy-yanks-every-line-of-it", "1\n2\n3\n", "zfjyyGp"),
+        case("fold-zo-opens-it", "1\n2\n3\n4\n", "zfjzojdd"),
+        case("fold-zc-closes-it-again-from-inside", "1\n2\n3\n4\n", "zfjzojzcdd"),
+        case("fold-za-toggles-it", "1\n2\n3\n4\n", "zfjzajzadd"),
+        case("fold-zR-opens-everything", "1\n2\n3\n4\n", "zfjzRjdd"),
+        case("fold-zE-removes-every-fold", "1\n2\n3\n4\n", "zfjzEjdd"),
+        case("fold-zd-removes-the-fold", "1\n2\n3\n4\n", "zfjzdjdd"),
+        case("fold-zF-folds-count-lines", "1\n2\n3\n4\n", "3zFjdd"),
+        case("fold-visual-zf-folds-the-selection", "1\n2\n3\n4\n", "Vjzfjdd"),
+        case("fold-ex-fold-folds-a-range", "1\n2\n3\n4\n", ":2,3fold\rggjdd"),
+        case("fold-zj-moves-to-the-next-fold", "1\n2\n3\n4\n5\n", "jjzfjggzjdd"),
+        case("fold-nested-zo-opens-one-level", "1\n2\n3\n4\n", "zfjzfjzodd"),
+        // What moves by rows stops on a closed fold; what was looking for
+        // something opens the fold it finds it in.
+        case("fold-search-opens-the-fold-it-lands-in", "one\ntwo\nthree\nfour\n", "jjzfjgg/four\rdd"),
+        case("fold-l-opens-the-fold", "ab\ncd\nef\n", "zfjlx"),
+        // A fold moves with its lines.
+        case("fold-moves-with-a-line-opened-above", "1\n2\n3\n4\n", "jzfjggOnew\u{1b}jjdd"),
+        case("fold-survives-an-undo", "1\n2\n3\n4\n", "zfjGdduggdd"),
     ];
 
     // Cases bish does not match today, each with why. Asserted to

@@ -86,6 +86,14 @@ pub enum Motion {
     // -- it special-cases this variant to call `text_object_range` directly
     // instead. `bool` is `around` (`a{obj}`) vs inner (`i{obj}`).
     TextObject(TextObjectKind, bool),
+    /// `zj`: down to where the next fold starts.
+    FoldNextStart,
+    /// `zk`: up to where the previous fold ends.
+    FoldPreviousEnd,
+    /// `[z`: to the start of the open fold the cursor is in.
+    FoldStart,
+    /// `]z`: to its end.
+    FoldEnd,
 }
 
 /// The object an `i`/`a` text object names. `b`/`B` are vim's own aliases for
@@ -1391,12 +1399,113 @@ fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex,
     }
 }
 
+/// The line `n` rows below `line`, a closed fold counting as one row --
+/// and never past the last line.
+pub fn rows_down(buf: &impl Buffer, line: usize, n: usize) -> usize {
+    let last = buf.line_count().saturating_sub(1);
+    let mut at = line;
+    for _ in 0..n {
+        let end = buf.fold_span(at).1;
+        if end >= last {
+            break;
+        }
+        at = end + 1;
+    }
+    buf.fold_span(at).0
+}
+
+/// The line `n` rows above `line`, a closed fold counting as one row.
+pub fn rows_up(buf: &impl Buffer, line: usize, n: usize) -> usize {
+    let mut at = buf.fold_span(line).0;
+    for _ in 0..n {
+        if at == 0 {
+            break;
+        }
+        at = buf.fold_span(at - 1).0;
+    }
+    at
+}
+
+/// The first and last line of the `count` rows starting at the cursor's:
+/// what `dd`, `yy`, `>>` and every other doubled operator act on. A
+/// closed fold is one row, and goes whole.
+pub fn line_span(buf: &impl Buffer, count: usize) -> (usize, usize) {
+    let (line, _) = buf.cursor();
+    let last_line = buf.line_count().saturating_sub(1);
+    let (first, mut last) = buf.fold_span(line);
+    for _ in 1..count.max(1) {
+        if last >= last_line {
+            break;
+        }
+        last = buf.fold_span(last + 1).1;
+    }
+    (first, last)
+}
+
+/// Whether landing inside a closed fold opens it -- vim's default
+/// `foldopen`. What moves by rows (`j`, `G`, a page, `zj`) stops *on* a
+/// closed fold and leaves it be; a search, a mark, `%`, `l` and the rest
+/// were looking for something in particular, and it is in there.
+fn opens_folds(m: &Motion) -> bool {
+    !matches!(
+        m,
+        Motion::Down
+            | Motion::Up
+            | Motion::GotoFirstLine
+            | Motion::GotoLastLine
+            | Motion::GotoPercent
+            | Motion::ScreenTop
+            | Motion::ScreenMiddle
+            | Motion::ScreenBottom
+            | Motion::HalfPageDown
+            | Motion::HalfPageUp
+            | Motion::PageDown
+            | Motion::PageUp
+            | Motion::ScrollLineDown
+            | Motion::ScrollLineUp
+            | Motion::ScrollCenter
+            | Motion::ScrollTop
+            | Motion::ScrollBottom
+            | Motion::NextLineNonBlank
+            | Motion::PrevLineNonBlank
+            | Motion::SetMark(_)
+            | Motion::FoldNextStart
+            | Motion::FoldPreviousEnd
+            | Motion::FoldStart
+            | Motion::FoldEnd
+    )
+}
+
 /// Applies a single motion to `buf`'s cursor. `count` is the raw count typed
 /// before the motion (`None` if the user typed no digits) -- most motions
 /// treat it as a repeat count defaulting to 1, but `GotoFirstLine`/
 /// `GotoLastLine`/`GotoColumn` treat it as an explicit target, so `None` and
 /// `Some(1)` are not interchangeable for those.
+///
+/// A cursor that ends up inside a closed fold either opens it or goes to
+/// the row that stands for it (see `opens_folds`). An operator's motion
+/// does neither -- `motion_range` takes a closed fold whole instead -- so
+/// it moves through `move_cursor` directly.
 pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) {
+    let opens = opens_folds(&motion);
+    move_cursor(buf, motion, count);
+    let (line, col) = buf.cursor();
+    // `closed_at` rather than `fold_span`: a closed fold one line long
+    // spans only itself, and `l` still opens it.
+    let Some((start, _)) = buf.folds().and_then(|folds| folds.closed_at(line)) else {
+        return;
+    };
+    if opens {
+        if let Some(folds) = buf.folds_mut() {
+            folds.open_all(line);
+        }
+    } else {
+        let col = col.min(last_col(buf, start));
+        buf.set_cursor(start, col);
+    }
+}
+
+fn move_cursor(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) {
     let n = count.unwrap_or(1).max(1);
     match motion {
         // Steps by whole grapheme cluster, `n` times, rather than raw
@@ -1429,13 +1538,13 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::Down => {
             let (line, col) = buf.cursor();
-            let new_line = (line + n).min(buf.line_count().saturating_sub(1));
+            let new_line = rows_down(buf, line, n);
             let new_col = col.min(last_col(buf, new_line));
             buf.set_cursor(new_line, new_col);
         }
         Motion::Up => {
             let (line, col) = buf.cursor();
-            let new_line = line.saturating_sub(n);
+            let new_line = rows_up(buf, line, n);
             let new_col = col.min(last_col(buf, new_line));
             buf.set_cursor(new_line, new_col);
         }
@@ -1630,15 +1739,34 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         Motion::NextLineNonBlank => {
             let (line, _) = buf.cursor();
-            let target = (line + n).min(buf.line_count() - 1);
+            let target = rows_down(buf, line, n);
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
         Motion::PrevLineNonBlank => {
             let (line, _) = buf.cursor();
-            let target = line.saturating_sub(n);
+            let target = rows_up(buf, line, n);
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
+        }
+        Motion::FoldNextStart | Motion::FoldPreviousEnd | Motion::FoldStart | Motion::FoldEnd => {
+            let (line, col) = buf.cursor();
+            let mut at = line;
+            for _ in 0..n {
+                let next = buf.folds().and_then(|folds| match motion {
+                    Motion::FoldNextStart => folds.next_start(at),
+                    Motion::FoldPreviousEnd => folds.previous_end(at),
+                    Motion::FoldStart => folds.edge(at, false),
+                    _ => folds.edge(at, true),
+                });
+                match next {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            if at != line {
+                buf.set_cursor(at, col.min(last_col(buf, at)));
+            }
         }
         Motion::MatchPair => {
             if let Some(target) = match_pair_once(buf, buf.cursor()) {
@@ -1974,6 +2102,10 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         // future caller might reasonably expect `motion_shape` to be total.
         Motion::TextObject(TextObjectKind::Paragraph, _) => Linewise,
         Motion::TextObject(..) => Inclusive,
+        // vim's own classification: `dzj` takes whole lines, `d]z` does
+        // not.
+        Motion::FoldNextStart | Motion::FoldPreviousEnd => Linewise,
+        Motion::FoldStart | Motion::FoldEnd => Exclusive,
     })
 }
 
@@ -2030,7 +2162,7 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         _ => false,
     };
     let start = buf.cursor();
-    apply_motion(buf, motion, count);
+    move_cursor(buf, motion, count);
     let end = buf.cursor();
     if start == end {
         // A motion that did not move usually covers nothing, and an
@@ -2052,7 +2184,31 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
         }
         return None;
     }
-    let (from, to) = if pos_lt(start, end) { (start, end) } else { (end, start) };
+    let (mut from, mut to) = if pos_lt(start, end) { (start, end) } else { (end, start) };
+    // A closed fold at either end is taken whole: vim's rule, which is
+    // what makes `dj` on a fold delete the fold and the line after it,
+    // and `dl` on one empty every line in it rather than one character.
+    // The far end only counts if the motion reaches into that line at
+    // all -- an exclusive motion stopping at column 0 of it does not.
+    if let Some(folds) = buf.folds() {
+        let head = folds.closed_at(from.0);
+        let tail = folds.closed_at(to.0).filter(|_| shape != MotionShape::Exclusive || to.1 > 0);
+        if let Some((first, _)) = head {
+            from = (first, 0);
+        }
+        // The end has to be a position `extract_text` can step onto, or
+        // it walks straight past it: an exclusive range ends where the
+        // next line starts, which also takes the line break and so every
+        // line of the fold -- vim's `dl` on one -- and an inclusive one
+        // ends on the fold's last character.
+        if let Some((_, last)) = tail {
+            to = match shape {
+                MotionShape::Exclusive if last + 1 < buf.line_count() => (last + 1, 0),
+                MotionShape::Exclusive => (last, buf.line_len(last)),
+                _ => (last, buf.line_len(last).saturating_sub(1)),
+            };
+        }
+    }
     buf.set_cursor(from.0, from.1);
     Some(MotionRange { shape, from, to })
 }
@@ -2125,17 +2281,20 @@ pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
 /// column-width fragment of whatever wrapped there.
 pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
     let (cursor_line, _) = buf.cursor();
-    let mut line = cursor_line;
+    let mut line = buf.fold_span(cursor_line).0;
     while line > 0 && buf.line_wraps(line - 1) {
         line -= 1;
     }
     // `count` logical lines, not physical rows -- each iteration widens
     // `last` out to the end of whichever logical line it currently sits
     // at the start of, then (unless this was the last one wanted) steps
-    // onto the first row of the next logical line.
+    // onto the first row of the next logical line. A closed fold is one
+    // of them, however many lines it holds: `yy` on one yanks it whole,
+    // exactly as `dd` deletes it (see `line_span`).
     let count = count.max(1);
     let mut last = line;
     for i in 0..count {
+        last = buf.fold_span(last).1;
         while buf.line_wraps(last) && last + 1 < buf.line_count() {
             last += 1;
         }
@@ -2218,6 +2377,10 @@ pub fn describe_motion(motion: &Motion) -> String {
         SectionForwardEnd => "section-forward-end",
         SectionBackward => "section-backward",
         SectionBackwardEnd => "section-backward-end",
+        FoldNextStart => "fold-next-start",
+        FoldPreviousEnd => "fold-previous-end",
+        FoldStart => "fold-start",
+        FoldEnd => "fold-end",
         // The rest carry something, and say so.
         FindChar { ch, till, forward } => {
             let verb = if *till { "till-char" } else { "find-char" };

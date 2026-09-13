@@ -241,6 +241,10 @@ pub struct TextBuffer {
     // lines have no entry at all rather than an explicit "unchanged"
     // marker.
     pub diff: Option<std::collections::HashMap<usize, crate::git::DiffMark>>,
+    // `zf` and friends. Unlike `diff` and `blame` just above, not thrown
+    // away on an edit: a fold is the reader's own structure, so it moves
+    // with its lines instead -- see `content_changed`'s callers.
+    pub folds: crate::bishedit::fold::Folds,
     // `:dbg`'s own breakpoint set (see GUTTER_COLUMNS's breakpoint column
     // in fileeditor.rs, which is what actually reads this) -- 1-based
     // line numbers, matching how the debugger itself reports lines.
@@ -358,6 +362,7 @@ impl TextBuffer {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            folds: crate::bishedit::fold::Folds::default(),
             breakpoints: std::collections::BTreeSet::new(),
             debug_attached: false,
             readonly: false,
@@ -416,6 +421,7 @@ impl TextBuffer {
         let decoded = crate::encoding::decode(&std::fs::read(&path)?);
         let (row, col) = self.cursor;
         let fresh = TextBuffer::from_text(&path, &decoded.text, self.vheight);
+        self.folds.text_replaced(&self.lines, &fresh.lines);
         self.lines = fresh.lines;
         self.eol = fresh.eol;
         self.encoding = decoded.encoding;
@@ -507,6 +513,7 @@ impl TextBuffer {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            folds: crate::bishedit::fold::Folds::default(),
             breakpoints: std::collections::BTreeSet::new(),
             debug_attached: false,
             readonly: false,
@@ -622,6 +629,9 @@ impl TextBuffer {
     // content/cursor back into the buffer and updates everything that
     // depends on "what does the buffer actually contain right now."
     fn restore_snapshot(&mut self, content: Vec<Vec<char>>, cursor: (usize, usize)) {
+        // A snapshot says what the text was, not which lines moved to
+        // get there; `text_replaced` works that out for the folds.
+        self.folds.text_replaced(&self.lines, &content);
         self.lines = content;
         self.cursor = cursor;
         // Positions may no longer be valid -- same reasoning insert_text/
@@ -759,6 +769,12 @@ impl TextBuffer {
             new_lines.push(last);
             let new_row = row + parts.len() - 1;
             self.lines.splice(row..=row, new_lines);
+            // Inserted at the very start of the line, what the line held
+            // moved down and the new lines are above it; anywhere else
+            // they follow it. A fold only grows by lines that land
+            // between two of its own.
+            let at = if col == 0 { row } else { row + 1 };
+            self.folds.lines_inserted(at, parts.len() - 1);
             (new_row, new_col)
         };
         self.dirty = true;
@@ -791,6 +807,7 @@ impl TextBuffer {
         match range.shape {
             motion::MotionShape::Linewise => {
                 self.lines.drain(range.from.0..=range.to.0);
+                self.folds.lines_deleted(range.from.0, range.to.0 - range.from.0 + 1);
                 if self.lines.is_empty() {
                     // No lines left at all. The placeholder below is
                     // somewhere to keep the cursor, not content -- see
@@ -829,6 +846,9 @@ impl TextBuffer {
                 let mut joined: Vec<char> = first_line[..range.from.1.min(first_line.len())].to_vec();
                 joined.extend(after);
                 self.lines.splice(range.from.0..=range.to.0, std::iter::once(joined));
+                // The lines after the first were joined onto it, so it is
+                // those that are gone.
+                self.folds.lines_deleted(range.from.0 + 1, range.to.0 - range.from.0);
                 let row = range.from.0;
                 self.cursor = (row, range.from.1.min(self.lines[row].len()));
             }
@@ -873,6 +893,7 @@ impl TextBuffer {
             }
             self.lines[row].extend(next);
         }
+        self.folds.lines_deleted(row + 1, joins);
         self.cursor = (row, join_col.min(self.lines[row].len().saturating_sub(1)));
         self.dirty = true;
         self.content_changed();
@@ -1075,6 +1096,14 @@ impl Buffer for TextBuffer {
     fn word_chars(&self) -> &str {
         &self.iskeyword
     }
+
+    fn folds(&self) -> Option<&crate::bishedit::fold::Folds> {
+        Some(&self.folds)
+    }
+
+    fn folds_mut(&mut self) -> Option<&mut crate::bishedit::fold::Folds> {
+        Some(&mut self.folds)
+    }
 }
 
 // The buffer half of a live snippet -- see bishedit::snippet's own
@@ -1174,6 +1203,7 @@ mod tests {
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
+            folds: crate::bishedit::fold::Folds::default(),
             breakpoints: std::collections::BTreeSet::new(),
             debug_attached: false,
             readonly: false,
@@ -1186,6 +1216,79 @@ mod tests {
 
     fn text_of(buf: &TextBuffer) -> String {
         buf.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn folded(text: &str, start: usize, end: usize) -> TextBuffer {
+        let mut buf = TextBuffer::from_text(std::path::Path::new("/tmp/bish-fold-test.txt"), text, 10);
+        buf.folds.create(start, end);
+        buf
+    }
+
+    #[test]
+    fn j_and_k_step_over_a_closed_fold_as_one_line() {
+        let mut buf = folded("0\n1\n2\n3\n4\n", 1, 3);
+        motion::apply_motion(&mut buf, motion::Motion::Down, None);
+        assert_eq!(buf.cursor().0, 1, "onto the fold's row");
+        motion::apply_motion(&mut buf, motion::Motion::Down, None);
+        assert_eq!(buf.cursor().0, 4, "and past every line of it");
+        motion::apply_motion(&mut buf, motion::Motion::Up, None);
+        assert_eq!(buf.cursor().0, 1, "back onto its row, not its last line");
+        motion::apply_motion(&mut buf, motion::Motion::Down, Some(2));
+        assert_eq!(buf.cursor().0, 4, "a count clamps at the last line");
+    }
+
+    #[test]
+    fn landing_in_a_closed_fold_opens_it_only_for_a_motion_that_was_looking() {
+        let mut buf = folded("0\n1\n2\n3\n4\n", 1, 3);
+        motion::apply_motion(&mut buf, motion::Motion::GotoFirstLine, Some(3));
+        assert_eq!(buf.cursor().0, 1, "`3gg` stops on the fold's row");
+        assert_eq!(buf.folds.closed_at(2), Some((1, 3)), "and leaves it closed");
+        buf.set_cursor(2, 0);
+        motion::apply_motion(&mut buf, motion::Motion::Right, None);
+        assert_eq!(buf.folds.closed_at(2), None, "`l` opens it");
+        assert_eq!(buf.cursor().0, 2);
+    }
+
+    #[test]
+    fn an_operator_takes_a_closed_fold_whole() {
+        let mut buf = folded("0\n1\n2\n3\n4\n", 0, 1);
+        let range = motion::motion_range(&mut buf, motion::Motion::Down, None).unwrap();
+        assert_eq!((range.from.0, range.to.0), (0, 2), "`dj` is the fold and the line after it");
+        buf.set_cursor(0, 0);
+        assert_eq!(motion::line_span(&buf, 1), (0, 1), "`dd` is the fold");
+        assert_eq!(motion::line_span(&buf, 2), (0, 2), "`2dd` is the fold and one more line");
+        assert_eq!(motion::whole_lines(&buf, 1), "0\n1\n", "`yy` yanks what `dd` would delete");
+    }
+
+    #[test]
+    fn a_charwise_operator_on_a_closed_fold_stops_at_the_fold() {
+        let mut buf = folded("ab\ncd\nef\ngh\n", 0, 1);
+        let range = motion::motion_range(&mut buf, motion::Motion::Right, None).unwrap();
+        assert_eq!(motion::extract_text(&buf, &range), "ab\ncd\n", "`yl` takes the fold and not the rest of the file");
+        buf.delete_range(&range);
+        assert_eq!(text_of(&buf), "ef\ngh", "`dl` takes every line of it");
+    }
+
+    #[test]
+    fn a_fold_moves_with_the_lines_an_edit_adds_and_removes() {
+        let mut buf = folded("0\n1\n2\n3\n", 2, 3);
+        buf.insert_text((0, 0), "new\n");
+        assert_eq!(buf.folds.closed_at(3), Some((3, 4)), "a line above pushes it down");
+        buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Linewise, from: (0, 0), to: (1, 0) });
+        assert_eq!(buf.folds.closed_at(1), Some((1, 2)), "two lines above gone pull it up");
+        buf.set_cursor(1, 0);
+        buf.join_lines(2, true);
+        assert_eq!(text_of(&buf), "1\n2 3");
+        assert_eq!(buf.folds.closed_at(1), Some((1, 1)), "a joined-away line leaves it");
+    }
+
+    #[test]
+    fn a_line_opened_or_put_on_a_closed_fold_goes_below_the_whole_of_it() {
+        let mut buf = folded("0\n1\n2\n", 0, 1);
+        crate::fileeditor::open_line(&mut buf, false);
+        assert_eq!(text_of(&buf), "0\n1\n\n2");
+        assert_eq!(buf.cursor().0, 2);
+        assert_eq!(buf.folds.closed_at(1), Some((0, 1)), "and the fold did not grow to take it in");
     }
 
     fn make_registers() -> Registers {

@@ -5967,6 +5967,20 @@ impl BisheditBuffer for NavBuffer {
             NavBuffer::Editable(b) => b.line_wraps(line),
         }
     }
+
+    fn folds(&self) -> Option<&crate::bishedit::fold::Folds> {
+        match self {
+            NavBuffer::ReadOnly(b) => b.folds(),
+            NavBuffer::Editable(b) => b.folds(),
+        }
+    }
+
+    fn folds_mut(&mut self) -> Option<&mut crate::bishedit::fold::Folds> {
+        match self {
+            NavBuffer::ReadOnly(b) => b.folds_mut(),
+            NavBuffer::Editable(b) => b.folds_mut(),
+        }
+    }
 }
 
 // Adjusts `buf`'s viewport so its navigation cursor's line is visible,
@@ -6859,6 +6873,18 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     })
 }
 
+// A cursor inside a closed fold sits on the row that stands for it --
+// vim's own rule, and the only place on screen it could be drawn. Motions
+// already see to this (motion::apply_motion); this is for everything else
+// that can put a cursor somewhere: `:N`, undo, a fold closing around it.
+fn rest_on_fold(buf: &mut impl BisheditBuffer) {
+    let (line, col) = buf.cursor();
+    let (start, _) = buf.fold_span(line);
+    if start != line {
+        buf.set_cursor(start, col.min(buf.line_len(start).saturating_sub(1)));
+    }
+}
+
 fn render_nav_frame(
     buf: &mut NavBuffer,
     vk: &VimKeys,
@@ -6872,6 +6898,11 @@ fn render_nav_frame(
     // being drawn into. Without this a shrink leaves the scroll
     // arithmetic working from a height the pane no longer has.
     buf.set_viewport_height(normal_mode_content_rows(rect));
+    // Not while selecting: a Visual selection is allowed to reach into a
+    // closed fold, and takes it whole when it is used.
+    if !vk.is_visual() {
+        rest_on_fold(buf);
+    }
     match buf {
         // ReadOnly (NavStart::Prompt/JobDetach) never carries file syntax
         // highlighting to color-override at all -- it's replaying/
@@ -8203,6 +8234,43 @@ fn run_normal_mode_navigation(
                     show_command_mode_error(&message, app.term_rows, app.term_cols);
                 }
             }
+            KeyOutcome::Fold(cmd, count) => {
+                use crate::bishedit::vimkeys::FoldCmd;
+                let n = count.unwrap_or(1).max(1);
+                let line = buf.cursor().0;
+                let selection = if cmd == FoldCmd::CreateFromSelection { active_visual_range(&vk, &buf) } else { None };
+                let lines = motion::line_span(&buf, n);
+                if let Some(folds) = buf.folds_mut() {
+                    match cmd {
+                        FoldCmd::Open => folds.open(line, n),
+                        FoldCmd::OpenAll | FoldCmd::View => folds.open_all(line),
+                        FoldCmd::Close => folds.close(line, n),
+                        FoldCmd::CloseAll => folds.close_all(line),
+                        FoldCmd::Toggle => folds.toggle(line, n),
+                        FoldCmd::ToggleAll => folds.toggle_all(line),
+                        FoldCmd::OpenEverything => folds.set_all(false),
+                        FoldCmd::CloseEverything => folds.set_all(true),
+                        FoldCmd::Delete => folds.delete(line),
+                        FoldCmd::DeleteAll => folds.delete_all(line),
+                        FoldCmd::Eliminate => folds.clear(),
+                        FoldCmd::ToggleEnabled => folds.enabled = !folds.enabled,
+                        FoldCmd::CreateLines => folds.create(lines.0, lines.1),
+                        FoldCmd::CreateFromSelection => {
+                            if let Some(range) = selection {
+                                folds.create(range.from.0, range.to.0);
+                            }
+                        }
+                    }
+                }
+                if cmd == FoldCmd::CreateFromSelection {
+                    let at = buf.cursor();
+                    vk.end_visual(at);
+                }
+                rest_on_fold(&mut buf);
+                let content_cols = nav_content_cols(&buf, rect);
+                nav_scroll_to_show_cursor(&mut buf, content_cols);
+                render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+            }
             KeyOutcome::Motion(m, count) => {
                 // `apply_motion_or_reselect` records this into `vk`'s
                 // own list too, which the editor no longer reads -- see
@@ -8479,6 +8547,15 @@ fn run_normal_mode_navigation(
             KeyOutcome::Operator(op, motion, count, register) => {
                 if op == Op::Yank {
                     editor::yank_motion(&mut buf, &mut app.registers, motion, count, register);
+                } else if op == Op::Fold {
+                    // Before the writable check: a fold changes no text,
+                    // so a read-only buffer folds like any other.
+                    if let Some(range) = motion::motion_range(&mut buf, motion, count)
+                        && let Some(folds) = buf.folds_mut()
+                    {
+                        folds.create(range.from.0, range.to.0);
+                    }
+                    rest_on_fold(&mut buf);
                 } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
                         Op::Delete => {
@@ -8511,7 +8588,7 @@ fn run_normal_mode_navigation(
                         }
                         Op::Indent => fileeditor::indent_operator_motion(tb, motion, count),
                         Op::Outdent => fileeditor::outdent_operator_motion(tb, motion, count),
-                        Op::Yank => unreachable!("handled above"),
+                        Op::Yank | Op::Fold => unreachable!("handled above"),
                     }
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -8519,6 +8596,12 @@ fn run_normal_mode_navigation(
             KeyOutcome::OperatorLines(op, count, register) => {
                 if op == Op::Yank {
                     editor::yank_lines(&buf, &mut app.registers, count, register);
+                } else if op == Op::Fold {
+                    let (first, last) = motion::line_span(&buf, count.unwrap_or(1));
+                    if let Some(folds) = buf.folds_mut() {
+                        folds.create(first, last);
+                    }
+                    rest_on_fold(&mut buf);
                 } else if let Some(tb) = buf.as_writable_mut() {
                     match op {
                         Op::Delete => fileeditor::delete_lines(tb, &mut app.registers, count, register),
@@ -8547,7 +8630,7 @@ fn run_normal_mode_navigation(
                         }
                         Op::Indent => fileeditor::indent_lines(tb, count),
                         Op::Outdent => fileeditor::outdent_lines(tb, count),
-                        Op::Yank => unreachable!("handled above"),
+                        Op::Yank | Op::Fold => unreachable!("handled above"),
                     }
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -8684,6 +8767,16 @@ pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Op
     let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
     let (from, to) =
         if motion_shape == motion::MotionShape::Blockwise { ((from.0.min(to.0), anchor.1), (from.0.max(to.0), cursor.1)) } else { (from, to) };
+    // A selection reaching into a closed fold takes the fold whole, the
+    // same rule an operator's motion follows (see motion::motion_range).
+    let (from, to) = match buf.folds() {
+        Some(folds) if motion_shape != motion::MotionShape::Blockwise => {
+            let from = folds.closed_at(from.0).map_or(from, |(first, _)| (first, 0));
+            let to = folds.closed_at(to.0).map_or(to, |(_, last)| (last, buf.line_len(last).saturating_sub(1)));
+            (from, to)
+        }
+        _ => (from, to),
+    };
     Some(motion::MotionRange { shape: motion_shape, from, to })
 }
 
@@ -11063,6 +11156,7 @@ const EDITOR_HELP_MARKDOWN: &str = r#"# bish editor
 | `/pat` `?pat` `n` `N` | search |
 | `m{a-z}` `` `{mark} `` `'{mark}` | marks |
 | `<C-o>` `<C-i>` | jump back / forward |
+| `zf{motion}` `zF` `zo zc za` `zR zM` `zd zE` `zj zk` | folds — a closed fold is one line to `j`, `k` and `dd` |
 
 ## Changing things
 
@@ -11093,6 +11187,7 @@ its decompressed text.
 | `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
 | `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
 | `:diff` | +/~/- vs. what's on disk, no git needed |
+| `:fold` | fold this line, or a range before it (`:foldopen[!]`, `:foldclose[!]`) |
 | `:format` | run this file's own formatter |
 | `:diag [clear]` | toggle the diagnostics pane |
 | `:dbg` | attach a read-only debug session (`:dbg help`) |
@@ -11798,6 +11893,9 @@ pub(crate) const COLON_COMMANDS: &[&str] = &[
     "e!",
     "edit!",
     "fmt",
+    "fold",
+    "foldclose",
+    "foldopen",
     "format",
     "git",
     "h",
@@ -13819,6 +13917,22 @@ enum LineCommand {
         times: usize,
     },
     Normal(String),
+    /// `:fold`, `:foldopen[!]` and `:foldclose[!]` over a range, the
+    /// current line when there is none.
+    Fold {
+        from: LineRef,
+        to: LineRef,
+        action: FoldAction,
+    },
+}
+
+/// Which of the fold commands. `all` is the `!`: every level, rather
+/// than one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldAction {
+    Create,
+    Open { all: bool },
+    Close { all: bool },
 }
 
 /// What a `!` at the head of a colon line turned out to be. `None` from
@@ -13998,6 +14112,25 @@ fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
             let times = chars[i..].iter().take_while(|ch| **ch == c).count();
             (i + times == chars.len()).then_some(LineCommand::Shift { from, to, right, times })
         }
+        // `:fo[ld]`, `:foldo[pen][!]`, `:foldc[lose][!]` -- vim's own
+        // abbreviations, and like `:d` a missing range is this line.
+        // Any other word is not a line command, and goes on to the
+        // commands that are not.
+        (Some(c), range) if c.is_ascii_alphabetic() => {
+            let word: String = chars[i..].iter().collect();
+            let (word, bang) = match word.strip_suffix('!') {
+                Some(word) => (word.to_string(), true),
+                None => (word, false),
+            };
+            let action = match word.as_str() {
+                "fo" | "fol" | "fold" if !bang => FoldAction::Create,
+                w if w.len() >= 5 && "foldopen".starts_with(w) => FoldAction::Open { all: bang },
+                w if w.len() >= 5 && "foldclose".starts_with(w) => FoldAction::Close { all: bang },
+                _ => return None,
+            };
+            let (from, to) = range.unwrap_or((LineRef::Current, LineRef::Current));
+            Some(LineCommand::Fold { from, to, action })
+        }
         _ => None,
     }
 }
@@ -14085,6 +14218,15 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
                 }
             }
             tb.set_cursor(b.min(tb.line_count().saturating_sub(1)), 0);
+            Ok(())
+        }
+        LineCommand::Fold { from, to, action } => {
+            let (a, b) = ordered(from, to, current, last);
+            match action {
+                FoldAction::Create => tb.folds.create(a, b),
+                FoldAction::Open { all } => tb.folds.open_range(a, b, all),
+                FoldAction::Close { all } => tb.folds.close_range(a, b, all),
+            }
             Ok(())
         }
         LineCommand::Normal(_) => Ok(()),
@@ -15739,6 +15881,19 @@ mod substitute_command_tests {
         assert!(parse_substitute_command("set foo").is_none());
         assert!(parse_substitute_command("sort").is_none());
         assert!(parse_substitute_command("w").is_none());
+    }
+
+    #[test]
+    fn parse_line_command_reads_the_fold_commands_and_their_abbreviations() {
+        use LineCommand::*;
+        let fold = |from, to, action| Some(Fold { from, to, action });
+        assert_eq!(parse_line_command("2,3fold"), fold(LineRef::Number(2), LineRef::Number(3), FoldAction::Create));
+        assert_eq!(parse_line_command("fo"), fold(LineRef::Current, LineRef::Current, FoldAction::Create));
+        assert_eq!(parse_line_command("%foldopen!"), fold(LineRef::Number(1), LineRef::Last, FoldAction::Open { all: true }));
+        assert_eq!(parse_line_command("foldc"), fold(LineRef::Current, LineRef::Current, FoldAction::Close { all: false }));
+        assert_eq!(parse_line_command("fold!"), None, "`:fold` takes no `!`");
+        assert_eq!(parse_line_command("foldx"), None);
+        assert_eq!(parse_line_command("format"), None, "a word that is not one goes on to the other commands");
     }
 
     #[test]

@@ -734,6 +734,9 @@ impl HexSession {
             Op::Indent | Op::Outdent => {
                 self.status = Some("indent has no meaning in a byte buffer".to_string());
             }
+            Op::Fold => {
+                self.status = Some("folds have no meaning in a byte buffer".to_string());
+            }
         }
     }
 
@@ -1330,7 +1333,12 @@ impl HexSession {
             // A hex view of a binary file has no identifiers and no
             // language server; `gd`/`gr` simply do nothing, the same
             // way every other outcome this view has no meaning for does.
-            KeyOutcome::GotoDefinition(_) | KeyOutcome::GotoReferences | KeyOutcome::DocumentSymbols | KeyOutcome::CodeActions => {}
+            // Folds too: a hex dump's rows are all the same kind of thing.
+            KeyOutcome::GotoDefinition(_)
+            | KeyOutcome::GotoReferences
+            | KeyOutcome::DocumentSymbols
+            | KeyOutcome::CodeActions
+            | KeyOutcome::Fold(..) => {}
             KeyOutcome::ReselectVisual => {
                 if let Some((shape, anchor, cursor)) = self.vk.last_visual() {
                     self.buf.set_cursor(cursor.0, cursor.1);

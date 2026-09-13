@@ -62,6 +62,41 @@ impl GotoKind {
     }
 }
 
+/// Which `z` fold command, for `KeyOutcome::Fold`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldCmd {
+    /// `zo`: open what hides the cursor's line, one level per count.
+    Open,
+    /// `zO`: every fold around the cursor's line, open.
+    OpenAll,
+    /// `zc`: close one level more around the cursor's line.
+    Close,
+    /// `zC`: every fold around the cursor's line, closed.
+    CloseAll,
+    /// `za`
+    Toggle,
+    /// `zA`
+    ToggleAll,
+    /// `zv`: open just enough to show the cursor's line.
+    View,
+    /// `zR`
+    OpenEverything,
+    /// `zM`
+    CloseEverything,
+    /// `zd`
+    Delete,
+    /// `zD`
+    DeleteAll,
+    /// `zE`
+    Eliminate,
+    /// `zi`: folding on or off, every fold kept either way.
+    ToggleEnabled,
+    /// `zF`: a fold over `count` lines from the cursor's.
+    CreateLines,
+    /// `zf` in Visual mode: a fold over the selection.
+    CreateFromSelection,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyOutcome {
     /// A motion is ready to apply, with the raw count the user typed before
@@ -188,6 +223,12 @@ pub enum KeyOutcome {
     /// bish cannot use: `gr` already emits references and never waits
     /// for a third key.
     CodeActions,
+    /// `zo`, `zc`, `za`, `zR`, `zM`, `zd`, `zE`, `zi` and the rest: a
+    /// change to which lines are folded, applied by whoever owns the
+    /// buffer's folds. `zf{motion}` is not one of these -- it takes a
+    /// motion, so it is `Operator(Op::Fold, ..)` -- and neither are `zj`,
+    /// `zk`, `[z` and `]z`, which move the cursor and are motions.
+    Fold(FoldCmd, Option<usize>),
     /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
     /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
     /// (buf.cursor())` (this crate owns the jump-list state -- see
@@ -339,6 +380,9 @@ pub enum Op {
     /// up to one shiftwidth (a line indented less than that just loses
     /// whatever leading whitespace it has).
     Outdent,
+    /// `zf{motion}` -- a closed fold over every line the target touches.
+    /// Changes no text, so it writes no register and leaves no undo step.
+    Fold,
 }
 
 /// `KeyOutcome::AddSurround`'s own target: either a motion's resolved
@@ -372,6 +416,9 @@ impl Op {
             Op::CaseToggle => '~',
             Op::Indent => '>',
             Op::Outdent => '<',
+            // `zf` has no doubled form -- `zfj` folds two lines and `zF`
+            // folds by count -- so nothing that can be typed repeats it.
+            Op::Fold => '\0',
         }
     }
 }
@@ -2015,6 +2062,7 @@ impl VimKeys {
             Key::Char('{') => self.emit(Motion::UnmatchedOpenBrace),
             Key::Char('[') => self.emit(Motion::SectionBackward),
             Key::Char(']') => self.emit(Motion::SectionBackwardEnd),
+            Key::Char('z') => self.emit(Motion::FoldStart),
             _ => self.abort(),
         }
     }
@@ -2025,6 +2073,7 @@ impl VimKeys {
             Key::Char('}') => self.emit(Motion::UnmatchedCloseBrace),
             Key::Char(']') => self.emit(Motion::SectionForward),
             Key::Char('[') => self.emit(Motion::SectionForwardEnd),
+            Key::Char('z') => self.emit(Motion::FoldEnd),
             _ => self.abort(),
         }
     }
@@ -2126,8 +2175,38 @@ impl VimKeys {
             Key::Char('z') => self.emit(Motion::ScrollCenter),
             Key::Char('t') => self.emit(Motion::ScrollTop),
             Key::Char('b') => self.emit(Motion::ScrollBottom),
+            // Folds. `zf` is the one that takes a motion, except in
+            // Visual mode, where the selection already says which lines.
+            Key::Char('f') if self.visual.is_some() => self.emit_fold(FoldCmd::CreateFromSelection),
+            Key::Char('f') => {
+                self.pending = Pending::None;
+                self.emit_operator(Op::Fold)
+            }
+            Key::Char('F') => self.emit_fold(FoldCmd::CreateLines),
+            Key::Char('o') => self.emit_fold(FoldCmd::Open),
+            Key::Char('O') => self.emit_fold(FoldCmd::OpenAll),
+            Key::Char('c') => self.emit_fold(FoldCmd::Close),
+            Key::Char('C') => self.emit_fold(FoldCmd::CloseAll),
+            Key::Char('a') => self.emit_fold(FoldCmd::Toggle),
+            Key::Char('A') => self.emit_fold(FoldCmd::ToggleAll),
+            Key::Char('v') => self.emit_fold(FoldCmd::View),
+            Key::Char('R') => self.emit_fold(FoldCmd::OpenEverything),
+            Key::Char('M') => self.emit_fold(FoldCmd::CloseEverything),
+            Key::Char('d') => self.emit_fold(FoldCmd::Delete),
+            Key::Char('D') => self.emit_fold(FoldCmd::DeleteAll),
+            Key::Char('E') => self.emit_fold(FoldCmd::Eliminate),
+            Key::Char('i') => self.emit_fold(FoldCmd::ToggleEnabled),
+            Key::Char('j') => self.emit(Motion::FoldNextStart),
+            Key::Char('k') => self.emit(Motion::FoldPreviousEnd),
             _ => self.abort(),
         }
+    }
+
+    fn emit_fold(&mut self, cmd: FoldCmd) -> KeyOutcome {
+        let count = self.count.take();
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Fold(cmd, count)
     }
 
     fn feed_window(&mut self, key: Key) -> KeyOutcome {
@@ -2358,6 +2437,7 @@ pub fn describe_outcome(outcome: &KeyOutcome) -> String {
         AdjustNumber { delta } => format!("adjust-number {delta}"),
         OpenLine { above } => format!("open-line-{}", if *above { "above" } else { "below" }),
         SwapVisualEnds => "visual-swap-ends".to_string(),
+        Fold(cmd, count) => format!("fold-{}{}", describe_fold_cmd(cmd), n(count)),
         // Neither is a resolved action: `Pending` means the sequence
         // wants more keys, `None` that nothing recognized it. `::bish
         // map` refuses a right-hand side that ends on either rather than
@@ -2378,6 +2458,27 @@ fn describe_op(op: &Op) -> &'static str {
         Op::CaseToggle => "case-toggle",
         Op::Indent => "indent",
         Op::Outdent => "outdent",
+        Op::Fold => "fold",
+    }
+}
+
+fn describe_fold_cmd(cmd: &FoldCmd) -> &'static str {
+    match cmd {
+        FoldCmd::Open => "open",
+        FoldCmd::OpenAll => "open-all",
+        FoldCmd::Close => "close",
+        FoldCmd::CloseAll => "close-all",
+        FoldCmd::Toggle => "toggle",
+        FoldCmd::ToggleAll => "toggle-all",
+        FoldCmd::View => "view",
+        FoldCmd::OpenEverything => "open-everything",
+        FoldCmd::CloseEverything => "close-everything",
+        FoldCmd::Delete => "delete",
+        FoldCmd::DeleteAll => "delete-all",
+        FoldCmd::Eliminate => "eliminate",
+        FoldCmd::ToggleEnabled => "toggle-enabled",
+        FoldCmd::CreateLines => "create-lines",
+        FoldCmd::CreateFromSelection => "create-from-selection",
     }
 }
 
@@ -2899,6 +3000,24 @@ mod tests {
         assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('t')]), KeyOutcome::Motion(Motion::ScrollTop, None));
         let mut vk = VimKeys::new();
         assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('b')]), KeyOutcome::Motion(Motion::ScrollBottom, None));
+    }
+
+    #[test]
+    fn z_prefix_fold_commands() {
+        let mut vk = VimKeys::new();
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('o')]), KeyOutcome::Fold(FoldCmd::Open, None));
+        assert_eq!(last(&mut vk, &[Key::Char('3'), Key::Char('z'), Key::Char('F')]), KeyOutcome::Fold(FoldCmd::CreateLines, Some(3)));
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('f'), Key::Char('j')]), KeyOutcome::Operator(Op::Fold, Motion::Down, None, None));
+        assert_eq!(
+            last(&mut vk, &[Key::Char('d'), Key::Char('z'), Key::Char('j')]),
+            KeyOutcome::Operator(Op::Delete, Motion::FoldNextStart, None, None)
+        );
+        assert_eq!(last(&mut vk, &[Key::Char('['), Key::Char('z')]), KeyOutcome::Motion(Motion::FoldStart, None));
+        assert_eq!(last(&mut vk, &[Key::Char(']'), Key::Char('z')]), KeyOutcome::Motion(Motion::FoldEnd, None));
+        // In Visual mode the selection is the target, so there is no
+        // motion to wait for.
+        vk.begin_visual(RegisterShape::Line, (0, 0));
+        assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('f')]), KeyOutcome::Fold(FoldCmd::CreateFromSelection, None));
     }
 
     // `:noh` is only safe to press because anything that searches again

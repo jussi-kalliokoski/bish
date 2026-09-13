@@ -2891,6 +2891,8 @@ fn run_line_normal_mode(
                         // motion itself is ignored here.
                         Op::Indent => indent_line(&mut lb),
                         Op::Outdent => outdent_line(&mut lb),
+                        // One line has nothing to fold.
+                        Op::Fold => {}
                     },
                     KeyOutcome::OperatorLines(op, count, register) => match op {
                         Op::Yank => yank_lines(&lb, registers, count, register),
@@ -2902,6 +2904,7 @@ fn run_line_normal_mode(
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
                         Op::Indent => indent_line(&mut lb),
                         Op::Outdent => outdent_line(&mut lb),
+                        Op::Fold => {}
                     },
                     KeyOutcome::Put { before, count, register } => put(&mut lb.ed.buf, &mut lb.ed.cursor, registers, before, count, register),
                     KeyOutcome::DeleteCharForward { count, register } => {
@@ -2936,8 +2939,13 @@ fn run_line_normal_mode(
                         }
                     }
                     // See the note on the other arm in this file:
-                    // nothing to ask, and nowhere to go.
-                    KeyOutcome::GotoDefinition(_) | KeyOutcome::GotoReferences | KeyOutcome::DocumentSymbols | KeyOutcome::CodeActions => {}
+                    // nothing to ask, and nowhere to go. A single line has
+                    // nothing to fold either.
+                    KeyOutcome::GotoDefinition(_)
+                    | KeyOutcome::GotoReferences
+                    | KeyOutcome::DocumentSymbols
+                    | KeyOutcome::CodeActions
+                    | KeyOutcome::Fold(..) => {}
                     KeyOutcome::Jump { forward } => {
                         let current = lb.cursor();
                         let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
@@ -3451,7 +3459,7 @@ fn case_kind_for_op(op: Op) -> motion::CaseKind {
         Op::Lowercase => motion::CaseKind::Lower,
         Op::Uppercase => motion::CaseKind::Upper,
         Op::CaseToggle => motion::CaseKind::Toggle,
-        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent => {
+        Op::Yank | Op::Delete | Op::Change | Op::Indent | Op::Outdent | Op::Fold => {
             unreachable!("case_kind_for_op is only ever called for Op::Lowercase/Uppercase/CaseToggle")
         }
     }
@@ -3650,6 +3658,7 @@ fn run_one_shot_normal_command(
                             }
                             Op::Indent => indent_line(&mut lb),
                             Op::Outdent => outdent_line(&mut lb),
+                            Op::Fold => {}
                         }
                         break None;
                     }
@@ -3660,6 +3669,7 @@ fn run_one_shot_normal_command(
                             Op::Lowercase | Op::Uppercase | Op::CaseToggle => case_operator_lines(&mut lb, case_kind_for_op(op)),
                             Op::Indent => indent_line(&mut lb),
                             Op::Outdent => outdent_line(&mut lb),
+                            Op::Fold => {}
                         }
                         break None;
                     }
@@ -3727,6 +3737,7 @@ fn run_one_shot_normal_command(
                     | KeyOutcome::GotoReferences
                     | KeyOutcome::DocumentSymbols
                     | KeyOutcome::CodeActions
+                    | KeyOutcome::Fold(..)
                     | KeyOutcome::None => break None,
                     // `<C-o>u`/`<C-o>Ctrl-R`/`<C-o>g-`/`<C-o>g+`: real vim
                     // treats these as ordinary one-shot Normal commands
