@@ -1425,6 +1425,7 @@ fn highlight_tok(
         | Tok::RedirFdDup { .. }
         | Tok::RedirDupWord { .. }
         | Tok::RedirFdClose { .. }
+        | Tok::RedirFdHere { .. }
         | Tok::HereString
         | Tok::HereDoc(_, _) => out.push(whole(HighlightKind::Redirect)),
 

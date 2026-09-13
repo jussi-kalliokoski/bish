@@ -510,6 +510,11 @@ mod tests {
             "a-forked-subshell-or-a-function-leaves-every-redirect-in-place",
             r#"( trap 'echo bye1' EXIT; { exit; } > g1 ); { trap 'echo bye2' EXIT; { exit; } > g2; } | cat; "$BASH" -c 'trap "echo bye3" EXIT; f(){ { exit; } > g3; }; f'; "$BASH" -c 'trap "echo bye4" EXIT; h(){ exit; }; { h; } > g4'; echo "g1=[$(cat g1)] g2=[$(cat g2)] g3=[$(cat g3)] g4=[$(cat g4)]""#,
         ),
+        // A here-string or a heredoc on a descriptor of its own.
+        case(
+            "a-here-string-and-a-heredoc-on-numbered-descriptors",
+            "{ read a <&3; read b <&4; echo \"$a/$b\"; } 3<<<one 4<<EOF\ntwo\nEOF\ncat 0<<<zero",
+        ),
         // `-c` alone is not a login shell, so `logout` refuses and the
         // script carries on. The login side is LOGIN_CASES.
         case("logout-outside-a-login-shell", r#"logout 2>/dev/null; echo "rc=$?"; logout 5 2>/dev/null; echo "rc=$?"; shopt login_shell"#),

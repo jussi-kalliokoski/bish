@@ -20,6 +20,11 @@ pub enum Redirect {
     DupErrToOut,
     HereString(Word),
     HereDoc(Word, crate::lexer::HereDocSpelling),
+    // `N<<<word` and `N<<DELIM`: the same two, on a descriptor of their
+    // own -- `{ read l <&3; } 3<<<text`. With fd 0 they are the plain
+    // forms above; these are only ever made for any other number.
+    FdHereString { fd: u32, word: Word },
+    FdHereDoc { fd: u32, body: Word, spelling: crate::lexer::HereDocSpelling },
     // Arbitrary-fd forms: `N>file`/`N>>file`/`N<file` and `N>&M`/`N<&M`.
     // Only per-command (not the persistent shell-level `exec N>file` form,
     // which would need fds kept open for the rest of the shell's life --
@@ -965,6 +970,23 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::FdClose { fd });
                 }
+                // `N<<<` / `N<<`: the descriptor, then the operator it
+                // belongs to (see Tok::RedirFdHere).
+                Some(Tok::RedirFdHere { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    match self.advance() {
+                        Some(Tok::HereString) => {
+                            let word = self.expect_word()?;
+                            redirects.push(if fd == 0 { Redirect::HereString(word) } else { Redirect::FdHereString { fd, word } });
+                        }
+                        Some(Tok::HereDoc(chunks, spelling)) => {
+                            let body = Word { chunks, globbable: false };
+                            redirects.push(if fd == 0 { Redirect::HereDoc(body, spelling) } else { Redirect::FdHereDoc { fd, body, spelling } });
+                        }
+                        _ => return Err(format!("expected `<<<' or `<<' after `{fd}<'")),
+                    }
+                }
                 Some(Tok::HereString) => {
                     self.advance();
                     let word = self.expect_word()?;
@@ -1145,6 +1167,23 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::FdClose { fd });
                 }
+                // `N<<<` / `N<<`: the descriptor, then the operator it
+                // belongs to (see Tok::RedirFdHere).
+                Some(Tok::RedirFdHere { fd }) => {
+                    let fd = *fd;
+                    self.advance();
+                    match self.advance() {
+                        Some(Tok::HereString) => {
+                            let word = self.expect_word()?;
+                            redirects.push(if fd == 0 { Redirect::HereString(word) } else { Redirect::FdHereString { fd, word } });
+                        }
+                        Some(Tok::HereDoc(chunks, spelling)) => {
+                            let body = Word { chunks, globbable: false };
+                            redirects.push(if fd == 0 { Redirect::HereDoc(body, spelling) } else { Redirect::FdHereDoc { fd, body, spelling } });
+                        }
+                        _ => return Err(format!("expected `<<<' or `<<' after `{fd}<'")),
+                    }
+                }
                 Some(Tok::HereString) => {
                     self.advance();
                     let word = self.expect_word()?;
@@ -1246,6 +1285,24 @@ fn describe_token(tok: &Tok) -> String {
         Tok::LBrace => "{".to_string(),
         Tok::RBrace => "}".to_string(),
         Tok::Newline => "newline".to_string(),
+        // Redirect operators, spelled as written. They all used to come
+        // out as the word "token", which says nothing about which one
+        // the parser did not expect.
+        Tok::RedirIn => "<".to_string(),
+        Tok::RedirOut { append, .. } => if *append { ">>" } else { ">" }.to_string(),
+        Tok::RedirInOut => "<>".to_string(),
+        Tok::RedirErr { append, .. } => if *append { "2>>" } else { "2>" }.to_string(),
+        Tok::RedirBoth { append } => if *append { "&>>" } else { "&>" }.to_string(),
+        Tok::DupErrToOut => "2>&1".to_string(),
+        Tok::RedirFdOut { fd, append, .. } => format!("{fd}{}", if *append { ">>" } else { ">" }),
+        Tok::RedirFdIn { fd } => format!("{fd}<"),
+        Tok::RedirFdInOut { fd } => format!("{fd}<>"),
+        Tok::RedirFdDup { fd, target } => format!("{fd}>&{target}"),
+        Tok::RedirDupWord { fd } => format!("{fd}>&"),
+        Tok::RedirFdClose { fd } => format!("{fd}>&-"),
+        Tok::HereString => "<<<".to_string(),
+        Tok::HereDoc(..) => "<<".to_string(),
+        Tok::RedirFdHere { fd } => format!("{fd}<"),
         other => keyword_text(other).unwrap_or("token").to_string(),
     }
 }

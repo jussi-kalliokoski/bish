@@ -271,6 +271,12 @@ pub enum Tok {
     // `[N]>&-` / `[N]<&-`: closes fd N (1/0 if no leading digit).
     RedirFdClose { fd: u32 },
     HereString,
+    // `N<<<` / `N<<`: the descriptor a here-string or heredoc goes to,
+    // pushed immediately ahead of the ordinary `HereString`/`HereDoc`
+    // token for it. Two tokens rather than a numbered copy of each, so
+    // a numbered heredoc's body is filled in by exactly the code that
+    // fills in any other's.
+    RedirFdHere { fd: u32 },
     // Placeholder pushed at the `<<WORD` site; patched in place with the
     // real (already expansion-processed) body once the line's newline is
     // reached (see Lexer::pending_heredocs).
@@ -742,6 +748,26 @@ impl<'a> Lexer<'a> {
                             } else if self.chars.peek().copied() == Some('>') {
                                 self.advance();
                                 push_tok!(Tok::RedirFdInOut { fd });
+                            } else if self.chars.peek().copied() == Some('<') {
+                                // `N<<<` and `N<<DELIM`. Lexed as `N<` and
+                                // then a stray `<<`, which the parser
+                                // could only call a syntax error.
+                                self.advance();
+                                push_tok!(Tok::RedirFdHere { fd });
+                                if self.chars.peek().copied() == Some('<') {
+                                    self.advance();
+                                    push_tok!(Tok::HereString);
+                                } else {
+                                    let strip_tabs = self.chars.peek().copied() == Some('-');
+                                    if strip_tabs {
+                                        self.advance();
+                                    }
+                                    self.skip_spaces();
+                                    let (delim, expand) = self.read_heredoc_delimiter();
+                                    let tok_idx = toks.len();
+                                    push_tok!(Tok::HereDoc(vec![Chunk::Str(String::new())], HereDocSpelling::default()));
+                                    self.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
+                                }
                             } else {
                                 push_tok!(Tok::RedirFdIn { fd });
                             }

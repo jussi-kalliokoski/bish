@@ -5927,7 +5927,12 @@ impl Shell {
     // on moves under it.
     fn stays_in_process(r: &Redirect) -> bool {
         match r {
-            Redirect::FdOut { fd, .. } | Redirect::FdIn { fd, .. } | Redirect::FdInOut { fd, .. } | Redirect::FdClose { fd } => *fd >= 3,
+            Redirect::FdOut { fd, .. }
+            | Redirect::FdIn { fd, .. }
+            | Redirect::FdInOut { fd, .. }
+            | Redirect::FdClose { fd }
+            | Redirect::FdHereString { fd, .. }
+            | Redirect::FdHereDoc { fd, .. } => *fd >= 3,
             Redirect::FdDup { fd, target } => *fd >= 3 && *target >= 3,
             _ => false,
         }
@@ -13083,6 +13088,15 @@ impl Shell {
                     // Body already ends in '\n' from capture_heredoc_body.
                     let content = self.expand_word(w);
                     actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
+                }
+                Redirect::FdHereString { fd, word } => {
+                    let mut content = self.expand_word(word);
+                    content.push('\n');
+                    actions.push(FdAction::Open { fd: *fd as i32, file: here_string_file(&content)? });
+                }
+                Redirect::FdHereDoc { fd, body, .. } => {
+                    let content = self.expand_word(body);
+                    actions.push(FdAction::Open { fd: *fd as i32, file: here_string_file(&content)? });
                 }
                 Redirect::Out { word, append, clobber } | Redirect::FdOut { fd: 1, word, append, clobber } => {
                     let p = self.expand_word(word);

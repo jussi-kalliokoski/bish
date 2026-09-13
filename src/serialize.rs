@@ -138,8 +138,50 @@ pub fn serialize_command(cmd: &Command) -> String {
 fn serialize_command_parts(cmd: &Command) -> (String, Vec<String>) {
     match cmd {
         Command::Simple(sc) => serialize_simple_with_heredocs(sc),
-        other => (serialize_command_inner(other, true), Vec::new()),
+        // The body's heredoc bodies come back apart from its text, so
+        // whatever follows the definition goes after them. Glued in, a
+        // `; next` landed on the line after the delimiter, where it is a
+        // syntax error.
+        Command::FuncDef { name, body } => {
+            let (line, bodies) = serialize_command_parts(body);
+            (format!("{}() {}", name, line), bodies)
+        }
+        other => (serialize_command_inner(other, true), heredoc_bodies(compound_redirects(other))),
     }
+}
+
+/// A compound command's own redirects -- the ones after its `}`, `done`
+/// or `fi` -- or none, for a command that has no place for any.
+fn compound_redirects(cmd: &Command) -> &[Redirect] {
+    match cmd {
+        Command::If { redirects, .. }
+        | Command::While { redirects, .. }
+        | Command::For { redirects, .. }
+        | Command::CFor { redirects, .. }
+        | Command::Select { redirects, .. }
+        | Command::Case { redirects, .. }
+        | Command::Group(_, redirects)
+        | Command::Subshell(_, redirects)
+        | Command::Arith(_, redirects)
+        | Command::Test(_, redirects) => redirects,
+        _ => &[],
+    }
+}
+
+/// The bodies of whichever of `redirects` are heredocs, in order.
+///
+/// A compound command's heredoc used to be written back as its `<<EOF`
+/// alone: only a simple command's bodies were ever collected, so
+/// `{ cat; } <<EOF` round-tripped into a group reading nothing, and
+/// `declare -f` printed a heredoc with no document under it.
+fn heredoc_bodies(redirects: &[Redirect]) -> Vec<String> {
+    redirects
+        .iter()
+        .filter_map(|r| match r {
+            Redirect::HereDoc(w, spelling) | Redirect::FdHereDoc { body: w, spelling, .. } => Some(heredoc_body(w, spelling)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The same text without the compound's *own* trailing redirects, for a
@@ -287,7 +329,7 @@ fn serialize_simple_with_heredocs(sc: &SimpleCommand) -> (String, Vec<String>) {
     let mut bodies = Vec::new();
     for r in &sc.redirects {
         parts.push(serialize_redirect(r));
-        if let Redirect::HereDoc(w, spelling) = r {
+        if let Redirect::HereDoc(w, spelling) | Redirect::FdHereDoc { body: w, spelling, .. } = r {
             bodies.push(heredoc_body(w, spelling));
         }
     }
@@ -388,6 +430,12 @@ pub fn serialize_redirect(r: &Redirect) -> String {
             let dash = if spelling.strip_tabs { "-" } else { "" };
             let delim = if spelling.quoted { format!("'{}'", spelling.delimiter) } else { spelling.delimiter.clone() };
             format!("<<{}{}", dash, delim)
+        }
+        Redirect::FdHereString { fd, word } => format!("{fd}<<<{}", redirect_target(word)),
+        Redirect::FdHereDoc { fd, spelling, .. } => {
+            let dash = if spelling.strip_tabs { "-" } else { "" };
+            let delim = if spelling.quoted { format!("'{}'", spelling.delimiter) } else { spelling.delimiter.clone() };
+            format!("{fd}<<{}{}", dash, delim)
         }
         Redirect::VarFd { var, kind, word } => {
             let op = match kind {
@@ -694,6 +742,15 @@ fn format_function_at(name: &str, body: &Command, indent: usize, nested: bool) -
                 out.push(' ');
                 out.push_str(&format_redirect(r));
             }
+            // The function's own heredocs, whose bodies come after the
+            // line its `}` is on. The last body keeps its newline: with
+            // the one `declare -f` ends every function with, that is the
+            // blank line bash leaves after a heredoc.
+            let bodies = heredoc_bodies(redirects);
+            if !bodies.is_empty() {
+                out.push('\n');
+                out.push_str(&bodies.concat());
+            }
         }
         other => {
             let (text, bodies) = format_command(other, indent + 1);
@@ -835,7 +892,10 @@ fn format_pipeline(p: &Pipeline, indent: usize) -> (String, Vec<String>) {
 fn format_command(cmd: &Command, indent: usize) -> (String, Vec<String>) {
     let inner = pad(indent + 1);
     let here = pad(indent);
-    let plain = |s: String| (s, Vec::new());
+    // A compound's text, and the bodies of any heredocs among its own
+    // redirects, which follow the line it ends on just as a simple
+    // command's do.
+    let plain = |s: String| (s, heredoc_bodies(compound_redirects(cmd)));
     match cmd {
         Command::Simple(sc) => format_simple(sc),
         // `elif` is not in bash's output at all: it prints the second
@@ -1009,7 +1069,7 @@ fn format_simple(sc: &SimpleCommand) -> (String, Vec<String>) {
     let mut bodies = Vec::new();
     for r in &sc.redirects {
         parts.push(format_redirect(r));
-        if let Redirect::HereDoc(w, spelling) = r {
+        if let Redirect::HereDoc(w, spelling) | Redirect::FdHereDoc { body: w, spelling, .. } = r {
             bodies.push(heredoc_body(w, spelling));
         }
     }
