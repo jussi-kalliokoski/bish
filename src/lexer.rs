@@ -2115,6 +2115,32 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                         } else if lexer.chars.peek().copied() == Some('>') {
                             lexer.advance();
                             items.push(SpannedItem::Tok(Tok::RedirFdInOut { fd }, start..lexer.pos));
+                        } else if lexer.chars.peek().copied() == Some('<') {
+                            // `N<<<` and `N<<DELIM`, the same two tokens the
+                            // parser's lexer makes of them. Read as `N<` and
+                            // a stray heredoc, the lines after `3<<<x` were
+                            // highlighted as the body of a document nobody
+                            // had started.
+                            lexer.advance();
+                            items.push(SpannedItem::Tok(Tok::RedirFdHere { fd }, start..lexer.pos));
+                            let here = lexer.pos;
+                            if lexer.chars.peek().copied() == Some('<') {
+                                lexer.advance();
+                                items.push(SpannedItem::Tok(Tok::HereString, here..lexer.pos));
+                            } else {
+                                let strip_tabs = lexer.chars.peek().copied() == Some('-');
+                                if strip_tabs {
+                                    lexer.advance();
+                                }
+                                lexer.skip_spaces();
+                                let (delim, expand) = lexer.read_heredoc_delimiter();
+                                let tok_idx = items.len();
+                                items.push(SpannedItem::Tok(
+                                    Tok::HereDoc(vec![Chunk::Str(String::new())], HereDocSpelling::default()),
+                                    here..lexer.pos,
+                                ));
+                                lexer.pending_heredocs.push((tok_idx, delim, strip_tabs, expand));
+                            }
                         } else {
                             items.push(SpannedItem::Tok(Tok::RedirFdIn { fd }, start..lexer.pos));
                         }

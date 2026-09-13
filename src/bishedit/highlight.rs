@@ -1676,6 +1676,23 @@ mod tests {
         assert!(spans.iter().any(|s| s.2 == HighlightKind::Operator));
     }
 
+    // A here-string or heredoc on a numbered descriptor is one redirect,
+    // and what follows it is the script again. The highlighter's own
+    // lexer read `3<<<x` as `3<` and then a heredoc, so every line after
+    // it was coloured as the body of a document nobody had started.
+    #[test]
+    fn a_numbered_here_string_or_heredoc_ends_where_it_ends() {
+        let text = "cat 3<<<x\nif true; then :; fi";
+        let spans = kinds(text);
+        let redirect_at = |i: usize| spans.iter().any(|s| s.2 == HighlightKind::Redirect && s.0 <= i && i < s.1);
+        assert!((4..8).all(redirect_at), "all of `3<<<` is the redirect: {spans:?}");
+        assert!(spans.contains(&(10, 12, HighlightKind::Keyword)), "the next line is a command again: {spans:?}");
+
+        let text = "cat 4<<EOF\nbody\nEOF\nif true; then :; fi";
+        let spans = kinds(text);
+        assert!(spans.contains(&(20, 22, HighlightKind::Keyword)), "after the document ends, the script resumes: {spans:?}");
+    }
+
     #[test]
     fn redirect_gets_its_own_span() {
         let text = "ls > out.txt";
