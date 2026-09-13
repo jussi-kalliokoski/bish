@@ -4545,6 +4545,13 @@ impl Shell {
     /// function: the question now depends on this shell's own state,
     /// which a free function cannot see.
     pub(crate) fn is_active_builtin(&self, name: &str) -> bool {
+        // `win`/`window` are builtins on the editor's colon line and
+        // nowhere else (see their arm in the dispatcher). Anywhere else
+        // `type win` said "shell builtin" about a name that was then not
+        // found.
+        if matches!(name, "win" | "window") && !self.restrict_to_builtins {
+            return false;
+        }
         is_known_builtin(name) && !self.disabled_builtins.contains(name)
     }
 
@@ -13909,6 +13916,17 @@ mod did_you_mean_tests {
         let miss = stderr_of("nosuchcommand_at_all\n");
         assert!(miss.contains("nosuchcommand_at_all"), "{miss}");
         assert!(!miss.contains("did you mean"), "{miss}");
+    }
+
+    // `win` is a builtin on the editor's colon line and nowhere else. So
+    // anywhere else it is not found -- `type` agrees -- and what is worth
+    // saying is the spelling that works there, not `win` itself.
+    #[test]
+    fn win_outside_the_colon_line_says_what_to_use_instead() {
+        let err = stderr_of("type win; win split\n");
+        assert!(err.contains("type: win: not found"), "{err}");
+        assert!(err.contains("::bish window"), "{err}");
+        assert!(!err.contains("did you mean 'win'"), "{err}");
     }
 
     #[test]

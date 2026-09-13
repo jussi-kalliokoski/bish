@@ -28,7 +28,10 @@ pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a s
     }
     candidates
         .into_iter()
-        .filter(|candidate| !candidate.is_empty())
+        // Never the word itself. A name that is a builtin somewhere and
+        // not reachable where it was typed failed with "did you mean
+        // 'win'?" -- the one suggestion guaranteed not to help.
+        .filter(|candidate| !candidate.is_empty() && *candidate != word)
         .map(|candidate| (distance(word, candidate), candidate))
         .filter(|(d, _)| *d <= limit)
         .min_by_key(|(d, _)| *d)
@@ -47,7 +50,16 @@ pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a s
 /// worse than saying so: this shell's editor is not readline, and its
 /// keymap is `::bish map`. Saying where to go turns a dead end into a
 /// signpost without pretending the command ran.
-const INSTEAD: &[(&str, &str)] = &[("bind", "this shell's keymap is `::bish map`"), ("logout", "use `exit`")];
+///
+/// `win` and `window` are builtins on the editor's colon line and
+/// nowhere else, on purpose (see their arm in exec.rs) -- so typed at a
+/// prompt they are not found, and what is worth saying is the spelling
+/// that works there.
+const INSTEAD: &[(&str, &str)] = &[
+    ("bind", "this shell's keymap is `::bish map`"),
+    ("win", "outside the editor's colon line it is `::bish window`"),
+    ("window", "outside the editor's colon line it is `::bish window`"),
+];
 
 pub(crate) fn instead_of(word: &str) -> String {
     match INSTEAD.iter().find(|(name, _)| *name == word) {
@@ -100,6 +112,15 @@ pub(crate) fn distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{did_you_mean, distance, nearest};
+
+    // A word that is itself one of the candidates is not a near miss of
+    // it. `win` is a builtin on the editor's colon line only, and typed
+    // at a prompt it was not found -- and then offered back as the fix.
+    #[test]
+    fn a_word_is_never_suggested_to_itself() {
+        assert_eq!(did_you_mean("win", ["win", "wait"]), "", "nothing else is close enough to say");
+        assert_eq!(nearest("ecoh", ["ecoh", "echo"]), Some("echo"));
+    }
 
     #[test]
     fn a_transposition_costs_one_edit_not_two() {
