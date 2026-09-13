@@ -4634,6 +4634,10 @@ pub fn render_editor_frame(
 ) {
     let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
     out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col, color_overrides));
+    // An editor paints the terminal directly and never the pane's own
+    // grid, so this is the only record of what it shows -- see
+    // `repl::record_paint`.
+    crate::repl::record_paint(rect, &out);
     print!("{}", out);
     let _ = io::stdout().flush();
 }

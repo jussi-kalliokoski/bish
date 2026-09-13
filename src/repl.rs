@@ -2137,7 +2137,11 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
 
     let quit = loop {
         let rect = pane_rect(&app.windows[app.current_window], own_pane_id, app.term_rows, app.term_cols);
-        print!("{}", session.render(rect, app.term_rows, app.term_cols));
+        {
+            let frame = session.render(rect, app.term_rows, app.term_cols);
+            record_paint(rect, &frame);
+            print!("{frame}");
+        }
         let _ = io::stdout().flush();
 
         // Waiting for the next byte out here, rather than inside
@@ -2150,7 +2154,11 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
             if service_background_jobs(app) {
                 let rect = pane_rect(&app.windows[app.current_window], own_pane_id, app.term_rows, app.term_cols);
-                print!("{}", session.render(rect, app.term_rows, app.term_cols));
+                {
+                    let frame = session.render(rect, app.term_rows, app.term_cols);
+                    record_paint(rect, &frame);
+                    print!("{frame}");
+                }
                 let _ = io::stdout().flush();
             }
         }
@@ -2793,6 +2801,7 @@ fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize)
         row += 1;
     }
     out.push_str("\x1b[?25l");
+    record_paint(rect, &out);
     print!("{}", out);
     let _ = io::stdout().flush();
 }
@@ -2994,7 +3003,9 @@ fn run_browse_frame(
 
     let outcome = loop {
         let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
-        print!("{}", browser.render(rect, app.term_rows, app.term_cols));
+        let frame = browser.render(rect, app.term_rows, app.term_cols);
+        record_paint(rect, &frame);
+        print!("{frame}");
         let _ = io::stdout().flush();
 
         let key = match editor::read_key_idle(&mut || {
@@ -3144,6 +3155,7 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
         row += 1;
     }
     out.push_str("\x1b[?25l");
+    record_paint(rect, &out);
     print!("{}", out);
     let _ = io::stdout().flush();
 }
@@ -3184,6 +3196,7 @@ fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
             out.push_str(&format!("\x1b[{};{}H\x1b[K", rect.row + row + 1, rect.col + 1));
         }
         out.push_str("\x1b[?25l");
+        record_paint(rect, &out);
         print!("{out}");
         let _ = io::stdout().flush();
 
@@ -5485,18 +5498,70 @@ fn prompt_claims_mouse(mouse_bishopt: bool, sinks_are_grid: bool) -> bool {
     mouse_bishopt && sinks_are_grid
 }
 
+thread_local! {
+    // The last frame a view that paints the terminal directly -- the
+    // editor, the hex view, the browser, the list panes, the pager, a
+    // review -- put on screen, and where. See `focused_pane_text`.
+    //
+    // Plain thread-local state, for the reason `session.rs`'s bridge
+    // gives: this process is single-threaded, and "what was last painted"
+    // describes the whole process at this moment.
+    static PAINTED: std::cell::RefCell<Option<(Rect, String)>> = const { std::cell::RefCell::new(None) };
+    // How many of the views that open *over* a pane (the pager, a review)
+    // are open now. Under one of those the pane's own frame -- a shell's
+    // grid, say -- is not what is on screen.
+    static OVERLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Remembers `frame`, just painted into `rect`, as what that pane shows:
+/// the only record of it there is, for anything that paints the terminal
+/// directly rather than a pane's grid.
+pub(crate) fn record_paint(rect: Rect, frame: &str) {
+    PAINTED.with(|p| *p.borrow_mut() = Some((rect, frame.to_string())));
+}
+
+// A view open over the focused pane for as long as this lives.
+struct OverlayOpen;
+
+impl OverlayOpen {
+    fn new() -> OverlayOpen {
+        OVERLAYS.with(|o| o.set(o.get() + 1));
+        OverlayOpen
+    }
+}
+
+impl Drop for OverlayOpen {
+    fn drop(&mut self) {
+        OVERLAYS.with(|o| o.set(o.get().saturating_sub(1)));
+    }
+}
+
 // What the focused pane currently shows, as plain text: one line per
 // row, trailing blanks trimmed off each, and wholly blank rows at the
 // bottom dropped. No colours or attributes -- this is what `bish
 // session capture` prints, and what a script grepping it wants is the
 // words, not the SGR codes around them.
+//
+// A pane showing an editor, a hex view, a browser or a list, or with the
+// pager or a review open over it, is not in its grid at all: those paint
+// the terminal directly. For them the answer is the last frame they
+// painted (see `record_paint`), cut down to the pane. Reading the grid
+// there answered with a blank screen.
 fn focused_pane_text(app: &App) -> String {
-    let sid = app.windows[app.current_window].owning_session();
-    let screen = app.sessions[&sid].screen.borrow();
-    let (rows, _cols) = screen.size();
-    let mut lines: Vec<String> = (0..rows)
-        .map(|row| {
-            let mut line: String = screen.row_text(row);
+    let window = &app.windows[app.current_window];
+    let painted_over = OVERLAYS.with(|o| o.get()) > 0 || !matches!(window.focused().stack.last(), Some(Frame::Session(_) | Frame::Job(_)));
+    let painted = if painted_over { PAINTED.with(|p| p.borrow().clone()) } else { None };
+    let rows: Vec<String> = match painted {
+        Some((rect, frame)) => painted_rows(rect, &frame, app.term_rows, app.term_cols),
+        None => {
+            let screen = app.sessions[&window.owning_session()].screen.borrow();
+            let (rows, _cols) = screen.size();
+            (0..rows).map(|row| screen.row_text(row)).collect()
+        }
+    };
+    let mut lines: Vec<String> = rows
+        .into_iter()
+        .map(|mut line| {
             while line.ends_with(' ') {
                 line.pop();
             }
@@ -5508,6 +5573,18 @@ fn focused_pane_text(app: &App) -> String {
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+// What `frame` shows inside `rect`, a row per line. The frame places
+// itself absolutely on a terminal `term_rows` by `term_cols`, so it is
+// replayed onto one that size and the pane is read back out of it --
+// including the half of a wide character that is not a character.
+fn painted_rows(rect: Rect, frame: &str, term_rows: usize, term_cols: usize) -> Vec<String> {
+    let mut screen = vt100::Screen::new(term_rows.max(rect.row + rect.rows), term_cols.max(rect.col + rect.cols));
+    screen.feed(frame.as_bytes());
+    (rect.row..rect.row + rect.rows)
+        .map(|row| (rect.col..rect.col + rect.cols).map(|col| screen.cell(row, col)).filter(|cell| !cell.continuation).map(|cell| cell.ch).collect())
+        .collect()
 }
 
 fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize) {
@@ -11495,12 +11572,16 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
 // verdicts can be acted on, and not when it was walked away from.
 fn run_review(app: &mut App, title: &str, old: Vec<String>, new: Vec<String>) -> Option<crate::review::Review> {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
+    // What capture reports while this is open -- see `OVERLAYS`.
+    let _overlay = OverlayOpen::new();
     let mut rect = app.focused_pane_rect();
     compositor_redraw(app);
     let mut view = crate::review::Review::new(title, old, new, rect.rows, rect.cols);
     let mut last_size = (app.term_rows, app.term_cols);
     let outcome = loop {
-        print!("{}", view.render(rect));
+        let frame = view.render(rect);
+        record_paint(rect, &frame);
+        print!("{frame}");
         let _ = io::stdout().flush();
         let key = match editor::read_key_idle(&mut || {
             service_background_jobs(app);
@@ -11527,6 +11608,8 @@ fn run_review(app: &mut App, title: &str, old: Vec<String>, new: Vec<String>) ->
 
 fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
+    // What capture reports while this is open -- see `OVERLAYS`.
+    let _overlay = OverlayOpen::new();
     // One pane's rectangle, not the whole screen. The neighbours are
     // painted once here and then left alone -- the pager only ever
     // writes inside its own rect, the same arrangement browser.rs and
@@ -11536,7 +11619,9 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
     let mut view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
     let mut last_size = (app.term_rows, app.term_cols);
     loop {
-        print!("{}", view.render(rect));
+        let frame = view.render(rect);
+        record_paint(rect, &frame);
+        print!("{frame}");
         let _ = io::stdout().flush();
         let key = match editor::read_key_idle(&mut || {
             service_background_jobs(app);
@@ -16789,6 +16874,17 @@ mod substitute_command_tests {
 #[cfg(test)]
 mod capture_text_tests {
     use super::*;
+
+    // A view that paints the terminal directly -- the editor, the pager,
+    // a review -- is read back out of the frame it painted: only the
+    // pane's rectangle, positioned the way the frame positions itself,
+    // with nothing from outside it leaking in.
+    #[test]
+    fn a_painted_frame_is_read_back_inside_its_pane() {
+        let rect = Rect { row: 1, col: 4, rows: 2, cols: 6 };
+        let frame = "\x1b[1;1Hstatus-outside\x1b[2;5Hhello!\x1b[3;5H\x1b[1mbold\x1b[0m\x1b[4;1Hbelow";
+        assert_eq!(painted_rows(rect, frame, 5, 20), vec!["hello!".to_string(), "bold  ".to_string()]);
+    }
 
     fn screen_showing(lines: &[&str], rows: usize, cols: usize) -> vt100::Screen {
         let mut screen = vt100::Screen::new(rows, cols);
