@@ -140,7 +140,7 @@ fn main() {
         }
     }
 
-    let invocation = match Invocation::parse(&args[1..]) {
+    let mut invocation = match Invocation::parse(&args[1..]) {
         Ok(inv) => inv,
         Err(e) => {
             eprintln!("bish: {e}");
@@ -148,6 +148,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // `login(1)`, and a terminal emulator imitating it, start a login
+    // shell by naming it `-bish` rather than passing `-l`.
+    if args.first().is_some_and(|name| name.starts_with('-')) {
+        invocation.login = true;
+    }
     if invocation.print_version {
         println!("bish {} (bash {} compatible)", env!("CARGO_PKG_VERSION"), exec::BASH_VERSION);
         std::process::exit(0);
@@ -158,6 +163,8 @@ fn main() {
     }
 
     let mut shell = exec::Shell::new();
+    shell.started_as_login = invocation.login;
+    shell.login_shell = invocation.login;
     // $SHLVL counts how deep this shell is inside other shells. bash
     // reads whatever it inherited and adds one; a shell that does not
     // is invisible to anything counting nesting, `exit`-on-last-level

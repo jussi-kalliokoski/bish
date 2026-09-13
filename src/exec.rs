@@ -2119,6 +2119,15 @@ pub struct Shell {
     // a readonly variable, and would be intolerable if it did that to
     // someone's session over a typo.
     interactive: bool,
+    // Whether this shell was started as a login shell: `-l`, `--login`,
+    // or an argv[0] starting with a dash. What `shopt login_shell`
+    // reports, in every child alike -- `( shopt login_shell )` says on.
+    pub(crate) started_as_login: bool,
+    // Whether *this* shell is the login shell, which is what `logout`
+    // asks. Inherited by a virtual child, except where bash's own child
+    // is not the login shell: a `( )` and a pipeline stage (see
+    // run_body_in_child_shell).
+    pub(crate) login_shell: bool,
     // Set when expanding a *word* of the command currently being built
     // failed: `${x!y}` and `${a[}` (no such parameter), `${x:?}` (the
     // one whose whole purpose is to stop), and an arithmetic expansion
@@ -2393,6 +2402,8 @@ impl Shell {
             pending_edit: None,
             pending_exit: None,
             interactive: false,
+            started_as_login: false,
+            login_shell: false,
             expansion_failed: false,
             stdio_override: None,
             debug_hook: None,
@@ -2765,6 +2776,8 @@ impl Shell {
             pending_edit: None,
             pending_exit: None,
             interactive: self.interactive,
+            started_as_login: self.started_as_login,
+            login_shell: self.login_shell,
             expansion_failed: false,
             stdio_override: None,
             debug_hook: self.debug_hook.clone(),
@@ -3793,6 +3806,9 @@ impl Shell {
     pub(crate) fn shopt_is_on(&self, name: &str) -> bool {
         if name == "extglob" {
             return true;
+        }
+        if name == "login_shell" {
+            return self.started_as_login;
         }
         self.shopt_options.get(name).copied().unwrap_or_else(|| shopt_default_on(name).unwrap_or(false))
     }
@@ -5588,6 +5604,12 @@ impl Shell {
             child.debug_trap = None;
             child.err_trap = None;
             child.return_trap = None;
+        }
+        // A `( )` and a pipeline stage are not the login shell, though
+        // a `$( )` still is: bash's asymmetry, and the one `logout`
+        // sees. `x=$(logout 3)` leaves with 3; `( logout 3 )` refuses.
+        if matches!(body, ChildBody::Enclosed(_) | ChildBody::Parsed(_)) {
+            child.login_shell = false;
         }
 
         // The real OS cwd is process-wide, shared with the real parent,
@@ -8491,23 +8513,50 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            "exit" => {
-                let code = match argv.get(1) {
-                    Some(a) => match a.parse::<i32>() {
+            // `logout` is `exit` for a login shell, and a refusal
+            // anywhere else -- including a `( )` or a pipeline stage of
+            // one, which bash does not count as the login shell either.
+            "exit" | "logout" => {
+                let name = argv[0].as_str();
+                if name == "logout" && !self.login_shell {
+                    sh_eprintln!(self, "bish: logout: not login shell: use `exit'");
+                    return ExecResult::Status(1);
+                }
+                let operands = match argv.get(1).map(String::as_str) {
+                    Some("--") => &argv[2..],
+                    _ => &argv[1..],
+                };
+                let code = match operands {
+                    [] => self.last_status,
+                    [a] => match a.parse::<i32>() {
                         Ok(n) => n,
-                        // Still exits -- bash does too, with 2, rather
-                        // than carrying on as if `exit` had not been
-                        // written.
+                        // Reported, and then *not* obeyed: bash 5.3
+                        // carries on with 2 rather than guessing what
+                        // was meant. Posix mode still leaves.
                         Err(_) => {
-                            sh_eprintln!(self, "bish: exit: {}: numeric argument required", a);
+                            sh_eprintln!(self, "bish: {}: {}: numeric argument required", name, a);
+                            if !self.opt_posix {
+                                return ExecResult::Status(2);
+                            }
+                            self.last_status = 2;
                             self.run_exit_trap();
                             return ExecResult::Exit(2);
                         }
                     },
-                    None => self.last_status,
+                    // An error that still leaves, with 1. It used to
+                    // leave with the first number, silently.
+                    _ => {
+                        sh_eprintln!(self, "bish: {}: too many arguments", name);
+                        1
+                    }
                 };
+                // The trap sees the status being left with as `$?`:
+                // `trap 'echo $?' EXIT; exit 4` prints 4. It printed
+                // whatever the command before `exit` had left behind.
+                let code = exit_status_byte(code);
+                self.last_status = code;
                 self.run_exit_trap();
-                return ExecResult::Exit(exit_status_byte(code));
+                return ExecResult::Exit(code);
             }
             "read" => {
                 let mut array_name: Option<&str> = None;
@@ -9782,6 +9831,9 @@ impl Shell {
                 true => self.new_virtual_child(),
                 false => self.child_for_stdio(ChildStdio::default()),
             };
+            // A stage is a subshell, and so not the login shell -- see
+            // run_body_in_child_shell.
+            child.login_shell = false;
             // No DEBUG trap inside this stage, in the two cases where
             // bash has none either. A simple stage was already named
             // and traced by `run_multi` before any stage started; a
@@ -13709,6 +13761,42 @@ mod subshell_inheritance_tests {
         out
     }
 
+    fn login_output(script: &str) -> String {
+        let mut shell = super::Shell::new();
+        shell.started_as_login = true;
+        shell.login_shell = true;
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        shell.set_sink_capture(captured.clone());
+        shell.run_source_here(script, "<login>");
+        captured.borrow().clone()
+    }
+
+    #[test]
+    fn logout_refuses_a_shell_that_is_not_a_login_shell() {
+        assert_eq!(output("logout 3 2>/dev/null; echo \"rc=$?\"\n", &[]), "rc=1\n");
+        assert_eq!(output("shopt -q login_shell; echo \"q=$?\"\n", &[]), "q=1\n");
+    }
+
+    #[test]
+    fn a_subshell_of_a_login_shell_is_not_one_and_a_command_substitution_is() {
+        let script = "( logout 4 2>/dev/null; echo \"paren=$?\" )\nlogout 4 2>/dev/null | cat; echo \"stage=${PIPESTATUS[0]}\"\nx=$(logout 6; echo no); echo \"subst=$? [$x]\"\nlogout 7; echo not-reached\n";
+        assert_eq!(login_output(script), "paren=1\nstage=1\nsubst=6 []\n");
+    }
+
+    #[test]
+    fn login_shell_reports_how_the_shell_started_and_cannot_be_changed() {
+        assert_eq!(login_output("shopt -u login_shell; echo \"rc=$?\"; shopt -q login_shell; echo \"q=$?\"\n"), "rc=0\nq=0\n");
+        // Still a login shell's child, even where `logout` refuses.
+        assert_eq!(login_output("( shopt -q login_shell; echo \"q=$?\"; logout 2>/dev/null; echo \"rc=$?\" )\n"), "q=0\nrc=1\n");
+        assert_eq!(output("shopt -s login_shell; shopt -q login_shell; echo \"q=$?\"\n", &[]), "q=1\n");
+    }
+
+    #[test]
+    fn exit_carries_on_after_a_word_it_cannot_use() {
+        assert_eq!(output("exit x 2>/dev/null; echo \"rc=$?\"\n", &[]), "rc=2\n");
+        assert_eq!(output("( exit 5 2 ) 2>/dev/null; echo \"rc=$?\"; ( exit -- 5 ); echo \"rc=$?\"\n", &[]), "rc=1\nrc=5\n");
+    }
+
     #[test]
     fn a_command_substitution_sees_the_positional_parameters() {
         assert_eq!(output("printf '%s' \"$(printf '%s' \"$1\")\"\n", &["hello", "there"]), "hello");
@@ -16658,6 +16746,7 @@ pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     ("kill", "Send a signal to a job or process."),
     ("let", "Evaluate arithmetic expressions."),
     ("local", "Declare variables local to the current function."),
+    ("logout", "Leave a login shell."),
     ("mapfile", "Read lines of input into an array."),
     ("popd", "Pop a directory off the stack and go there."),
     ("printf", "Print according to a format."),
@@ -16720,6 +16809,7 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "shift",
     "local",
     "exit",
+    "logout",
     "read",
     "mapfile",
     "readarray",

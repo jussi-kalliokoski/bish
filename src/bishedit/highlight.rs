@@ -1083,6 +1083,7 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "shift",
     "local",
     "exit",
+    "logout",
     "read",
     "mapfile",
     "readarray",

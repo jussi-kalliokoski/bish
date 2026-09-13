@@ -472,6 +472,19 @@ mod tests {
         // 255 and `exit 300` is 44. bish handed the number back whole.
         case("exit-status-is-one-byte", r#"(exit -1); echo $?; (exit 300); echo $?; (exit 256); echo $?"#),
         case("return-status-is-one-byte", r#"f(){ return -1; }; f; echo $?; g(){ return 300; }; g; echo $?"#),
+        // What `exit` does with arguments it cannot use. A word that is
+        // not a number is reported and *not* obeyed: bash 5.3 carries
+        // on with a status of 2 (posix mode aside). Two numbers is an
+        // error that still leaves, with 1. `--` ends the options.
+        case("exit-with-a-word-carries-on", r#"exit x 2>/dev/null; echo "rc=$?""#),
+        case("exit-with-two-numbers-leaves-with-one", r#"( exit 5 2 ) 2>/dev/null; echo "rc=$?""#),
+        case("exit-after-a-double-dash", r#"( exit -- 5 ); echo "rc=$?""#),
+        // The EXIT trap sees the status being left with, not the one
+        // the command before `exit` left behind.
+        case("the-exit-trap-sees-the-status-being-left-with", r#"trap 'echo "rc=$?"' EXIT; true; exit 4"#),
+        // `-c` alone is not a login shell, so `logout` refuses and the
+        // script carries on. The login side is LOGIN_CASES.
+        case("logout-outside-a-login-shell", r#"logout 2>/dev/null; echo "rc=$?"; logout 5 2>/dev/null; echo "rc=$?"; shopt login_shell"#),
         // A prefix assignment belongs to the command it prefixes --
         // all three kinds of command. It was expanded wherever each
         // consumer wanted it, which meant twice for an external, never
@@ -1655,10 +1668,11 @@ y
         ("extglob-cannot-be-turned-off", "`shopt extglob` says on where bash says off, because here it is always on"),
         ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
         // The builtin *set* differs, legitimately: bish has builtins
-        // bash does not (`abbr`, `win`, `::bish`) and lacks `bind` and
-        // `logout`. Listed rather than fixed because the difference is
+        // bash does not (`abbr`, `win`, `::bish`) and lacks `bind`, which
+        // it will not have: key bindings are bish's own keymap, not
+        // readline's. Listed rather than fixed because the difference is
         // the point -- the list is honest about what this shell has.
-        ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`/`logout`"),
+        ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`"),
         // Where the *whole* match lands, both shells now agree on:
         // leftmost, then longest. What is left is which spelling of an
         // equally long match the capture groups report. bash's answer
@@ -1677,6 +1691,22 @@ y
             "regex-submatch-of-an-ambiguous-empty-branch",
             "`(|a)(a|)` against `a` fills the first group in bash and the second here; the whole match agrees",
         ),
+        // Found by `logout`'s corpus, and true of `exit` just the same.
+        // The EXIT trap runs where `exit` is, which inside `{ } > f` is
+        // with stdout still on `f`. bash undoes a group's redirects
+        // before the trap -- though not a function's, `g > f` keeps
+        // its `f` -- and matching that means deferring the trap past
+        // exactly the frames bash unwinds, rather than running it at
+        // the site, which every exit path here currently relies on.
+        (
+            "the-exit-trap-runs-inside-a-redirected-group",
+            "`{ exit; } > f` runs the EXIT trap with stdout still on `f`; bash undoes the group's redirects first",
+        ),
+        // A group with a numbered-fd redirect has no in-process model
+        // (see compound_redirects_are_simple) and runs as a separate
+        // bish, so `exit` there leaves that process and the script
+        // carries on. `logout` inherits the same hole.
+        ("exit-in-a-group-with-a-numbered-fd-redirect-leaves-only-the-group", "`{ exit 3; } 3>f; echo after` prints `after`; bash leaves with 3"),
     ];
 
     // The cases the divergence list is about. Kept apart from `CASES`
@@ -1687,6 +1717,8 @@ y
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         case("regex-submatch-of-an-ambiguous-empty-branch", r#"re='(|a)(a|)'; [[ a =~ $re ]]; echo "[${BASH_REMATCH[1]}][${BASH_REMATCH[2]}]""#),
+        case("the-exit-trap-runs-inside-a-redirected-group", r#"trap 'cat f 2>/dev/null; echo bye' EXIT; { echo in; exit; } > f"#),
+        case("exit-in-a-group-with-a-numbered-fd-redirect-leaves-only-the-group", r#"{ exit 3; } 3>f; echo after"#),
         // -- roadmap 10: parser leniency, the part still standing -----
         // Also not recordable, and for the same kind of reason: a
         // signal this shell was *started* with ignored is reported by
@@ -2147,6 +2179,55 @@ y
             "{} of {} cases differ from bash:\n{}",
             differing.len(),
             CASES.len(),
+            differing.iter().map(|(name, want, got)| format!("  {name}\n    bash: {want:?}\n    bish: {got:?}")).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    /// Cases that only mean something in a login shell, run under `-l`
+    /// by both shells.
+    ///
+    /// The status of a shell that has left is not in the text compared,
+    /// so each case shows it from where it can still be seen: a `$( )`
+    /// (which bash counts as the login shell) or an EXIT trap.
+    const LOGIN_CASES: &[Case] = &[
+        case("logout-leaves-from-a-command-substitution", r#"x=$(echo a; logout 3; echo b); echo "[$x] rc=$?""#),
+        case("logout-runs-the-exit-trap", r#"trap 'echo "trapped rc=$?"' EXIT; logout 4; echo not-reached"#),
+        case("logout-in-a-subshell-refuses", r#"( logout 4; echo "in rc=$?" ) 2>/dev/null; echo "out rc=$?""#),
+        case("logout-in-a-pipeline-stage-refuses", r#"logout 4 2>/dev/null | cat; echo "rc=${PIPESTATUS[0]}""#),
+        case("logout-with-a-word-carries-on", r#"logout x 2>/dev/null; echo "rc=$?""#),
+        case("logout-with-two-numbers-leaves-with-one", r#"x=$(logout 5 2 2>/dev/null); echo "rc=$?""#),
+        case("logout-status-is-one-byte", r#"x=$(logout -1); echo "rc=$?"; x=$(logout -- 300); echo "rc=$?""#),
+        case("login-shell-cannot-be-unset", r#"shopt login_shell; shopt -u login_shell; echo "rc=$?"; shopt login_shell; ( shopt login_shell )"#),
+    ];
+
+    #[test]
+    fn bish_agrees_with_bash_as_a_login_shell() {
+        let Some(bish) = bish_binary() else { return };
+        if !have_bash() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("bish-bashdiff-login-{}", std::process::id()));
+        let mut differing = Vec::new();
+        for case in LOGIN_CASES {
+            let dir = root.join(case.name);
+            let answer = |shell: &std::ffi::OsStr| {
+                std::fs::create_dir_all(&dir).unwrap();
+                let outcome = run_with(shell, &["-l"], case.script, &dir);
+                std::fs::remove_dir_all(&dir).ok();
+                outcome
+            };
+            let want = answer(std::ffi::OsStr::new("bash"));
+            let got = answer(bish.as_os_str());
+            if want.timed_out || got.timed_out || want.text != got.text {
+                differing.push((case.name, want.text, got.text));
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            differing.is_empty(),
+            "{} of {} login cases differ from bash:\n{}",
+            differing.len(),
+            LOGIN_CASES.len(),
             differing.iter().map(|(name, want, got)| format!("  {name}\n    bash: {want:?}\n    bish: {got:?}")).collect::<Vec<_>>().join("\n")
         );
     }

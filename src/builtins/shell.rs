@@ -168,6 +168,12 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
         }
         Some(on) => {
             for n in &names {
+                // A fact about how the shell was started, not a
+                // setting. bash takes the `-s`/`-u` with a status of 0
+                // and changes nothing, and so does this.
+                if *n == "login_shell" {
+                    continue;
+                }
                 sh.shopt_options.insert(n.to_string(), on);
             }
             0
