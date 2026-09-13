@@ -310,6 +310,79 @@ pub fn selection_notification(focus: Option<&FileState>) -> Option<Vec<u8>> {
     Some(json::compact_print(&payload).into_bytes())
 }
 
+/// A proposed new version of a file, for somebody to go through change
+/// by change -- `openDiff`, in bish's own terms.
+///
+/// The one question in this protocol whose answer cannot come from the
+/// tick that received it: it waits on a person. So it carries an `id`,
+/// and the answer names it, rather than being whatever reply comes next.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewRequest {
+    pub id: u64,
+    pub path: std::path::PathBuf,
+    pub proposed: String,
+    pub title: String,
+}
+
+impl ReviewRequest {
+    fn to_value(&self) -> Value {
+        object(vec![
+            ("q", string("review")),
+            ("id", Value::Number(self.id as f64)),
+            ("path", string(&self.path.to_string_lossy())),
+            ("proposed", string(&self.proposed)),
+            ("title", string(&self.title)),
+        ])
+    }
+
+    /// The request `question` is, if it is one.
+    pub fn from_question(question: &[u8]) -> Option<ReviewRequest> {
+        let value = json::parse(std::str::from_utf8(question).ok()?).ok()?;
+        if string_at(&value, ".q")? != "review" {
+            return None;
+        }
+        Some(ReviewRequest {
+            id: number_at(&value, ".id") as u64,
+            path: std::path::PathBuf::from(string_at(&value, ".path")?),
+            proposed: string_at(&value, ".proposed")?,
+            title: string_at(&value, ".title").unwrap_or_default(),
+        })
+    }
+}
+
+/// How a review ended: with the file as it now stands, written, or with
+/// nothing done to it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviewOutcome {
+    Saved(String),
+    Rejected,
+}
+
+/// The answer to review `id`.
+pub fn review_answer(id: u64, outcome: &ReviewOutcome) -> Vec<u8> {
+    let mut fields = vec![("a", string("review")), ("id", Value::Number(id as f64))];
+    match outcome {
+        ReviewOutcome::Saved(text) => {
+            fields.push(("outcome", string("saved")));
+            fields.push(("text", string(text)));
+        }
+        ReviewOutcome::Rejected => fields.push(("outcome", string("rejected"))),
+    }
+    json::compact_print(&object(fields)).into_bytes()
+}
+
+/// The outcome `payload` reports for review `id`, if that is what it is.
+fn review_outcome(payload: &[u8], id: u64) -> Option<ReviewOutcome> {
+    let value = json::parse(std::str::from_utf8(payload).ok()?).ok()?;
+    if string_at(&value, ".a")? != "review" || number_at(&value, ".id") as u64 != id {
+        return None;
+    }
+    match string_at(&value, ".outcome")?.as_str() {
+        "saved" => Some(ReviewOutcome::Saved(string_at(&value, ".text")?)),
+        _ => Some(ReviewOutcome::Rejected),
+    }
+}
+
 /// The other end of it.
 fn ask_state(peer: &mut crate::session::Peer) -> Result<EditorState, String> {
     let reply = peer.ask(br#"{"q":"state"}"#, std::time::Duration::from_millis(2000)).map_err(|e| e.to_string())?;
@@ -326,6 +399,12 @@ pub struct Server {
     /// and offers no tools, which a client discovers and works around.
     /// That is the shape that makes starting small safe.
     session: Option<crate::session::Peer>,
+    /// The last review asked for, so each answer can name its question.
+    next_review: u64,
+    /// What the session said while a review was being waited on and
+    /// that was not its answer -- held for `forward_notifications`,
+    /// since a wait is no reason to drop a notification.
+    held: Vec<Vec<u8>>,
 }
 
 impl Default for Server {
@@ -384,12 +463,12 @@ pub fn run(args: &[String]) -> i32 {
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    Server { initialized: false, session: peer }.serve(&mut stdin.lock(), &mut stdout.lock())
+    Server { initialized: false, next_review: 0, held: Vec::new(), session: peer }.serve(&mut stdin.lock(), &mut stdout.lock())
 }
 
 impl Server {
     pub fn new() -> Server {
-        Server { initialized: false, session: None }
+        Server { initialized: false, next_review: 0, held: Vec::new(), session: None }
     }
 
     /// The loop, over any reader and writer rather than stdin and stdout
@@ -431,7 +510,11 @@ impl Server {
     /// understands is a bug rather than something to relay blindly.
     fn forward_notifications(&mut self, output: &mut impl Write) {
         let Some(peer) = self.session.as_mut() else { return };
-        let Ok(payloads) = peer.poll() else { return };
+        // What arrived during a review's wait first, since it came first.
+        let mut payloads = std::mem::take(&mut self.held);
+        if let Ok(fresh) = peer.poll() {
+            payloads.extend(fresh);
+        }
         for payload in payloads {
             if let Some(message) = selection_changed(&payload) {
                 self.send(output, message);
@@ -544,6 +627,17 @@ impl Server {
                 vec![("uri", "string", "Optional file:// URI. Omitted, this reports every open file.")],
             ),
             tool("closeAllDiffTabs", "Close any diff views bish has open", Vec::new()),
+            tool(
+                "openDiff",
+                "Show a proposed new version of a file in bish, to be gone through change by change",
+                vec![
+                    ("old_file_path", "string", "The file being changed."),
+                    ("new_file_path", "string", "Where the new version goes; the same file, for an edit."),
+                    ("new_file_contents", "string", "The whole proposed text."),
+                    ("tab_name", "string", "What to call the review."),
+                ],
+            ),
+            tool("close_tab", "Close a diff view by name", vec![("tab_name", "string", "The name it was opened with.")]),
         ]
     }
 
@@ -555,12 +649,55 @@ impl Server {
         let arguments = json::query(params, ".arguments").cloned().unwrap_or(Value::Null);
         match name.as_str() {
             "getDiagnostics" => self.get_diagnostics(&arguments),
-            // bish opens no diff views yet, so there are none to close.
-            // Answered rather than refused because a client calls this
-            // unprompted at the start of every turn, and an error there
-            // is noise about nothing.
+            "openDiff" => self.open_diff(&arguments),
+            // A review closes itself the moment it is decided, which is
+            // before `openDiff` answers -- so by the time a client asks
+            // for one to be closed, there is never one open. Answered
+            // rather than refused because a client calls both of these
+            // unprompted, and an error there is noise about nothing.
+            "close_tab" => tool_result("TAB_CLOSED", false),
             "closeAllDiffTabs" => tool_result("CLOSED_0_DIFF_TABS", false),
             other => tool_result(&format!("bish has no tool called {other}"), true),
+        }
+    }
+
+    /// Puts a proposed version of a file in front of whoever is at the
+    /// session, and answers once they have been through it: the file as
+    /// it now stands, written, or word that nothing was taken.
+    ///
+    /// Blocks this server until then, deliberately. The client asking is
+    /// itself waiting on exactly this answer, and has nothing else it
+    /// could usefully be told meanwhile.
+    fn open_diff(&mut self, arguments: &Value) -> Value {
+        let Some(proposed) = string_at(arguments, ".new_file_contents") else {
+            return tool_result("openDiff needs new_file_contents", true);
+        };
+        let Some(path) = string_at(arguments, ".new_file_path").or_else(|| string_at(arguments, ".old_file_path")) else {
+            return tool_result("openDiff needs a file path", true);
+        };
+        self.next_review += 1;
+        let id = self.next_review;
+        let request = ReviewRequest { id, path: path.into(), proposed, title: string_at(arguments, ".tab_name").unwrap_or_default() };
+        let Some(peer) = self.session.as_mut() else {
+            return tool_result("this bish is not reporting on any session", true);
+        };
+        if let Err(e) = peer.tell(json::compact_print(&request.to_value()).as_bytes()) {
+            return tool_result(&format!("could not ask the session: {e}"), true);
+        }
+        match peer.wait_for(|payload| review_outcome(payload, id).is_some()) {
+            Ok((answer, others)) => {
+                self.held.extend(others);
+                let block = |text: &str| object(vec![("type", string("text")), ("text", string(text))]);
+                match review_outcome(&answer, id) {
+                    // Two blocks, the second the file as written: what a
+                    // client reads a saved review as.
+                    Some(ReviewOutcome::Saved(text)) => {
+                        object(vec![("content", Value::Array(vec![block("FILE_SAVED"), block(&text)])), ("isError", Value::Bool(false))])
+                    }
+                    _ => tool_result("DIFF_REJECTED", false),
+                }
+            }
+            Err(e) => tool_result(&format!("the session went away before the review was decided: {e}"), true),
         }
     }
 
@@ -976,9 +1113,22 @@ mod tests {
                 }
                 decoder.feed(&buf[..n]);
                 while let Ok(Some(message)) = decoder.next_message() {
-                    if let Wire::Rpc(question) = message
-                        && let Some(reply) = answer(&state, &question)
-                    {
+                    let Wire::Rpc(question) = message else { continue };
+                    // A review is decided on the spot, the way someone at
+                    // the session would decide it: kept, unless the
+                    // proposal asks to be refused. The focus notice sent
+                    // ahead of the answer is what a wait has to hold on
+                    // to rather than drop.
+                    if let Some(review) = ReviewRequest::from_question(&question) {
+                        if let Some(focus) = state.focused().or(state.files.first())
+                            && let Some(notice) = selection_notification(Some(focus))
+                        {
+                            let _ = stream.write_all(&Wire::RpcReply(notice).encode());
+                        }
+                        let outcome =
+                            if review.proposed.contains("REFUSE") { ReviewOutcome::Rejected } else { ReviewOutcome::Saved(review.proposed.clone()) };
+                        let _ = stream.write_all(&Wire::RpcReply(review_answer(review.id, &outcome)).encode());
+                    } else if let Some(reply) = answer(&state, &question) {
                         let _ = stream.write_all(&Wire::RpcReply(reply).encode());
                     }
                 }
@@ -991,7 +1141,7 @@ mod tests {
             input.push('\n');
         }
         let mut output: Vec<u8> = Vec::new();
-        let mut server = Server { initialized: false, session: Some(crate::session::Peer::over(ours)) };
+        let mut server = Server { initialized: false, next_review: 0, held: Vec::new(), session: Some(crate::session::Peer::over(ours)) };
         server.serve(&mut input.as_bytes(), &mut output);
         drop(server);
         let _ = daemon.join();
@@ -1003,6 +1153,59 @@ mod tests {
             .collect()
     }
 
+    // The whole of `openDiff` as a client sees it: a proposal goes in,
+    // and the answer comes back only once somebody has decided -- in the
+    // shape a client reads, two text blocks for a saved file and one for
+    // a refused one. The focus notice the session sent while the review
+    // was open is not lost to the wait.
+    #[test]
+    fn open_diff_answers_once_the_review_is_decided_and_keeps_what_arrived_meanwhile() {
+        let file = FileState {
+            path: "/tmp/x.rs".into(),
+            line_count: 1,
+            focused: true,
+            dirty: false,
+            selection: None,
+            selected_text: String::new(),
+            diagnostics: Vec::new(),
+        };
+        let open = |id: f64, contents: &str| {
+            let arguments = object(vec![
+                ("old_file_path", string("/tmp/x.rs")),
+                ("new_file_path", string("/tmp/x.rs")),
+                ("new_file_contents", string(contents)),
+                ("tab_name", string("x.rs")),
+            ]);
+            request(id, "tools/call", object(vec![("name", string("openDiff")), ("arguments", arguments)]))
+        };
+        let out = with_session(EditorState { files: vec![file] }, &[initialize(), open(1.0, "fn main() {}\n"), open(2.0, "REFUSE\n")]);
+        let texts = |id: f64| -> Vec<String> {
+            let answer = result(&out, id);
+            let Ok(Value::Array(blocks)) = json::query(&answer, ".content") else { panic!("{answer:?}") };
+            blocks.iter().filter_map(|b| string_at(b, ".text")).collect()
+        };
+        assert_eq!(texts(1.0), vec!["FILE_SAVED", "fn main() {}\n"]);
+        assert_eq!(texts(2.0), vec!["DIFF_REJECTED"]);
+        assert!(
+            out.iter().any(|m| matches!(m, Message::Notification { method, .. } if method == "selection_changed")),
+            "the notice that arrived during the wait still reaches the client: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_review_request_reads_back_as_itself_and_its_answer_names_it() {
+        let request = ReviewRequest { id: 7, path: "/tmp/x.rs".into(), proposed: "fn main() {}\n".to_string(), title: "edit x.rs".to_string() };
+        let question = json::compact_print(&request.to_value());
+        assert_eq!(ReviewRequest::from_question(question.as_bytes()), Some(request));
+        assert_eq!(ReviewRequest::from_question(br#"{"q":"state"}"#), None, "another question is not a review");
+
+        let saved = review_answer(7, &ReviewOutcome::Saved("text".to_string()));
+        assert_eq!(review_outcome(&saved, 7), Some(ReviewOutcome::Saved("text".to_string())));
+        assert_eq!(review_outcome(&saved, 8), None, "an answer is to one review, not the next one waiting");
+        assert_eq!(review_outcome(&review_answer(7, &ReviewOutcome::Rejected), 7), Some(ReviewOutcome::Rejected));
+        assert_eq!(review_outcome(br#"{"n":"focus","file":null}"#, 7), None, "a notification is not an answer");
+    }
+
     // What a client is told exists. Short on purpose -- a client reads
     // this rather than assuming, so an absent tool costs that tool and
     // nothing else.
@@ -1012,7 +1215,7 @@ mod tests {
         let listed = result(&out, 1.0);
         let Ok(Value::Array(tools)) = json::query(&listed, ".tools") else { panic!() };
         let names: Vec<String> = tools.iter().filter_map(|t| string_at(t, ".name")).collect();
-        assert_eq!(names, vec!["getDiagnostics", "closeAllDiffTabs"]);
+        assert_eq!(names, vec!["getDiagnostics", "closeAllDiffTabs", "openDiff", "close_tab"]);
         assert_eq!(json::query(&tools[0], ".inputSchema.type"), Ok(&string("object")));
         assert_eq!(json::query(&tools[0], ".inputSchema.properties.uri.type"), Ok(&string("string")));
 

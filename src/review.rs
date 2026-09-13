@@ -74,6 +74,25 @@ pub fn hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
     out
 }
 
+/// The text the verdicts add up to: the new version of every accepted
+/// change and the old version of every other, with `undecided` saying
+/// which way a change nobody ruled on goes.
+pub fn resolve(old: &[String], new: &[String], hunks: &[Hunk], verdicts: &[Verdict], undecided: Verdict) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (hunk, verdict) in hunks.iter().zip(verdicts) {
+        out.extend_from_slice(&old[at..hunk.old.start]);
+        let verdict = if *verdict == Verdict::Undecided { undecided } else { *verdict };
+        match verdict {
+            Verdict::Accepted => out.extend_from_slice(&new[hunk.new.clone()]),
+            _ => out.extend_from_slice(&old[hunk.old.clone()]),
+        }
+        at = hunk.old.end;
+    }
+    out.extend_from_slice(&old[at..]);
+    out
+}
+
 // Unchanged lines kept either side of a change. `diff -u`'s own number.
 const CONTEXT: usize = 3;
 
@@ -138,6 +157,17 @@ impl Review {
         self.height = rows.saturating_sub(2).max(1);
         self.cols = cols;
         self.top = self.top.min(self.max_top());
+    }
+
+    /// The text the verdicts add up to, with `undecided` saying which way
+    /// a change nobody ruled on goes -- see `resolve`.
+    pub fn resolved(&self, undecided: Verdict) -> Vec<String> {
+        resolve(&self.old, &self.new, &self.hunks, &self.verdicts, undecided)
+    }
+
+    /// Whether anything at all was taken.
+    pub fn accepted_any(&self) -> bool {
+        self.verdicts.contains(&Verdict::Accepted)
     }
 
     /// What undoes every refused change in a text that already holds the
@@ -383,6 +413,18 @@ mod tests {
         assert_eq!(hunks(&old, &new), vec![Hunk { old: 1..2, new: 1..2 }, Hunk { old: 4..4, new: 4..5 }]);
         let removed = lines("a\nc");
         assert_eq!(hunks(&old, &removed)[0], Hunk { old: 1..2, new: 1..1 });
+    }
+
+    #[test]
+    fn the_verdicts_decide_which_version_of_each_change_is_kept() {
+        let old = lines("a\nb\nc\nd");
+        let new = lines("a\nB\nc\nD");
+        let h = hunks(&old, &new);
+        let both = [Verdict::Accepted, Verdict::Rejected];
+        assert_eq!(resolve(&old, &new, &h, &both, Verdict::Rejected), lines("a\nB\nc\nd"));
+        let open = [Verdict::Undecided, Verdict::Rejected];
+        assert_eq!(resolve(&old, &new, &h, &open, Verdict::Accepted), lines("a\nB\nc\nd"), "undecided goes the way asked");
+        assert_eq!(resolve(&old, &new, &h, &open, Verdict::Rejected), old);
     }
 
     #[test]

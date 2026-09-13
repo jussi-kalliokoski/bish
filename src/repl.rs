@@ -269,6 +269,15 @@ struct App {
     /// publishes here on its idle tick; `service_background_jobs` reads
     /// it and needs nothing else.
     focus: Option<mcp::FileState>,
+    /// Proposed versions of files waiting for somebody to go through
+    /// them, each with the client that asked -- which is waiting on the
+    /// answer, and gets it once the review is decided.
+    ///
+    /// Queued rather than opened on the tick they arrive: that tick can
+    /// be inside any loop in this file, most of which could not redraw
+    /// what the review covered. The prompt and the editor's Normal mode
+    /// open them, being the two that can (see `open_pending_reviews`).
+    pending_reviews: Vec<(mcp::ReviewRequest, session::Caller)>,
     term_rows: usize,
     term_cols: usize,
 }
@@ -537,6 +546,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         file_watcher: crate::watch::Watcher::new().ok(),
         dap_frames: HashMap::new(),
         focus: None,
+        pending_reviews: Vec::new(),
         term_rows,
         term_cols,
     };
@@ -835,7 +845,12 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     // why the signal is threaded through rather than either side
                     // just redrawing everything.
                     || {
-                        let changed = service_background_jobs(app);
+                        let mut changed = service_background_jobs(app);
+                        // A review a client is waiting on opens here, at an
+                        // idle prompt -- see `pending_reviews`. Afterwards is
+                        // a repaint, which this closure already knows how to
+                        // ask for.
+                        changed |= open_pending_reviews(app);
                         if changed && app.sinks_are_grid {
                             compositor_redraw(app);
                         }
@@ -1730,6 +1745,7 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         file_watcher: crate::watch::Watcher::new().ok(),
         dap_frames: HashMap::new(),
         focus: None,
+        pending_reviews: Vec::new(),
         term_rows,
         term_cols,
     };
@@ -4761,8 +4777,20 @@ fn service_background_jobs(app: &mut App) -> bool {
     // Built inside the closure, which only runs when a question is
     // actually waiting -- unlike the snapshot above, this walks every
     // open buffer, and nothing asks on most ticks.
+    //
+    // A review is the one question not answered here: its answer is
+    // somebody's decision, so it is set aside with who asked, for the
+    // prompt or the editor to open when it can (see `pending_reviews`).
     let asked = &*app;
-    session::answer_rpc_requests(|question| mcp::answer(&editor_state(asked), question));
+    let mut reviews = Vec::new();
+    session::answer_rpc_requests_with(|question, caller| {
+        if let Some(review) = mcp::ReviewRequest::from_question(question) {
+            reviews.push((review, caller));
+            return None;
+        }
+        mcp::answer(&editor_state(asked), question)
+    });
+    app.pending_reviews.extend(reviews);
     let just_attached = session::take_bridge_just_attached();
     // Whatever the background jobs have said since the last tick, into
     // the grid of whichever session started each one -- see
@@ -7143,7 +7171,21 @@ fn run_normal_mode_navigation(
                 print!("{popup}");
                 let _ = io::stdout().flush();
             }
-            let attached = service_background_jobs(app);
+            let mut attached = service_background_jobs(app);
+            // And here, the editor at rest in Normal mode -- see
+            // `pending_reviews`. The buffer in front is not in
+            // `edit_frames`, so `review_proposal` cannot reload it; it
+            // follows the file here instead, when it has nothing unsaved
+            // that reloading would lose.
+            if open_pending_reviews(app) {
+                attached = true;
+                if let Some(tb) = buf.as_editable_mut()
+                    && !tb.is_dirty()
+                    && tb.changed_on_disk()
+                {
+                    let _ = tb.reload();
+                }
+            }
             // Published from here because this is one of only two places
             // holding both `App` and the buffer being edited -- see
             // `App::focus`. Whether it changed is also what tells the
@@ -11384,6 +11426,68 @@ fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
         return None;
     }
     crate::bishedit::manpages::source_for(&word).map(|source| (word, source))
+}
+
+// Opens every review waiting in `pending_reviews`, one after another,
+// and answers each client as soon as its review is decided. Says whether
+// anything was opened: the caller's cue to repaint what a review covered,
+// the same contract `service_background_jobs`'s own return has.
+fn open_pending_reviews(app: &mut App) -> bool {
+    if app.pending_reviews.is_empty() {
+        return false;
+    }
+    for (request, caller) in std::mem::take(&mut app.pending_reviews) {
+        let outcome = review_proposal(app, &request);
+        session::reply_to(caller, &mcp::review_answer(request.id, &outcome));
+    }
+    compositor_redraw(app);
+    true
+}
+
+// One proposed version of a file, gone through against the file as it is
+// now. What was taken is written, and the answer carries what the file
+// then holds; nothing taken, or the review walked away from, leaves the
+// file alone and says so.
+//
+// A change nobody ruled on is not taken. The proposal is not in the file
+// yet, so leaving a change undecided leaves it out -- `:review`'s own
+// "nothing happens unless you say so", from the other side.
+fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOutcome {
+    let current = match std::fs::read(&request.path) {
+        Ok(bytes) => crate::encoding::decode(&bytes).text,
+        // Not there yet: empty, so the whole proposal is new.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(_) => return mcp::ReviewOutcome::Rejected,
+    };
+    let old: Vec<String> = current.lines().map(str::to_string).collect();
+    let new: Vec<String> = request.proposed.lines().map(str::to_string).collect();
+    let title = match request.title.as_str() {
+        "" => request.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "review".to_string()),
+        title => title.to_string(),
+    };
+    let Some(review) = run_review(app, &title, old, new) else {
+        return mcp::ReviewOutcome::Rejected;
+    };
+    if !review.accepted_any() {
+        return mcp::ReviewOutcome::Rejected;
+    }
+    let lines = review.resolved(crate::review::Verdict::Rejected);
+    let mut text = lines.join("\n");
+    if !lines.is_empty() && (request.proposed.ends_with('\n') || (request.proposed.is_empty() && current.ends_with('\n'))) {
+        text.push('\n');
+    }
+    if std::fs::write(&request.path, &text).is_err() {
+        return mcp::ReviewOutcome::Rejected;
+    }
+    // An open buffer on the file with nothing unsaved of its own follows
+    // it. One that has unsaved changes is left to say so itself -- see
+    // `sync_watched_file` -- rather than having them thrown away here.
+    for session in app.edit_frames.values_mut() {
+        if session.buffer.path() == Some(request.path.as_path()) && !session.buffer.is_dirty() {
+            let _ = session.buffer.reload();
+        }
+    }
+    mcp::ReviewOutcome::Saved(text)
 }
 
 // `:review`'s loop -- `run_pager`'s arrangement, for a view that decides

@@ -971,16 +971,6 @@ impl SessionBridge {
         !self.pending_rpc.is_empty()
     }
 
-    // Hands every waiting message to `handle` and sends back whatever it
-    // makes of each. `None` from `handle` is a notification -- something
-    // with no answer to give -- and sends nothing.
-    fn answer_rpc(&mut self, handle: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>) {
-        for (id, payload) in std::mem::take(&mut self.pending_rpc) {
-            let Some(reply) = handle(&payload) else { continue };
-            self.send_to(id, &Message::RpcReply(reply).encode());
-        }
-    }
-
     // An unsolicited message to every RPC peer. Nothing is queued for a
     // peer that is not there: a notification describes a moment, and a
     // client that connects later wants the state it finds, not a replay.
@@ -1057,24 +1047,41 @@ pub fn answer_capture_requests(screen: impl FnOnce() -> String) -> bool {
     })
 }
 
-/// Answers every JSON-RPC message that has arrived from a peer, and
-/// says whether there was one.
+/// Who asked a question, kept by whoever cannot answer it yet.
 ///
-/// `handle` is only called when something is actually waiting, and
-/// returns `None` for a message with no answer (a notification). A
-/// closure for the same reason `answer_capture_requests` takes one: what
-/// the answers are made of lives in repl.rs, which this module has no
-/// access to and keeps none of.
-pub fn answer_rpc_requests(mut handle: impl FnMut(&[u8]) -> Option<Vec<u8>>) -> bool {
+/// Most questions are answered inside the tick that received them, and
+/// never need this. One that waits on a person deciding something is
+/// answered minutes later, from somewhere else entirely -- and has to
+/// reach the one client that asked, not every client listening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller(ClientId);
+
+/// `answer_rpc_requests`, with each question's `Caller` handed over
+/// alongside it, for a handler that means to answer some of them later
+/// with `reply_to`. `None` sends nothing now, exactly as there.
+pub fn answer_rpc_requests_with(mut handle: impl FnMut(&[u8], Caller) -> Option<Vec<u8>>) -> bool {
     ACTIVE_BRIDGE.with(|b| {
         let mut guard = b.borrow_mut();
         let Some(bridge) = guard.as_mut() else { return false };
         if !bridge.wants_rpc() {
             return false;
         }
-        bridge.answer_rpc(&mut handle);
+        for (id, payload) in std::mem::take(&mut bridge.pending_rpc) {
+            let Some(reply) = handle(&payload, Caller(id)) else { continue };
+            bridge.send_to(id, &Message::RpcReply(reply).encode());
+        }
         true
     })
+}
+
+/// The answer to a question put earlier, to the client that put it. A
+/// client that has gone since gets nothing, which is all there is to do.
+pub fn reply_to(caller: Caller, payload: &[u8]) {
+    ACTIVE_BRIDGE.with(|b| {
+        if let Some(bridge) = b.borrow_mut().as_mut() {
+            bridge.send_to(caller.0, &Message::RpcReply(payload.to_vec()).encode());
+        }
+    });
 }
 
 /// Sends one unsolicited JSON-RPC message to every peer that has spoken
@@ -1305,6 +1312,33 @@ impl Peer {
             out.push(reply);
         }
         Ok(out)
+    }
+
+    /// Waits for the one reply `wanted` picks out, for as long as that
+    /// takes, and hands back everything else that arrived meanwhile -- so
+    /// a notification is not lost to a wait that was not about it.
+    ///
+    /// No timeout, unlike `ask`. What this waits for is somebody making up
+    /// their mind about something, which takes as long as it takes; the
+    /// session going away is what ends it otherwise.
+    pub fn wait_for(&mut self, wanted: impl Fn(&[u8]) -> bool) -> io::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+        let mut others = Vec::new();
+        self.stream.set_read_timeout(None)?;
+        loop {
+            while let Some(reply) = self.next_reply()? {
+                if wanted(&reply) {
+                    return Ok((reply, others));
+                }
+                others.push(reply);
+            }
+            let mut buf = [0u8; 8192];
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session went away")),
+                Ok(n) => self.decoder.feed(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// The next already-arrived reply, if there is one. Everything else
