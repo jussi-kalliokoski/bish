@@ -254,6 +254,11 @@ pub struct Server {
     // symptom.
     stdout_eof: bool,
     eof_ticks: u32,
+    // When a write to the server's stdin found nobody reading. Almost
+    // always a server on its way out, whose exit -- and whatever it said
+    // about why -- has not been collected yet; so this waits for that
+    // rather than reporting the broken pipe as the reason.
+    stdin_broken_at: Option<Instant>,
     next_id: i64,
     initialize_id: i64,
     encoding: PositionEncoding,
@@ -496,6 +501,7 @@ impl Server {
             responses: Vec::new(),
             stdout_eof: false,
             eof_ticks: 0,
+            stdin_broken_at: None,
             next_id: 1,
             initialize_id: 0,
             // What the protocol says to assume when nothing has been
@@ -843,6 +849,17 @@ impl Server {
                 self.die("server closed its stdout".to_string());
             }
         }
+        // A broken stdin with no exit to show for it a second later: a
+        // server that stopped listening and kept running, which will
+        // never answer anything either. A server that is exiting has
+        // been collected by `check_alive` long before this.
+        const STDIN_GRACE: Duration = Duration::from_secs(1);
+        if let Some(broken) = self.stdin_broken_at
+            && broken.elapsed() > STDIN_GRACE
+            && !matches!(self.state, State::Dead(_))
+        {
+            self.die("server closed its stdin".to_string());
+        }
         self.flush_outgoing();
 
         let mut incoming = Vec::new();
@@ -1153,6 +1170,16 @@ impl Server {
                 // case a writer thread would otherwise exist to handle.
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                // Nobody is reading: the server has closed its stdin,
+                // which nearly always means it is exiting and has not
+                // been collected yet. Its exit status and last words are
+                // the reason worth reporting, and they are one tick away
+                // -- so stop writing and let `service` wait for them.
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.stdin_broken_at.get_or_insert_with(Instant::now);
+                    self.outgoing.clear();
+                    return;
+                }
                 Err(e) => {
                     self.die(format!("writing stdin: {e}"));
                     return;
@@ -3363,6 +3390,35 @@ mod tests {
         assert!(why.contains("status 3"), "{why}");
         assert!(why.contains("cannot find configuration"), "the last thing it said should be the reason: {why}");
         assert!(server.log().any(|l| l.contains("cannot find configuration")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The race that made the test above fail under load: the first write
+    // reaches a server that has stopped reading but has not exited yet,
+    // or has exited and not been collected. The broken pipe is how the
+    // death was noticed, not why it happened, and reporting it hid the
+    // reason the server gave. Forced here by closing stdin well before
+    // exiting, and by not writing anything until it has.
+    #[test]
+    fn a_server_that_stops_reading_before_it_exits_is_reported_by_its_exit() {
+        let dir = temp_dir("stops-reading");
+        let script = "exec 0<&-; echo 'cannot find configuration' >&2; sleep 0.3; exit 3";
+        let mut server =
+            Server::start(1, &["sh".to_string(), "-c".to_string(), script.to_string()], "sh", &dir, ApplyEdits::default(), Value::Object(Vec::new()))
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for _ in 0..400 {
+            server.service();
+            if matches!(server.state(), State::Dead(_)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let State::Dead(why) = server.state() else {
+            panic!("still {:?}", server.state());
+        };
+        assert!(why.contains("status 3"), "{why}");
+        assert!(why.contains("cannot find configuration"), "{why}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
