@@ -11187,6 +11187,7 @@ its decompressed text.
 | `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
 | `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
 | `:diff` | +/~/- vs. what's on disk, no git needed |
+| `:review [git [REV]]` | go through those changes one by one, keeping or putting back each |
 | `:fold` | fold this line, or a range before it (`:foldopen[!]`, `:foldclose[!]`) |
 | `:format` | run this file's own formatter |
 | `:diag [clear]` | toggle the diagnostics pane |
@@ -11383,6 +11384,41 @@ fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
         return None;
     }
     crate::bishedit::manpages::source_for(&word).map(|source| (word, source))
+}
+
+// `:review`'s loop -- `run_pager`'s arrangement, for a view that decides
+// rather than reads. The review comes back when it was finished, so its
+// verdicts can be acted on, and not when it was walked away from.
+fn run_review(app: &mut App, title: &str, old: Vec<String>, new: Vec<String>) -> Option<crate::review::Review> {
+    let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
+    let mut rect = app.focused_pane_rect();
+    compositor_redraw(app);
+    let mut view = crate::review::Review::new(title, old, new, rect.rows, rect.cols);
+    let mut last_size = (app.term_rows, app.term_cols);
+    let outcome = loop {
+        print!("{}", view.render(rect));
+        let _ = io::stdout().flush();
+        let key = match editor::read_key_idle(&mut || {
+            service_background_jobs(app);
+        }) {
+            Ok(Some(k)) => k,
+            // EOF: there is nobody left to decide anything.
+            Ok(None) | Err(_) => break crate::review::Outcome::Cancel,
+        };
+        if (app.term_rows, app.term_cols) != last_size {
+            last_size = (app.term_rows, app.term_cols);
+            rect = app.focused_pane_rect();
+            compositor_redraw(app);
+            view.resize(rect.rows, rect.cols);
+        }
+        match view.handle_key(key) {
+            crate::review::Outcome::Continue => {}
+            finished => break finished,
+        }
+    };
+    print!("{}", term::MOUSE_REPORTING_ENABLE);
+    let _ = io::stdout().flush();
+    (outcome == crate::review::Outcome::Done).then_some(view)
 }
 
 fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
@@ -11910,6 +11946,7 @@ pub(crate) const COLON_COMMANDS: &[&str] = &[
     "q",
     "q!",
     "rename",
+    "review",
     "rn",
     "sym",
     "symbols",
@@ -12617,6 +12654,62 @@ fn run_command_mode(
                                 status: 0,
                             });
                             return CommandModeOutcome::Symbols(query);
+                        }
+                        // `:review [git [REV]]` -- what `:diff` (or `:git
+                        // diff`) marks, as changes to decide on one at a
+                        // time. What is refused goes back to how the
+                        // other version has it; what is accepted, or not
+                        // ruled on, stays as it is in the buffer. All of
+                        // it one undo step, like any other command.
+                        "review" => {
+                            let old = match arg {
+                                None => fileeditor::disk_text(tb),
+                                Some(a) if a == "git" || a.starts_with("git ") => {
+                                    let rev = a[3..].trim();
+                                    fileeditor::git_text(tb, (!rev.is_empty()).then_some(rev))
+                                }
+                                Some(a) => Err(format!(
+                                    "unexpected argument '{a}' -- `:review` compares with the file on disk, `:review git [REV]` with git"
+                                )),
+                            };
+                            let old = match old {
+                                Ok(old) => old,
+                                Err(e) => {
+                                    show_command_mode_error(&format!("bish: review: {e}"), app.term_rows, app.term_cols);
+                                    buffer.clear();
+                                    continue;
+                                }
+                            };
+                            let old: Vec<String> = old.lines().map(str::to_string).collect();
+                            let new: Vec<String> = tb.text().lines().map(str::to_string).collect();
+                            let output = if crate::review::hunks(&old, &new).is_empty() {
+                                "No changes to review.".to_string()
+                            } else {
+                                let name = tb
+                                    .path()
+                                    .and_then(|p| p.file_name())
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "review".to_string());
+                                let Some(review) = run_review(app, &name, old, new) else {
+                                    return CommandModeOutcome::Cancelled;
+                                };
+                                let reverts = review.reverts();
+                                let count = reverts.len();
+                                for (range, lines) in reverts {
+                                    tb.replace_lines(range, lines);
+                                }
+                                match count {
+                                    0 => "Every change kept.".to_string(),
+                                    1 => "1 change put back.".to_string(),
+                                    n => format!("{n} changes put back."),
+                                }
+                            };
+                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                command: trimmed,
+                                output: output.clone(),
+                                status: 0,
+                            });
+                            return CommandModeOutcome::Ran { output, status: 0 };
                         }
                         // `diff` (bare, no `git` prefix): the same +/~/-
                         // gutter marker toggle `:git diff` uses, but

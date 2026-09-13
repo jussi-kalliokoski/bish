@@ -3941,6 +3941,22 @@ pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
 
 // The two things every `:git` gutter needs before it can ask git
 // anything: a buffer that has a file at all, and a git to ask.
+/// The file this buffer came from, as it is on disk now -- decoded the
+/// way the buffer was, so a latin-1 file compares with its own text
+/// rather than failing on the first byte that is not UTF-8.
+pub(crate) fn disk_text(buf: &TextBuffer) -> Result<String, String> {
+    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
+    Ok(crate::encoding::decode(&std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?).text)
+}
+
+/// This file as git has it at `rev`, or in the index for `None`. A file
+/// that revision does not have is empty, so every line of the buffer
+/// reads as new.
+pub(crate) fn git_text(buf: &TextBuffer, rev: Option<&str>) -> Result<String, String> {
+    let path = git_path(buf)?;
+    Ok(crate::git::file_at_rev(&path, rev)?.unwrap_or_default())
+}
+
 fn git_path(buf: &TextBuffer) -> Result<std::path::PathBuf, String> {
     let path = buf.path().ok_or_else(|| "no file name".to_string())?.to_path_buf();
     if !crate::git::available() {
@@ -4005,8 +4021,7 @@ pub(crate) fn toggle_git_diff(buf: &mut TextBuffer, rev: Option<&str>) -> Result
         buf.diff = None;
         return Ok(false);
     }
-    let path = git_path(buf)?;
-    let old = crate::git::file_at_rev(&path, rev)?.unwrap_or_default();
+    let old = git_text(buf, rev)?;
     let old_lines: Vec<&str> = old.lines().collect();
     let current = buf.text();
     let current_lines: Vec<&str> = current.lines().collect();
@@ -4031,11 +4046,7 @@ pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
         buf.diff = None;
         return Ok(false);
     }
-    let path = buf.path().ok_or_else(|| "no file name".to_string())?;
-    // Decoded the same way the buffer itself was, so a latin-1 file
-    // diffs against its own text rather than failing on the first byte
-    // that is not UTF-8.
-    let on_disk = crate::encoding::decode(&std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?).text;
+    let on_disk = disk_text(buf)?;
     let disk_lines: Vec<&str> = on_disk.lines().collect();
     let current = buf.text();
     let current_lines: Vec<&str> = current.lines().collect();

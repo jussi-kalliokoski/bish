@@ -45,6 +45,7 @@ mod prompt;
 mod pty;
 mod regex;
 mod repl;
+mod review;
 mod roff;
 mod scheduler;
 mod serialize;

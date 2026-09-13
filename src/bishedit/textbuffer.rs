@@ -790,6 +790,36 @@ impl TextBuffer {
         new_pos
     }
 
+    /// Replaces the lines in `range` with `with`, whole lines for whole
+    /// lines -- what putting back one refused change of a review is.
+    ///
+    /// Not a `delete_range` then an `insert_text`: removing every line
+    /// leaves a placeholder that the insert would then keep as a real,
+    /// empty last line, and a range at the very end has no line after it
+    /// to insert in front of. Working on the lines themselves has neither
+    /// edge.
+    pub fn replace_lines(&mut self, range: std::ops::Range<usize>, with: Vec<String>) {
+        let start = range.start.min(self.lines.len());
+        let end = range.end.min(self.lines.len());
+        let added = with.len();
+        if self.empty {
+            self.lines.clear();
+        }
+        let (start, end) = (start.min(self.lines.len()), end.min(self.lines.len()));
+        self.lines.splice(start..end, with.into_iter().map(|line| line.chars().collect::<Vec<char>>()));
+        self.folds.lines_deleted(start, end - start);
+        self.folds.lines_inserted(start, added);
+        self.empty = self.lines.is_empty();
+        if self.empty {
+            self.lines.push(Vec::new());
+        }
+        let row = start.min(self.lines.len() - 1);
+        self.cursor = (row, 0);
+        self.dirty = true;
+        self.content_changed();
+        self.marks.insert('.', self.cursor);
+    }
+
     // Removes a `MotionRange` that may span several real lines (joining
     // the two cut ends into one line), returning the removed text.
     // `motion::extract_text`/`motion::motion_range` already resolve a
@@ -1289,6 +1319,19 @@ mod tests {
         assert_eq!(text_of(&buf), "0\n1\n\n2");
         assert_eq!(buf.cursor().0, 2);
         assert_eq!(buf.folds.closed_at(1), Some((0, 1)), "and the fold did not grow to take it in");
+    }
+
+    #[test]
+    fn replace_lines_swaps_whole_lines_in_the_middle_at_the_end_and_everywhere() {
+        let mut buf = TextBuffer::from_text(std::path::Path::new("/tmp/bish-replace-test.txt"), "a\nB\nB2\nc\n", 10);
+        buf.replace_lines(1..3, vec!["b".to_string()]);
+        assert_eq!(text_of(&buf), "a\nb\nc");
+        buf.replace_lines(3..3, vec!["d".to_string()]);
+        assert_eq!(text_of(&buf), "a\nb\nc\nd", "past the last line is an append");
+        buf.replace_lines(0..4, Vec::new());
+        assert_eq!(buf.on_disk_text(), "", "every line gone is an empty file, not one empty line");
+        buf.replace_lines(0..0, vec!["x".to_string()]);
+        assert_eq!(buf.on_disk_text(), "x\n");
     }
 
     fn make_registers() -> Registers {
