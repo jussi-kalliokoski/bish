@@ -5,6 +5,7 @@ mod bashdiff;
 mod bishedit;
 mod browser;
 mod builtins;
+mod commitlist;
 mod compgen;
 mod coroutine;
 mod csscolor;

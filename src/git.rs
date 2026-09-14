@@ -249,6 +249,57 @@ pub fn show(dir: &Path, rev: &str) -> Result<Commit, String> {
     Ok(Commit { root, hash, merge: parents.len() > 1, parent: parents.into_iter().next(), header, files: parse_name_status_z(&listing) })
 }
 
+/// One commit in a history, as `:git log` lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub hash: String,
+    /// The author date, `YYYY-MM-DD`.
+    pub date: String,
+    pub author: String,
+    pub subject: String,
+}
+
+/// The commits reachable from `rev` (HEAD without one), newest first:
+/// every one that touched `path`, followed back through its renames, or
+/// every one there is without a path.
+pub fn log(dir: &Path, path: Option<&Path>, rev: Option<&str>) -> Result<Vec<LogEntry>, String> {
+    let root = std::path::PathBuf::from(String::from_utf8_lossy(&git(dir, &["rev-parse", "--show-toplevel"])?).trim());
+    let rev = rev.unwrap_or("HEAD");
+    git(&root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")])
+        .map_err(|_| format!("unknown revision '{rev}'"))?;
+    // Absolute, so it names the same file from the top level as from
+    // wherever the buffer is; git takes a path inside the work tree
+    // either way.
+    let file = path.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned());
+    let mut args = vec!["log", "--date=short", "--format=%H%x1f%ad%x1f%an%x1f%s%x1e"];
+    if file.is_some() {
+        args.push("--follow");
+    }
+    args.extend(["--end-of-options", rev, "--"]);
+    if let Some(file) = &file {
+        args.push(file);
+    }
+    Ok(parse_log(&git(&root, &args)?))
+}
+
+// `git log` in the format `log` asks for: each commit ended by 0x1e, its
+// fields split by 0x1f -- two bytes no hash, date, name or subject has
+// any use for, which a tab or a newline could not promise.
+pub(crate) fn parse_log(bytes: &[u8]) -> Vec<LogEntry> {
+    String::from_utf8_lossy(bytes)
+        .split('\u{1e}')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\u{1f}');
+            Some(LogEntry {
+                hash: fields.next()?.to_string(),
+                date: fields.next()?.to_string(),
+                author: fields.next()?.to_string(),
+                subject: fields.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// The bytes of `path` (relative to the repository's top level) at `rev`.
 pub fn blob(root: &Path, rev: &str, path: &str) -> Result<Vec<u8>, String> {
     git(root, &["cat-file", "blob", &format!("{rev}:{path}")])
@@ -422,6 +473,54 @@ fn format_unix_date(epoch_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_record_is_its_four_fields_and_a_subject_keeps_its_tabs() {
+        let bytes = b"abc\x1f2026-09-14\x1fA Person\x1fFix\tthis\x1e\ndef\x1f2026-09-13\x1fB\x1finitial\x1e\n";
+        let got = parse_log(bytes);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], LogEntry { hash: "abc".into(), date: "2026-09-14".into(), author: "A Person".into(), subject: "Fix\tthis".into() });
+        assert_eq!(got[1].subject, "initial");
+        assert!(parse_log(b"").is_empty());
+    }
+
+    #[test]
+    fn log_follows_a_file_through_its_rename_and_lists_everything_without_one() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-log-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let status = Command::new("git").args(args).current_dir(&dir).stdout(Stdio::null()).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+        std::fs::write(dir.join("other.txt"), "x\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "unrelated"]);
+        run(&["mv", "a.txt", "b.txt"]);
+        run(&["commit", "-q", "-m", "renamed"]);
+
+        let subjects = |entries: Vec<LogEntry>| entries.into_iter().map(|e| e.subject).collect::<Vec<_>>();
+        assert_eq!(
+            subjects(log(&dir, Some(&dir.join("b.txt")), None).unwrap()),
+            ["renamed", "initial"],
+            "back past the rename, and not the commit that left it alone"
+        );
+        assert_eq!(subjects(log(&dir, None, None).unwrap()), ["renamed", "unrelated", "initial"]);
+        assert_eq!(subjects(log(&dir, None, Some("HEAD~1")).unwrap()), ["unrelated", "initial"]);
+        assert_eq!(log(&dir, None, Some("no-such-rev")).unwrap_err(), "unknown revision 'no-such-rev'");
+        let entry = &log(&dir, None, None).unwrap()[0];
+        assert_eq!((entry.hash.len(), entry.author.as_str()), (40, "Test User"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_name_status_listing_reads_renames_as_one_entry_and_paths_as_they_are() {

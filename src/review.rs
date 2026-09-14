@@ -696,7 +696,7 @@ fn fit_cells(cells: &[Cell], cols: usize) -> Vec<Cell> {
 // Exactly `cols` columns of `text`: cut at the last whole character that
 // fits, then padded. Tabs become spaces first -- a tab's width depends on
 // where it lands, and here every line starts after a two-column marker.
-fn fit(text: &str, cols: usize) -> String {
+pub(crate) fn fit(text: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
     for ch in text.chars().flat_map(|c| if c == '\t' { vec![' '; 4] } else { vec![c] }) {

@@ -11308,6 +11308,7 @@ its decompressed text.
 | `:w [FILE]` | write (`:wq`/`:x` write+quit, `:q`, `:q!`) |
 | `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
 | `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
+| `:git log [REV]` | this file's commits; Enter shows one |
 | `:git show [REV]` | the commit (`HEAD`, or the cursor line's with blame on), opened at this file |
 | `:diff` | +/~/- vs. what's on disk, no git needed |
 | `:review [git [REV]]` | go through those changes one by one, keeping or putting back each |
@@ -11687,6 +11688,62 @@ fn run_review(app: &mut App, mut view: crate::review::Review) -> Option<crate::r
     print!("{}", term::MOUSE_REPORTING_ENABLE);
     let _ = io::stdout().flush();
     (outcome == crate::review::Outcome::Done).then_some(view)
+}
+
+// `:git log`'s loop: the list, and the diff view a commit opens in.
+// The list lets go of the terminal while a commit is open -- the diff
+// view takes it for itself -- and takes it back afterwards, with the
+// same commit still picked out. What comes back is why a commit could
+// not be opened, if one could not.
+fn run_commit_list(
+    app: &mut App,
+    mut list: crate::commitlist::CommitList,
+    open: impl Fn(&str, usize, usize) -> Result<crate::review::Review, String>,
+) -> Option<String> {
+    use crate::commitlist::Outcome;
+    loop {
+        let choice = {
+            let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
+            // What capture reports while this is open -- see `OVERLAYS`.
+            let _overlay = OverlayOpen::new();
+            let mut rect = app.focused_pane_rect();
+            compositor_redraw(app);
+            list.resize(rect.rows, rect.cols);
+            let mut last_size = (app.term_rows, app.term_cols);
+            loop {
+                let frame = list.render(rect);
+                record_paint(rect, &frame);
+                print!("{frame}");
+                let _ = io::stdout().flush();
+                let key = match editor::read_key_idle(&mut || {
+                    service_background_jobs(app);
+                }) {
+                    Ok(Some(k)) => k,
+                    Ok(None) | Err(_) => break Outcome::Close,
+                };
+                if (app.term_rows, app.term_cols) != last_size {
+                    last_size = (app.term_rows, app.term_cols);
+                    rect = app.focused_pane_rect();
+                    compositor_redraw(app);
+                    list.resize(rect.rows, rect.cols);
+                }
+                match list.handle_key(key) {
+                    Outcome::Continue => {}
+                    chosen => break chosen,
+                }
+            }
+        };
+        print!("{}", term::MOUSE_REPORTING_ENABLE);
+        let _ = io::stdout().flush();
+        let Outcome::Open(index) = choice else { return None };
+        let rect = app.focused_pane_rect();
+        match open(&list.entry(index).hash, rect.rows, rect.cols) {
+            Ok(view) => {
+                run_review(app, view);
+            }
+            Err(e) => return Some(e),
+        }
+    }
 }
 
 fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
@@ -13872,7 +13929,7 @@ fn run_command_mode(
                                 },
                                 None => {
                                     show_command_mode_error(
-                                        "bish: git: missing subcommand (expected: blame, diff, show)",
+                                        "bish: git: missing subcommand (expected: blame, diff, log, show)",
                                         app.term_rows,
                                         app.term_cols,
                                     );
@@ -13974,9 +14031,51 @@ fn run_command_mode(
                                         }
                                     }
                                 }
+                                // `log [REV]`: this file's commits,
+                                // newest first and followed through
+                                // renames -- every commit, for a buffer
+                                // with no file. Enter opens one in the
+                                // diff view; closing that comes back to
+                                // the list.
+                                "log" => {
+                                    let path = tb.path().map(Path::to_path_buf);
+                                    let dir = match path.as_deref().and_then(Path::parent).filter(|d| !d.as_os_str().is_empty()) {
+                                        Some(dir) => dir.to_path_buf(),
+                                        None => std::env::current_dir().unwrap_or_default(),
+                                    };
+                                    let entries = match crate::git::log(&dir, path.as_deref(), subarg) {
+                                        Ok(entries) if entries.is_empty() => {
+                                            show_command_mode_error("bish: git: log: no commit has touched this file", app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                        Ok(entries) => entries,
+                                        Err(e) => {
+                                            show_command_mode_error(&format!("bish: git: log: {e}"), app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    };
+                                    let title = match path.as_deref().and_then(Path::file_name) {
+                                        Some(name) => format!("git log {}", name.to_string_lossy()),
+                                        None => "git log".to_string(),
+                                    };
+                                    let rect = app.focused_pane_rect();
+                                    let colors = syntax_color_overrides(&app.sessions[&session_id].shell);
+                                    let list = crate::commitlist::CommitList::new(&title, entries, rect.rows, rect.cols);
+                                    let failed = run_commit_list(app, list, |hash, rows, cols| {
+                                        git_show_view(path.as_deref(), hash, Some(&colors), rows, cols)
+                                    });
+                                    if let Some(e) = failed {
+                                        show_command_mode_error(&format!("bish: git: log: {e}"), app.term_rows, app.term_cols);
+                                        buffer.clear();
+                                        continue;
+                                    }
+                                    return CommandModeOutcome::Cancelled;
+                                }
                                 other => {
                                     show_command_mode_error(
-                                        &format!("bish: git: unknown subcommand '{}' (expected: blame, diff, show)", other),
+                                        &format!("bish: git: unknown subcommand '{}' (expected: blame, diff, log, show)", other),
                                         app.term_rows,
                                         app.term_cols,
                                     );
