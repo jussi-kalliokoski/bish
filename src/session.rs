@@ -594,7 +594,12 @@ pub struct SessionBridge {
     // half, each tagged with its own id so the main thread can take one
     // away without disturbing the others. Kept in step with `clients`
     // by attach/detach, the only two places either is ever changed.
-    writes: Arc<Mutex<Vec<(ClientId, UnixStream)>>>,
+    //
+    // The flag is whether the client is watching the screen. Every one
+    // is until it asks a question: a peer that speaks RPC reads replies
+    // and notifications, and was being sent every byte a busy session
+    // drew only to throw each one away.
+    writes: Arc<Mutex<Vec<(ClientId, UnixStream, bool)>>>,
     next_client_id: ClientId,
     // The daemon's own pidfile, held open for its lock and written
     // through for the status line -- see write_status. `None` outside a
@@ -674,7 +679,7 @@ const MAX_READS_PER_TICK: u32 = 16;
 // forward attempt and keeps reading. Returns (ending the thread) only
 // when the pty master itself is gone, which in practice means the
 // whole daemon process is exiting.
-fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex<Vec<(ClientId, UnixStream)>>>) {
+fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex<Vec<(ClientId, UnixStream, bool)>>>) {
     let mut buf = [0u8; 4096];
     loop {
         match pty_master_read.read(&mut buf) {
@@ -690,7 +695,7 @@ fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex
                 // racing it for that decision is the one way the two
                 // halves could come to disagree about who is here.
                 if let Ok(guard) = writes.lock() {
-                    for (_, stream) in guard.iter() {
+                    for (_, stream, _) in guard.iter().filter(|(_, _, watching)| *watching) {
                         let _ = (&*stream).write_all(&encoded);
                     }
                 }
@@ -850,7 +855,7 @@ impl SessionBridge {
         let id = self.next_client_id;
         self.next_client_id += 1;
         match self.writes.lock() {
-            Ok(mut guard) => guard.push((id, write_half)),
+            Ok(mut guard) => guard.push((id, write_half, true)),
             Err(_) => return,
         }
         self.clients.push(Client { id, read: stream, decoder: Decoder::new(), size: (0, 0) });
@@ -869,7 +874,7 @@ impl SessionBridge {
         self.rpc_clients.retain(|other| *other != id);
         self.pending_rpc.retain(|(other, _)| *other != id);
         self.clients.retain(|c| c.id != id);
-        self.writes.lock().unwrap_or_else(|p| p.into_inner()).retain(|(other, _)| *other != id);
+        self.writes.lock().unwrap_or_else(|p| p.into_inner()).retain(|(other, _, _)| *other != id);
         self.resize_to_smallest_client();
     }
 
@@ -977,6 +982,13 @@ impl SessionBridge {
                     // place (`answer_rpc_requests`).
                     if !self.rpc_clients.contains(&id) {
                         self.rpc_clients.push(id);
+                        // Asking, not watching: it is sent answers from
+                        // here on, and no more of the screen.
+                        if let Ok(mut guard) = self.writes.lock() {
+                            for entry in guard.iter_mut().filter(|(other, _, _)| *other == id) {
+                                entry.2 = false;
+                            }
+                        }
                     }
                     self.pending_rpc.push((id, payload));
                 }
@@ -1016,7 +1028,7 @@ impl SessionBridge {
     // One already-encoded message to one client, if it is still there.
     fn send_to(&mut self, id: ClientId, encoded: &[u8]) {
         if let Ok(guard) = self.writes.lock()
-            && let Some((_, stream)) = guard.iter().find(|(other, _)| *other == id)
+            && let Some((_, stream, _)) = guard.iter().find(|(other, _, _)| *other == id)
         {
             let _ = (&*stream).write_all(encoded);
         }
@@ -1028,7 +1040,7 @@ impl SessionBridge {
         let encoded = Message::CaptureReply(text.as_bytes().to_vec()).encode();
         for id in std::mem::take(&mut self.capture_requests) {
             if let Ok(guard) = self.writes.lock()
-                && let Some((_, stream)) = guard.iter().find(|(other, _)| *other == id)
+                && let Some((_, stream, _)) = guard.iter().find(|(other, _, _)| *other == id)
             {
                 let _ = (&*stream).write_all(&encoded);
             }
@@ -1885,6 +1897,55 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
+    }
+
+    // A busy session's screen is bytes nobody asking questions reads. The
+    // drain thread is fed through a socket pair standing in for the pty
+    // master, so what each client is sent can be read back.
+    #[test]
+    fn the_screen_goes_to_whoever_watches_it_and_not_to_a_peer_asking_questions() {
+        let (master, master_far_end) = UnixStream::pair().unwrap();
+        let master_read = std::fs::File::from(std::os::fd::OwnedFd::from(master_far_end));
+        let (watcher_end, mut watcher) = UnixStream::pair().unwrap();
+        let (asker_end, mut asker) = UnixStream::pair().unwrap();
+        let writes = Arc::new(Mutex::new(vec![(1, watcher_end, true), (2, asker_end, false)]));
+        std::thread::spawn({
+            let writes = writes.clone();
+            move || drain_pty_master_thread(master_read, writes)
+        });
+        (&master).write_all(b"hello").unwrap();
+
+        watcher.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut decoder = Decoder::new();
+        let mut buf = [0u8; 64];
+        let got = loop {
+            let n = watcher.read(&mut buf).unwrap();
+            decoder.feed(&buf[..n]);
+            if let Ok(Some(message)) = decoder.next_message() {
+                break message;
+            }
+        };
+        assert!(matches!(&got, Message::Bytes(bytes) if bytes == b"hello"));
+        // Written in the same pass as the watcher's, so had it been sent,
+        // it would be there by now.
+        asker.set_nonblocking(true).unwrap();
+        assert_eq!(asker.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock, "nothing for the peer asking questions");
+    }
+
+    #[test]
+    fn a_client_stops_being_sent_the_screen_once_it_asks_a_question() {
+        with_isolated_runtime_dir("asker", |_| {
+            let dir = ensure_socket_dir().unwrap();
+            let mut bridge = SessionBridge::without_terminal(UnixListener::bind(dir.join("t.sock")).unwrap()).unwrap();
+            let (ours, mut theirs) = UnixStream::pair().unwrap();
+            bridge.attach(ours);
+            let watching = |bridge: &SessionBridge| bridge.writes.lock().unwrap().iter().map(|(_, _, watching)| *watching).collect::<Vec<_>>();
+            assert_eq!(watching(&bridge), [true], "a client is watching until it says otherwise");
+            theirs.write_all(&Message::Rpc(br#"{"q":"hello"}"#.to_vec()).encode()).unwrap();
+            bridge.drain_clients();
+            assert_eq!(watching(&bridge), [false]);
+            assert_eq!(bridge.pending_rpc.len(), 1, "and its question is still there to answer");
+        });
     }
 
     // A plain bish's socket, end to end over a real bound one: a question
