@@ -1332,7 +1332,10 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                                     // unconditionally killed the whole
                                     // process, regardless of which
                                     // session/pane triggered it.
-                                    ExecResult::Exit(code) => std::process::exit(code),
+                                    ExecResult::Exit(code) => {
+                                        session::stop_listening();
+                                        std::process::exit(code)
+                                    }
                                     _ => {}
                                 }
                             }
@@ -14100,7 +14103,10 @@ fn run_command_mode(
                                     // ExecResult::Exit arm above) -- the
                                     // exit trap already ran wherever this
                                     // was produced.
-                                    ExecResult::Exit(code) => std::process::exit(code),
+                                    ExecResult::Exit(code) => {
+                                        session::stop_listening();
+                                        std::process::exit(code)
+                                    }
                                     _ => {
                                         let status = app.sessions[&session_id].shell.last_status;
                                         app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {

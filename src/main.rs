@@ -223,7 +223,14 @@ fn main() {
 
     if invocation.interactive.unwrap_or_else(|| std::io::stdin().is_terminal()) {
         shell.invocation_flag = Some('i');
+        // Reachable by what runs in its panes -- see session::listen_here.
+        // A bish that cannot listen is still a shell, so a failure here
+        // only means nothing can ask it anything.
+        if let Ok(path) = session::listen_here() {
+            shell.export_var("BISH_SOCKET", path.to_string_lossy().into_owned());
+        }
         repl::run(shell, invocation.promoted, !invocation.norc);
+        session::stop_listening();
     } else {
         shell.invocation_flag = Some('s');
         source_bash_env(&mut shell, &invocation);

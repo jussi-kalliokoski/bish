@@ -415,6 +415,11 @@ impl Default for Server {
 
 /// `bish tool mcp-server [--session NAME]`.
 ///
+/// Without `--session`, the bish it is running inside, found through the
+/// `BISH_SOCKET` every interactive bish gives its panes (see
+/// `session::listen_here`). Run from anywhere else, it reports on nothing,
+/// as it always did.
+///
 /// Unlisted, and with no `--help` of its own: `tool.rs` leaves it out of
 /// the subcommand table, so it is not offered, not suggested after a
 /// typo, and not described anywhere a reader would find it by looking.
@@ -439,8 +444,14 @@ pub fn run(args: &[String]) -> i32 {
         rest = &rest[if arg == "--session" { 2 } else { 1 }..];
         session = Some(name);
     }
-    let peer = match session {
-        Some(name) => match crate::session::Peer::connect(&name) {
+    let connected = match &session {
+        Some(name) => Some(crate::session::Peer::connect(name)),
+        None => std::env::var_os("BISH_SOCKET")
+            .filter(|path| !path.is_empty())
+            .map(|path| crate::session::Peer::connect_path(std::path::Path::new(&path))),
+    };
+    let peer = match connected {
+        Some(connected) => match connected {
             Ok(mut peer) => {
                 // Before the client has asked anything. What the editor
                 // publishes for us to read is only kept current while a

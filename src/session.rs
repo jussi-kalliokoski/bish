@@ -621,8 +621,10 @@ pub struct SessionBridge {
     rpc_clients: Vec<ClientId>,
     // The main thread's own pty-master handle -- writes only (client
     // input, `Pty::set_size`); the background thread owns the read side
-    // via its own separate fd (see SessionBridge::new).
-    pty_master: std::fs::File,
+    // via its own separate fd (see SessionBridge::new). `None` for a
+    // plain bish's bridge (see `listen_here`), which has no terminal of
+    // its own to share: its peers ask questions and never type.
+    pty_master: Option<std::fs::File>,
     // Set true the moment a connection is accepted (a first attach *or*
     // a reattach after a prior client detached); consumed once by
     // take_just_attached below. repl.rs's on_idle hook uses this to
@@ -722,7 +724,30 @@ impl SessionBridge {
             capture_requests: Vec::new(),
             pending_rpc: Vec::new(),
             rpc_clients: Vec::new(),
-            pty_master,
+            pty_master: Some(pty_master),
+            just_attached: false,
+            pending_capability: None,
+        })
+    }
+
+    /// A bridge with no terminal behind it: what a plain interactive bish
+    /// listens with, so the programs in its panes can ask it what they
+    /// would ask a named session. Questions and captures are answered as
+    /// there; keys, sizes and terminal capabilities have nowhere to go
+    /// and are ignored.
+    pub fn without_terminal(listener: UnixListener) -> io::Result<SessionBridge> {
+        listener.set_nonblocking(true)?;
+        Ok(SessionBridge {
+            listener,
+            clients: Vec::new(),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            next_client_id: 1,
+            pidfile: None,
+            reported_attached: 0,
+            capture_requests: Vec::new(),
+            pending_rpc: Vec::new(),
+            rpc_clients: Vec::new(),
+            pty_master: None,
             just_attached: false,
             pending_capability: None,
         })
@@ -786,8 +811,8 @@ impl SessionBridge {
     // to nothing for everybody else while its handshake is in flight.
     fn resize_to_smallest_client(&mut self) {
         let sizes: Vec<(u16, u16)> = self.clients.iter().map(|c| c.size).collect();
-        if let Some((rows, cols)) = smallest_size(&sizes) {
-            let _ = crate::pty::set_size(self.pty_master.as_raw_fd(), rows, cols);
+        if let (Some((rows, cols)), Some(master)) = (smallest_size(&sizes), self.pty_master.as_ref()) {
+            let _ = crate::pty::set_size(master.as_raw_fd(), rows, cols);
         }
     }
 
@@ -829,7 +854,10 @@ impl SessionBridge {
             Err(_) => return,
         }
         self.clients.push(Client { id, read: stream, decoder: Decoder::new(), size: (0, 0) });
-        self.just_attached = true;
+        // A repaint is for a terminal that has just started watching. A
+        // plain bish's peers watch nothing, and repainting the real
+        // screen every time an agent connects would only flicker it.
+        self.just_attached = self.pty_master.is_some();
     }
 
     // Drops one client from both `clients` (this struct's own handles)
@@ -900,7 +928,9 @@ impl SessionBridge {
                     //
                     // Every client types into the same shell. That is
                     // what sharing a session means.
-                    let _ = self.pty_master.write_all(&payload);
+                    if let Some(master) = self.pty_master.as_mut() {
+                        let _ = master.write_all(&payload);
+                    }
                 }
                 Ok(Some(Message::Resize { rows, cols })) => {
                     // Recorded against this client and then resolved
@@ -932,7 +962,9 @@ impl SessionBridge {
                     // exactly one moment, then exec.rs's own
                     // sync_real_state_in silently undid it the next
                     // time any session ran a command).
-                    self.pending_capability = Some((term, colorterm));
+                    if self.pty_master.is_some() {
+                        self.pending_capability = Some((term, colorterm));
+                    }
                 }
                 Ok(Some(Message::CaptureRequest)) => {
                     // Recorded, not answered: the answer lives in a
@@ -1166,13 +1198,72 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
     bridge.watch_pidfile(pidfile_lock);
     install_bridge(bridge);
 
-    let shell = crate::exec::Shell::new();
+    let mut shell = crate::exec::Shell::new();
+    // How a program in one of its panes finds this session without being
+    // told its name -- `bish tool mcp-server` does. See `listen_here`.
+    shell.export_var("BISH_SOCKET", sock_path.to_string_lossy().into_owned());
     // `true`: a session daemon is an interactive shell like any other,
     // and reads the user's config like one. It did not, for as long as
     // loading that config was the *caller's* job -- which is exactly
     // why it is `repl::run`'s now.
     crate::repl::run(shell, true, true);
     Ok(0)
+}
+
+/// Makes this interactive bish reachable the way a named session is, and
+/// returns where: the path its panes are given as `BISH_SOCKET`, so a
+/// program running inside it -- an agent's MCP server -- can ask it what
+/// is open and what is wrong with it without anyone naming anything.
+///
+/// The socket sits in the same 0700 directory as every session's, and
+/// the bridge checks each peer's uid as it does there. Named
+/// `<pid>.ide` rather than `.sock`, so `session ls` and `attach` never
+/// mistake it for a session: there is no terminal here to attach to.
+///
+/// Questions are answered from the idle loop, as a session's are, so an
+/// agent gets its answers while it runs as a command of its own in a
+/// pane. They wait while a command runs at a prompt with no panes, or
+/// partway through a list (`cd proj && claude`, driven by
+/// `drive_pending_fg_inline`): nothing services the socket until that
+/// command is done.
+///
+/// A bish that dies without `stop_listening` leaves its socket behind.
+/// Nothing answers on it, so the next one to start sweeps it up -- asked
+/// by connecting rather than by pid, which the kernel reuses.
+pub fn listen_here() -> io::Result<PathBuf> {
+    let dir = ensure_socket_dir()?;
+    remove_unanswered_ide_sockets(&dir);
+    let path = ide_socket_path(std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    install_bridge(SessionBridge::without_terminal(listener)?);
+    Ok(path)
+}
+
+/// Where a plain bish with this pid listens -- see `listen_here`.
+pub fn ide_socket_path(pid: u32) -> PathBuf {
+    socket_dir().join(format!("{pid}.ide"))
+}
+
+/// Takes this bish's own socket away as it exits. A no-op for a session
+/// daemon, whose socket and pidfile are looked after as a pair.
+pub fn stop_listening() {
+    let plain = ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| bridge.pty_master.is_none()));
+    if plain {
+        let _ = std::fs::remove_file(ide_socket_path(std::process::id()));
+    }
+}
+
+fn remove_unanswered_ide_sockets(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "ide")
+            && matches!(UnixStream::connect(&path), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 // `bish session ls`: every name in the socket directory whose pidfile
@@ -1233,6 +1324,18 @@ impl Peer {
         let stream = UnixStream::connect(&path).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 io::Error::new(e.kind(), format!("no live session named '{name}' (try `bish session ls`)"))
+            }
+            _ => e,
+        })?;
+        Ok(Peer { stream, decoder: Decoder::default() })
+    }
+
+    /// Connects to the bish listening at `path` -- the one a program is
+    /// running inside, named by its `BISH_SOCKET` (see `listen_here`).
+    pub fn connect_path(path: &std::path::Path) -> io::Result<Peer> {
+        let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                io::Error::new(e.kind(), format!("no bish is listening at {} any more", path.display()))
             }
             _ => e,
         })?;
@@ -1782,6 +1885,47 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
+    }
+
+    // A plain bish's socket, end to end over a real bound one: a question
+    // put through `Peer::connect_path` comes back answered, a peer
+    // arriving does not repaint anything, and a socket left by a bish
+    // that died is gone once the next one listens.
+    #[test]
+    fn a_plain_bish_answers_on_its_own_socket_and_sweeps_up_a_dead_ones() {
+        with_isolated_runtime_dir("listen-here", |_| {
+            let dir = ensure_socket_dir().unwrap();
+            let dead = dir.join("999999999.ide");
+            drop(UnixListener::bind(&dead).unwrap());
+            let session_like = dir.join("work.sock");
+            drop(UnixListener::bind(&session_like).unwrap());
+
+            let path = listen_here().unwrap();
+            assert_eq!(path, ide_socket_path(std::process::id()));
+            assert!(!dead.exists(), "nothing answered on it, so it was swept");
+            assert!(session_like.exists(), "a session's own files are not this sweep's to touch");
+
+            let asker = std::thread::spawn({
+                let path = path.clone();
+                move || Peer::connect_path(&path).unwrap().ask(br#"{"q":"ping"}"#, std::time::Duration::from_secs(10)).unwrap()
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut repainted = false;
+            while !asker.is_finished() && std::time::Instant::now() < deadline {
+                service_current_bridge();
+                repainted |= take_bridge_just_attached();
+                answer_rpc_requests_with(|payload, _| Some([b"pong:".as_slice(), payload].concat()));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(asker.join().unwrap(), br#"pong:{"q":"ping"}"#);
+            assert!(!repainted, "a peer with no terminal is no reason to repaint one");
+
+            stop_listening();
+            assert!(!path.exists(), "gone as this bish leaves");
+            ACTIVE_BRIDGE.with(|b| *b.borrow_mut() = None);
+            let Err(gone) = Peer::connect_path(&path) else { panic!("connected to a bish that has left") };
+            assert!(gone.to_string().contains("no bish is listening"), "{gone}");
+        });
     }
 
     #[test]
