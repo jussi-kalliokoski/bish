@@ -77,6 +77,15 @@ mod tests {
         case("dot-repeats-a-change", "one two three\n", "cwZ\u{1b}w."),
         case("dot-repeats-a-line-delete", "a\nb\nc\nd\n", "dd."),
         case("dot-after-undo-repeats-the-change-not-the-undo", "abcdef\n", "xu."),
+        // A count before an insert repeats what is typed; before `.` it
+        // takes the place of the count the change was made with.
+        case("insert-with-count", "a\n", "3ihi\u{1b}"),
+        case("append-at-end-with-count", "a\n", "2Abc\u{1b}"),
+        case("open-line-with-count", "a\nb\n", "3oX\u{1b}"),
+        case("open-line-above-with-count", "a\nb\n", "j2OX\u{1b}"),
+        case("replace-mode-with-count", "abcdef\n", "2Rxy\u{1b}"),
+        case("dot-repeats-a-counted-insert", "a\nb\n", "2iX\u{1b}j."),
+        case("dot-with-a-count-replaces-the-count", "1\n2\n3\n4\n5\n6\n", "3ddj2."),
         case("dot-with-nothing-to-repeat", "abc\n", "."),
         case("mark-linewise-delete", "a\nb\nc\n", "maGd'a"),
         case("mark-linewise-delete-partial", "a\nb\nc\nd\n", "jmaGd'a"),

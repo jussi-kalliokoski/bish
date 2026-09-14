@@ -123,9 +123,10 @@ pub enum KeyOutcome {
     /// first" -- so, like `Window`, the caller applies this against
     /// whatever it considers "the buffer" (which may not even be the same
     /// `Buffer` a `Motion` was just applied to -- see apply_insert_cmd's own
-    /// doc comment). Any count typed before one of these (`3i`) is silently
-    /// discarded, same as it would be for a key `feed_fresh` doesn't
-    /// otherwise recognize -- there's no insert-repeat-on-exit support yet.
+    /// doc comment). A count typed before `i`/`a`/`I`/`A` repeats the text
+    /// typed, which `VimKeys` does itself as the excursion ends (see
+    /// `capture_insert_key`), so the host never sees it; before `s`/`S`/`C`,
+    /// where vim's count says how much to change, it is dropped.
     EnterInsert(InsertCmd),
     /// `y{motion}` -- an operator applied to a motion's resulting range.
     /// `register` is the explicit `"x` prefix if any (`None` means "use
@@ -745,6 +746,14 @@ pub struct VimKeys {
     // too.
     current_change: Vec<Key>,
     last_change: Vec<Key>,
+    /// How many times an open Insert-mode excursion's text is to go in,
+    /// and whether each copy after the first starts a line of its own --
+    /// `3ihi<Esc>` and `3oX<Esc>`. Set by the command that opens the
+    /// excursion, spent on the escape that closes it.
+    insert_repeat: Option<(usize, bool)>,
+    /// Where in `current_change` the text typed during the open
+    /// excursion starts.
+    insert_text_start: usize,
     // Set when a command opens Insert mode, cleared when the escape that
     // closes it comes back through `next_key`. While it is set, the
     // host's own Insert-mode reads are part of the change being
@@ -813,6 +822,8 @@ impl VimKeys {
             last_completed: String::new(),
             current_change: Vec::new(),
             last_change: Vec::new(),
+            insert_repeat: None,
+            insert_text_start: 0,
             capturing_insert: false,
             macros: HashMap::new(),
             recording: None,
@@ -1243,6 +1254,34 @@ impl VimKeys {
     /// here -- `capturing_insert` is false then, which is what keeps
     /// them from being counted twice.
     fn capture_insert_key(&mut self, key: Key) -> Key {
+        // The escape that closes a counted excursion (`3ihi<Esc>`). The
+        // text goes in again first, count - 1 more times, while the host
+        // is still in Insert mode to type it -- after a line break each
+        // time for `o`/`O` -- and the escape that really ends the
+        // excursion comes last. The change `.` repeats is what was
+        // typed, count included, so it is recorded here and the copies
+        // are not. `Ctrl-C` leaves without repeating, as vim's does.
+        if self.capturing_insert
+            && key == Key::Escape
+            && let Some((count, new_line)) = self.insert_repeat.take()
+        {
+            let typed = self.current_change[self.insert_text_start.min(self.current_change.len())..].to_vec();
+            let mut again = Vec::new();
+            for _ in 1..count {
+                if new_line {
+                    again.push(Key::Enter);
+                }
+                again.extend_from_slice(&typed);
+            }
+            again.push(Key::Escape);
+            self.current_change.push(key);
+            self.capturing_insert = false;
+            self.last_change = std::mem::take(&mut self.current_change);
+            for queued in again.into_iter().rev() {
+                self.replay_queue.push_front(queued);
+            }
+            return self.replay_queue.pop_front().unwrap_or(key);
+        }
         if self.capturing_insert {
             self.current_change.push(key);
             if matches!(key, Key::Escape | Key::CtrlC) {
@@ -1308,6 +1347,11 @@ impl VimKeys {
         if self.current_input.is_empty() && !self.capturing_insert {
             self.current_change.clear();
         }
+        // A count to repeat an excursion's text by belongs to the command
+        // that opens it, which the emitters below set as they resolve.
+        if !self.capturing_insert {
+            self.insert_repeat = None;
+        }
         self.current_change.push(key);
         // Wrapped rather than inlined below, because what a key resolves
         // to is not settled until every one of `feed_resolving`'s own
@@ -1323,6 +1367,7 @@ impl VimKeys {
                 // it arrives through `next_key`, which closes this out
                 // on the escape.
                 self.capturing_insert = true;
+                self.insert_text_start = self.current_change.len();
             } else {
                 self.last_change = self.current_change.clone();
             }
@@ -1498,19 +1543,21 @@ impl VimKeys {
         KeyOutcome::Window(cmd, count)
     }
 
-    // Unlike emit()/emit_window(), the count is dropped rather than
-    // returned -- see KeyOutcome::EnterInsert's own doc comment on why a
-    // leading count on an insert-entry command has no effect yet.
+    // Unlike emit()/emit_window(), the count is not handed to the host:
+    // for `i`/`a`/`I`/`A` it repeats what gets typed, and `VimKeys` does
+    // that itself -- see KeyOutcome::EnterInsert's own doc comment.
     fn emit_insert(&mut self, cmd: InsertCmd) -> KeyOutcome {
-        self.count = None;
+        let count = self.count.take();
+        if matches!(cmd, InsertCmd::Before | InsertCmd::After | InsertCmd::LineStart | InsertCmd::LineEnd) {
+            self.insert_repeat = count.filter(|n| *n > 1).map(|n| (n, false));
+        }
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::EnterInsert(cmd)
     }
 
-    // `v`/`V`: same shape as emit_insert -- a count typed before entering
-    // Visual mode has no effect yet, same "not supported in this pass" as
-    // an insert-entry command's own leading count. Doesn't touch
+    // `v`/`V`: same shape as emit_insert -- but a count typed before
+    // entering Visual mode has no effect yet. Doesn't touch
     // `self.visual` itself -- that only happens once the caller calls
     // `begin_visual` back with the anchor, which this function has no way
     // to know (see `KeyOutcome::EnterVisual`'s own doc comment).
@@ -1521,14 +1568,17 @@ impl VimKeys {
         KeyOutcome::EnterVisual(shape)
     }
 
+    // `2Rab<Esc>`: what is typed replaces, and then replaces again.
     fn emit_replace(&mut self) -> KeyOutcome {
-        self.count = None;
+        let count = self.count.take();
+        self.insert_repeat = count.filter(|n| *n > 1).map(|n| (n, false));
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::EnterReplace
     }
 
-    // Same shape as emit_insert -- a leading count has no effect yet.
+    // Same shape as emit_insert, and a count the same: `3oX<Esc>` opens a
+    // line three times, with `X` on each.
     //
     // In Visual mode neither `o` nor `O` is "open a line" at all: both
     // swap which end of the selection is being held. Deciding that here
@@ -1543,12 +1593,13 @@ impl VimKeys {
     // block it moves to a corner rather than opening a line, which is
     // the nearer of the two wrong answers by a distance.
     fn emit_open_line(&mut self, above: bool) -> KeyOutcome {
-        self.count = None;
+        let count = self.count.take();
         self.pending = Pending::None;
         self.last_completed = std::mem::take(&mut self.current_input);
         if self.visual.is_some() {
             return KeyOutcome::SwapVisualEnds;
         }
+        self.insert_repeat = count.filter(|n| *n > 1).map(|n| (n, true));
         KeyOutcome::OpenLine { above }
     }
 
@@ -1669,14 +1720,20 @@ impl VimKeys {
     /// through the ordinary path, which is also what leaves `.` itself
     /// repeatable afterwards.
     ///
-    /// `[count].` replays once, not `count` times, and does not
-    /// substitute the count into the repeated command the way vim does.
+    /// `[count].` repeats the change with its count in place of the one
+    /// it was made with, as vim's does: `3dd` then `2.` deletes two lines,
+    /// where a plain `.` would delete three again.
     fn emit_repeat_change(&mut self) -> KeyOutcome {
-        self.count = None;
+        let count = self.count.take();
         self.pending = Pending::None;
         self.pending_register = None;
         self.last_completed = std::mem::take(&mut self.current_input);
-        for key in self.last_change.clone().iter().rev() {
+        let mut keys = self.last_change.clone();
+        if let Some(count) = count {
+            let digits = keys.iter().take_while(|k| matches!(k, Key::Char(c) if c.is_ascii_digit())).count();
+            keys.splice(..digits, count.to_string().chars().map(Key::Char));
+        }
+        for key in keys.iter().rev() {
             self.replay_queue.push_front(*key);
         }
         KeyOutcome::None
@@ -4051,6 +4108,62 @@ mod tests {
             replayed.push(key);
         }
         assert_eq!(replayed, vec![Key::Char('i'), Key::Char('h'), Key::Char('i'), Key::Escape]);
+    }
+
+    // Drives one Insert-mode excursion the way a host does -- `opening`
+    // fed as Normal-mode keys, `typed` read through the insert seam until
+    // an escape comes back -- and returns what the host got to insert.
+    fn excursion(vk: &mut VimKeys, opening: &str, typed: &str) -> Vec<Key> {
+        for c in opening.chars() {
+            vk.feed(Key::Char(c));
+        }
+        let mut feed_from = typed.chars().map(Key::Char).chain([Key::Escape]);
+        let mut inserted = Vec::new();
+        while let Some(key) = vk.next_mapped_key("insert", || Ok(feed_from.next())).unwrap() {
+            if key == Key::Escape {
+                break;
+            }
+            inserted.push(key);
+        }
+        inserted
+    }
+
+    fn replay(vk: &mut VimKeys) -> Vec<Key> {
+        let mut replayed = Vec::new();
+        while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
+            replayed.push(key);
+        }
+        replayed
+    }
+
+    #[test]
+    fn a_counted_insert_types_its_text_that_many_times_and_dot_repeats_it_whole() {
+        let mut vk = VimKeys::new();
+        assert_eq!(excursion(&mut vk, "3i", "hi"), "hihihi".chars().map(Key::Char).collect::<Vec<_>>());
+        vk.feed(Key::Char('.'));
+        assert_eq!(replay(&mut vk), [Key::Char('3'), Key::Char('i'), Key::Char('h'), Key::Char('i'), Key::Escape], "the change, count and all");
+    }
+
+    #[test]
+    fn a_counted_open_line_puts_each_copy_on_a_line_of_its_own() {
+        let mut vk = VimKeys::new();
+        assert_eq!(excursion(&mut vk, "3o", "x"), [Key::Char('x'), Key::Enter, Key::Char('x'), Key::Enter, Key::Char('x')]);
+        // Only for the commands whose count vim reads that way.
+        let mut vk = VimKeys::new();
+        assert_eq!(excursion(&mut vk, "3s", "x"), [Key::Char('x')], "`3s` changes three characters in vim; the count is not a repeat");
+    }
+
+    #[test]
+    fn a_count_before_dot_takes_the_place_of_the_one_the_change_had() {
+        let mut vk = VimKeys::new();
+        for c in "3dd".chars() {
+            vk.feed(Key::Char(c));
+        }
+        vk.feed(Key::Char('2'));
+        vk.feed(Key::Char('.'));
+        assert_eq!(replay(&mut vk), "2dd".chars().map(Key::Char).collect::<Vec<_>>());
+        vk.feed(Key::Char('.'));
+        assert_eq!(replay(&mut vk), "3dd".chars().map(Key::Char).collect::<Vec<_>>(), "and a plain `.` still repeats it as it was made");
     }
 
     #[test]
