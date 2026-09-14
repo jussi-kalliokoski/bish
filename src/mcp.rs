@@ -300,6 +300,15 @@ pub fn answer(state: &EditorState, question: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// `answer`, for the one question a stored copy of the state can answer
+/// by itself -- what a peer is told while a command holds the loop that
+/// would otherwise build the state fresh (see `session::service_while_busy`).
+/// Every other question is `None`, and waits to be asked of `answer`.
+pub fn answer_from_state(state: &EditorState, question: &[u8]) -> Option<Vec<u8>> {
+    let value = json::parse(std::str::from_utf8(question).ok()?).ok()?;
+    (string_at(&value, ".q")? == "state").then(|| answer(state, question)).flatten()
+}
+
 /// The focus notification, in the private protocol: what the editor is
 /// showing now, or that it is showing nothing.
 ///
@@ -1346,6 +1355,16 @@ mod tests {
         let answer = result(&out, 1.0);
         assert_eq!(json::query(&answer, ".isError"), Ok(&Value::Bool(false)));
         assert_eq!(json::query(&answer, ".content[0].text"), Ok(&string("CLOSED_0_DIFF_TABS")));
+    }
+
+    #[test]
+    fn a_stored_state_answers_the_state_question_and_nothing_else() {
+        let state = EditorState { files: vec![a_file()] };
+        let asked = answer_from_state(&state, br#"{"q":"state"}"#);
+        assert!(asked.is_some());
+        assert_eq!(asked, answer(&state, br#"{"q":"state"}"#), "the same answer the loop would give");
+        assert_eq!(answer_from_state(&state, br#"{"q":"hello"}"#), None);
+        assert_eq!(answer_from_state(&state, b"not a question"), None);
     }
 
     // The one place a client's own vocabulary is spoken. Everything

@@ -1144,6 +1144,60 @@ pub fn has_rpc_peers() -> bool {
     ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| !bridge.rpc_clients.is_empty()))
 }
 
+/// Whether this process has a socket to answer on -- a session daemon's,
+/// or a plain interactive bish's (see `listen_here`).
+pub fn is_listening() -> bool {
+    ACTIVE_BRIDGE.with(|b| b.try_borrow().map_or(true, |bridge| bridge.is_some()))
+}
+
+// A question answered without the idle loop -- see `answer_while_busy`.
+type BusyAnswer = Box<dyn Fn(&[u8]) -> Option<Vec<u8>>>;
+
+thread_local! {
+    static BUSY_ANSWER: RefCell<Option<BusyAnswer>> = const { RefCell::new(None) };
+}
+
+/// What `service_while_busy` may answer, and with what, while a command
+/// holds the idle loop; `None` once it no longer does. repl.rs sets it
+/// just before a line runs, from the editor's state as it is then --
+/// which is how it stays, since nothing drives the editor until the line
+/// is done.
+pub fn answer_while_busy(answer: Option<BusyAnswer>) {
+    BUSY_ANSWER.with(|a| *a.borrow_mut() = answer);
+}
+
+/// The socket, serviced from inside a wait that is not the idle loop:
+/// a command running partway through a list, or at a prompt with no
+/// panes, where nothing else would answer before a peer gave up.
+///
+/// Answers only what `answer_while_busy` covers. Everything else -- a
+/// review, a capture, a question it has no answer for -- stays queued, in
+/// the order it came, for the idle loop once the command is done. Does
+/// nothing inside a coroutine, or while the bridge is already in use
+/// further up this thread.
+pub fn service_while_busy() {
+    if crate::coroutine::in_coroutine() {
+        return;
+    }
+    ACTIVE_BRIDGE.with(|b| {
+        let Ok(mut guard) = b.try_borrow_mut() else { return };
+        let Some(bridge) = guard.as_mut() else { return };
+        bridge.service();
+        BUSY_ANSWER.with(|a| {
+            let Ok(answer) = a.try_borrow() else { return };
+            let Some(answer) = answer.as_ref() else { return };
+            let mut unanswered = Vec::new();
+            for (id, question) in std::mem::take(&mut bridge.pending_rpc) {
+                match answer(&question) {
+                    Some(reply) => bridge.send_to(id, &Message::RpcReply(reply).encode()),
+                    None => unanswered.push((id, question)),
+                }
+            }
+            bridge.pending_rpc = unanswered;
+        });
+    });
+}
+
 // True at most once per attach (a first attach or a reattach) -- lets
 // repl.rs's own on_idle hook trigger one explicit full repaint right
 // when a client connects. See SessionBridge::just_attached's own doc
@@ -1945,6 +1999,36 @@ mod tests {
             bridge.drain_clients();
             assert_eq!(watching(&bridge), [false]);
             assert_eq!(bridge.pending_rpc.len(), 1, "and its question is still there to answer");
+        });
+    }
+
+    // A command holding the idle loop: the question a stored answer covers
+    // is answered from the wait itself, and one it does not cover stays
+    // queued, in order, for the loop once the command is done.
+    #[test]
+    fn a_busy_wait_answers_what_it_can_and_leaves_the_rest_queued() {
+        with_isolated_runtime_dir("busy", |_| {
+            let path = listen_here().unwrap();
+            answer_while_busy(Some(Box::new(|question: &[u8]| (question == b"state").then(|| b"the state".to_vec()))));
+            let asker = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    let mut peer = Peer::connect_path(&path).unwrap();
+                    peer.tell(b"later").unwrap();
+                    peer.ask(b"state", std::time::Duration::from_secs(10)).unwrap()
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !asker.is_finished() && std::time::Instant::now() < deadline {
+                service_while_busy();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(asker.join().unwrap(), b"the state");
+            let left = ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().unwrap().pending_rpc.iter().map(|(_, q)| q.clone()).collect::<Vec<_>>());
+            assert_eq!(left, [b"later".to_vec()], "left for the idle loop");
+            answer_while_busy(None);
+            stop_listening();
+            ACTIVE_BRIDGE.with(|b| *b.borrow_mut() = None);
         });
     }
 

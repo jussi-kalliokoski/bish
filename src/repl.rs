@@ -1298,8 +1298,17 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                                 // idempotent when this session was
                                 // already the one last synced in.
                                 session.shell.sync_real_state_in();
+                                // What a peer asking about the editor is
+                                // told if it asks while this line runs:
+                                // the state as it is now, which is how it
+                                // stays -- nothing drives the editor until
+                                // `run_program` returns. See
+                                // `session::service_while_busy`.
+                                let state = editor_state(app);
+                                session::answer_while_busy(Some(Box::new(move |question: &[u8]| mcp::answer_from_state(&state, question))));
                                 let session = app.sessions.get_mut(&session_id).unwrap();
                                 let result = session.shell.run_program(&prog);
+                                session::answer_while_busy(None);
                                 session.shell.sync_real_state_out();
                                 if session.shell.cwd != cwd_before {
                                     push_dir_history(session, session.shell.cwd.clone());

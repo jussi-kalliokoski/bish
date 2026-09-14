@@ -3221,8 +3221,17 @@ impl Shell {
             }
             fed
         };
+        // A peer asking about the editor is answered from in here too --
+        // see `session::service_while_busy` -- at most every 10ms, so a
+        // job that prints without pause does not pay for the socket on
+        // every read.
+        let mut serviced = std::time::Instant::now();
         loop {
             let fed = drain(&mut job);
+            if serviced.elapsed() >= std::time::Duration::from_millis(10) {
+                crate::session::service_while_busy();
+                serviced = std::time::Instant::now();
+            }
             let done = match job.children.last_mut() {
                 Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
                 None => true,
@@ -15681,10 +15690,25 @@ fn wait_status_stop_sig(status: i32) -> i32 {
 // pids real job control (Job::pgid) has isolated into their own process
 // group; every other job in this shell is still waited on the ordinary
 // way, via Child::wait/try_wait.
+//
+// With a socket to answer on, it polls rather than blocks, so a peer
+// asking about the editor while a command runs at a prompt with no panes
+// is answered in between (`session::service_while_busy`). The naps start
+// at a quarter of a millisecond and double to 20ms: a command that is
+// over at once is waited on about as long as before, and a long one is
+// looked in on fifty times a second.
 pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
+    let flags = if crate::session::is_listening() { WNOHANG | WUNTRACED } else { WUNTRACED };
+    let mut nap = std::time::Duration::from_micros(250);
     loop {
         let mut status: i32 = 0;
-        let r = unsafe { waitpid(pid as i32, &mut status, WUNTRACED) };
+        let r = unsafe { waitpid(pid as i32, &mut status, flags) };
+        if r == 0 {
+            crate::session::service_while_busy();
+            std::thread::sleep(nap);
+            nap = (nap * 2).min(std::time::Duration::from_millis(20));
+            continue;
+        }
         if r < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
