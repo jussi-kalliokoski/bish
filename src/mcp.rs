@@ -709,12 +709,21 @@ impl Server {
             Ok(state) => state,
             Err(e) => return tool_result(&format!("could not ask the session: {e}"), true),
         };
-        // A `file://` URI back to the path it names. Anything else --
-        // including a scheme bish does not serve -- matches nothing,
-        // which is the honest answer rather than an error.
-        let wanted = string_at(arguments, ".uri").map(|uri| uri.strip_prefix("file://").unwrap_or(&uri).to_string());
-        let files: Vec<Value> =
-            state.files.iter().filter(|f| wanted.as_ref().is_none_or(|w| f.path.to_string_lossy() == *w)).map(file_diagnostics).collect();
+        // A `file://` URI back to the path it names, percent-decoded, so
+        // `file:///tmp/my%20notes.sh` is the file with a space in its
+        // name. Anything else -- a bare path, a scheme bish does not
+        // serve -- matches nothing, which is the honest answer rather
+        // than an error.
+        let wanted = string_at(arguments, ".uri").map(|uri| crate::url::to_file_path(&uri));
+        let files: Vec<Value> = state
+            .files
+            .iter()
+            .filter(|f| match &wanted {
+                None => true,
+                Some(path) => path.as_deref() == Some(f.path.as_path()),
+            })
+            .map(file_diagnostics)
+            .collect();
         tool_result(&json::pretty_print(&Value::Array(files)), false)
     }
 }
@@ -756,7 +765,7 @@ fn file_diagnostics(file: &FileState) -> Value {
         })
         .collect();
     object(vec![
-        ("uri", string(&format!("file://{}", file.path.to_string_lossy()))),
+        ("uri", string(&crate::url::from_file_path(&file.path))),
         ("linesInFile", Value::Number(file.line_count as f64)),
         ("diagnostics", Value::Array(findings)),
     ])
@@ -782,7 +791,7 @@ fn selection_changed(payload: &[u8]) -> Option<Message> {
         // the last one is over, and which file is in front now.
         None => ((0, 0), (0, 0)),
     };
-    let uri = format!("file://{}", file.path.to_string_lossy());
+    let uri = crate::url::from_file_path(&file.path);
     Some(Message::Notification {
         method: "selection_changed".to_string(),
         params: object(vec![
@@ -1271,6 +1280,37 @@ mod tests {
         assert_eq!(json::parse(text).unwrap(), Value::Array(vec![]));
     }
 
+    // A path is not a URI. One with a space, a `#` or anything outside
+    // ASCII has to go out encoded -- `#` would otherwise start a fragment
+    // -- and come back in decoded, or the file a client asks about is
+    // never the file bish has.
+    #[test]
+    fn a_path_that_needs_encoding_goes_out_encoded_and_is_found_by_it() {
+        let odd = std::path::PathBuf::from("/tmp/my notes/#1 caf\u{e9}.sh");
+        let encoded = "file:///tmp/my%20notes/%231%20caf%C3%A9.sh";
+        let state = EditorState {
+            files: vec![
+                FileState { path: std::path::PathBuf::from("/tmp/other.sh"), focused: false, ..a_file() },
+                FileState { path: odd, ..a_file() },
+            ],
+        };
+        let call = |uri: &str| object(vec![("name", string("getDiagnostics")), ("arguments", object(vec![("uri", string(uri))]))]);
+        let files_for = |uri: &str| {
+            let out = with_session(state.clone(), &[initialize(), request(1.0, "tools/call", call(uri))]);
+            let answer = result(&out, 1.0);
+            let Ok(Value::Str(text)) = json::query(&answer, ".content[0].text") else { panic!("{answer:?}") };
+            json::parse(text).unwrap()
+        };
+
+        let files = files_for(encoded);
+        assert_eq!(json::query(&files, "[0].uri"), Ok(&string(encoded)), "encoded going out");
+        assert_eq!(json::query(&files, "[1]"), Ok(&Value::Null), "and only that file, found by it");
+        // Not a URI at all, and not one naming a file: nothing, rather
+        // than a guess at what was meant.
+        assert_eq!(files_for("/tmp/other.sh"), Value::Array(vec![]));
+        assert_eq!(files_for("https://example.com/tmp/other.sh"), Value::Array(vec![]));
+    }
+
     // Registration is a side effect and nothing else. A reply here
     // would sit in the socket waiting to be mistaken for the answer to
     // the first real question, which is why `answer` gives none -- and
@@ -1317,6 +1357,13 @@ mod tests {
         let notice = selection_notification(Some(&FileState { selection: None, selected_text: String::new(), ..a_file() })).unwrap();
         let Some(Message::Notification { params, .. }) = selection_changed(&notice) else { panic!() };
         assert_eq!(json::query(&params, ".selection.isEmpty"), Ok(&Value::Bool(true)));
+
+        // The path as it is, the URL encoded -- the same file either way.
+        let odd = FileState { path: std::path::PathBuf::from("/tmp/my notes/#1 caf\u{e9}.sh"), ..a_file() };
+        let notice = selection_notification(Some(&odd)).unwrap();
+        let Some(Message::Notification { params, .. }) = selection_changed(&notice) else { panic!() };
+        assert_eq!(json::query(&params, ".filePath"), Ok(&string("/tmp/my notes/#1 caf\u{e9}.sh")));
+        assert_eq!(json::query(&params, ".fileUrl"), Ok(&string("file:///tmp/my%20notes/%231%20caf%C3%A9.sh")));
 
         // Nothing in front of the user is nothing to say.
         let notice = selection_notification(None).unwrap();
