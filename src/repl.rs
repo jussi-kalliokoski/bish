@@ -10152,23 +10152,30 @@ fn apply_workspace_edit(
     let plan = crate::fileops::plan(&operations, &unsaved).map_err(|why| format!("{why} -- nothing changed"))?;
     // Every buffer is matched by where its file will be once the plan
     // has run, and every text change by where the file it names will be.
+    //
+    // A file can be named by more than one entry -- `documentChanges`
+    // allows it -- and each entry applies to the text the one before it
+    // left, so every entry is kept, in order, rather than the last.
     let here = buf.path().map(|p| plan.follow(p));
-    let mut in_this_buffer: Vec<crate::lsp::TextEdit> = Vec::new();
+    let mut in_this_buffer: Vec<Vec<crate::lsp::TextEdit>> = Vec::new();
     let mut in_open_buffers: Vec<(EditFrameId, Vec<crate::lsp::TextEdit>)> = Vec::new();
-    let mut to_load: Vec<(std::path::PathBuf, Vec<crate::lsp::TextEdit>)> = Vec::new();
+    let mut to_load: Vec<(std::path::PathBuf, Vec<Vec<crate::lsp::TextEdit>>)> = Vec::new();
     for (position, (uri, edits)) in edit.changes.iter().enumerate() {
         // A file a later step deletes: whatever this change did to it
         // would be deleted with it.
         let Some(path) = plan.destination(position, &path_of(uri)?) else { continue };
         if here.as_deref() == Some(path.as_path()) {
-            in_this_buffer = edits.clone();
+            in_this_buffer.push(edits.clone());
             continue;
         }
         if let Some((id, _)) = edit_frames.iter().find(|(_, s)| s.buffer.path().map(|p| plan.follow(p)).as_deref() == Some(path.as_path())) {
             in_open_buffers.push((*id, edits.clone()));
             continue;
         }
-        to_load.push((path, edits.clone()));
+        match to_load.iter_mut().find(|(loaded, _)| *loaded == path) {
+            Some((_, entries)) => entries.push(edits.clone()),
+            None => to_load.push((path, vec![edits.clone()])),
+        }
     }
 
     // Phase two: the files themselves -- created, renamed and deleted,
@@ -10176,7 +10183,7 @@ fn apply_workspace_edit(
     // back every file operation, and nothing has changed.
     let mut done = crate::fileops::commit(&plan).map_err(|why| format!("{why} -- nothing changed"))?;
     let mut on_disk: Vec<(std::path::PathBuf, TextBuffer)> = Vec::new();
-    for (path, edits) in to_load {
+    for (path, entries) in to_load {
         let mut loaded = match TextBuffer::open(&path, 1) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -10184,7 +10191,9 @@ fn apply_workspace_edit(
                 return Err(format!("{}: {e} -- nothing changed", path.display()));
             }
         };
-        fileeditor::apply_text_edits(&mut loaded, &edits, encoding);
+        for edits in &entries {
+            fileeditor::apply_text_edits(&mut loaded, edits, encoding);
+        }
         on_disk.push((path, loaded));
     }
 
@@ -10223,8 +10232,13 @@ fn apply_workspace_edit(
             fileeditor::apply_text_edits(&mut session.buffer, edits, encoding);
         }
     }
-    fileeditor::apply_text_edits(buf, &in_this_buffer, encoding);
-    Ok((written, in_open_buffers.len() + usize::from(!in_this_buffer.is_empty())))
+    for edits in &in_this_buffer {
+        fileeditor::apply_text_edits(buf, edits, encoding);
+    }
+    // Buffers, not entries: one buffer given two entries is one buffer
+    // left to save.
+    let open_buffers = in_open_buffers.iter().map(|(id, _)| id).collect::<std::collections::HashSet<_>>().len();
+    Ok((written, open_buffers + usize::from(!in_this_buffer.is_empty())))
 }
 
 // An open buffer whose file an edit has just renamed. The language server
@@ -12124,6 +12138,28 @@ mod workspace_edit_tests {
         assert_eq!(followed, [dir.join("new.rs")]);
         assert_eq!(buf.path(), Some(dir.join("new.rs").as_path()));
         assert_eq!(fileeditor::buffer_text(&buf).lines().next(), Some("fn b() {}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_entry_for_one_file_lands_in_order_whether_it_is_open_or_not() {
+        let dir = scratch("entries");
+        std::fs::write(dir.join("closed.rs"), "one\n").unwrap();
+        std::fs::write(dir.join("open.rs"), "one\n").unwrap();
+        let mut buf = TextBuffer::open(&dir.join("open.rs"), 10).unwrap();
+        // The second entry's position is in the text the first one left:
+        // ` three` goes after the ` two` the first entry put there.
+        let entries = |path: &Path| vec![(uri(path), vec![replace(0, 3, 3, " two")]), (uri(path), vec![replace(0, 7, 7, " three")])];
+        let edit = WorkspaceEdit {
+            changes: [entries(&dir.join("closed.rs")), entries(&dir.join("open.rs"))].concat(),
+            operations: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let counts =
+            apply_workspace_edit(&mut HashMap::new(), &mut buf, &edit, PositionEncoding::Utf16, &mut |_: &mut TextBuffer, _: &Path| {}).unwrap();
+        assert_eq!(counts, (1, 1), "a file written and a buffer changed, however many entries each had");
+        assert_eq!(std::fs::read_to_string(dir.join("closed.rs")).unwrap(), "one two three\n");
+        assert_eq!(fileeditor::buffer_text(&buf).lines().next(), Some("one two three"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
