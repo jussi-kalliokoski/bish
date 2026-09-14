@@ -1693,15 +1693,10 @@ y
     // Cases bish does not match today, each with why. Asserted to
     // *still* diverge -- fixing one fails this test until its line is
     // removed, which is the only way a list like this stays true.
-    // Empty, for now. The list is the point, not its length: anything
-    // found and not yet fixed belongs here with its reason, so that
-    // "bish agrees with bash" never quietly means "except where it
-    // doesn't".
+    // The list is the point, not its length: anything found and not yet
+    // fixed belongs here with its reason, so that "bish agrees with
+    // bash" never quietly means "except where it doesn't".
     const DIVERGENCES: &[(&str, &str)] = &[
-        // A DEBUG trap fires once per pipeline *stage* in bash. Here it
-        // fires only for a stage that runs in the shell: an external
-        // one is spawned without going through the path that fires it,
-        // so `echo a | cat` traces one command rather than two.
         // `( )` and `$( )` run in this shell rather than in a forked
         // copy of it, so there is no second process to have a pid.
         // Reporting a made-up one would break `kill $BASHPID`, which is
