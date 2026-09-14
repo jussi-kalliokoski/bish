@@ -11308,7 +11308,7 @@ its decompressed text.
 | `:w [FILE]` | write (`:wq`/`:x` write+quit, `:q`, `:q!`) |
 | `:s/PAT/REPL/[g]` | substitute (prefix a range, e.g. `:%s/../../`) |
 | `:git blame [REV]` | per-line blame gutter (`:git diff [REV]` for +/~/-) |
-| `:git show [REV]` | the commit (`HEAD` by default), opened at this file |
+| `:git show [REV]` | the commit (`HEAD`, or the cursor line's with blame on), opened at this file |
 | `:diff` | +/~/- vs. what's on disk, no git needed |
 | `:review [git [REV]]` | go through those changes one by one, keeping or putting back each |
 | `:fold` | fold this line, or a range before it (`:foldopen[!]`, `:foldclose[!]`) |
@@ -13945,11 +13945,24 @@ fn run_command_mode(
                                 },
                                 // `show [REV]`: the whole commit in the
                                 // diff view, read-only, opened at this
-                                // file when the commit touched it.
+                                // file when the commit touched it. With
+                                // no REV and blame on, the commit the
+                                // gutter names beside the cursor -- see
+                                // fileeditor::blamed_commit_at_cursor.
                                 "show" => {
+                                    let rev = match (subarg, fileeditor::blamed_commit_at_cursor(tb)) {
+                                        (Some(rev), _) => rev.to_string(),
+                                        (None, Some(Ok(commit))) => commit,
+                                        (None, Some(Err(e))) => {
+                                            show_command_mode_error(&format!("bish: git: show: {e}"), app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                        (None, None) => "HEAD".to_string(),
+                                    };
                                     let rect = app.focused_pane_rect();
                                     let colors = syntax_color_overrides(&app.sessions[&session_id].shell);
-                                    match git_show_view(tb.path(), subarg.unwrap_or("HEAD"), Some(&colors), rect.rows, rect.cols) {
+                                    match git_show_view(tb.path(), &rev, Some(&colors), rect.rows, rect.cols) {
                                         Ok(view) => {
                                             run_review(app, view);
                                             return CommandModeOutcome::Cancelled;

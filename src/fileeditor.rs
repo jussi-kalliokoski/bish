@@ -4015,6 +4015,23 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Resul
     Ok(true)
 }
 
+// What `:git show` with no revision means while blame is on: the commit
+// the gutter names beside the cursor's line. `None` while blame is off,
+// so a plain `:git show` goes on meaning HEAD.
+//
+// A line with no commit behind it -- typed since, or not in the revision
+// blame was run against -- is an error that says so. Showing HEAD instead
+// would be showing a commit the gutter never named.
+pub(crate) fn blamed_commit_at_cursor(buf: &TextBuffer) -> Option<Result<String, String>> {
+    let blame = buf.blame.as_ref()?;
+    let (row, _) = buf.cursor();
+    Some(match blame.get(row).cloned().flatten() {
+        Some(line) if line.short_commit.chars().all(|c| c == '0') => Err("this line is not committed yet".to_string()),
+        Some(line) => Ok(line.short_commit),
+        None => Err("this line is not in the revision blame was run against".to_string()),
+    })
+}
+
 // `:git diff [REV]`'s own worker -- same "one command, two states" toggle
 // shape as toggle_git_blame just above, and the same reason it needs no
 // dirty-buffer refusal either: the comparison is between what git says
@@ -7475,6 +7492,32 @@ mod git_blame_tests {
         assert!(blame[0].is_some(), "`one` is unchanged since HEAD~1");
         assert!(blame[1].is_none(), "`TWO` only exists after HEAD~1");
         assert!(blame[2].is_none(), "`three` only exists after HEAD~1");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_commit_at_the_cursor_is_the_one_blame_names_for_that_line() {
+        if !crate::git::available() {
+            return;
+        }
+        let dir = repo_with_history("blame-show-test");
+        let rev = |name: &str| {
+            let out = std::process::Command::new("git").args(["rev-parse", name]).current_dir(&dir).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim()[..8].to_string()
+        };
+        // A line on disk that no commit has, before anything is blamed.
+        std::fs::write(dir.join("f.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
+        assert_eq!(blamed_commit_at_cursor(&buf), None, "with blame off there is nothing to say, so `:git show` stays HEAD");
+
+        assert!(toggle_git_blame(&mut buf, None).unwrap());
+        buf.set_cursor(0, 0);
+        assert_eq!(blamed_commit_at_cursor(&buf), Some(Ok(rev("HEAD~1"))), "`one` came in with the first commit");
+        buf.set_cursor(1, 0);
+        assert_eq!(blamed_commit_at_cursor(&buf), Some(Ok(rev("HEAD"))), "`TWO` with the second");
+        buf.set_cursor(3, 0);
+        assert_eq!(blamed_commit_at_cursor(&buf), Some(Err("this line is not committed yet".to_string())));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
