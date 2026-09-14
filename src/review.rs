@@ -209,17 +209,14 @@ impl Review {
             }
         }
         let rows_all = layout(mode, &header, &files, &hunks_all);
-        // A change that removes some lines and adds others is, line for
-        // line, most often the same lines rewritten: the first removed
-        // beside the first added, and so on for as many as both have.
+        // Which removed line of a change was rewritten into which added
+        // one -- see `pair_lines` -- and the words that differ in each.
         let mut changed = HashMap::new();
         for (f, hunk) in &hunks_all {
             let file = &files[*f];
-            for (old, new) in hunk.old.clone().zip(hunk.new.clone()) {
-                if let Some((was, is)) = changed_words(&file.old[old], &file.new[new]) {
-                    changed.insert((*f, 0, old), was);
-                    changed.insert((*f, 1, new), is);
-                }
+            for (old, new, rewrite) in pair_lines(&file.old[hunk.old.clone()], &file.new[hunk.new.clone()]) {
+                changed.insert((*f, 0, hunk.old.start + old), rewrite.was);
+                changed.insert((*f, 1, hunk.new.start + new), rewrite.is);
             }
         }
         Review {
@@ -617,6 +614,59 @@ fn paint(language: &str, lines: &[String], overrides: Option<&ColorOverrides>) -
 // The character ranges in one line that `changed_words` picks out.
 type Words = Vec<Range<usize>>;
 
+// One line rewritten into another: the words that differ on each side,
+// and how much of the line's visible text stayed as it was -- what
+// `pair_lines` weighs one pairing against another by.
+struct Rewrite {
+    was: Words,
+    is: Words,
+    kept: usize,
+}
+
+// Comparisons past which a change's lines are paired first with first,
+// second with second, rather than weighed against each other: fifty
+// removed lines beside fifty added.
+const ALIGN_LIMIT: usize = 2500;
+
+// Which of a change's removed lines was rewritten into which of its added
+// ones, as indices into the two, in order. The pairing chosen is the one
+// that keeps the most text unchanged across all its pairs, so a line
+// added above a rewritten one is left on its own rather than being
+// compared with the line it was added above -- which then goes unmarked
+// too. Only lines `changed_words` would mark can pair at all.
+fn pair_lines(old: &[String], new: &[String]) -> Vec<(usize, usize, Rewrite)> {
+    if old.len() * new.len() > ALIGN_LIMIT {
+        return old.iter().zip(new).enumerate().filter_map(|(i, (o, n))| changed_words(o, n).map(|r| (i, i, r))).collect();
+    }
+    let mut rewrites: Vec<Vec<Option<Rewrite>>> = old.iter().map(|o| new.iter().map(|n| changed_words(o, n)).collect()).collect();
+    // best[i][j]: the most text a pairing of the first i removed lines
+    // with the first j added ones keeps.
+    let mut best = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in 1..=old.len() {
+        for j in 1..=new.len() {
+            let paired = rewrites[i - 1][j - 1].as_ref().map_or(0, |r| best[i - 1][j - 1] + r.kept);
+            best[i][j] = best[i - 1][j].max(best[i][j - 1]).max(paired);
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (old.len(), new.len());
+    while i > 0 && j > 0 {
+        let paired = rewrites[i - 1][j - 1].as_ref().is_some_and(|r| best[i][j] == best[i - 1][j - 1] + r.kept);
+        if paired {
+            if let Some(rewrite) = rewrites[i - 1][j - 1].take() {
+                pairs.push((i - 1, j - 1, rewrite));
+            }
+            (i, j) = (i - 1, j - 1);
+        } else if best[i][j] == best[i - 1][j] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    pairs.reverse();
+    pairs
+}
+
 // Which words of a line differ from the line that replaced it, on each
 // side, as character ranges. A word is a run of letters, digits and `_`;
 // a run of whitespace is one token too, and anything else is a token of
@@ -624,7 +674,7 @@ type Words = Vec<Range<usize>>;
 //
 // `None` when most of the line changed: every word marked says nothing a
 // whole red or green line does not already say, and says it louder.
-fn changed_words(old: &str, new: &str) -> Option<(Words, Words)> {
+fn changed_words(old: &str, new: &str) -> Option<Rewrite> {
     let (old_tokens, new_tokens) = (tokens(old), tokens(new));
     let texts = |tokens: &[(Range<usize>, String)]| tokens.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
     let ops = crate::diff::diff(&texts(&old_tokens), &texts(&new_tokens));
@@ -648,7 +698,7 @@ fn changed_words(old: &str, new: &str) -> Option<(Words, Words)> {
     if total == 0 || marked * 5 > total * 3 {
         return None;
     }
-    Some((was, is))
+    Some(Rewrite { was, is, kept: total - marked })
 }
 
 // A line cut into the tokens `changed_words` compares, each with where it
@@ -854,6 +904,25 @@ mod tests {
         let review = Review::new("t", lines("alpha beta"), lines("gamma delta"), "text", 10, 80);
         let removed = review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
         assert!(!removed.contains(";7;"), "{removed:?}");
+    }
+
+    #[test]
+    fn a_line_added_above_a_rewritten_one_does_not_take_its_place() {
+        let review = Review::new("t", lines("let total = price * count;"), lines("// by amount now\nlet total = price * amount;"), "text", 10, 80);
+        let removed = review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
+        let comment = review.render_row(Row::Added { file: 0, line: 0, hunk: 0 });
+        let rewritten = review.render_row(Row::Added { file: 0, line: 1, hunk: 0 });
+        assert!(removed.contains("\x1b[0;7;31mcount"), "{removed:?}");
+        assert!(rewritten.contains("\x1b[0;7;32mamount"), "paired with the line it rewrote: {rewritten:?}");
+        assert!(!comment.contains(";7;"), "the line that was only added is compared with nothing: {comment:?}");
+    }
+
+    #[test]
+    fn lines_pair_in_order_by_what_they_keep() {
+        let old = lines("alpha beta gamma\ndelta epsilon zeta");
+        let new = lines("unrelated text here\nalpha beta GAMMA\ndelta epsilon ZETA");
+        let got: Vec<(usize, usize)> = pair_lines(&old, &new).into_iter().map(|(o, n, _)| (o, n)).collect();
+        assert_eq!(got, [(0, 1), (1, 2)]);
     }
 
     #[test]
