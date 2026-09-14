@@ -758,14 +758,18 @@ impl Server {
                             (
                                 "workspaceEdit".to_string(),
                                 Value::Object(vec![
-                                    // What bish can actually carry out. A
-                                    // server that would need to create,
-                                    // rename or delete a file is told so
-                                    // here, and the rename that needs one is
-                                    // refused rather than half-applied (see
-                                    // `lsp::WorkspaceEdit::unsupported`).
+                                    // What bish can carry out, and how: an
+                                    // edit may create, rename and delete
+                                    // files, and a step that fails undoes
+                                    // every step before it, so a project
+                                    // is never left half-changed (see
+                                    // `apply_workspace_edit`).
                                     ("documentChanges".to_string(), Value::Bool(true)),
-                                    ("resourceOperations".to_string(), Value::Array(Vec::new())),
+                                    (
+                                        "resourceOperations".to_string(),
+                                        Value::Array(["create", "rename", "delete"].iter().map(|kind| Value::Str(kind.to_string())).collect()),
+                                    ),
+                                    ("failureHandling".to_string(), Value::Str("undo".to_string())),
                                 ]),
                             ),
                             // Declared to match the policy rather than

@@ -698,19 +698,32 @@ fn text_edit(value: &Value) -> Option<TextEdit> {
     Some(TextEdit { start, end, text: text.clone() })
 }
 
+/// A change to a file itself rather than to its text -- one of the
+/// resource operations `documentChanges` can carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOperation {
+    Create { uri: String, overwrite: bool, ignore_if_exists: bool },
+    Rename { old_uri: String, new_uri: String, overwrite: bool, ignore_if_exists: bool },
+    Delete { uri: String, recursive: bool, ignore_if_not_exists: bool },
+}
+
 /// A change to a whole project: which files, and what to do to each.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceEdit {
     /// One entry per file, in the order the server gave them.
     pub changes: Vec<(String, Vec<TextEdit>)>,
-    /// Resource operations bish cannot perform -- creating, renaming or
-    /// deleting files -- named so the caller can say what it is
-    /// refusing.
+    /// Files to create, rename or delete, each with how many of
+    /// `changes` come before it. `documentChanges` is one list in one
+    /// order, and the order is part of the edit: rust-analyzer renames a
+    /// module's file and then edits the file under its new name.
+    pub operations: Vec<(usize, FileOperation)>,
+    /// Operations that could not be read -- a kind this has never heard
+    /// of, or one missing a URI it needs -- named so the caller can say
+    /// what it is refusing.
     ///
-    /// These are not ignorable. rust-analyzer sends a `RenameFile` when
-    /// the thing being renamed owns a module file, and applying only
-    /// the text half of that leaves the project broken. A caller that
-    /// sees any of these must do nothing at all.
+    /// These are not ignorable. Applying the rest of an edit without one
+    /// of its steps leaves the project broken, so a caller that sees any
+    /// of these must do nothing at all.
     pub unsupported: Vec<String>,
 }
 
@@ -727,7 +740,10 @@ pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
             // A resource operation names its own kind; a
             // `TextDocumentEdit` has none.
             if let Ok(Value::Str(kind)) = json::query(item, ".kind") {
-                edit.unsupported.push(kind.clone());
+                match file_operation(kind, item) {
+                    Some(operation) => edit.operations.push((edit.changes.len(), operation)),
+                    None => edit.unsupported.push(kind.clone()),
+                }
                 continue;
             }
             let Ok(Value::Str(uri)) = json::query(item, ".textDocument.uri") else { continue };
@@ -747,6 +763,30 @@ pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
         }
     }
     edit
+}
+
+// One resource operation, or `None` for a kind this does not know or one
+// without the URIs its kind needs. An option left out is false, which is
+// what the spec says it means.
+fn file_operation(kind: &str, item: &Value) -> Option<FileOperation> {
+    let uri = |at: &str| match json::query(item, at) {
+        Ok(Value::Str(uri)) => Some(uri.clone()),
+        _ => None,
+    };
+    let option = |name: &str| matches!(json::query(item, &format!(".options.{name}")), Ok(Value::Bool(true)));
+    match kind {
+        "create" => Some(FileOperation::Create { uri: uri(".uri")?, overwrite: option("overwrite"), ignore_if_exists: option("ignoreIfExists") }),
+        "rename" => Some(FileOperation::Rename {
+            old_uri: uri(".oldUri")?,
+            new_uri: uri(".newUri")?,
+            overwrite: option("overwrite"),
+            ignore_if_exists: option("ignoreIfExists"),
+        }),
+        "delete" => {
+            Some(FileOperation::Delete { uri: uri(".uri")?, recursive: option("recursive"), ignore_if_not_exists: option("ignoreIfNotExists") })
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1985,21 +2025,44 @@ mod tests {
         assert_eq!(edit.changes[0].0, "file:///c.rs");
     }
 
-    // The case that must not be silently half-applied: rust-analyzer
-    // sends a RenameFile when the renamed thing owns a module file, and
-    // doing only the text half leaves the project broken.
+    // rust-analyzer renames a module's file and then edits it under its
+    // new name, so where each operation sits among the text edits is
+    // part of what is read. An operation that cannot be read is still
+    // reported rather than dropped: doing the rest without it leaves the
+    // project broken.
     #[test]
-    fn resource_operations_are_reported_rather_than_ignored() {
-        let with_rename = json::parse(
-            r#"{"documentChanges":[
+    fn file_operations_are_read_in_their_place_among_the_text_edits() {
+        let edit = workspace_edit(
+            &json::parse(
+                r#"{"documentChanges":[
+                {"kind":"create","uri":"file:///new.rs","options":{"ignoreIfExists":true}},
                 {"textDocument":{"uri":"file:///a.rs","version":1},
                  "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
-                {"kind":"rename","oldUri":"file:///old.rs","newUri":"file:///new.rs"}]}"#,
-        )
-        .unwrap();
-        let edit = workspace_edit(&with_rename);
-        assert_eq!(edit.changes.len(), 1, "the text half is still read");
-        assert_eq!(edit.unsupported, vec!["rename".to_string()], "...and so is the half we cannot do");
+                {"kind":"rename","oldUri":"file:///old.rs","newUri":"file:///moved.rs","options":{"overwrite":true}},
+                {"kind":"delete","uri":"file:///gone","options":{"recursive":true}},
+                {"kind":"chmod","uri":"file:///x"},
+                {"kind":"rename","oldUri":"file:///only-one-side.rs"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(edit.changes.len(), 1, "the text half is read as before");
+        assert_eq!(
+            edit.operations,
+            vec![
+                (0, FileOperation::Create { uri: "file:///new.rs".into(), overwrite: false, ignore_if_exists: true }),
+                (
+                    1,
+                    FileOperation::Rename {
+                        old_uri: "file:///old.rs".into(),
+                        new_uri: "file:///moved.rs".into(),
+                        overwrite: true,
+                        ignore_if_exists: false
+                    }
+                ),
+                (1, FileOperation::Delete { uri: "file:///gone".into(), recursive: true, ignore_if_not_exists: false }),
+            ]
+        );
+        assert_eq!(edit.unsupported, vec!["chmod".to_string(), "rename".to_string()], "a kind never heard of, and a rename missing its target");
     }
 
     #[test]

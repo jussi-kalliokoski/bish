@@ -538,6 +538,13 @@ impl TextBuffer {
         self.path.as_deref()
     }
 
+    /// Points the buffer at the file its own has been renamed to. The
+    /// text, and whether it is saved, stay as they are: the file on disk
+    /// moved with its contents.
+    pub fn set_path(&mut self, path: &Path) {
+        self.path = Some(path.to_path_buf());
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

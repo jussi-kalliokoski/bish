@@ -20,6 +20,7 @@ mod editorconfig;
 mod encoding;
 mod exec;
 mod fileeditor;
+mod fileops;
 mod framing;
 mod git;
 mod gitignore;

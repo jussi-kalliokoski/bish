@@ -9979,8 +9979,10 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
         if !edit.unsupported.is_empty() {
             return Some(format!("that action also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
         }
-        if !edit.changes.is_empty() {
-            match apply_workspace_edit(&mut app.edit_frames, buf, edit, encoding) {
+        if !edit.changes.is_empty() || !edit.operations.is_empty() {
+            match apply_workspace_edit(&mut app.edit_frames, buf, edit, encoding, &mut |b: &mut TextBuffer, to: &Path| {
+                follow_rename(&mut app.sessions, session_id, b, to)
+            }) {
                 Ok((w, u)) => {
                     written += w;
                     unsaved += u;
@@ -10076,11 +10078,13 @@ fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer,
         // comment, and `lsp::WorkspaceEdit::unsupported`.
         return Err(format!("this rename also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
     }
-    if edit.changes.is_empty() {
+    if edit.changes.is_empty() && edit.operations.is_empty() {
         return Err("the language server had nothing to rename here".to_string());
     }
 
-    let (written, unsaved) = apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding)?;
+    let (written, unsaved) = apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding, &mut |b: &mut TextBuffer, to: &Path| {
+        follow_rename(&mut app.sessions, session_id, b, to)
+    })?;
     let mut message = format!("renamed to {new_name} in {} file{}", written + unsaved, if written + unsaved == 1 { "" } else { "s" });
     if unsaved > 0 {
         message.push_str(&format!(" ({unsaved} open, unsaved -- :w to keep)"));
@@ -10103,6 +10107,13 @@ fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer,
 // **not** open are written, because there is nowhere else for them to
 // go.
 //
+// Files an edit creates, renames or deletes are dealt with first, and
+// only once `fileops::plan` has found nothing to refuse. A text change
+// before a rename follows its file to where the rename puts it, and an
+// open buffer whose file moves moves with it -- `renamed` is told, so the
+// language server can be too. Anything that fails before a file holds
+// new text takes the file operations back.
+//
 // Shared by `:rename` and by code actions, which are the same operation
 // wearing different names.
 fn apply_workspace_edit(
@@ -10110,33 +10121,102 @@ fn apply_workspace_edit(
     buf: &mut TextBuffer,
     edit: &crate::lsp::WorkspaceEdit,
     encoding: crate::lsp::PositionEncoding,
+    renamed: &mut dyn FnMut(&mut TextBuffer, &Path),
 ) -> Result<(usize, usize), String> {
-    let here = buf.path().map(|p| p.to_path_buf());
+    use crate::fileops::Operation;
+    use crate::lsp::FileOperation;
+    let path_of = |uri: &str| {
+        crate::url::to_file_path(uri).ok_or_else(|| format!("the language server named {uri}, which is not a local file -- nothing changed"))
+    };
     // Phase one: work everything out, touching no disk.
+    let mut operations = Vec::new();
+    for (position, operation) in &edit.operations {
+        let operation = match operation {
+            FileOperation::Create { uri, overwrite, ignore_if_exists } => {
+                Operation::Create { path: path_of(uri)?, overwrite: *overwrite, ignore_if_exists: *ignore_if_exists }
+            }
+            FileOperation::Rename { old_uri, new_uri, overwrite, ignore_if_exists } => {
+                Operation::Rename { from: path_of(old_uri)?, to: path_of(new_uri)?, overwrite: *overwrite, ignore_if_exists: *ignore_if_exists }
+            }
+            FileOperation::Delete { uri, recursive, ignore_if_not_exists } => {
+                Operation::Delete { path: path_of(uri)?, recursive: *recursive, ignore_if_not_exists: *ignore_if_not_exists }
+            }
+        };
+        operations.push((*position, operation));
+    }
+    let unsaved: Vec<std::path::PathBuf> = std::iter::once(&*buf)
+        .chain(edit_frames.values().map(|session| &session.buffer))
+        .filter(|b| b.is_dirty())
+        .filter_map(|b| b.path().map(Path::to_path_buf))
+        .collect();
+    let plan = crate::fileops::plan(&operations, &unsaved).map_err(|why| format!("{why} -- nothing changed"))?;
+    // Every buffer is matched by where its file will be once the plan
+    // has run, and every text change by where the file it names will be.
+    let here = buf.path().map(|p| plan.follow(p));
     let mut in_this_buffer: Vec<crate::lsp::TextEdit> = Vec::new();
     let mut in_open_buffers: Vec<(EditFrameId, Vec<crate::lsp::TextEdit>)> = Vec::new();
-    let mut on_disk: Vec<(std::path::PathBuf, TextBuffer)> = Vec::new();
-    for (uri, edits) in &edit.changes {
-        let Some(path) = crate::url::to_file_path(uri) else {
-            return Err(format!("the language server named {uri}, which is not a local file -- nothing changed"));
-        };
+    let mut to_load: Vec<(std::path::PathBuf, Vec<crate::lsp::TextEdit>)> = Vec::new();
+    for (position, (uri, edits)) in edit.changes.iter().enumerate() {
+        // A file a later step deletes: whatever this change did to it
+        // would be deleted with it.
+        let Some(path) = plan.destination(position, &path_of(uri)?) else { continue };
         if here.as_deref() == Some(path.as_path()) {
             in_this_buffer = edits.clone();
             continue;
         }
-        if let Some((id, _)) = edit_frames.iter().find(|(_, s)| s.buffer.path() == Some(path.as_path())) {
+        if let Some((id, _)) = edit_frames.iter().find(|(_, s)| s.buffer.path().map(|p| plan.follow(p)).as_deref() == Some(path.as_path())) {
             in_open_buffers.push((*id, edits.clone()));
             continue;
         }
-        let mut loaded = TextBuffer::open(&path, 1).map_err(|e| format!("{}: {e} -- nothing changed", path.display()))?;
-        fileeditor::apply_text_edits(&mut loaded, edits, encoding);
+        to_load.push((path, edits.clone()));
+    }
+
+    // Phase two: the files themselves -- created, renamed and deleted,
+    // then read and edited in memory. A failure in any of that takes
+    // back every file operation, and nothing has changed.
+    let mut done = crate::fileops::commit(&plan).map_err(|why| format!("{why} -- nothing changed"))?;
+    let mut on_disk: Vec<(std::path::PathBuf, TextBuffer)> = Vec::new();
+    for (path, edits) in to_load {
+        let mut loaded = match TextBuffer::open(&path, 1) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                done.undo();
+                return Err(format!("{}: {e} -- nothing changed", path.display()));
+            }
+        };
+        fileeditor::apply_text_edits(&mut loaded, &edits, encoding);
         on_disk.push((path, loaded));
     }
 
-    // Phase two: commit.
+    // Phase three: commit the text.
     let written = on_disk.len();
-    for (path, mut loaded) in on_disk {
-        loaded.save(None).map_err(|e| format!("{}: {e} -- some files were already written", path.display()))?;
+    for (n, (path, mut loaded)) in on_disk.into_iter().enumerate() {
+        if let Err(e) = loaded.save(None) {
+            if n == 0 {
+                done.undo();
+                return Err(format!("{}: {e} -- nothing changed", path.display()));
+            }
+            // Files already hold their new text, under the names the
+            // operations gave them, so the operations stay.
+            done.finish();
+            return Err(format!("{}: {e} -- some files were already written", path.display()));
+        }
+    }
+    done.finish();
+    // Open buffers follow their files before taking their edits.
+    if let Some(from) = buf.path().map(Path::to_path_buf) {
+        let to = plan.follow(&from);
+        if to != from {
+            renamed(buf, &to);
+        }
+    }
+    for session in edit_frames.values_mut() {
+        if let Some(from) = session.buffer.path().map(Path::to_path_buf) {
+            let to = plan.follow(&from);
+            if to != from {
+                renamed(&mut session.buffer, &to);
+            }
+        }
     }
     for (id, edits) in &in_open_buffers {
         if let Some(session) = edit_frames.get_mut(id) {
@@ -10145,6 +10225,16 @@ fn apply_workspace_edit(
     }
     fileeditor::apply_text_edits(buf, &in_this_buffer, encoding);
     Ok((written, in_open_buffers.len() + usize::from(!in_this_buffer.is_empty())))
+}
+
+// An open buffer whose file an edit has just renamed. The language server
+// hears the document close under its old name and open under its new
+// one, which is what it would have heard had the file been closed and
+// opened again.
+fn follow_rename(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer, to: &Path) {
+    close_language_server_document(sessions, session_id, buf);
+    buf.set_path(to);
+    open_language_server_document(sessions, session_id, buf);
 }
 
 // `:fmt` through the language server. `None` when there is nothing to
@@ -10680,7 +10770,9 @@ fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer
                 failure = Some(format!("that command wanted to {} files, which bish cannot do -- nothing changed", edit.unsupported.join("/")));
                 false
             } else {
-                match apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding) {
+                match apply_workspace_edit(&mut app.edit_frames, buf, &edit, encoding, &mut |b: &mut TextBuffer, to: &Path| {
+                    follow_rename(&mut app.sessions, session_id, b, to)
+                }) {
                     Ok((w, u)) => {
                         written += w;
                         unsaved += u;
@@ -11974,6 +12066,125 @@ mod git_show_tests {
         let frame = from_nowhere.render(crate::window::Rect { row: 0, col: 0, rows: 30, cols: 60 });
         assert!(frame.contains("all of it"), "an untouched file opens at the top, header first: {frame:?}");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workspace_edit_tests {
+    use super::*;
+    use crate::lsp::{FileOperation, PositionEncoding, TextEdit, WorkspaceEdit};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bish-workspace-edit-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn uri(path: &Path) -> String {
+        crate::url::from_file_path(path)
+    }
+
+    fn replace(line: usize, from: usize, to: usize, text: &str) -> TextEdit {
+        TextEdit { start: (line, from), end: (line, to), text: text.to_string() }
+    }
+
+    // rust-analyzer's own shape for renaming a module that has a file of
+    // its own: the file moves, then it and whatever names it are edited.
+    #[test]
+    fn a_file_is_renamed_then_edited_by_its_new_name_and_its_open_buffer_follows() {
+        let dir = scratch("rename");
+        std::fs::write(dir.join("lib.rs"), "mod old;\n").unwrap();
+        std::fs::write(dir.join("old.rs"), "fn a() {}\n").unwrap();
+        let mut buf = TextBuffer::open(&dir.join("old.rs"), 10).unwrap();
+        let edit = WorkspaceEdit {
+            changes: vec![(uri(&dir.join("new.rs")), vec![replace(0, 3, 4, "b")]), (uri(&dir.join("lib.rs")), vec![replace(0, 4, 7, "new")])],
+            operations: vec![(
+                0,
+                FileOperation::Rename {
+                    old_uri: uri(&dir.join("old.rs")),
+                    new_uri: uri(&dir.join("new.rs")),
+                    overwrite: false,
+                    ignore_if_exists: false,
+                },
+            )],
+            unsupported: Vec::new(),
+        };
+        let mut followed = Vec::new();
+        let counts = apply_workspace_edit(&mut HashMap::new(), &mut buf, &edit, PositionEncoding::Utf16, &mut |b: &mut TextBuffer, to: &Path| {
+            followed.push(to.to_path_buf());
+            b.set_path(to);
+        })
+        .unwrap();
+        assert_eq!(counts, (1, 1), "lib.rs written; the open buffer edited and left for :w");
+        assert_eq!(std::fs::read_to_string(dir.join("lib.rs")).unwrap(), "mod new;\n");
+        assert!(!dir.join("old.rs").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("new.rs")).unwrap(), "fn a() {}\n", "on disk it is what was saved; the edit is in the buffer");
+        assert_eq!(followed, [dir.join("new.rs")]);
+        assert_eq!(buf.path(), Some(dir.join("new.rs").as_path()));
+        assert_eq!(fileeditor::buffer_text(&buf).lines().next(), Some("fn b() {}"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_takes_back_the_rename_before_it() {
+        let dir = scratch("undo");
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::create_dir(dir.join("not-a-file")).unwrap();
+        let edit = WorkspaceEdit {
+            changes: vec![(uri(&dir.join("not-a-file")), vec![replace(0, 0, 0, "x")])],
+            operations: vec![(
+                0,
+                FileOperation::Rename {
+                    old_uri: uri(&dir.join("a.txt")),
+                    new_uri: uri(&dir.join("b.txt")),
+                    overwrite: false,
+                    ignore_if_exists: false,
+                },
+            )],
+            unsupported: Vec::new(),
+        };
+        let why = apply_workspace_edit(
+            &mut HashMap::new(),
+            &mut TextBuffer::new_unnamed(10),
+            &edit,
+            PositionEncoding::Utf16,
+            &mut |_: &mut TextBuffer, _: &Path| {},
+        )
+        .unwrap_err();
+        assert!(why.ends_with("nothing changed"), "{why}");
+        assert!(dir.join("a.txt").exists() && !dir.join("b.txt").exists(), "the rename is taken back");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_operation_that_cannot_be_done_is_refused_before_any_text_changes() {
+        let dir = scratch("refused");
+        std::fs::write(dir.join("lib.rs"), "mod old;\n").unwrap();
+        let edit = WorkspaceEdit {
+            changes: vec![(uri(&dir.join("lib.rs")), vec![replace(0, 4, 7, "new")])],
+            operations: vec![(
+                1,
+                FileOperation::Rename {
+                    old_uri: uri(&dir.join("missing.rs")),
+                    new_uri: uri(&dir.join("new.rs")),
+                    overwrite: false,
+                    ignore_if_exists: false,
+                },
+            )],
+            unsupported: Vec::new(),
+        };
+        let why = apply_workspace_edit(
+            &mut HashMap::new(),
+            &mut TextBuffer::new_unnamed(10),
+            &edit,
+            PositionEncoding::Utf16,
+            &mut |_: &mut TextBuffer, _: &Path| {},
+        )
+        .unwrap_err();
+        assert_eq!(why, format!("{} does not exist -- nothing changed", dir.join("missing.rs").display()));
+        assert_eq!(std::fs::read_to_string(dir.join("lib.rs")).unwrap(), "mod old;\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
