@@ -20,6 +20,7 @@ use crate::bishedit::unicode_width::char_width;
 use crate::editor::Key;
 use crate::vt100::{Cell, CellAttrs, Color};
 use crate::window::Rect;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// One change: the lines of the old text it replaces, and the lines of
@@ -173,6 +174,11 @@ pub struct Review {
     // line. Empty until `highlighted`, and for a language with no
     // highlighter.
     paint: Vec<[Vec<Vec<StyledSpan>>; 2]>,
+    // The words that differ within a rewritten line, as character ranges,
+    // keyed by (file, side, line) -- see `changed_words`. Only lines
+    // paired inside a change have an entry, which is most lines having
+    // none.
+    changed: HashMap<(usize, usize, usize), Words>,
 }
 
 impl Review {
@@ -203,6 +209,19 @@ impl Review {
             }
         }
         let rows_all = layout(mode, &header, &files, &hunks_all);
+        // A change that removes some lines and adds others is, line for
+        // line, most often the same lines rewritten: the first removed
+        // beside the first added, and so on for as many as both have.
+        let mut changed = HashMap::new();
+        for (f, hunk) in &hunks_all {
+            let file = &files[*f];
+            for (old, new) in hunk.old.clone().zip(hunk.new.clone()) {
+                if let Some((was, is)) = changed_words(&file.old[old], &file.new[new]) {
+                    changed.insert((*f, 0, old), was);
+                    changed.insert((*f, 1, new), is);
+                }
+            }
+        }
         Review {
             title: title.to_string(),
             mode,
@@ -217,6 +236,7 @@ impl Review {
             height: rows.saturating_sub(2).max(1),
             cols,
             paint: Vec::new(),
+            changed,
         }
     }
 
@@ -478,6 +498,14 @@ impl Review {
             })
             .collect();
         let mut cells = highlight::compose(&chars, &[&whole, &syntax]);
+        // The words that changed, in reverse over whatever colour they
+        // are, so a rewritten line says which part of it was rewritten.
+        if let Some(words) = self.changed.get(&(file, side, line)) {
+            let reverse = CellAttrs { reverse: true, ..CellAttrs::default() };
+            let marks: Vec<StyledSpan> =
+                words.iter().map(|w| StyledSpan { start: w.start + offset, end: w.end + offset, fg: base, attrs: reverse }).collect();
+            highlight::compose_attrs(&mut cells, &marks);
+        }
         if gone {
             let struck = CellAttrs { dim: true, strikethrough: true, ..CellAttrs::default() };
             let end = cells.len();
@@ -581,6 +609,68 @@ fn paint(language: &str, lines: &[String], overrides: Option<&ColorOverrides>) -
                 out[line].push(StyledSpan { start, end, fg, attrs });
             }
             line += 1;
+        }
+    }
+    out
+}
+
+// The character ranges in one line that `changed_words` picks out.
+type Words = Vec<Range<usize>>;
+
+// Which words of a line differ from the line that replaced it, on each
+// side, as character ranges. A word is a run of letters, digits and `_`;
+// a run of whitespace is one token too, and anything else is a token of
+// its own, so `count;` to `amount;` is one word changed and not two.
+//
+// `None` when most of the line changed: every word marked says nothing a
+// whole red or green line does not already say, and says it louder.
+fn changed_words(old: &str, new: &str) -> Option<(Words, Words)> {
+    let (old_tokens, new_tokens) = (tokens(old), tokens(new));
+    let texts = |tokens: &[(Range<usize>, String)]| tokens.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+    let ops = crate::diff::diff(&texts(&old_tokens), &texts(&new_tokens));
+    let span = |tokens: &[(Range<usize>, String)], at: usize, len: usize| tokens[at].0.start..tokens[at + len - 1].0.end;
+    let (mut was, mut is) = (Vec::new(), Vec::new());
+    for op in ops {
+        match op {
+            crate::diff::DiffOp::Delete { a, len } => was.push(span(&old_tokens, a, len)),
+            crate::diff::DiffOp::Insert { b, len } => is.push(span(&new_tokens, b, len)),
+            crate::diff::DiffOp::Equal { .. } => {}
+        }
+    }
+    let visible = |text: &str, ranges: &[Range<usize>]| {
+        let chars: Vec<char> = text.chars().collect();
+        let total = chars.iter().filter(|c| !c.is_whitespace()).count();
+        let marked = ranges.iter().flat_map(|r| chars[r.clone()].iter()).filter(|c| !c.is_whitespace()).count();
+        (marked, total)
+    };
+    let ((marked_old, total_old), (marked_new, total_new)) = (visible(old, &was), visible(new, &is));
+    let (marked, total) = (marked_old + marked_new, total_old + total_new);
+    if total == 0 || marked * 5 > total * 3 {
+        return None;
+    }
+    Some((was, is))
+}
+
+// A line cut into the tokens `changed_words` compares, each with where it
+// is in the line's characters.
+fn tokens(text: &str) -> Vec<(Range<usize>, String)> {
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut out: Vec<(Range<usize>, String)> = Vec::new();
+    for (i, c) in text.chars().enumerate() {
+        match out.last_mut() {
+            Some((range, token)) if class(c) != 2 && token.chars().next().map(class) == Some(class(c)) => {
+                range.end = i + 1;
+                token.push(c);
+            }
+            _ => out.push((i..i + 1, c.to_string())),
         }
     }
     out
@@ -749,6 +839,27 @@ mod tests {
         let frame = plain(&review.render(Rect { row: 0, col: 0, rows: 10, cols: 120 }));
         assert!(frame.contains("file.rs  change 1 of 1"), "{frame}");
         assert!(frame.contains("0 accepted, 0 rejected, 1 to go"), "{frame}");
+    }
+
+    #[test]
+    fn a_rewritten_word_is_marked_and_the_rest_of_its_line_is_not() {
+        let review = Review::new("t", lines("let total = price * count;"), lines("let total = price * amount;"), "text", 10, 80);
+        let removed = review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
+        let added = review.render_row(Row::Added { file: 0, line: 0, hunk: 0 });
+        assert!(removed.starts_with("\x1b[0;31m- let total = price * \x1b[0;7;31mcount\x1b[0;31m;"), "{removed:?}");
+        assert!(added.starts_with("\x1b[0;32m+ let total = price * \x1b[0;7;32mamount\x1b[0;32m;"), "{added:?}");
+
+        // A line rewritten through and through is left as it was: all red,
+        // all green, nothing picked out.
+        let review = Review::new("t", lines("alpha beta"), lines("gamma delta"), "text", 10, 80);
+        let removed = review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
+        assert!(!removed.contains(";7;"), "{removed:?}");
+    }
+
+    #[test]
+    fn a_line_splits_into_words_spaces_and_single_marks() {
+        let got: Vec<String> = tokens("a_b  c;;d").into_iter().map(|(_, t)| t).collect();
+        assert_eq!(got, ["a_b", "  ", "c", ";", ";", "d"]);
     }
 
     #[test]
