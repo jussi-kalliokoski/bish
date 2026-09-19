@@ -6909,6 +6909,7 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.cursorshape = shell.bishopt_bool("cursorshape");
     buf.mouse = shell.bishopt_bool("mouse");
     buf.inlayhints = shell.bishopt_bool("inlayhints");
+    buf.matchbrackets = shell.bishopt_bool("matchbrackets");
     buf.iskeyword = shell.bishopt_str("iskeyword");
     buf.ignorecase = shell.bishopt_bool("ignorecase");
     buf.smartcase = shell.bishopt_bool("smartcase");

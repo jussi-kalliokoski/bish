@@ -17395,6 +17395,9 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("relativenumber", BishOptDefault::Bool(false)),
     ("ignorecase", BishOptDefault::Bool(false)),
     ("inlayhints", BishOptDefault::Bool(true)),
+    // On, as vim's own matchparen is: a bracket saying where its pair
+    // is, is what makes nested ones readable without counting.
+    ("matchbrackets", BishOptDefault::Bool(true)),
     ("smartcase", BishOptDefault::Bool(false)),
     // Whether a project's own `.editorconfig` wins over the settings
     // just below. On, it does -- a project's conventions are the point
@@ -17564,6 +17567,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("relativenumber", "Number lines by their distance from the cursor's."),
     ("ignorecase", "Ignore case when searching, unless smartcase says otherwise."),
     ("inlayhints", "Draw the language server's inline parameter-name and inferred-type hints."),
+    ("matchbrackets", "Mark the bracket under the cursor and the one it pairs with, where `%` would jump."),
     ("smartcase", "With ignorecase on, an uppercase letter in the pattern makes that one search case-sensitive again."),
     ("editorconfig", "Let a project's `.editorconfig` override the settings below it."),
     ("mouse", "Ask the terminal to report mouse events. Off gives the terminal's own selection back."),

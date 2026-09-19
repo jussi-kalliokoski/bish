@@ -4418,7 +4418,13 @@ fn fold_row(buf: &TextBuffer, line: usize, end: usize, width: usize) -> String {
 // Insert and Replace leave the cursor one past what was just typed, so
 // the bracket behind it counts there too -- which is what lights a pair
 // up as the closing half is typed, as vim's does.
+//
+// Nothing at all with `matchbrackets` off, which is also the one thing
+// that stops the search below from running on every redraw.
 fn matching_brackets(buf: &TextBuffer, mode: EditorMode) -> Vec<(usize, usize)> {
+    if !buf.matchbrackets {
+        return Vec::new();
+    }
     let (line, col) = buf.cursor();
     let here = motion::bracket_pair_at(buf, (line, col));
     let behind = (mode != EditorMode::Normal && col > 0).then(|| motion::bracket_pair_at(buf, (line, col - 1))).flatten();
@@ -6998,6 +7004,12 @@ mod pre_save_hook_tests {
         buf.set_cursor(0, 2);
         assert_eq!(frame(&buf, EditorMode::Insert).matches("\x1b[0;7m").count(), 2, "the pair behind the cursor");
         assert!(!frame(&buf, EditorMode::Normal).contains(";7m"), "and in Normal mode it does not");
+
+        // `bishopt --set matchbrackets off`, and nothing is marked.
+        buf.set_cursor(0, 1);
+        buf.matchbrackets = false;
+        assert!(!frame(&buf, EditorMode::Normal).contains(";7m"), "nothing marked with the option off");
+        assert!(!frame(&buf, EditorMode::Insert).contains(";7m"), "in Insert mode either");
     }
 
     // A spliced hint has to leave every one of `Row`'s promises intact,

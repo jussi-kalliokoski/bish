@@ -131,6 +131,11 @@ pub struct TextBuffer {
     /// Whether to draw them at all. On by default; `bishopt
     /// inlayhints=false` turns them off.
     pub inlayhints: bool,
+    /// Whether the bracket under the cursor and the one it pairs with are
+    /// marked -- the `matchbrackets` bishopt, copied here the way
+    /// `inlayhints` just above is. `bishopt --set matchbrackets off`
+    /// turns the marks off.
+    pub matchbrackets: bool,
     // A fingerprint of the file's bytes as of the last read or write, for
     // noticing that something else rewrote it since. `None` for a buffer
     // that is not a view of a file on disk at all.
@@ -359,6 +364,7 @@ impl TextBuffer {
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
             inlayhints: true,
+            matchbrackets: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -510,6 +516,7 @@ impl TextBuffer {
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
             inlayhints: true,
+            matchbrackets: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
@@ -1237,6 +1244,7 @@ mod tests {
             document_highlights: Vec::new(),
             inlay_hints: Vec::new(),
             inlayhints: true,
+            matchbrackets: true,
             diagnostics: Vec::new(),
             blame: None,
             diff: None,
