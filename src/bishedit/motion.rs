@@ -626,13 +626,31 @@ fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usi
             }
         }
     }
-    let start = start?;
+    partner_of(buf, start?, None)
+}
+
+// How far `bracket_pair_at` looks before giving up. `%` itself has no
+// budget -- it is typed once, and taking a moment to answer beats not
+// answering -- while the mark is worked out on every redraw, where an
+// unmatched bracket in a long file would otherwise be chased from end to
+// end between one keystroke and the next.
+const MATCH_LIMIT: usize = 20_000;
+
+// The bracket that closes the one at `start`, or opens it for a closing
+// one. `None` when nothing does -- and, given a `budget`, when nothing
+// does within that many characters.
+fn partner_of(buf: &impl Buffer, start: (usize, usize), budget: Option<usize>) -> Option<(usize, usize)> {
     let ch0 = buf.char_at(start.0, start.1)?;
     let (partner_char, is_opening) = bracket_partner(ch0)?;
     let mut depth = 1;
     let mut cur = start;
+    let mut steps = 0;
     loop {
         cur = if is_opening { step_forward(buf, cur)? } else { step_backward(buf, cur)? };
+        steps += 1;
+        if budget.is_some_and(|budget| steps > budget) {
+            return None;
+        }
         if let Some(c) = buf.char_at(cur.0, cur.1) {
             if c == ch0 {
                 depth += 1;
@@ -644,6 +662,19 @@ fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usi
             }
         }
     }
+}
+
+/// The bracket the cursor is *on* and the one it pairs with, for a caller
+/// that shows both at once -- which is what vim does, and what says where
+/// `%` would land before it is pressed.
+///
+/// Deliberately not `%`'s own rule: `%` scans forward to the first
+/// bracket on the line and jumps from there, where vim marks nothing at
+/// all unless the cursor is on a bracket itself. `None` for an unmatched
+/// bracket, and for one whose partner is further off than `MATCH_LIMIT`.
+pub fn bracket_pair_at(buf: &impl Buffer, pos: (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
+    bracket_partner(buf.char_at(pos.0, pos.1)?)?;
+    Some((pos, partner_of(buf, pos, Some(MATCH_LIMIT))?))
 }
 
 /// The word (contiguous run of word chars) at or after `pos`. If `pos`
@@ -3023,6 +3054,26 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 11));
         buf.set_cursor(0, 11);
         assert_eq!(go(&mut buf, Motion::MatchPair, None), (0, 7));
+    }
+
+    #[test]
+    fn a_bracket_pair_is_found_from_a_bracket_the_cursor_is_on_and_from_nothing_else() {
+        let mut buf = TestBuffer::new("foo(bar[baz]qux)end");
+        // `%` from here scans forward to the `(`; the mark says nothing,
+        // because vim's says nothing until the cursor is on one.
+        buf.set_cursor(0, 0);
+        assert_eq!(bracket_pair_at(&buf, buf.cursor()), None);
+        buf.set_cursor(0, 3);
+        assert_eq!(bracket_pair_at(&buf, buf.cursor()), Some(((0, 3), (0, 15))), "past the nested pair");
+        buf.set_cursor(0, 15);
+        assert_eq!(bracket_pair_at(&buf, buf.cursor()), Some(((0, 15), (0, 3))), "and back from the closing one");
+        buf.set_cursor(0, 7);
+        assert_eq!(bracket_pair_at(&buf, buf.cursor()), Some(((0, 7), (0, 11))));
+
+        // Nothing closes it, so there is nothing to mark.
+        let mut open = TestBuffer::new("foo(bar");
+        open.set_cursor(0, 3);
+        assert_eq!(bracket_pair_at(&open, open.cursor()), None);
     }
 
     #[test]

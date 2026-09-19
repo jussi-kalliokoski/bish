@@ -4412,6 +4412,22 @@ fn fold_row(buf: &TextBuffer, line: usize, end: usize, width: usize) -> String {
     format!("{sgr}{shown}\x1b[0m")
 }
 
+// The brackets to mark for the cursor where it is: the one it is on and
+// the one that closes or opens it, or neither.
+//
+// Insert and Replace leave the cursor one past what was just typed, so
+// the bracket behind it counts there too -- which is what lights a pair
+// up as the closing half is typed, as vim's does.
+fn matching_brackets(buf: &TextBuffer, mode: EditorMode) -> Vec<(usize, usize)> {
+    let (line, col) = buf.cursor();
+    let here = motion::bracket_pair_at(buf, (line, col));
+    let behind = (mode != EditorMode::Normal && col > 0).then(|| motion::bracket_pair_at(buf, (line, col - 1))).flatten();
+    match here.or(behind) {
+        Some((at, partner)) => vec![at, partner],
+        None => Vec::new(),
+    }
+}
+
 pub fn build_editor_frame(
     buf: &TextBuffer,
     vk: &VimKeys,
@@ -4426,6 +4442,9 @@ pub fn build_editor_frame(
     // What `hlsearch` should be drawing right now, worked out once for
     // the whole frame rather than per row.
     let search_pattern = active_search_pattern(vk, buf);
+    // The bracket the cursor is on and the one it pairs with, found once
+    // for the frame rather than per row -- see `matching_brackets`.
+    let matched_brackets = matching_brackets(buf, mode);
     // Reserves at least one column for content even if the gutter would
     // otherwise want more than the whole pane -- only reachable in a
     // pathologically narrow split, but `content_cols` below would
@@ -4561,7 +4580,17 @@ pub fn build_editor_frame(
             // The server's `documentHighlight` answer, kept on its own
             // axis so an occurrence keeps its colour and gains an
             // underline rather than losing one for the other.
-            let line_marks = map(spans_for_line(&buf.document_highlights, starts[line], line_len));
+            let mut line_marks = map(spans_for_line(&buf.document_highlights, starts[line], line_len));
+            // On that same axis, and for the same reason: a bracket keeps
+            // whatever colour its language gave it and gains the mark.
+            line_marks.extend(matched_brackets.iter().filter(|(at, _)| *at == line).filter_map(|(_, col)| {
+                to_window(&display, start_cell, avail, *col, *col + 1).map(|(start, end)| StyledSpan {
+                    start,
+                    end,
+                    fg: vt100::Color::Default,
+                    attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() },
+                })
+            }));
             let diag_styled = map(diagnostic_spans_for_line(buf, &buf.diagnostics, starts[line], line_len));
             let links: Vec<highlight::LinkSpan> = links_for_line(&whole_links, starts[line], line_len)
                 .into_iter()
@@ -6939,6 +6968,36 @@ mod pre_save_hook_tests {
         buf.document_highlights.clear();
         let cleared = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
         assert_eq!(cleared, plain, "clearing the marks restores exactly the unmarked frame");
+    }
+
+    // What `%` would jump onto, said before it is pressed -- and the
+    // bracket it would jump from, so a pair reads as a pair.
+    #[test]
+    fn the_bracket_under_the_cursor_and_the_one_it_pairs_with_are_both_marked() {
+        let mut buf = TextBuffer::new_unnamed(10);
+        buf.insert_text((0, 0), "f(a, g(b))");
+        let rect = Rect { row: 0, col: 0, rows: 4, cols: 40 };
+        let frame = |buf: &TextBuffer, mode| build_editor_frame(buf, &VimKeys::new(), mode, rect, 0, 0, None);
+
+        // On `f`, which is no bracket at all: nothing is marked, even
+        // though `%` from here would jump to the last `)`.
+        buf.set_cursor(0, 0);
+        let plain = frame(&buf, EditorMode::Normal);
+        assert!(!plain.contains(";7m"), "nothing marked yet:\n{plain:?}");
+
+        // On the outer `(`: it and the `)` that closes it, and neither of
+        // the inner pair between them.
+        buf.set_cursor(0, 1);
+        let marked = frame(&buf, EditorMode::Normal);
+        assert!(marked.contains("\x1b[0;7m(\x1b[0ma, g(b)"), "the opening bracket marked:\n{marked:?}");
+        assert!(marked.contains("\x1b[0;7m)\x1b[0m"), "the closing bracket marked:\n{marked:?}");
+        assert_eq!(marked.matches("\x1b[0;7m").count(), 2, "one mark each, and no more:\n{marked:?}");
+
+        // In Insert mode the cursor sits past what was just typed, so the
+        // bracket behind it is the one that counts.
+        buf.set_cursor(0, 2);
+        assert_eq!(frame(&buf, EditorMode::Insert).matches("\x1b[0;7m").count(), 2, "the pair behind the cursor");
+        assert!(!frame(&buf, EditorMode::Normal).contains(";7m"), "and in Normal mode it does not");
     }
 
     // A spliced hint has to leave every one of `Row`'s promises intact,
