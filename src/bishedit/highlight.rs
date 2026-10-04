@@ -51,6 +51,19 @@ pub struct HighlightContext<'a> {
     // paints a working command as an error. `None` at the ordinary
     // prompt, whose vocabulary is the shell's and nothing more.
     pub line_commands: Option<&'a [&'a str]>,
+    // The session's own `PATH`, which is what the command-validity check
+    // resolves a bare name against -- *not* the real process
+    // environment's. An exported variable no longer reaches the real
+    // environment at all (`export_to_environment` is a documented no-op;
+    // a child is built from the shell's own exported names instead), so
+    // `std::env::var("PATH")` is frozen at whatever bish inherited when
+    // it started. Anything that puts a directory on PATH afterwards -- a
+    // `.bishrc`, or a per-directory hook like mise's or direnv's, firing
+    // on every `cd` -- would otherwise have every command in that
+    // directory painted as an error while running perfectly well.
+    // `None` falls back to the real environment, for a context with no
+    // shell behind it (a test, `bish tool check`).
+    pub path: Option<&'a str>,
     // Unlike cwd/known_functions above, never read by the highlight_into
     // recursion itself (that step only ever produces a HighlightKind, not
     // a color) -- carried on this same bundle purely because every real
@@ -1145,7 +1158,7 @@ fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
     if name.contains('/') {
         return is_executable_file(Path::new(name));
     }
-    is_in_path(name)
+    is_in_path(name, ctx.path)
 }
 
 #[cfg(unix)]
@@ -1169,8 +1182,16 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
 // above). No caching, matching exec.rs's own real spawn path, which also
 // re-resolves PATH fresh every time rather than maintaining a command
 // cache.
-fn is_in_path(name: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else { return false };
+fn is_in_path(name: &str, path_var: Option<&str>) -> bool {
+    let inherited;
+    let path_var = match path_var {
+        Some(p) => p,
+        None => {
+            let Ok(v) = std::env::var("PATH") else { return false };
+            inherited = v;
+            &inherited
+        }
+    };
     path_var.split(':').any(|dir| is_executable_file(&Path::new(dir).join(name)))
 }
 
@@ -2292,6 +2313,35 @@ mod tests {
         // same assumption this whole feature already leans on for `man`.
         assert!(is_valid_command_name("true", &ctx));
         assert!(is_valid_command_name("ls", &ctx));
+    }
+
+    // The bug this guards: `export PATH="$PATH:$HOME/bin"` -- or a
+    // per-directory hook rewriting PATH on every `cd`, which is how
+    // mise and direnv work -- put a directory on the *session's* PATH,
+    // where every command bish runs resolves against it, while the real
+    // process environment kept the PATH bish started with. So `cargo`
+    // in a repo whose toolchain the hook had just activated ran fine
+    // and was painted as an error.
+    #[test]
+    fn a_bare_name_resolves_against_the_sessions_path_not_the_processs() {
+        let dir = crate::tempdir::TempDir::new("highlight-path-tests");
+        let exe = dir.path().join("bish-test-hookbin");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = dir.path().display().to_string();
+        let ctx = HighlightContext { path: Some(&path), ..HighlightContext::default() };
+        assert!(is_valid_command_name("bish-test-hookbin", &ctx));
+        // And the real environment is genuinely not consulted once a
+        // session has handed its own PATH over: `ls` is on every test
+        // runner's PATH and on no part of this one.
+        assert!(!is_valid_command_name("ls", &ctx));
+        // Falling back to the real environment is still what a context
+        // with no shell behind it gets.
+        assert!(is_valid_command_name("ls", &HighlightContext::default()));
     }
 
     #[test]

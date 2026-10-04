@@ -711,6 +711,12 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         // command-validity check needs (see HighlightContext's own doc
         // comment on why aliases are deliberately not included here too).
         let cwd_snapshot = app.sessions[&session_id].shell.cwd.clone();
+        // Same owned-snapshot pattern, and read per prompt rather than
+        // once per shell: a per-directory hook (mise, direnv) rewrites
+        // PATH on every `cd`, and the command-validity check has to see
+        // what the *session* has, not what the process inherited -- see
+        // HighlightContext::path.
+        let path_snapshot = app.sessions[&session_id].shell.raw_var_lookup("PATH");
         let known_functions: HashSet<String> = app.sessions[&session_id].shell.function_names().map(String::from).collect();
         // Same owned-snapshot pattern as cwd_snapshot/known_functions --
         // read_line's own abbrs param needs this session's current table
@@ -738,6 +744,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         let highlight_ctx = HighlightContext {
             cwd: Some(cwd_snapshot.as_path()),
             known_functions: Some(&known_functions),
+            path: Some(&path_snapshot),
             color_overrides: Some(&color_overrides),
             hyperlinks,
             // The shell prompt is the shell's whole vocabulary -- the
