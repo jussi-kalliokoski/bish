@@ -1195,16 +1195,26 @@ fn is_in_path(name: &str, path_var: Option<&str>) -> bool {
     path_var.split(':').any(|dir| is_executable_file(&Path::new(dir).join(name)))
 }
 
-// Command-name completion's PATH source: every executable filename on PATH
-// that starts with `prefix`, deduplicated. Filtered by prefix *before*
+// Command-name completion's PATH source: every executable filename on
+// `path_var` -- the session's own PATH, for the same reason
+// HighlightContext::path exists; `None` falls back to the real
+// environment's -- that starts with `prefix`, deduplicated. Filtered by prefix *before*
 // returning (not left to the caller's fuzzy step) so a single keystroke
 // never has to score every executable on the system. One read_dir per PATH
 // directory; a directory that fails to open (stale/nonexistent entry) is
 // silently skipped, same tolerance real PATH resolution already has. The
 // same name can legitimately live in multiple PATH dirs -- only the name
 // is returned, so first-found-wins is fine and a HashSet dedups it.
-pub(crate) fn enumerate_path_matches(prefix: &str) -> Vec<String> {
-    let Ok(path_var) = std::env::var("PATH") else { return Vec::new() };
+pub(crate) fn enumerate_path_matches(prefix: &str, path_var: Option<&str>) -> Vec<String> {
+    let inherited;
+    let path_var = match path_var {
+        Some(p) => p,
+        None => {
+            let Ok(v) = std::env::var("PATH") else { return Vec::new() };
+            inherited = v;
+            &inherited
+        }
+    };
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for dir in path_var.split(':') {
@@ -2400,12 +2410,10 @@ mod tests {
         assert!(!is_valid_command_name("/definitely/not/a/real/path/xyz", &ctx));
     }
 
-    // Real temp-dir fixture: prepends a stale (nonexistent) PATH entry and a
-    // real one containing an executable + a non-executable file, restoring
-    // PATH afterward. Prepending (rather than replacing) keeps the other
-    // PATH-reading tests in this module safe even if they happen to run
-    // concurrently, since every real PATH dir they depend on is still
-    // present throughout.
+    // Real temp-dir fixture: a stale (nonexistent) PATH entry ahead of a
+    // real one containing an executable + a non-executable file. Handed
+    // in rather than exported, so nothing else running in this test
+    // binary can see it.
     #[test]
     fn enumerate_path_matches_filters_by_prefix_and_executable_bit() {
         let dir = std::env::temp_dir().join(format!("bish-completion-test-{}", std::process::id()));
@@ -2419,20 +2427,10 @@ mod tests {
         }
         std::fs::write(dir.join("bish-test-plain"), b"not executable").unwrap();
 
-        let original_path = std::env::var("PATH").unwrap_or_default();
         let stale_dir = dir.join("does-not-exist-as-a-dir");
-        let new_path = format!("{}:{}:{}", stale_dir.display(), dir.display(), original_path);
+        let path = format!("{}:{}", stale_dir.display(), dir.display());
 
-        let matches = {
-            // SAFETY: no other thread in this test binary spawns child
-            // processes or otherwise depends on PATH being atomically
-            // consistent across this narrow window; the value is restored
-            // before returning.
-            unsafe { std::env::set_var("PATH", &new_path) };
-            let matches = enumerate_path_matches("bish-test-w");
-            unsafe { std::env::set_var("PATH", &original_path) };
-            matches
-        };
+        let matches = enumerate_path_matches("bish-test-w", Some(&path));
 
         std::fs::remove_dir_all(&dir).ok();
 

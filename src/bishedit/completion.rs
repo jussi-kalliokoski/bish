@@ -673,7 +673,19 @@ impl<'a> ShellCompletionProvider<'a> {
         if let Some(functions) = self.known_functions {
             names.extend(functions.iter().cloned());
         }
-        names.extend(highlight::enumerate_path_matches(prefix));
+        // The caller's own PATH scan (`Shell::action_context`, one per
+        // prompt, which is also what `compgen -c` answers from) rather
+        // than a second one here: it walked the *session's* PATH, which
+        // is the only one a typed command actually resolves against --
+        // see highlight.rs's HighlightContext::path. Scanning again here
+        // would be both a second read_dir per PATH directory per
+        // keystroke and the wrong PATH. Nothing but this module's own
+        // tests passes no context at all; those still get the real
+        // environment's.
+        match self.action_ctx {
+            Some(ctx) => names.extend(ctx.path_commands.iter().filter(|n| n.starts_with(prefix)).cloned()),
+            None => names.extend(highlight::enumerate_path_matches(prefix, None)),
+        }
         rank(prefix, names.into_iter().collect())
     }
 
@@ -1104,6 +1116,37 @@ mod tests {
         };
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
+    }
+
+    // Same bug as the command-validity check's: a session that put a
+    // directory on PATH after bish started (a `.bishrc`, or mise/direnv
+    // firing on every `cd`) saw a second, process-environment PATH scan
+    // here, so Tab would not offer a command that ran perfectly well.
+    #[test]
+    fn command_name_candidates_come_from_the_callers_own_path_scan() {
+        let ctx = compgen::ActionContext {
+            path_commands: vec!["zz-bish-hookbin".to_string(), "zz-bish-elsewhere".to_string()],
+            ..compgen::ActionContext::default()
+        };
+        let provider = ShellCompletionProvider {
+            cwd: None,
+            known_functions: None,
+            completions: None,
+            default_completion: None,
+            action_ctx: Some(&ctx),
+            functions_preamble: None,
+            honor_gitignore: false,
+            fignore: Vec::new(),
+            force_fignore: true,
+            hl_names: Vec::new(),
+        };
+        let names = display_names(provider.command_name_candidates("zz-bish-hook"));
+        assert!(names.iter().any(|n| n == "zz-bish-hookbin"), "{names:?}");
+        // Prefix-filtered, as the PATH scan it replaces was.
+        assert!(!names.iter().any(|n| n == "zz-bish-elsewhere"), "{names:?}");
+        // And the real environment's PATH is not consulted alongside it.
+        let names = display_names(provider.command_name_candidates("tru"));
+        assert!(!names.iter().any(|n| n == "true"), "{names:?}");
     }
 
     #[test]

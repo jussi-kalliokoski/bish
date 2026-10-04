@@ -4342,7 +4342,12 @@ impl Shell {
             jobs: jobs.jobs.iter().map(|j| j.cmd_text.clone()).collect(),
             running_jobs: jobs.jobs.iter().filter(|j| !j.stopped).map(|j| j.cmd_text.clone()).collect(),
             stopped_jobs: jobs.jobs.iter().filter(|j| j.stopped).map(|j| j.cmd_text.clone()).collect(),
-            path_commands: highlight::enumerate_path_matches(""),
+            // This session's own PATH, not the real environment's --
+            // see highlight.rs's HighlightContext::path for why the two
+            // are not the same thing (and `compgen -c` offering a
+            // command that no longer runs, or hiding one that does, is
+            // the same bug the command-validity check had).
+            path_commands: highlight::enumerate_path_matches("", Some(&self.raw_var_lookup("PATH"))),
         }
     }
 
