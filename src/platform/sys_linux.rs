@@ -88,3 +88,26 @@ pub(crate) const SIGTTOU: i32 = 22;
 // `signal(2)`'s "ignore this" handler, as a plain number because that is
 // what the C declaration takes.
 pub(crate) const SIG_IGN: usize = 1;
+
+// `ioctl(2)` request numbers for a terminal. Linux's are small
+// sequential constants; Darwin encodes the direction and the argument
+// size into them, so not one of these four agrees -- and an `ioctl` with
+// the wrong number fails with ENOTTY at best and asks the terminal for
+// something else entirely at worst.
+pub(crate) const TIOCGWINSZ: u64 = 0x5413;
+pub(crate) const TIOCSWINSZ: u64 = 0x5414;
+pub(crate) const TIOCSCTTY: u64 = 0x540E;
+pub(crate) const TIOCSPGRP: u64 = 0x5410;
+
+// The rest of the `open`/`fcntl` numbers, beside `O_CLOEXEC` above.
+// `O_RDWR` and the two `fcntl` commands are the same everywhere;
+// `O_NOCTTY` and `O_NONBLOCK` are not.
+pub(crate) const O_RDWR: i32 = 0o2;
+pub(crate) const O_NOCTTY: i32 = 0o400;
+pub(crate) const O_NONBLOCK: i32 = 0o4000;
+pub(crate) const F_GETFL: i32 = 3;
+pub(crate) const F_SETFL: i32 = 4;
+
+// `signal(2)`'s "do whatever you would have done" handler, the other
+// half of `SIG_IGN`.
+pub(crate) const SIG_DFL: usize = 0;

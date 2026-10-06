@@ -26,7 +26,7 @@
 //!   is not shown, not a wrong one -- and `O_EVTONLY` plus APFS's
 //!   nanosecond timestamps make it a narrow window to begin with.
 
-use super::unix::{DirSnapshot, EntryChange};
+use super::unix::{DirSnapshot, EntryChange, c_open};
 use super::{RawChange, RawEvent, WatchId};
 use std::collections::HashMap;
 use std::io;
@@ -37,13 +37,6 @@ use std::path::{Path, PathBuf};
 unsafe extern "C" {
     fn kqueue() -> i32;
     fn kevent(kq: i32, changes: *const KEvent, nchanges: i32, events: *mut KEvent, nevents: i32, timeout: *const TimeSpec) -> i32;
-    // Spelled exactly as `pty.rs` spells the same symbol, mode
-    // included: `open(2)` is variadic, and two differing non-variadic
-    // views of one C function is a hazard rather than a style
-    // difference. The mode is read only for `O_CREAT`, which this never
-    // passes, so it goes in as zero.
-    #[link_name = "open"]
-    fn c_open(path: *const i8, flags: i32, mode: i32) -> i32;
     fn close(fd: i32) -> i32;
 }
 

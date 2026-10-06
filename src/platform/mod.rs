@@ -152,7 +152,6 @@ mod os_guard {
         ("src/history.rs", 1, "locks the history file against another bish"),
         ("src/poll.rs", 6, "waits on a set of fds"),
         ("src/prompt.rs", 1, "whether the prompt belongs to root"),
-        ("src/pty.rs", 11, "opens a pty, sizes it, and makes it a session's controlling terminal"),
         ("src/repl.rs", 1, "reads a key without going through the editor"),
         ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
         ("src/session.rs", 6, "the session socket: who is on the other end, and the lock on it"),

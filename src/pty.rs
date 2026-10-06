@@ -1,13 +1,15 @@
-// Hand-rolled pseudo-terminal allocation and control, in the same
-// no-libc-crate, extern "C"-against-glibc style as term.rs. Provides the
-// primitive `Pty::open()` (allocate a master/slave pair) and
-// `spawn_attached()` (launch a child with the slave side as its
-// controlling terminal), plus TIOCGWINSZ/TIOCSWINSZ helpers. Full-screen
-// programs (vim, htop, less, ...) actively probe isatty()/TIOCGWINSZ and
-// misbehave without a real pty; a hidden window's job output also needs
-// to be captured on the master side rather than inherited straight to
-// bish's own real terminal fd. Consumed by the future VT100 emulator and
-// compositor -- this module only builds and owns the pty itself.
+// Pseudo-terminal allocation and control: `open()` for a master/slave
+// pair, `spawn_attached()` to launch a child with the slave side as its
+// controlling terminal, and the size helpers around them. Full-screen
+// programs (vim, htop, less, ...) probe isatty()/TIOCGWINSZ and misbehave
+// without a real pty, and a hidden window's job output has to be captured
+// on the master side rather than going straight to bish's own terminal.
+//
+// The syscalls and their numbers are in `platform`: which `ioctl` request
+// means "set the controlling terminal" is a different number on every
+// Unix, and what is left here is the part that is bish's -- when to
+// attach, what a child has to put back before it execs, and who owns
+// which end.
 //
 // Wired into exec.rs (run_single's background-job spawn path attaches a
 // pty when promoted and unredirected) and repl.rs (drives a fg'd job's
@@ -15,55 +17,17 @@
 // items here (e.g. Pty::resize) are for future callers.
 #![allow(dead_code)]
 
+use crate::platform;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Winsize {
-    pub rows: u16,
-    pub cols: u16,
-    pub xpixel: u16,
-    pub ypixel: u16,
-}
-
-// Linux x86_64 ioctl request numbers (stable/standard, same "safe to
-// hardcode" reasoning term.rs already uses for signal numbers).
-const TIOCGWINSZ: u64 = 0x5413;
-const TIOCSWINSZ: u64 = 0x5414;
-const TIOCSCTTY: u64 = 0x540E;
-const TIOCSPGRP: u64 = 0x5410;
-
-const O_RDWR: i32 = 0o2;
-const O_NOCTTY: i32 = 0o400;
-const F_SETFD: i32 = 2;
-const FD_CLOEXEC: i32 = 1;
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-const O_NONBLOCK: i32 = 0o4000;
-// Linux signal number (stable/standard -- see term.rs's own comment on
-// hardcoding these) and disposition constant for resetting SIGINT below.
-const SIGINT: i32 = 2;
-const SIG_DFL: usize = 0;
-
-unsafe extern "C" {
-    fn posix_openpt(flags: i32) -> i32;
-    fn grantpt(fd: i32) -> i32;
-    fn unlockpt(fd: i32) -> i32;
-    fn ptsname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
-    fn ioctl(fd: i32, request: u64, arg: usize) -> i32;
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-    fn setsid() -> i32;
-    fn signal(signum: i32, handler: usize) -> usize;
-    #[link_name = "open"]
-    fn c_open(path: *const i8, flags: i32, mode: i32) -> i32;
-    fn close(fd: i32) -> i32;
-    fn dup2(oldfd: i32, newfd: i32) -> i32;
-}
+/// A terminal's size. The platform layer's, because `struct winsize` is
+/// the kernel's; re-exported here because this is where bish asks.
+pub(crate) use crate::platform::Winsize;
 
 // A master/slave pty pair. `master` is the end bish itself reads/writes
 // (the "far end" of the terminal from the child's perspective); `slave_path`
@@ -76,67 +40,8 @@ pub struct Pty {
 }
 
 pub fn open() -> io::Result<Pty> {
-    let master_fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
-    if master_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Close-on-exec so ordinary child processes (external commands, not
-    // explicitly attached to this pty) never inherit the master fd.
-    unsafe { fcntl(master_fd, F_SETFD, FD_CLOEXEC) };
-
-    let setup = || -> io::Result<String> {
-        if unsafe { grantpt(master_fd) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { unlockpt(master_fd) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buf = [0u8; 64];
-        if unsafe { ptsname_r(master_fd, buf.as_mut_ptr(), buf.len()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(0);
-        Ok(String::from_utf8_lossy(&buf[..len]).into_owned())
-    };
-
-    match setup() {
-        Ok(slave_path) => Ok(Pty { master: unsafe { File::from_raw_fd(master_fd) }, slave_path }),
-        Err(e) => {
-            unsafe { close(master_fd) };
-            Err(e)
-        }
-    }
-}
-
-// Shared by spawn_attached's pre_exec closure below (a freshly forked
-// child attaching to a job's pty) and attach_self_to_pty (this same,
-// already-running process attaching *itself* to its own freshly-opened
-// pty pair, for a `bish session` daemon -- see that function's own doc
-// comment): setsid() to leave whatever session/process group is current
-// (a precondition for TIOCSCTTY to actually take), open the slave
-// fresh, make it the controlling terminal, dup2 onto 0/1/2.
-fn attach_current_process_to_pty_slave(slave_path: &CString) -> io::Result<()> {
-    unsafe {
-        if setsid() < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let slave_fd = c_open(slave_path.as_ptr(), O_RDWR, 0);
-        if slave_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if ioctl(slave_fd, TIOCSCTTY, 0) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for target in 0..3 {
-            if dup2(slave_fd, target) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        if slave_fd > 2 {
-            close(slave_fd);
-        }
-    }
-    Ok(())
+    let (master, slave_path) = platform::open_pty()?;
+    Ok(Pty { master, slave_path })
 }
 
 // Spawns `cmd` with its stdin/stdout/stderr replaced by a freshly-opened
@@ -172,8 +77,8 @@ pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
             // would silently inherit "ignore SIGINT" and never respond to
             // a forwarded Ctrl-C, even though the pty's line discipline
             // correctly raises the signal.
-            signal(SIGINT, SIG_DFL);
-            attach_current_process_to_pty_slave(&path)
+            platform::reset_signal(platform::SIGINT);
+            platform::attach_to_pty_slave(&path)
         });
     }
     Ok(())
@@ -193,23 +98,15 @@ pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
 // session.rs's SessionBridge for that half.
 pub fn attach_self_to_pty(slave_path: &str) -> io::Result<()> {
     let path = CString::new(slave_path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    attach_current_process_to_pty_slave(&path)
+    platform::attach_to_pty_slave(&path)
 }
 
 pub fn get_size(fd: RawFd) -> io::Result<Winsize> {
-    let mut ws = Winsize::default();
-    if unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize as usize) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ws)
+    platform::terminal_size(fd)
 }
 
 pub fn set_size(fd: RawFd, rows: u16, cols: u16) -> io::Result<()> {
-    let ws = Winsize { rows, cols, xpixel: 0, ypixel: 0 };
-    if unsafe { ioctl(fd, TIOCSWINSZ, &ws as *const Winsize as usize) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    platform::set_terminal_size(fd, rows, cols)
 }
 
 // Makes `pgrp` the controlling terminal's foreground process group --
@@ -223,20 +120,14 @@ pub fn set_size(fd: RawFd, rows: u16, cols: u16) -> io::Result<()> {
 // by exec.rs's callers -- losing this is a UX regression (Ctrl-Z would
 // misbehave again), not a correctness one.
 pub fn tcsetpgrp(fd: RawFd, pgrp: i32) -> io::Result<()> {
-    if unsafe { ioctl(fd, TIOCSPGRP, &pgrp as *const i32 as usize) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    platform::set_foreground_pgrp(fd, pgrp)
 }
 
 // Used by a poll-driven fg loop (repl.rs's drive_fg_job) so it can drain
 // whatever output has arrived on a job's pty master without ever
 // blocking on it.
 pub fn set_nonblocking(fd: RawFd) {
-    unsafe {
-        let flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
+    platform::set_nonblocking(fd);
 }
 
 impl Pty {

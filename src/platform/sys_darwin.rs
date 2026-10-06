@@ -90,3 +90,25 @@ pub(crate) const SIGTTIN: i32 = 21;
 pub(crate) const SIGTTOU: i32 = 22;
 
 pub(crate) const SIG_IGN: usize = 1;
+
+// `ioctl(2)` request numbers for a terminal, from <sys/ttycom.h>, where
+// they are built by `_IOR`/`_IOW`/`_IO` macros that pack the direction
+// and the argument's size in alongside the number: `TIOCGWINSZ` is
+// `_IOR('t', 104, struct winsize)`, which is 0x40087468, where Linux has
+// 0x5413. Nothing about using the wrong one is a build error.
+pub(crate) const TIOCGWINSZ: u64 = 0x4008_7468;
+pub(crate) const TIOCSWINSZ: u64 = 0x8008_7467;
+pub(crate) const TIOCSCTTY: u64 = 0x2000_7461;
+pub(crate) const TIOCSPGRP: u64 = 0x8004_7476;
+
+// `O_NOCTTY` and `O_NONBLOCK` are both different numbers here --
+// `O_NONBLOCK` is 4 against Linux's 2048, which is `O_NOCTTY`'s
+// neighbourhood there. Setting one and getting the other is the kind of
+// thing that makes a pty hang instead of fail.
+pub(crate) const O_RDWR: i32 = 0x0002;
+pub(crate) const O_NOCTTY: i32 = 0x0002_0000;
+pub(crate) const O_NONBLOCK: i32 = 0x0004;
+pub(crate) const F_GETFL: i32 = 3;
+pub(crate) const F_SETFL: i32 = 4;
+
+pub(crate) const SIG_DFL: usize = 0;

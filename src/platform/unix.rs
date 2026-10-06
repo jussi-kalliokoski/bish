@@ -171,6 +171,22 @@ impl DirSnapshot {
 }
 
 unsafe extern "C" {
+    // `open(2)` is variadic (`int open(const char *, int, ...)`), and one
+    // declaration of it for the whole directory rather than one per
+    // caller: two non-variadic views of the same C function with
+    // different argument counts is a hazard, and the compiler says so.
+    // The mode is read only for `O_CREAT`, which nothing here passes.
+    #[link_name = "open"]
+    pub(super) fn c_open(path: *const i8, flags: i32, mode: i32) -> i32;
+    fn posix_openpt(flags: i32) -> i32;
+    fn grantpt(fd: i32) -> i32;
+    fn unlockpt(fd: i32) -> i32;
+    fn ptsname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
+    fn setsid() -> i32;
+    fn ioctl(fd: i32, request: u64, arg: usize) -> i32;
+    fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
     fn tcgetattr(fd: i32, mode: *mut sys::Termios) -> i32;
     fn tcsetattr(fd: i32, actions: i32, mode: *const sys::Termios) -> i32;
     fn raise(signal: i32) -> i32;
@@ -303,6 +319,143 @@ pub(crate) fn read_bytes(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
             return Err(failure);
         }
     }
+}
+
+/// A terminal's size, in both cells and pixels.
+///
+/// `struct winsize` is four unsigned shorts in that order on every Unix
+/// bish targets, so unlike `Termios` this one layout serves both -- the
+/// `ioctl` numbers that carry it are what differ.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Winsize {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) xpixel: u16,
+    pub(crate) ypixel: u16,
+}
+
+/// A fresh pty: the master end, and the path of the slave end.
+///
+/// Only the path, never an open slave fd -- holding one would leak it
+/// into every child spawned from this process afterwards. The master is
+/// close-on-exec for the same reason: a child that was not deliberately
+/// attached to this pty has no business inheriting either end.
+pub(crate) fn open_pty() -> std::io::Result<(std::fs::File, String)> {
+    use std::os::fd::FromRawFd;
+
+    let master = unsafe { posix_openpt(sys::O_RDWR | sys::O_NOCTTY) };
+    if master < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { fcntl(master, sys::F_SETFD, sys::FD_CLOEXEC) };
+
+    let name = || -> std::io::Result<String> {
+        if unsafe { grantpt(master) } != 0 || unsafe { unlockpt(master) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = [0u8; 64];
+        if unsafe { ptsname_r(master, buf.as_mut_ptr(), buf.len()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+    };
+    match name() {
+        // SAFETY: a fresh descriptor from posix_openpt, owned by nothing
+        // else.
+        Ok(path) => Ok((unsafe { std::fs::File::from_raw_fd(master) }, path)),
+        Err(failure) => {
+            unsafe { close(master) };
+            Err(failure)
+        }
+    }
+}
+
+/// Makes `slave_path` this process's controlling terminal and its fd
+/// 0/1/2.
+///
+/// `setsid` first, and it is a precondition rather than tidiness:
+/// `TIOCSCTTY` only takes for a session leader with no controlling
+/// terminal yet. The `ioctl` is then explicit rather than relying on the
+/// first tty a session leader opens becoming its controlling terminal by
+/// itself -- true on Linux, and not something to depend on.
+///
+/// Called in two places: from a freshly forked child on its way to
+/// `exec`, and by a session daemon attaching *itself* to a pty of its own
+/// so that everything in bish which assumes a real terminal on 0/1/2
+/// keeps working untouched.
+pub(crate) fn attach_to_pty_slave(slave_path: &std::ffi::CStr) -> std::io::Result<()> {
+    unsafe {
+        if setsid() < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let slave = c_open(slave_path.as_ptr(), sys::O_RDWR, 0);
+        if slave < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if ioctl(slave, sys::TIOCSCTTY, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for target in 0..3 {
+            if dup2(slave, target) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if slave > 2 {
+            close(slave);
+        }
+    }
+    Ok(())
+}
+
+/// How big the terminal on `fd` is.
+pub(crate) fn terminal_size(fd: std::os::unix::io::RawFd) -> std::io::Result<Winsize> {
+    let mut size = Winsize::default();
+    match unsafe { ioctl(fd, sys::TIOCGWINSZ, &mut size as *mut Winsize as usize) } {
+        0 => Ok(size),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Tells the terminal on `fd` how big it now is -- for the pty bish owns
+/// the far end of, whose size is whatever bish says it is.
+pub(crate) fn set_terminal_size(fd: std::os::unix::io::RawFd, rows: u16, cols: u16) -> std::io::Result<()> {
+    let size = Winsize { rows, cols, xpixel: 0, ypixel: 0 };
+    match unsafe { ioctl(fd, sys::TIOCSWINSZ, &size as *const Winsize as usize) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Hands the terminal on `fd` to process group `pgrp`.
+///
+/// The other half of job control: `setpgid` puts a job in its own group,
+/// and this is what makes the terminal driver send its own signals --
+/// Ctrl-C, Ctrl-Z -- to that group rather than to bish.
+pub(crate) fn set_foreground_pgrp(fd: std::os::unix::io::RawFd, pgrp: i32) -> std::io::Result<()> {
+    match unsafe { ioctl(fd, sys::TIOCSPGRP, &pgrp as *const i32 as usize) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Stops reads on `fd` from blocking -- for a loop that drains whatever
+/// has arrived and gets on with the rest of its tick.
+pub(crate) fn set_nonblocking(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        let flags = fcntl(fd, sys::F_GETFL, 0);
+        fcntl(fd, sys::F_SETFL, flags | sys::O_NONBLOCK);
+    }
+}
+
+/// Puts `signal` back to whatever the OS would do with it by default.
+///
+/// For a child on its way to `exec`: bish ignores SIGINT for itself, and
+/// "ignore" is the one disposition POSIX carries *through* an exec, so a
+/// job would silently inherit it and never answer a Ctrl-C.
+pub(crate) fn reset_signal(signal_number: i32) {
+    unsafe { signal(signal_number, sys::SIG_DFL) };
 }
 
 #[cfg(test)]
