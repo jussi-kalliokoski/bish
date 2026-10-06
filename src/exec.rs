@@ -17697,10 +17697,7 @@ pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
 /// as a spawned child's `ChildStdout`, and the stage on the writing end
 /// of this one is not a child -- it is this shell.
 fn make_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    unsafe extern "C" {
-        fn pipe2(fds: *mut i32, flags: i32) -> i32;
-    }
-    // O_CLOEXEC, and it is load-bearing rather than hygiene. Both ends
+    // Close-on-exec, and it is load-bearing rather than hygiene. Both ends
     // are held by this shell while the *other* stages are spawned, so
     // without it every one of them inherits the write end -- and a
     // reader downstream then waits forever for an end-of-input that
@@ -17711,13 +17708,7 @@ fn make_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> 
     // through `dup2`, which clears the flag on the new descriptor: the
     // read end onto a spawned stage's fd 0, and the write end onto fd 1
     // for the stage running here.
-    const O_CLOEXEC: i32 = 0o2000000;
-    let mut fds = [0i32; 2];
-    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    use std::os::fd::FromRawFd;
-    Ok(unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) })
+    crate::platform::pipe_cloexec()
 }
 
 /// `make_pipe`, for the scheduler's own tests: they need a real pipe

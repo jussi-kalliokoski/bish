@@ -26,11 +26,15 @@
 //! to review and no way to tell a ported value from an unported one.
 //! Collected in one table per OS, they can be read side by side.
 //!
-//! # The three kinds of file
+//! # The kinds of file
 //!
 //! - `unix.rs` -- how a capability is *done* on a POSIX system, written
 //!   once for every such OS. The great majority of bish's OS use is of
-//!   this kind: a pty, a pipe, raw mode, a signal, a process group.
+//!   this kind: a pty, raw mode, a signal, a process group.
+//! - `linux.rs` / `darwin.rs` -- the capabilities where one body cannot
+//!   serve both, because the OSes do not offer the same call: `pipe2`
+//!   against `pipe` plus two `fcntl`s, `memfd_create` against a file
+//!   that is unlinked the moment it exists, inotify against kqueue.
 //! - `sys_linux.rs` / `sys_darwin.rs` -- what that OS's own numbers and
 //!   structs *are*. Tables, not logic, and the second kind of
 //!   difference above lives here and nowhere else.
@@ -39,9 +43,10 @@
 //!   not a Unix at all (a browser, an embedded runtime) replaces
 //!   `unix.rs`, and this surface is the contract it has to satisfy.
 //!
-//! `mod sys_tables` fails the build when one OS's table has a name the
-//! other's does not, so a port cannot half-happen: a constant added for
-//! Linux is a failure until macOS has one too.
+//! `mod sys_tables` pairs every `<name>_linux.rs` with its
+//! `<name>_darwin.rs` and fails the build when one of the two has a name
+//! the other does not, so a port cannot half-happen: a constant or a
+//! function added for Linux is a failure until macOS has one too.
 
 #[cfg(target_os = "linux")]
 #[path = "sys_linux.rs"]
@@ -57,7 +62,16 @@ compile_error!(
      and see src/platform/mod.rs for what belongs in it"
 );
 
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod os;
+
+#[cfg(target_os = "macos")]
+#[path = "darwin.rs"]
+mod os;
+
 mod unix;
+pub(crate) use os::*;
 pub(crate) use unix::*;
 
 #[cfg(test)]
@@ -76,7 +90,7 @@ mod os_guard {
         ("src/builtins/mod.rs", 4, "`test`'s own file questions: real and effective ids, access(2)"),
         ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
         ("src/editor.rs", 1, "reads a key from the terminal"),
-        ("src/exec.rs", 43, "the whole of job control: fds, pipes, signals, process groups, waiting"),
+        ("src/exec.rs", 42, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
         ("src/history.rs", 1, "locks the history file against another bish"),
         ("src/poll.rs", 6, "waits on a set of fds"),
@@ -205,19 +219,36 @@ mod sys_tables {
     #[test]
     fn linux_and_darwin_describe_the_same_things() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform");
-        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect("a platform table is readable");
-        let linux = exported_names(&read("sys_linux.rs"));
-        let darwin = exported_names(&read("sys_darwin.rs"));
-
-        let missing_from_darwin: Vec<&String> = linux.difference(&darwin).collect();
-        let missing_from_linux: Vec<&String> = darwin.difference(&linux).collect();
-        assert!(
-            missing_from_darwin.is_empty() && missing_from_linux.is_empty(),
-            "the two tables have to describe the same things, so that nothing bish calls is defined for one OS and not the other.\n  \
-             sys_darwin.rs is missing: {missing_from_darwin:?}\n  \
-             sys_linux.rs is missing: {missing_from_linux:?}\n  \
-             A name only one OS *has* still belongs in both -- give the other side the value it uses instead, or a stub that says it has none."
-        );
-        assert!(!linux.is_empty(), "the tables are empty, so this test is proving nothing");
+        let mut pairs = 0;
+        let mut problems: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("src/platform is readable").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Every Linux-side file, by either spelling: `linux.rs`
+            // itself, or `<something>_linux.rs`.
+            let Some(stem) = name.strip_suffix("linux.rs") else { continue };
+            let counterpart = format!("{stem}darwin.rs");
+            let Ok(darwin_source) = std::fs::read_to_string(dir.join(&counterpart)) else {
+                problems.push(format!("{name} has no {counterpart} beside it -- every Linux-side file needs the macOS half of itself"));
+                continue;
+            };
+            let linux = exported_names(&std::fs::read_to_string(entry.path()).expect("a platform file is readable"));
+            let darwin = exported_names(&darwin_source);
+            pairs += 1;
+            for (missing, from, source) in [
+                (linux.difference(&darwin).collect::<Vec<_>>(), &counterpart, &name),
+                (darwin.difference(&linux).collect::<Vec<_>>(), &name, &counterpart),
+            ] {
+                if !missing.is_empty() {
+                    problems.push(format!(
+                        "{from} is missing {missing:?}, which {source} has.\n     \
+                         Nothing bish calls may exist for one OS and not the other -- give that side the value or the body it uses instead, \
+                         or a stub that says it has none."
+                    ));
+                }
+            }
+            assert!(!linux.is_empty(), "{name} exposes nothing, so pairing it proves nothing");
+        }
+        assert!(problems.is_empty(), "\n  - {}", problems.join("\n  - "));
+        assert!(pairs >= 2, "only {pairs} pair(s) of platform files found, so this test is barely proving anything");
     }
 }
