@@ -8217,10 +8217,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: suspend: cannot suspend: no job control");
                     return ExecResult::Status(1);
                 }
-                unsafe extern "C" {
-                    fn getpid() -> i32;
-                }
-                send_signal(unsafe { getpid() } as u32, 19);
+                send_signal(std::process::id(), 19);
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
@@ -12181,9 +12178,9 @@ impl Shell {
                 // behavior for all of these once actually set.
                 match name {
                     "BASH_VERSION" => BASH_VERSION.to_string(),
-                    "PPID" => unsafe { getppid() }.to_string(),
-                    "UID" => unsafe { getuid() }.to_string(),
-                    "EUID" => unsafe { geteuid() }.to_string(),
+                    "PPID" => crate::platform::parent_process_id().to_string(),
+                    "UID" => crate::platform::real_user().to_string(),
+                    "EUID" => crate::platform::effective_user().to_string(),
                     "HOSTNAME" => get_hostname(),
                     // The path this shell was started from. `$0` is
                     // what it was *called* as, which is not the same
@@ -12194,7 +12191,9 @@ impl Shell {
                     // The same as `$$` here, where bash's differs
                     // inside a subshell, because a subshell here is
                     // not a process -- see run_in_child_shell.
-                    "BASHPID" => unsafe { getpid_raw() }.to_string(),
+                    // The real one, not a remembered one: a subshell
+                    // that is in fact this process still reports its own.
+                    "BASHPID" => std::process::id().to_string(),
                     "BASH_SUBSHELL" => self.subshell_depth.to_string(),
                     "BASH_COMMAND" => self.bash_command.to_string(),
                     // The `set -o` and `shopt` options currently on,
@@ -15104,16 +15103,6 @@ enum TrapAction {
 // narrow post-fork window; declared directly via extern "C" rather than
 // pulling in the `libc` crate, since libc is already linked into any
 // dynamically-linked Unix binary regardless.
-// $PPID/$UID/$EUID: raw libc calls declared directly via extern "C" (same
-// justification as dup2_stderr_to_stdout -- libc is already linked into
-// any dynamically-linked Unix binary, no external crate needed) since std
-// has no portable getppid/getuid/geteuid wrapper.
-unsafe extern "C" {
-    fn getppid() -> i32;
-    fn getuid() -> u32;
-    fn geteuid() -> u32;
-}
-
 /// The platform layer's, re-exported under the name the rest of this
 /// file has always used: POSIX has no query-only umask read, and what
 /// that costs is the layer's business.
@@ -15694,11 +15683,6 @@ fn xtrace_quote_word(value: &str) -> String {
     }
 }
 
-unsafe extern "C" {
-    #[link_name = "getpid"]
-    fn getpid_raw() -> i32;
-}
-
 // The variables lookup_var answers for without ever storing them.
 // Listed here so name enumeration -- `${!prefix*}`, completion -- can
 // see them too.
@@ -15720,10 +15704,9 @@ const COMPUTED_VAR_NAMES: &[&str] = &[
 ];
 
 pub fn get_hostname() -> String {
-    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        return s.trim_end().to_string();
-    }
-    std::env::var("HOSTNAME").unwrap_or_default()
+    // Asked of the OS rather than read out of /proc, which is Linux's
+    // alone -- `$HOSTNAME` stays the last resort, as it was.
+    crate::platform::hostname().or_else(|| std::env::var("HOSTNAME").ok()).unwrap_or_default()
 }
 
 // `${v@P}`'s own `\u`/`\$` helpers -- deliberately separate from
@@ -15735,10 +15718,7 @@ fn prompt_username() -> String {
 }
 
 fn is_effective_root() -> bool {
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    unsafe { geteuid() == 0 }
+    crate::platform::effective_user() == 0
 }
 
 // `\l`: basename of the controlling terminal's device name (bash reads
@@ -15746,16 +15726,8 @@ fn is_effective_root() -> bool {
 // real terminal, ttyname_r failing, ...) just gives an empty string,
 // same spirit as bash showing nothing useful there either in that case.
 fn tty_basename() -> String {
-    unsafe extern "C" {
-        fn ttyname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
-    }
-    let mut buf = [0u8; 256];
-    let ok = unsafe { ttyname_r(0, buf.as_mut_ptr(), buf.len()) == 0 };
-    if !ok {
-        return String::new();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    std::str::from_utf8(&buf[..end]).unwrap_or("").rsplit('/').next().unwrap_or("").to_string()
+    let Some(name) = crate::platform::terminal_name(0) else { return String::new() };
+    name.rsplit('/').next().unwrap_or("").to_string()
 }
 
 // `read -p`'s prompt only displays when input is coming from a terminal

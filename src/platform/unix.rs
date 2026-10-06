@@ -173,6 +173,10 @@ impl DirSnapshot {
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
     fn dup(fd: i32) -> i32;
+    fn getppid() -> i32;
+    fn getuid() -> u32;
+    fn ttyname_r(fd: i32, buf: *mut u8, len: usize) -> i32;
+    fn gethostname(buf: *mut u8, len: usize) -> i32;
     fn poll(fds: *mut PollFd, count: sys::NFds, timeout_ms: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -893,6 +897,46 @@ pub(crate) fn write_bytes(fd: std::os::unix::io::RawFd, bytes: &[u8]) -> std::io
 /// would otherwise be closed by the exec it was opened for.
 pub(crate) fn clear_cloexec(fd: std::os::unix::io::RawFd) {
     unsafe { fcntl(fd, sys::F_SETFD, 0) };
+}
+
+/// The process that started this one -- `$PPID`.
+pub(crate) fn parent_process_id() -> i32 {
+    unsafe { getppid() }
+}
+
+/// Who started this process, as opposed to who it is acting as -- `$UID`
+/// against `$EUID`.
+pub(crate) fn real_user() -> u32 {
+    unsafe { getuid() }
+}
+
+/// The device name of the terminal on `fd`, if it has one.
+///
+/// Best effort: a descriptor that is not a terminal, or a name that will
+/// not fit, gives `None` -- which is all a prompt can do with it anyway.
+pub(crate) fn terminal_name(fd: std::os::unix::io::RawFd) -> Option<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+/// This machine's name.
+///
+/// `gethostname(2)` rather than a file: bish used to read
+/// `/proc/sys/kernel/hostname`, which macOS does not have at all -- so
+/// `\h` in a prompt there would have been empty but for `$HOSTNAME`
+/// happening to be set.
+pub(crate) fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
