@@ -77,7 +77,7 @@ pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
             // would silently inherit "ignore SIGINT" and never respond to
             // a forwarded Ctrl-C, even though the pty's line discipline
             // correctly raises the signal.
-            platform::reset_signal(platform::SIGINT);
+            platform::default_signal(platform::SIGINT);
             platform::attach_to_pty_slave(&path)
         });
     }

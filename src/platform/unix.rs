@@ -173,6 +173,11 @@ impl DirSnapshot {
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
     fn dup(fd: i32) -> i32;
+    fn sigaction(signal: i32, action: *const sys::SigAction, previous: *mut sys::SigAction) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
+    fn setpgid(pid: i32, pgid: i32) -> i32;
+    fn getpgrp() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn getppid() -> i32;
     fn getuid() -> u32;
     fn ttyname_r(fd: i32, buf: *mut u8, len: usize) -> i32;
@@ -307,17 +312,6 @@ pub(crate) fn echoless_mode(from: &TerminalMode) -> TerminalMode {
     let mut silent = from.0;
     silent.c_lflag &= !sys::ECHO;
     TerminalMode(silent)
-}
-
-/// Makes this process ignore `signal` for the rest of its life.
-///
-/// The disposition is inherited by every forked child *and* survives
-/// exec: POSIX resets a real handler function to the default across an
-/// exec, and explicitly leaves "ignore" in place. So every site that
-/// forks a real child has to put it back by hand, or that child would
-/// silently ignore it too.
-pub(crate) fn ignore_signal(signal_number: i32) {
-    unsafe { signal(signal_number, sys::SIG_IGN) };
 }
 
 /// Sends `signal` to this process.
@@ -469,15 +463,6 @@ pub(crate) fn set_nonblocking(fd: std::os::unix::io::RawFd) {
         let flags = fcntl(fd, sys::F_GETFL, 0);
         fcntl(fd, sys::F_SETFL, flags | sys::O_NONBLOCK);
     }
-}
-
-/// Puts `signal` back to whatever the OS would do with it by default.
-///
-/// For a child on its way to `exec`: bish ignores SIGINT for itself, and
-/// "ignore" is the one disposition POSIX carries *through* an exec, so a
-/// job would silently inherit it and never answer a Ctrl-C.
-pub(crate) fn reset_signal(signal_number: i32) {
-    unsafe { signal(signal_number, sys::SIG_DFL) };
 }
 
 /// Which permission `is_accessible` is asking about.
@@ -937,6 +922,129 @@ pub(crate) fn hostname() -> Option<String> {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+// `signal(2)`'s two special handlers, as plain numbers because that is
+// what the C declaration takes. The same on every Unix.
+const HANDLER_DEFAULT: usize = 0;
+const HANDLER_IGNORE: usize = 1;
+
+/// Installs `handler` for `signal_number`, through `sigaction` rather
+/// than `signal`: it is the one with defined behaviour about what the
+/// handler inherits, and the one that can also report what the
+/// disposition was.
+///
+/// Only an async-signal-safe handler belongs here. bish's set a flag and
+/// return.
+pub(crate) fn handle_signal(signal_number: i32, handler: extern "C" fn(i32)) {
+    set_disposition(signal_number, handler as *const () as usize);
+}
+
+/// Puts `signal_number` back to what the OS would do with it.
+pub(crate) fn default_signal(signal_number: i32) {
+    set_disposition(signal_number, HANDLER_DEFAULT);
+}
+
+/// Makes this process ignore `signal_number`.
+///
+/// Inherited by every forked child *and* carried through an `exec`:
+/// POSIX resets a real handler to the default across one and explicitly
+/// leaves "ignore" in place. So every site that spawns a real child has
+/// to put it back with `default_signal`, or that child silently ignores
+/// it too -- which is how a job comes to not answer Ctrl-C.
+pub(crate) fn ignore_signal(signal_number: i32) {
+    set_disposition(signal_number, HANDLER_IGNORE);
+}
+
+fn set_disposition(signal_number: i32, handler: usize) {
+    let action = sys::SigAction { handler, ..sys::SigAction::default() };
+    unsafe { sigaction(signal_number, &action, std::ptr::null_mut()) };
+}
+
+/// Whether `signal_number` is being ignored right now.
+///
+/// POSIX: a signal ignored on entry to a shell cannot be trapped or
+/// reset, because the immunity was granted from outside -- `nohup`'s
+/// promise, and a backgrounded script's protection from a Ctrl-C aimed at
+/// the terminal. This is how bish finds out which those were.
+pub(crate) fn is_signal_ignored(signal_number: i32) -> bool {
+    let mut previous = sys::SigAction::default();
+    let asked = unsafe { sigaction(signal_number, std::ptr::null(), &mut previous) } == 0;
+    asked && previous.handler == HANDLER_IGNORE
+}
+
+/// Sends `signal_number` to one process.
+pub(crate) fn send_signal(pid: i32, signal_number: i32) -> bool {
+    unsafe { kill(pid, signal_number) == 0 }
+}
+
+/// Sends `signal_number` to a whole process group, which is what the
+/// terminal driver itself does for a Ctrl-C.
+pub(crate) fn send_signal_to_group(pgid: i32, signal_number: i32) -> bool {
+    unsafe { kill(-pgid, signal_number) == 0 }
+}
+
+/// Puts `pid` into process group `pgid` -- half of job control; handing
+/// the terminal to that group (`set_foreground_pgrp`) is the other.
+pub(crate) fn set_process_group(pid: i32, pgid: i32) -> bool {
+    unsafe { setpgid(pid, pgid) == 0 }
+}
+
+/// This process's own group.
+pub(crate) fn process_group() -> i32 {
+    unsafe { getpgrp() }
+}
+
+/// What became of a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Waited {
+    Exited(i32),
+    /// Killed by a signal -- the number, not bash's 128 + n, which is the
+    /// shell's own convention and not the OS's.
+    Killed(i32),
+    /// Stopped and still there, which `std::process::Child` cannot
+    /// observe at all: it has no way to ask for it, so a Ctrl-Z'd child
+    /// looks like one that is still running, for ever.
+    Stopped(i32),
+    /// Nothing has changed yet (only ever answered when not waiting).
+    Running,
+    /// There is nothing to wait for: already reaped, never ours, gone.
+    Gone,
+}
+
+/// Waits for one child, reporting a stop as well as an exit.
+///
+/// `block` of false asks without waiting. An interrupted wait is retried,
+/// since a signal arriving is not news about the child.
+///
+/// The status encoding -- the low seven bits for a signal, 0x7f for
+/// "stopped", the next eight for the code -- is the same on every Unix
+/// bish targets, so the decoding is here rather than in the tables.
+pub(crate) fn wait_for_child(pid: i32, block: bool) -> Waited {
+    const WNOHANG: i32 = 1;
+    const WUNTRACED: i32 = 2;
+
+    let options = if block { WUNTRACED } else { WNOHANG | WUNTRACED };
+    loop {
+        let mut status: i32 = 0;
+        let answer = unsafe { waitpid(pid, &mut status, options) };
+        if answer == 0 {
+            return Waited::Running;
+        }
+        if answer < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Waited::Gone;
+        }
+        if status & 0xff == 0x7f {
+            return Waited::Stopped((status >> 8) & 0xff);
+        }
+        return match status & 0x7f {
+            0 => Waited::Exited((status >> 8) & 0xff),
+            signal_number => Waited::Killed(signal_number),
+        };
+    }
 }
 
 #[cfg(test)]

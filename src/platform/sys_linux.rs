@@ -163,3 +163,69 @@ pub(crate) const SIGWINCH: i32 = 28;
 // call does not fail.
 pub(crate) const F_DUPFD_CLOEXEC: i32 = 1030;
 pub(crate) const F_GETFD: i32 = 1;
+
+// `struct sigaction` as glibc lays it out on Linux: the handler, then a
+// 128-byte signal set, the flags, and a restorer glibc fills in itself.
+// Darwin's is 16 bytes with a 32-bit set and no restorer at all, so a
+// struct of this shape passed there would be read as nonsense past the
+// handler -- and `sigaction` would be setting a mask out of whatever
+// happened to be on the stack.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct SigAction {
+    pub(crate) handler: usize,
+    pub(crate) mask: [u64; 16],
+    pub(crate) flags: i32,
+    pub(crate) restorer: usize,
+}
+
+// Job control's own signals. BSD renumbered these: `SIGSTOP` is 19 here
+// and 17 there, `SIGCONT` 18 against 19.
+pub(crate) const SIGCONT: i32 = 18;
+pub(crate) const SIGSTOP: i32 = 19;
+
+/// The highest signal number this OS has, which is what `trap` and
+/// `kill` accept up to. Linux's real-time range tops out at 64.
+pub(crate) const HIGHEST_SIGNAL: i32 = 64;
+
+/// Linux's real-time signals, which have no names of their own and are
+/// referred to as `RTMIN+n`.
+pub(crate) const REALTIME_SIGNALS: Option<(i32, i32)> = Some((34, 64));
+
+/// Name to number for every signal a script can trap here.
+///
+/// KILL and STOP are deliberately absent: neither can be caught or
+/// ignored, and bash refuses to let `trap` name them. The numbers are
+/// Linux's -- more than a third of them differ from Darwin's, which is
+/// why this is a table per OS rather than one shared list.
+pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("BUS", 7),
+    ("FPE", 8),
+    ("USR1", 10),
+    ("SEGV", 11),
+    ("USR2", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("STKFLT", 16),
+    ("CHLD", 17),
+    ("CONT", 18),
+    ("TSTP", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("URG", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("IO", 29),
+    ("PWR", 30),
+    ("SYS", 31),
+];

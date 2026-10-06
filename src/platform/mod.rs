@@ -87,7 +87,7 @@ pub(crate) use unix::*;
 pub(crate) use watch::DirWatch;
 // The signal numbers bish names. Facts about the OS, and two of them
 // differ: see either `sys_` table.
-pub(crate) use sys::{SIGHUP, SIGINT, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH};
+pub(crate) use sys::{HIGHEST_SIGNAL, REALTIME_SIGNALS, SIGCONT, SIGHUP, SIGINT, SIGNAL_NAMES, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH};
 
 /// One watched directory, as the OS identifies it.
 ///
@@ -143,7 +143,6 @@ mod os_guard {
     /// tree whether a declaration was added or moved out.
     const NOT_MOVED_YET: &[(&str, usize, &str)] = &[
         ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
-        ("src/exec.rs", 7, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/session.rs", 5, "the session socket: who is on the other end, and who is listening"),
     ];
 

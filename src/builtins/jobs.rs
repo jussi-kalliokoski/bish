@@ -247,9 +247,7 @@ pub(crate) fn run_fg(sh: &mut Shell, args: &[String]) -> ExecResult {
                 }
                 pty::tcsetpgrp(0, pgid as i32).ok();
                 let outcome = waitpid_untraced(job.pids[0]);
-                unsafe {
-                    pty::tcsetpgrp(0, getpgrp()).ok();
-                }
+                pty::tcsetpgrp(0, getpgrp()).ok();
                 return match outcome {
                     JobWaitOutcome::Exited(status) => ExecResult::Status(status),
                     JobWaitOutcome::Stopped(_sig) => {

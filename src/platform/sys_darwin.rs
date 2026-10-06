@@ -160,3 +160,68 @@ pub(crate) const SIGWINCH: i32 = 28;
 // -- see that table for what the wrong one costs.
 pub(crate) const F_DUPFD_CLOEXEC: i32 = 67;
 pub(crate) const F_GETFD: i32 = 1;
+
+// `struct sigaction` as macOS lays it out: a handler, a 32-bit signal
+// set, and the flags -- sixteen bytes against glibc's hundred and
+// fifty-two, with no restorer. See the Linux table for what crossing the
+// two would do.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct SigAction {
+    pub(crate) handler: usize,
+    pub(crate) mask: u32,
+    pub(crate) flags: i32,
+}
+
+// BSD's numbers: `SIGSTOP` 17 where Linux has 19, `SIGCONT` 19 where it
+// has 18. The two are each other's opposite, so crossing them would stop
+// a job that was asked to continue.
+pub(crate) const SIGCONT: i32 = 19;
+pub(crate) const SIGSTOP: i32 = 17;
+
+/// The highest signal number this OS has. No real-time range, so the
+/// named signals are all there is.
+pub(crate) const HIGHEST_SIGNAL: i32 = 31;
+
+/// macOS has no real-time signals at all.
+pub(crate) const REALTIME_SIGNALS: Option<(i32, i32)> = None;
+
+/// Name to number for every signal a script can trap here.
+///
+/// BSD's numbering, which differs from Linux's in eleven of these:
+/// `BUS` is 10 against 7, `USR1`/`USR2` are 30 and 31 against 10 and 12,
+/// `SYS` is 12 against 31, `URG` 16 against 23, and the job-control four
+/// are shuffled. `STKFLT`, `PWR` and Linux's `IO`-as-29 do not exist
+/// here; `EMT` and `INFO` do and Linux has no equivalent. KILL and STOP
+/// are absent for the same reason as in the other table.
+pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("EMT", 7),
+    ("FPE", 8),
+    ("BUS", 10),
+    ("SEGV", 11),
+    ("SYS", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("URG", 16),
+    ("TSTP", 18),
+    ("CONT", 19),
+    ("CHLD", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("IO", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("INFO", 29),
+    ("USR1", 30),
+    ("USR2", 31),
+];

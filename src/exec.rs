@@ -6102,9 +6102,9 @@ impl Shell {
         if background && self.opt_monitor {
             unsafe {
                 command.pre_exec(|| {
-                    setpgid(0, 0);
-                    sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
-                    sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                    crate::platform::set_process_group(0, 0);
+                    crate::platform::default_signal(crate::term::SIGTTIN);
+                    crate::platform::default_signal(crate::term::SIGTTOU);
                     Ok(())
                 });
             }
@@ -6115,7 +6115,7 @@ impl Shell {
                     let cmd_text = crate::serialize::serialize_command(cmd);
                     let pgid = if self.opt_monitor {
                         let pid = child.id() as i32;
-                        unsafe { setpgid(pid, pid) };
+                        crate::platform::set_process_group(pid, pid);
                         Some(pid as u32)
                     } else {
                         None
@@ -8150,7 +8150,7 @@ impl Shell {
                 // and never respond to Ctrl-C.
                 unsafe {
                     ext.pre_exec(|| {
-                        sigaction_raw(2, SIG_DFL);
+                        crate::platform::default_signal(crate::platform::SIGINT);
                         Ok(())
                     });
                 }
@@ -9342,13 +9342,13 @@ impl Shell {
                     }
                     if cmd_str == "-" {
                         self.traps.remove(&num);
-                        sigaction_raw(num, SIG_DFL);
+                        set_disposition(num, Disposition::Default);
                     } else if cmd_str.is_empty() {
                         self.traps.insert(num, TrapAction::Ignore);
-                        sigaction_raw(num, SIG_IGN);
+                        set_disposition(num, Disposition::Ignored);
                     } else {
                         self.traps.insert(num, TrapAction::Run(cmd_str.clone()));
-                        sigaction_raw(num, record_pending_signal as *const () as usize);
+                        set_disposition(num, Disposition::Trapped);
                     }
                 }
                 return ExecResult::Status(status);
@@ -9740,7 +9740,7 @@ impl Shell {
         if self.opt_monitor {
             unsafe {
                 command.pre_exec(|| {
-                    setpgid(0, 0);
+                    crate::platform::set_process_group(0, 0);
                     // bish ignores SIGTTIN/SIGTTOU for itself (see
                     // term::ignore_tty_signals), a disposition that
                     // survives exec() the same way SIGINT's does (see
@@ -9749,8 +9749,8 @@ impl Shell {
                     // moved to the background (`bg`) that tries to read
                     // the terminal would silently ignore SIGTTIN instead
                     // of correctly stopping.
-                    sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
-                    sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                    crate::platform::default_signal(crate::term::SIGTTIN);
+                    crate::platform::default_signal(crate::term::SIGTTOU);
                     Ok(())
                 });
             }
@@ -9761,7 +9761,7 @@ impl Shell {
             Ok(child) => {
                 let pid = child.id();
                 if self.opt_monitor {
-                    unsafe { setpgid(pid as i32, pid as i32) };
+                    crate::platform::set_process_group(pid as i32, pid as i32);
                 }
                 if background {
                     let mut cmd_text = argv.join(" ");
@@ -9779,9 +9779,7 @@ impl Shell {
                     // reclaim the terminal for bish either way.
                     pty::tcsetpgrp(0, pid as i32).ok();
                     let outcome = waitpid_untraced(pid);
-                    unsafe {
-                        pty::tcsetpgrp(0, getpgrp()).ok();
-                    }
+                    pty::tcsetpgrp(0, crate::platform::process_group()).ok();
                     self.drain_proc_subs();
                     match outcome {
                         JobWaitOutcome::Exited(status) => ExecResult::Status(status),
@@ -10447,9 +10445,9 @@ impl Shell {
                 let join_pgid = pgid;
                 unsafe {
                     command.pre_exec(move || {
-                        setpgid(0, join_pgid.unwrap_or(0));
-                        sigaction_raw(crate::term::SIGTTIN, SIG_DFL);
-                        sigaction_raw(crate::term::SIGTTOU, SIG_DFL);
+                        crate::platform::set_process_group(0, join_pgid.unwrap_or(0));
+                        crate::platform::default_signal(crate::term::SIGTTIN);
+                        crate::platform::default_signal(crate::term::SIGTTOU);
                         Ok(())
                     });
                 }
@@ -10468,7 +10466,7 @@ impl Shell {
                 Ok(mut child) => {
                     if background && self.opt_monitor {
                         let cpid = child.id() as i32;
-                        unsafe { setpgid(cpid, pgid.unwrap_or(cpid)) };
+                        crate::platform::set_process_group(cpid, pgid.unwrap_or(cpid));
                         if pgid.is_none() {
                             pgid = Some(cpid);
                         }
@@ -13644,22 +13642,13 @@ impl FgJob {
     // still running forever -- the same M11 gap Job::poll has for the
     // non-pty foreground path, fixed here for the pty-attached one.
     pub fn poll_untraced(&mut self) -> FgWait {
-        let pid = self.0.pids[0];
-        let mut status: i32 = 0;
-        let r = unsafe { waitpid(pid as i32, &mut status, WNOHANG | WUNTRACED) };
-        if r == 0 {
-            return FgWait::Running;
+        match crate::platform::wait_for_child(self.0.pids[0] as i32, false) {
+            crate::platform::Waited::Running => FgWait::Running,
+            crate::platform::Waited::Stopped(_) => FgWait::Stopped,
+            crate::platform::Waited::Killed(signum) => FgWait::Exited(128 + signum),
+            crate::platform::Waited::Exited(code) => FgWait::Exited(code),
+            crate::platform::Waited::Gone => FgWait::Exited(1),
         }
-        if r < 0 {
-            return FgWait::Exited(1);
-        }
-        if wait_status_stopped(status) {
-            return FgWait::Stopped;
-        }
-        if wait_status_signaled(status) {
-            return FgWait::Exited(128 + wait_status_term_sig(status));
-        }
-        FgWait::Exited(wait_status_exit_code(status))
     }
 }
 
@@ -15267,46 +15256,32 @@ fn restore_fd012(saved: [i32; 3]) {
 static PENDING_SIGNALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "C" fn record_pending_signal(sig: i32) {
+    // One bit per signal in a u64, so a number past 64 has nowhere to go
+    // -- which no OS bish runs on has, Linux's real-time range topping
+    // out exactly there.
     if (1..=64).contains(&sig) {
         PENDING_SIGNALS.fetch_or(1u64 << (sig - 1), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-// Layout matches glibc's `struct sigaction` on Linux x86_64: handler
-// pointer, then the 128-byte sigset_t (16 u64 words -- _NSIG/64 on this
-// platform), then the int flags, then the restorer pointer (glibc's own
-// sigaction() wrapper fills this in itself before the real syscall; it
-// doesn't need to be set here).
-#[repr(C)]
-struct SigActionRaw {
-    sa_handler: usize,
-    sa_mask: [u64; 16],
-    sa_flags: i32,
-    sa_restorer: usize,
+/// What `trap` does to one signal.
+///
+/// Named rather than the three raw handler values, because what the OS
+/// takes for "default" and "ignore" is the layer's business -- and
+/// because `Trapped` is the only one of the three that is a real
+/// function, which is what makes it the only one an `exec` resets.
+enum Disposition {
+    Default,
+    Ignored,
+    Trapped,
 }
 
-const SIG_DFL: usize = 0;
-const SIG_IGN: usize = 1;
-
-fn sigaction_raw(signum: i32, handler: usize) {
-    unsafe extern "C" {
-        fn sigaction(signum: i32, act: *const SigActionRaw, oldact: *mut SigActionRaw) -> i32;
+fn set_disposition(signum: i32, what: Disposition) {
+    match what {
+        Disposition::Default => crate::platform::default_signal(signum),
+        Disposition::Ignored => crate::platform::ignore_signal(signum),
+        Disposition::Trapped => crate::platform::handle_signal(signum, record_pending_signal),
     }
-    let act = SigActionRaw { sa_handler: handler, sa_mask: [0; 16], sa_flags: 0, sa_restorer: 0 };
-    unsafe {
-        sigaction(signum, &act, std::ptr::null_mut());
-    }
-}
-
-/// What a signal's disposition currently is, asking rather than setting
-/// -- the `oldact` half of the same call.
-fn sigaction_current(signum: i32) -> Option<usize> {
-    unsafe extern "C" {
-        fn sigaction(signum: i32, act: *const SigActionRaw, oldact: *mut SigActionRaw) -> i32;
-    }
-    let mut old = SigActionRaw { sa_handler: 0, sa_mask: [0; 16], sa_flags: 0, sa_restorer: 0 };
-    let ok = unsafe { sigaction(signum, std::ptr::null(), &mut old) } == 0;
-    ok.then_some(old.sa_handler)
 }
 
 /// The signals that were already ignored when this process started.
@@ -15333,7 +15308,7 @@ static IGNORED_AT_ENTRY: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::ne
 /// first shell exists, and a `Shell` built later (a subshell, a test)
 /// must see the same answer rather than whatever is current by then.
 pub fn record_signals_ignored_at_entry() {
-    let _ = IGNORED_AT_ENTRY.set(SIGNAL_NAMES.iter().filter(|(_, num)| sigaction_current(*num) == Some(SIG_IGN)).map(|(_, num)| *num).collect());
+    let _ = IGNORED_AT_ENTRY.set(SIGNAL_NAMES.iter().filter(|(_, num)| crate::platform::is_signal_ignored(*num)).map(|(_, num)| *num).collect());
 }
 
 /// Whether `trap` has to leave this one alone. False for every signal
@@ -15352,7 +15327,7 @@ fn ignored_at_entry(signum: i32) -> bool {
 // terminal-size-dependent state (every session's Screen, the tab bar) --
 // ever saw it. Same async-signal-safety reasoning as record_pending_signal:
 // the handler only stores a bool.
-pub const SIGWINCH: i32 = 28;
+pub const SIGWINCH: i32 = crate::platform::SIGWINCH;
 static WINCH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn record_winch(_sig: i32) {
@@ -15362,7 +15337,7 @@ extern "C" fn record_winch(_sig: i32) {
 // Called once, at interactive startup, so the compositor loop in repl.rs
 // can later poll take_winch() to notice terminal resizes.
 pub fn install_winch_handler() {
-    sigaction_raw(SIGWINCH, record_winch as *const () as usize);
+    crate::platform::handle_signal(SIGWINCH, record_winch);
 }
 
 // True at most once per resize -- clears the flag on read. repl.rs polls
@@ -15392,37 +15367,9 @@ fn inherited_shell_pid() -> Option<u32> {
     value.parse().ok()
 }
 
-pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("STKFLT", 16),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
+/// The layer's, under the name this file has always used: the numbers
+/// are the OS's and a third of them differ between the two.
+pub(crate) use crate::platform::SIGNAL_NAMES;
 
 /// The real-time range. Linux numbers it 34..64 and reserves 32 and 33
 /// for the thread library, which is why `kill -l` has a gap there --
@@ -15432,32 +15379,38 @@ pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
 /// the lower half from the bottom and the upper half from the top, and
 /// the halves meet in the middle. `kill -l 49` is `RTMIN+15` and
 /// `kill -l 50` is `RTMAX-14`.
-pub(crate) const SIGRTMIN: i32 = 34;
-pub(crate) const SIGRTMAX: i32 = 64;
+/// Where this OS's real-time range runs from and to, if it has one at
+/// all: macOS does not, and there `realtime_signal_name` and its number
+/// counterpart answer `None` for everything.
+fn realtime_range() -> Option<(i32, i32)> {
+    crate::platform::REALTIME_SIGNALS
+}
 
 fn realtime_signal_name(num: i32) -> Option<String> {
-    if !(SIGRTMIN..=SIGRTMAX).contains(&num) {
+    let (first, last) = realtime_range()?;
+    if !(first..=last).contains(&num) {
         return None;
     }
-    let above_min = num - SIGRTMIN;
-    let below_max = SIGRTMAX - num;
+    let above_min = num - first;
+    let below_max = last - num;
     Some(match (above_min, below_max) {
         (0, _) => "RTMIN".to_string(),
         (_, 0) => "RTMAX".to_string(),
-        _ if above_min <= (SIGRTMAX - SIGRTMIN) / 2 => format!("RTMIN+{above_min}"),
+        _ if above_min <= (last - first) / 2 => format!("RTMIN+{above_min}"),
         _ => format!("RTMAX-{below_max}"),
     })
 }
 
 fn realtime_signal_number(bare: &str) -> Option<i32> {
+    let (first, last) = realtime_range()?;
     let num = match (bare.strip_prefix("RTMIN"), bare.strip_prefix("RTMAX")) {
-        (Some(""), _) => SIGRTMIN,
-        (_, Some("")) => SIGRTMAX,
-        (Some(rest), _) => SIGRTMIN + rest.strip_prefix('+')?.parse::<i32>().ok()?,
-        (_, Some(rest)) => SIGRTMAX - rest.strip_prefix('-')?.parse::<i32>().ok()?,
+        (Some(""), _) => first,
+        (_, Some("")) => last,
+        (Some(rest), _) => first + rest.strip_prefix('+')?.parse::<i32>().ok()?,
+        (_, Some(rest)) => last - rest.strip_prefix('-')?.parse::<i32>().ok()?,
         (None, None) => return None,
     };
-    (SIGRTMIN..=SIGRTMAX).contains(&num).then_some(num)
+    (first..=last).contains(&num).then_some(num)
 }
 
 // The two `trap` must refuse, kept out of SIGNAL_NAMES precisely so
@@ -15467,13 +15420,15 @@ fn realtime_signal_number(bare: &str) -> Option<i32> {
 // is the other, and is the case this comment used to leave out.
 // `kill -KILL` was refused for as long as it did, which is a strange
 // thing for a shell not to accept -- see `kill_signal_number`.
-pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", 19)];
+pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", crate::platform::SIGSTOP)];
 
 /// Every signal by name and number, in numeric order -- the named ones
 /// and the whole real-time range after them.
 pub(crate) fn all_signals() -> Vec<(String, i32)> {
     let mut all: Vec<(String, i32)> = SIGNAL_NAMES.iter().chain(UNCATCHABLE_SIGNALS.iter()).map(|(name, num)| ((*name).to_string(), *num)).collect();
-    all.extend((SIGRTMIN..=SIGRTMAX).filter_map(|n| realtime_signal_name(n).map(|name| (name, n))));
+    if let Some((first, last)) = realtime_range() {
+        all.extend((first..=last).filter_map(|n| realtime_signal_name(n).map(|name| (name, n))));
+    }
     all.sort_by_key(|(_, n)| *n);
     all
 }
@@ -15505,7 +15460,7 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
     // rejects `trap x 99999` rather than recording a trap for a signal
     // that can never arrive. 64 is Linux's highest (the real-time
     // range tops out there).
-    bare.parse::<i32>().ok().filter(|n| (1..=64).contains(n))
+    bare.parse::<i32>().ok().filter(|n| (1..=crate::platform::HIGHEST_SIGNAL).contains(n))
 }
 
 fn signal_name(num: i32) -> String {
@@ -15513,47 +15468,24 @@ fn signal_name(num: i32) -> String {
 }
 
 pub(crate) fn send_signal(pid: u32, sig: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    unsafe { kill(pid as i32, sig) == 0 }
+    crate::platform::send_signal(pid as i32, sig)
 }
 
 // kill(2) with a negative pid targets the whole process group (POSIX) --
 // used to SIGCONT/SIGTERM/etc. a real-job-control job (Job::pgid) as a
 // unit, matching how the terminal driver itself would signal it.
 pub(crate) fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    unsafe { kill(-(pgid as i32), sig) == 0 }
+    crate::platform::send_signal_to_group(pgid as i32, sig)
 }
 
-// Real job control (M11): SIGCONT, used to resume a Stopped job (Job::
-// stopped) from `fg`/`bg`. Linux/glibc's standard number, same "safe to
-// hardcode" reasoning as this file's other signal constants.
-pub(crate) const SIGCONT: i32 = 18;
-// SIGSTOP: used by FgJob::send_stop instead of SIGTSTP -- see its own
-// doc comment for why the catchable version doesn't reliably work here.
-const SIGSTOP: i32 = 19;
-
-unsafe extern "C" {
-    fn setpgid(pid: i32, pgid: i32) -> i32;
-    pub(crate) fn getpgrp() -> i32;
-    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-}
-
-// WUNTRACED: makes waitpid additionally report a child that's stopped
-// (not just exited/signaled) -- Rust's Child::wait/try_wait never pass
-// this, so they can never observe a Ctrl-Z-stopped child (it just looks
-// like it's still running to them, forever). Real job control needs to
-// tell "stopped" apart from "still running" and "exited", hence this
-// raw waitpid wrapper instead.
-const WUNTRACED: i32 = 2;
-// WNOHANG: don't block if the child hasn't changed state -- used by
-// FgJob::poll_untraced, which (unlike waitpid_untraced) is a per-tick
-// poll, not a wait.
-const WNOHANG: i32 = 1;
+// Real job control: SIGCONT resumes a Stopped job from `fg`/`bg`, and
+// SIGSTOP is what FgJob::send_stop uses instead of SIGTSTP -- see its own
+// doc comment for why the catchable one does not reliably work here. Both
+// from the layer: BSD renumbered them, and they are each other's
+// opposite, so a wrong number would stop a job asked to continue.
+/// This process's own group, under the name `builtins::jobs` asks for.
+pub(crate) use crate::platform::process_group as getpgrp;
+pub(crate) use crate::platform::{SIGCONT, SIGSTOP};
 
 // How a real-job-control wait (waitpid_untraced) ended.
 pub(crate) enum JobWaitOutcome {
@@ -15577,26 +15509,6 @@ pub(crate) enum JobWaitOutcome {
 // std doesn't expose a way to inspect a raw waitpid status at all (only
 // ExitStatus, built from the exited/signaled cases exec_code_from_status
 // already handles -- a WUNTRACED stop has no ExitStatus representation).
-fn wait_status_exited(status: i32) -> bool {
-    (status & 0x7f) == 0
-}
-fn wait_status_exit_code(status: i32) -> i32 {
-    (status >> 8) & 0xff
-}
-fn wait_status_signaled(status: i32) -> bool {
-    let low = status & 0x7f;
-    low != 0 && low != 0x7f
-}
-fn wait_status_term_sig(status: i32) -> i32 {
-    status & 0x7f
-}
-fn wait_status_stopped(status: i32) -> bool {
-    (status & 0xff) == 0x7f
-}
-fn wait_status_stop_sig(status: i32) -> i32 {
-    (status >> 8) & 0xff
-}
-
 // Blocking wait for a single process, but (unlike Job::wait/poll, which
 // go through std::process::Child and can never ask for this) able to
 // observe it stopping instead of exiting -- see WUNTRACED. Used only for
@@ -15611,35 +15523,24 @@ fn wait_status_stop_sig(status: i32) -> i32 {
 // over at once is waited on about as long as before, and a long one is
 // looked in on fifty times a second.
 pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
-    let flags = if crate::session::is_listening() { WNOHANG | WUNTRACED } else { WUNTRACED };
+    let polling = crate::session::is_listening();
     let mut nap = std::time::Duration::from_micros(250);
     loop {
-        let mut status: i32 = 0;
-        let r = unsafe { waitpid(pid as i32, &mut status, flags) };
-        if r == 0 {
-            crate::session::service_while_busy();
-            std::thread::sleep(nap);
-            nap = (nap * 2).min(std::time::Duration::from_millis(20));
-            continue;
-        }
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        match crate::platform::wait_for_child(pid as i32, !polling) {
+            crate::platform::Waited::Running => {
+                crate::session::service_while_busy();
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(std::time::Duration::from_millis(20));
             }
-            // ECHILD or similar (the process is already gone some other
-            // way) -- nothing meaningful to report, but this must return
-            // *something* rather than loop forever.
-            return JobWaitOutcome::Exited(1);
+            crate::platform::Waited::Stopped(signum) => return JobWaitOutcome::Stopped(signum),
+            // 128 + n is bash's convention for "killed by a signal", not
+            // the OS's, so the shell is where it is applied.
+            crate::platform::Waited::Killed(signum) => return JobWaitOutcome::Exited(128 + signum),
+            crate::platform::Waited::Exited(code) => return JobWaitOutcome::Exited(code),
+            // Already gone some other way: nothing meaningful to report,
+            // but this has to answer rather than loop for ever.
+            crate::platform::Waited::Gone => return JobWaitOutcome::Exited(1),
         }
-        if wait_status_stopped(status) {
-            return JobWaitOutcome::Stopped(wait_status_stop_sig(status));
-        }
-        if wait_status_signaled(status) {
-            return JobWaitOutcome::Exited(128 + wait_status_term_sig(status));
-        }
-        debug_assert!(wait_status_exited(status));
-        return JobWaitOutcome::Exited(wait_status_exit_code(status));
     }
 }
 
@@ -15904,7 +15805,7 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
             // (SIG_IGN) disposition is explicitly left unchanged. Without
             // this reset, every external child would silently inherit
             // "ignore SIGINT" too and never respond to Ctrl-C.
-            sigaction_raw(2, SIG_DFL);
+            crate::platform::default_signal(crate::platform::SIGINT);
             for ef in &actions {
                 match ef {
                     FdAction::Open { fd, file } => {
