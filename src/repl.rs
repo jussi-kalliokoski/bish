@@ -4495,7 +4495,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         // new keystrokes.
         let ready = term::stdin_ready(10);
         if ready {
-            let n = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+            let n = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
             if n > 0 {
                 if n == 1 && buf[0] == 0 {
                     break FgOutcome::Detached;
@@ -4533,7 +4533,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                 // sequence's bytes as one contiguous burst).
                 let mut seq = buf[..n as usize].to_vec();
                 if n == 1 && buf[0] == 0x1b && term::stdin_ready(50) {
-                    let more = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+                    let more = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
                     if more > 0 {
                         seq.extend_from_slice(&buf[..more as usize]);
                     }
@@ -4558,7 +4558,7 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                     // report actually being complete (decode_fg_click's
                     // own doc comment).
                     while !seq[3..].iter().any(|b| *b == b'M' || *b == b'm') && term::stdin_ready(50) {
-                        let more = unsafe { raw_read(0, buf.as_mut_ptr(), buf.len()) };
+                        let more = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
                         if more <= 0 {
                             break;
                         }
@@ -4930,11 +4930,6 @@ fn service_background_jobs(app: &mut App) -> bool {
 // not going through std::io::Stdin here (its internal buffering could
 // swallow bytes term::stdin_ready's poll() wouldn't know about) -- same
 // reasoning as editor.rs's own read_byte.
-unsafe extern "C" {
-    #[link_name = "read"]
-    fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize;
-}
-
 // One leaf pane's rendering info, resolved from a window's layout tree
 // against the real terminal size: which rectangle it occupies, a live
 // (Rc-shared, not a content copy -- see run_fg_job_frame's own comment

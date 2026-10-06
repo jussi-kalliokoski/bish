@@ -147,3 +147,12 @@ pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
         _ => return None,
     })
 }
+
+// `poll(2)`'s count argument: `nfds_t` is `unsigned long` here and
+// `unsigned int` on Darwin. Same call, different width.
+pub(crate) type NFds = u64;
+
+// Terminal-resize signal. 28 on both, unlike the job-control numbers --
+// written out in both tables rather than shared, so one file answers
+// "which number is this signal here".
+pub(crate) const SIGWINCH: i32 = 28;

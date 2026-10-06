@@ -394,19 +394,11 @@ impl Scheduler {
 /// Puts fd 0 and fd 1 back to the shell's own, releasing whatever a
 /// task had installed on them.
 fn install_shell_fds(shells_own: [i32; 3]) {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-    }
-    unsafe {
-        dup2(shells_own[0], 0);
-        dup2(shells_own[1], 1);
-    }
+    crate::platform::duplicate_onto(shells_own[0], 0);
+    crate::platform::duplicate_onto(shells_own[1], 1);
 }
 
 fn install_fds(task: &Task, shells_own: [i32; 3]) {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-    }
     use std::os::fd::AsRawFd;
     // Both, every time, and `None` means the shell's own rather than
     // "leave it alone": whatever the previous task installed is still
@@ -414,10 +406,8 @@ fn install_fds(task: &Task, shells_own: [i32; 3]) {
     // the pipe `a` was writing to instead of to the terminal.
     let stdin = task.stdin.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[0]);
     let stdout = task.stdout.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[1]);
-    unsafe {
-        dup2(stdin, 0);
-        dup2(stdout, 1);
-    }
+    crate::platform::duplicate_onto(stdin, 0);
+    crate::platform::duplicate_onto(stdout, 1);
 }
 
 /// How long to wait on one descriptor before trying the next.
@@ -429,19 +419,8 @@ const POLL_SLICE_MS: i32 = 20;
 
 /// `poll_one`, for writability.
 fn poll_writable(fd: RawFd, timeout_ms: i32) -> bool {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-    }
-    const POLLOUT: i16 = 0x004;
-    const POLLERR: i16 = 0x008;
-    const POLLHUP: i16 = 0x010;
-    let mut p = PollFd { fd, events: POLLOUT, revents: 0 };
+    use crate::platform::{POLL_ERROR, POLL_HUNG_UP, POLL_WRITABLE, PollFd};
+    let mut watched = [PollFd::watching(fd, POLL_WRITABLE)];
     // A pipe whose reader has gone is not `POLLOUT` -- it is `POLLERR`.
     // Waiting for writability alone therefore waits for ever on a
     // descriptor whose next write would return `EPIPE` immediately,
@@ -449,7 +428,8 @@ fn poll_writable(fd: RawFd, timeout_ms: i32) -> bool {
     // `while true; do echo x; done | { read v; echo "$v"; }` printed
     // its line and then hung. The same mistake as watching for
     // `POLLIN` without `POLLHUP` on the reading side.
-    unsafe { poll(&mut p as *mut PollFd, 1, timeout_ms) > 0 && (p.revents & (POLLOUT | POLLERR | POLLHUP)) != 0 }
+    crate::platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0)
+        && watched[0].reported() & (POLL_WRITABLE | POLL_ERROR | POLL_HUNG_UP) != 0
 }
 
 #[cfg(test)]

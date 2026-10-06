@@ -15823,31 +15823,15 @@ fn tty_basename() -> String {
 // (bash-documented behavior), and `read -t`'s timeout is only meaningfully
 // pollable against a real fd (stdin), not a shell-internal here-doc/file
 // Cursor -- both need to know if fd 0 is an actual tty/pollable descriptor.
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
 fn stdin_is_tty() -> bool {
-    unsafe extern "C" {
-        fn isatty(fd: i32) -> i32;
-    }
-    unsafe { isatty(0) != 0 }
+    crate::platform::is_terminal(0)
 }
 
 // Polls fd 0 for readability, waiting up to `timeout_ms` (0 = check without
 // waiting). Used by `read -t` to implement its timeout without needing a
 // second thread or signal handling.
 fn stdin_ready(timeout_ms: i32) -> bool {
-    const POLLIN: i16 = 0x0001;
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-    }
-    let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
-    let r = unsafe { poll(&mut pfd as *mut PollFd, 1, timeout_ms) };
-    r > 0 && (pfd.revents & POLLIN) != 0
+    crate::poll::poll_one(0, timeout_ms)
 }
 
 // Single pre_exec hook covering both dup_stderr_to_stdout and any

@@ -36,10 +36,6 @@ use crate::repl::{erase_global_status_row, render_global_status_row};
 use crate::term;
 use crate::vt100;
 
-unsafe extern "C" {
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
     Char(char),
@@ -262,16 +258,9 @@ const ESCAPE_TIMEOUT_MS: i32 = 30;
 // keeps this consistent with what's actually been consumed.
 fn read_byte() -> io::Result<Option<u8>> {
     let mut b = [0u8; 1];
-    loop {
-        let n = unsafe { read(0, b.as_mut_ptr(), 1) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        return Ok(if n == 0 { None } else { Some(b[0]) });
+    match crate::platform::read_bytes(0, &mut b)? {
+        0 => Ok(None),
+        _ => Ok(Some(b[0])),
     }
 }
 

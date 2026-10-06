@@ -172,6 +172,9 @@ impl DirSnapshot {
 
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn poll(fds: *mut PollFd, count: sys::NFds, timeout_ms: i32) -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn getrlimit(resource: i32, limit: *mut ResourceLimit) -> i32;
     fn setrlimit(resource: i32, limit: *const ResourceLimit) -> i32;
     fn sysconf(name: i32) -> i64;
@@ -701,6 +704,113 @@ pub(crate) fn current_umask() -> u32 {
 /// Sets the file-creation mask, giving back what it was.
 pub(crate) fn set_umask(mask: u32) -> u32 {
     unsafe { umask(mask) }
+}
+
+/// One descriptor to wait on, and what the OS reported about it.
+///
+/// `struct pollfd` and the flag values are the same on Linux and macOS;
+/// the count `poll` takes is not the same width, which is in the tables.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+pub(crate) const POLL_READABLE: i16 = 0x0001;
+pub(crate) const POLL_WRITABLE: i16 = 0x0004;
+pub(crate) const POLL_ERROR: i16 = 0x0008;
+pub(crate) const POLL_HUNG_UP: i16 = 0x0010;
+
+impl PollFd {
+    pub(crate) fn watching(fd: std::os::unix::io::RawFd, events: i16) -> PollFd {
+        PollFd { fd, events, revents: 0 }
+    }
+
+    pub(crate) fn fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
+    }
+
+    /// What the OS said about it, as a mask of the `POLL_*` above.
+    pub(crate) fn reported(&self) -> i16 {
+        self.revents
+    }
+
+    /// Forgets the last answer, before asking again.
+    pub(crate) fn clear(&mut self) {
+        self.revents = 0;
+    }
+}
+
+/// Waits until one of `fds` has something to say, or `timeout_ms` passes
+/// (negative waits indefinitely).
+///
+/// `Ok(0)` is "the timeout passed, or a signal interrupted the wait" --
+/// the two are the same answer to every caller here, since a signal worth
+/// acting on arrives through a descriptor in this set rather than through
+/// this call's return value.
+pub(crate) fn wait_for_ready(fds: &mut [PollFd], timeout_ms: i32) -> std::io::Result<usize> {
+    let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as sys::NFds, timeout_ms) };
+    if ready >= 0 {
+        return Ok(ready as usize);
+    }
+    let failure = std::io::Error::last_os_error();
+    match failure.kind() {
+        std::io::ErrorKind::Interrupted => Ok(0),
+        _ => Err(failure),
+    }
+}
+
+/// A pipe for waking a wait: one end to register, one for a signal
+/// handler to write a byte to.
+///
+/// Both ends non-blocking -- the handler must never block, and the
+/// draining side wants to stop at "nothing left" rather than wait for
+/// more -- and both close-on-exec, since no child has any business
+/// holding either.
+pub(crate) fn wake_pipe() -> std::io::Result<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
+    let mut ends = [0i32; 2];
+    if unsafe { pipe(ends.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for end in ends {
+        set_nonblocking(end);
+        unsafe { fcntl(end, sys::F_SETFD, sys::FD_CLOEXEC) };
+    }
+    Ok((ends[0], ends[1]))
+}
+
+/// Writes one byte to a wake pipe.
+///
+/// The only thing in this layer meant to be called from inside a real
+/// signal handler, so it does exactly one `write(2)` -- which POSIX lists
+/// as async-signal-safe -- and nothing else: no allocation, no error
+/// formatting, no locks. A full pipe means a wake-up is already queued,
+/// which is as good as having written another.
+pub(crate) fn wake(fd: std::os::unix::io::RawFd) {
+    unsafe { write(fd, [0u8].as_ptr(), 1) };
+}
+
+/// Closes a raw descriptor this layer handed out.
+pub(crate) fn close_fd(fd: std::os::unix::io::RawFd) {
+    unsafe { close(fd) };
+}
+
+/// Points `to` at whatever `from` refers to, as a child does on its way
+/// to becoming a pipeline stage. The new descriptor is *not*
+/// close-on-exec, whatever `from` was -- which is what makes this the way
+/// to hand something to a child deliberately.
+pub(crate) fn duplicate_onto(from: std::os::unix::io::RawFd, to: std::os::unix::io::RawFd) -> bool {
+    unsafe { dup2(from, to) >= 0 }
+}
+
+/// Installs `handler` for `signal_number`.
+///
+/// Only a handler that is itself async-signal-safe belongs here -- see
+/// `wake`, which is what bish's handlers do.
+pub(crate) fn on_signal(signal_number: i32, handler: extern "C" fn(i32)) {
+    unsafe { signal(signal_number, handler as *const () as usize) };
 }
 
 #[cfg(test)]

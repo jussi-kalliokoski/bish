@@ -1,44 +1,29 @@
-// Hand-rolled poll(2) FFI -- no libc crate, same extern "C"-against-glibc
-// style as term.rs/pty.rs. The one place in this codebase that declares
-// poll(2) itself; term::stdin_ready (a single-fd, fixed-to-stdin
-// convenience wrapper that predates this module) now goes through
-// poll_one below instead of keeping its own separate copy.
+// Waiting on several descriptors at once, so repl.rs's main loop can
+// watch stdin, a job's pty master, a session socket and the resize
+// self-pipe together instead of blocking on one `read` with everything
+// else checked once per iteration in between.
 //
-// Exists so repl.rs's main loop can wait on several fds at once (stdin,
-// a job's pty master, a session socket, the SIGWINCH self-pipe below)
-// instead of blocking on a single read(2) with everything else checked
-// only "once per iteration" in between -- see repl.rs's own "a real
-// event loop... is M9b's job" comment for the gap this exists to close.
+// The syscall and its struct are in `platform`; what is here is the
+// part that is bish's -- which descriptors count as "ready" (a closed
+// peer does, see `PollSet`), the self-pipe trick, and the resize
+// handler.
 #![allow(dead_code)]
 
 use std::io;
 use std::os::unix::io::RawFd;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
+use crate::platform::{self, PollFd};
 
-pub const POLLIN: i16 = 0x0001;
-pub const POLLERR: i16 = 0x0008;
-pub const POLLHUP: i16 = 0x0010;
-
-unsafe extern "C" {
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-    fn pipe(fds: *mut i32) -> i32;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn close(fd: i32) -> i32;
-}
+// Under this module's own names, which is where the rest of bish asks.
+pub const POLLIN: i16 = platform::POLL_READABLE;
+pub const POLLERR: i16 = platform::POLL_ERROR;
+pub const POLLHUP: i16 = platform::POLL_HUNG_UP;
 
 // True if `fd` has input available within timeout_ms. The single-fd
 // case term::stdin_ready wraps.
 pub fn poll_one(fd: RawFd, timeout_ms: i32) -> bool {
-    let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
-    unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN) != 0 }
+    let mut watched = [PollFd::watching(fd, POLLIN)];
+    platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0) && watched[0].reported() & POLLIN != 0
 }
 
 /// `poll_one`, counting a closed peer as ready.
@@ -49,8 +34,8 @@ pub fn poll_one(fd: RawFd, timeout_ms: i32) -> bool {
 /// below watches for it, and it is what a pipeline stage waiting for
 /// end-of-input needs.
 pub fn poll_readable_or_eof(fd: RawFd, timeout_ms: i32) -> bool {
-    let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
-    unsafe { poll(&mut pfd, 1, timeout_ms) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0 }
+    let mut watched = [PollFd::watching(fd, POLLIN)];
+    platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0) && watched[0].reported() & (POLLIN | POLLHUP | POLLERR) != 0
 }
 
 // A set of fds, each watched for POLLIN (readable) plus POLLHUP/POLLERR
@@ -68,13 +53,13 @@ impl PollSet {
     }
 
     pub fn add(&mut self, fd: RawFd) {
-        if !self.fds.iter().any(|p| p.fd == fd) {
-            self.fds.push(PollFd { fd, events: POLLIN, revents: 0 });
+        if !self.fds.iter().any(|p| p.fd() == fd) {
+            self.fds.push(PollFd::watching(fd, POLLIN));
         }
     }
 
     pub fn remove(&mut self, fd: RawFd) {
-        self.fds.retain(|p| p.fd != fd);
+        self.fds.retain(|p| p.fd() != fd);
     }
 
     // `timeout_ms`: None blocks indefinitely; Some(0) polls without
@@ -90,22 +75,14 @@ impl PollSet {
             return Ok(Vec::new());
         }
         for p in &mut self.fds {
-            p.revents = 0;
+            p.clear();
         }
-        let timeout = timeout_ms.unwrap_or(-1);
-        let n = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as u64, timeout) };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            // A signal (e.g. SIGWINCH itself, delivered while blocked
-            // here) interrupting the call isn't a real error -- callers
-            // that care about the signal already learn about it via the
-            // self-pipe below, not via poll's own return value.
-            if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(Vec::new());
-            }
-            return Err(err);
-        }
-        Ok(self.fds.iter().filter(|p| p.revents & (POLLIN | POLLHUP | POLLERR) != 0).map(|p| p.fd).collect())
+        // A signal interrupting the wait is not an error and not a
+        // readiness either: anything worth acting on arrives through one
+        // of these descriptors (the self-pipe below), so the layer
+        // reports it as nothing ready.
+        platform::wait_for_ready(&mut self.fds, timeout_ms.unwrap_or(-1))?;
+        Ok(self.fds.iter().filter(|p| p.reported() & (POLLIN | POLLHUP | POLLERR) != 0).map(|p| p.fd()).collect())
     }
 }
 
@@ -129,13 +106,8 @@ pub struct SelfPipe {
 
 impl SelfPipe {
     pub fn new() -> io::Result<SelfPipe> {
-        let mut fds = [0i32; 2];
-        if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        crate::pty::set_nonblocking(fds[0]);
-        crate::pty::set_nonblocking(fds[1]);
-        Ok(SelfPipe { read_fd: fds[0], write_fd: fds[1] })
+        let (read_fd, write_fd) = platform::wake_pipe()?;
+        Ok(SelfPipe { read_fd, write_fd })
     }
 
     pub fn read_fd(&self) -> RawFd {
@@ -156,21 +128,16 @@ impl SelfPipe {
 
     pub fn drain(&self) {
         let mut buf = [0u8; 64];
-        loop {
-            let n = unsafe { read(self.read_fd, buf.as_mut_ptr(), buf.len()) };
-            if n <= 0 {
-                break;
-            }
-        }
+        // Non-blocking, so "nothing left" arrives as an error rather
+        // than as a wait.
+        while platform::read_bytes(self.read_fd, &mut buf).is_ok_and(|n| n > 0) {}
     }
 }
 
 impl Drop for SelfPipe {
     fn drop(&mut self) {
-        unsafe {
-            close(self.read_fd);
-            close(self.write_fd);
-        }
+        platform::close_fd(self.read_fd);
+        platform::close_fd(self.write_fd);
     }
 }
 
@@ -182,17 +149,10 @@ impl Drop for SelfPipe {
 // do" rather than an error -- losing a redundant wake-up byte when
 // one's already queued doesn't lose the wake-up itself.
 pub fn wake_from_signal_handler(fd: RawFd) {
-    unsafe {
-        write(fd, [0u8].as_ptr(), 1);
-    }
+    platform::wake(fd);
 }
 
-const SIGWINCH: i32 = 28;
 static SIGWINCH_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-unsafe extern "C" {
-    fn signal(signum: i32, handler: usize) -> usize;
-}
 
 extern "C" fn sigwinch_wake_handler(_sig: i32) {
     let fd = SIGWINCH_WAKE_FD.load(std::sync::atomic::Ordering::SeqCst);
@@ -214,9 +174,7 @@ extern "C" fn sigwinch_wake_handler(_sig: i32) {
 // current caller needs.
 pub fn install_sigwinch_wake(write_fd: RawFd) {
     SIGWINCH_WAKE_FD.store(write_fd, std::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        signal(SIGWINCH, sigwinch_wake_handler as *const () as usize);
-    }
+    platform::on_signal(platform::SIGWINCH, sigwinch_wake_handler);
 }
 
 #[cfg(test)]

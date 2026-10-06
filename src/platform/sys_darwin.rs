@@ -149,3 +149,9 @@ pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
         _ => return None,
     })
 }
+
+// `poll(2)`'s count argument: `nfds_t` is `unsigned int` here where Linux
+// has `unsigned long`.
+pub(crate) type NFds = u32;
+
+pub(crate) const SIGWINCH: i32 = 28;
