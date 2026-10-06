@@ -479,14 +479,6 @@ fn history_path(filename: &str) -> Option<PathBuf> {
     std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(filename))
 }
 
-unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
-}
-
-const LOCK_EX: i32 = 2;
-const LOCK_UN: i32 = 8;
-const LOCK_NB: i32 = 4;
-
 // Rewrites the history file down to its newest `limit` entries,
 // verbatim -- the surviving
 // lines are copied across exactly as they were read, never re-rendered,
@@ -513,7 +505,7 @@ fn compact(path: &Path, limit: usize) {
     use std::os::unix::io::AsRawFd;
     let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else { return };
     let fd = file.as_raw_fd();
-    if unsafe { flock(fd, LOCK_EX | LOCK_NB) } != 0 {
+    if crate::platform::lock_exclusive(fd).is_err() {
         return;
     }
     // Re-read here, under the lock, rather than reusing what the caller
@@ -523,7 +515,7 @@ fn compact(path: &Path, limit: usize) {
     // read-keep-write a unit.
     let mut content = String::new();
     if file.read_to_string(&mut content).is_err() {
-        unsafe { flock(fd, LOCK_UN) };
+        crate::platform::unlock(fd);
         return;
     }
     let lines: Vec<&str> = content.lines().collect();
@@ -534,7 +526,7 @@ fn compact(path: &Path, limit: usize) {
     }
     let done = file.set_len(0).and_then(|()| file.seek(SeekFrom::Start(0))).and_then(|_| file.write_all(out.as_bytes())).and_then(|()| file.flush());
     let _ = done;
-    unsafe { flock(fd, LOCK_UN) };
+    crate::platform::unlock(fd);
 }
 
 // ---------------------------------------------------------------------

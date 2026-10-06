@@ -172,6 +172,7 @@ impl DirSnapshot {
 
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn flock(fd: i32, operation: i32) -> i32;
     fn geteuid() -> u32;
     fn getegid() -> u32;
     // `open(2)` is variadic (`int open(const char *, int, ...)`), and one
@@ -507,6 +508,32 @@ pub(crate) fn is_terminal(fd: std::os::unix::io::RawFd) -> bool {
     // of this expression and `is_terminal` does not close what it is
     // asked about.
     unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.is_terminal()
+}
+
+/// Takes an exclusive advisory lock on `fd`, or says it could not.
+///
+/// Never waits: a caller that cannot have the lock now has something
+/// better to do than queue -- skip the compaction another bish is
+/// already doing, or refuse to be the second daemon of the same name.
+/// The lock lives with the open file and goes when the last descriptor
+/// for it closes, which is what lets a lock stand for "this process is
+/// still alive" across a crash.
+///
+/// `LOCK_EX`, `LOCK_NB` and `LOCK_UN` are 2, 4 and 8 on every Unix bish
+/// targets, so they are here rather than in the per-OS tables.
+pub(crate) fn lock_exclusive(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    match unsafe { flock(fd, LOCK_EX | LOCK_NB) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Gives a lock back without waiting for the file to close.
+pub(crate) fn unlock(fd: std::os::unix::io::RawFd) {
+    const LOCK_UN: i32 = 8;
+    unsafe { flock(fd, LOCK_UN) };
 }
 
 #[cfg(test)]

@@ -47,15 +47,11 @@ unsafe extern "C" {
     fn mkdir(path: *const i8, mode: u32) -> i32;
     fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn flock(fd: i32, operation: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
 const SOL_SOCKET: i32 = 1;
 const SO_PEERCRED: i32 = 17;
-const LOCK_EX: i32 = 2;
-const LOCK_UN: i32 = 8;
-const LOCK_NB: i32 = 4;
 const SIGTERM: i32 = 15;
 
 // Matches glibc's `struct ucred` (Linux x86_64) field for field -- same
@@ -145,9 +141,7 @@ pub fn pidfile_path(name: &str) -> PathBuf {
 // the socket file.
 fn acquire_pidfile_lock(name: &str) -> io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(pidfile_path(name))?;
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    crate::platform::lock_exclusive(file.as_raw_fd())?;
     use std::io::Write as _;
     let mut f = &file;
     write!(f, "{}", std::process::id())?;
@@ -166,11 +160,11 @@ fn is_daemon_alive(name: &str) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+    if crate::platform::lock_exclusive(file.as_raw_fd()).is_ok() {
         // Nobody else was holding it -- stale. Release our own probe
         // lock immediately; this function only ever answers a question,
         // it doesn't hold anything.
-        unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        crate::platform::unlock(file.as_raw_fd());
         false
     } else {
         true

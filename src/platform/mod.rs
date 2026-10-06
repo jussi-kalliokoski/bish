@@ -147,11 +147,10 @@ mod os_guard {
         ("src/editor.rs", 1, "reads a key from the terminal"),
         ("src/exec.rs", 41, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
-        ("src/history.rs", 1, "locks the history file against another bish"),
         ("src/poll.rs", 6, "waits on a set of fds"),
         ("src/repl.rs", 1, "reads a key without going through the editor"),
         ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
-        ("src/session.rs", 6, "the session socket: who is on the other end, and the lock on it"),
+        ("src/session.rs", 5, "the session socket: who is on the other end, and who is listening"),
         ("src/stackguard.rs", 1, "how much stack this process was given"),
         ("src/time.rs", 3, "the wall clock, and the local timezone it is shown in"),
     ];
