@@ -34,7 +34,10 @@
 //! - `linux.rs` / `darwin.rs` -- the capabilities where one body cannot
 //!   serve both, because the OSes do not offer the same call: `pipe2`
 //!   against `pipe` plus two `fcntl`s, `memfd_create` against a file
-//!   that is unlinked the moment it exists, inotify against kqueue.
+//!   that is unlinked the moment it exists, inotify against kqueue. A
+//!   flag belonging to a call only one of them has stays private in that
+//!   file, rather than forcing an invented counterpart into the other's
+//!   table.
 //! - `sys_linux.rs` / `sys_darwin.rs` -- what that OS's own numbers and
 //!   structs *are*. Tables, not logic, and the second kind of
 //!   difference above lives here and nowhere else.
@@ -90,7 +93,7 @@ mod os_guard {
         ("src/builtins/mod.rs", 4, "`test`'s own file questions: real and effective ids, access(2)"),
         ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
         ("src/editor.rs", 1, "reads a key from the terminal"),
-        ("src/exec.rs", 42, "the whole of job control: fds, signals, process groups, waiting"),
+        ("src/exec.rs", 41, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
         ("src/history.rs", 1, "locks the history file against another bish"),
         ("src/poll.rs", 6, "waits on a set of fds"),

@@ -41,3 +41,19 @@ pub(crate) fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
     }
     Ok(ends)
 }
+
+/// A file descriptor with no name.
+///
+/// macOS has no `memfd_create`, and `shm_open` -- the nearest thing --
+/// is worse for this: its objects live in one global namespace with a
+/// 31-character limit on the name, and on macOS they can only be
+/// mapped, not read and written, which is exactly what a capture fd is
+/// handed to a child to do. So: a temp file, unlinked the moment it
+/// exists, which costs a directory entry and an unlink that Linux does
+/// not pay. That is the price of a `$( )` here.
+///
+/// The mechanism is in `unix.rs` rather than here because every line of
+/// it is POSIX and it can therefore be tested without a Mac.
+pub(crate) fn anonymous_file() -> Option<std::fs::File> {
+    super::unix::unlinked_temp_file("capture")
+}

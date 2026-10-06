@@ -16083,17 +16083,19 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
 // still spawn a real external command, which needs a real file descriptor
 // to write into -- so an in-memory `OutputSink` alone is not enough, and a
 // pipe would deadlock the moment the output outgrew the pipe buffer with
-// nobody on the read end. `memfd_create(2)` gives both: a real fd, backed
-// by anonymous memory, with no name, no directory entry, and no unlink.
+// nobody on the read end. `platform::anonymous_file` gives both: a real
+// fd with no name, no directory entry and nothing to unlink, which on
+// Linux is `memfd_create(2)`.
 //
 // That replaces, per substitution, an open(O_CREAT) in $TMPDIR, the
 // directory-entry write it implies, and an unlink -- measured at ~23us of
 // a ~63us `x=$(printf hi)` on tmpfs, and considerably worse when $TMPDIR
-// is a real disk. Falls back to the old temp file where the syscall is
-// unavailable (pre-3.17 kernels, non-Linux).
+// is a real disk. (macOS has no such call and pays for the directory
+// entry either way; see that function's own note.) Falls back to a named
+// temp file where there is no anonymous one to be had at all.
 /// One stream of a child's output, held wherever this kernel lets it be
-/// held: an anonymous file when `memfd_create` works, a named temp file
-/// when it does not. The same two-way choice `run_command_substitution`
+/// held: an anonymous file where there is one, a named temp file where
+/// there is not. The same two-way choice `run_command_substitution`
 /// makes inline -- given a name here because a filter needs two of them
 /// and writing that dance twice more would be three copies.
 struct Captured {
@@ -16133,18 +16135,7 @@ impl Captured {
 }
 
 fn capture_file() -> Option<std::fs::File> {
-    unsafe extern "C" {
-        fn memfd_create(name: *const u8, flags: u32) -> i32;
-    }
-    // MFD_CLOEXEC: this fd is dup2'd onto the child's stdout explicitly
-    // where it is wanted, and must not leak into anything else spawned.
-    const MFD_CLOEXEC: u32 = 1;
-    let fd = unsafe { memfd_create(c"bish-capture".as_ptr() as *const u8, MFD_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    use std::os::fd::FromRawFd;
-    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+    crate::platform::anonymous_file()
 }
 
 // Reads back everything written to a `capture_file`, from the start.
