@@ -43,9 +43,22 @@
 //! other's does not, so a port cannot half-happen: a constant added for
 //! Linux is a failure until macOS has one too.
 
-// Nothing has moved in yet -- this commit is the boundary and its
-// enforcement. The `NOT_MOVED_YET` table below is the list of what is
-// still outside it, which is also the order the work goes in.
+#[cfg(target_os = "linux")]
+#[path = "sys_linux.rs"]
+mod sys;
+
+#[cfg(target_os = "macos")]
+#[path = "sys_darwin.rs"]
+mod sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "bish has no table of this OS's own numbers yet -- add src/platform/sys_<os>.rs beside the two that are there, \
+     and see src/platform/mod.rs for what belongs in it"
+);
+
+mod unix;
+pub(crate) use unix::*;
 
 #[cfg(test)]
 mod os_guard {
@@ -61,7 +74,7 @@ mod os_guard {
         ("src/bishedit/registers.rs", 1, "whether the editor is looking at a terminal"),
         ("src/builtins/limits.rs", 6, "`ulimit` and `times`: resource limits, clock ticks, the umask"),
         ("src/builtins/mod.rs", 4, "`test`'s own file questions: real and effective ids, access(2)"),
-        ("src/coroutine.rs", 5, "a guarded stack to run a coroutine on, and the context switch itself"),
+        ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
         ("src/editor.rs", 1, "reads a key from the terminal"),
         ("src/exec.rs", 43, "the whole of job control: fds, pipes, signals, process groups, waiting"),
         ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
@@ -161,5 +174,50 @@ mod os_guard {
             }
         }
         assert!(problems.is_empty(), "\n  - {}", problems.join("\n  - "));
+    }
+}
+
+#[cfg(test)]
+mod sys_tables {
+    /// Every name a `sys_` table exposes.
+    ///
+    /// Read from the source text rather than from the compiled module,
+    /// because only one of the two is ever compiled: on Linux the
+    /// Darwin table is `cfg`'d out, so nothing but reading it as text
+    /// can notice that it is missing something. `cargo check --target
+    /// aarch64-apple-darwin` is what type-checks the other side.
+    fn exported_names(source: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for line in source.lines() {
+            let Some(rest) = line.trim().strip_prefix("pub(crate) ") else { continue };
+            let rest = rest.strip_prefix("unsafe ").unwrap_or(rest);
+            for kind in ["const ", "static ", "fn ", "struct ", "type ", "enum ", "union "] {
+                if let Some(name) = rest.strip_prefix(kind) {
+                    let end = name.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(name.len());
+                    names.insert(name[..end].to_string());
+                    break;
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn linux_and_darwin_describe_the_same_things() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect("a platform table is readable");
+        let linux = exported_names(&read("sys_linux.rs"));
+        let darwin = exported_names(&read("sys_darwin.rs"));
+
+        let missing_from_darwin: Vec<&String> = linux.difference(&darwin).collect();
+        let missing_from_linux: Vec<&String> = darwin.difference(&linux).collect();
+        assert!(
+            missing_from_darwin.is_empty() && missing_from_linux.is_empty(),
+            "the two tables have to describe the same things, so that nothing bish calls is defined for one OS and not the other.\n  \
+             sys_darwin.rs is missing: {missing_from_darwin:?}\n  \
+             sys_linux.rs is missing: {missing_from_linux:?}\n  \
+             A name only one OS *has* still belongs in both -- give the other side the value it uses instead, or a stub that says it has none."
+        );
+        assert!(!linux.is_empty(), "the tables are empty, so this test is proving nothing");
     }
 }

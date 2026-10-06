@@ -157,30 +157,10 @@ struct Stack {
 
 impl Stack {
     fn new() -> std::io::Result<Stack> {
-        unsafe extern "C" {
-            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-            fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-        }
-        const PROT_NONE: i32 = 0;
-        const PROT_READ: i32 = 1;
-        const PROT_WRITE: i32 = 2;
-        const MAP_PRIVATE: i32 = 2;
-        const MAP_ANONYMOUS: i32 = 0x20;
-        const MAP_FAILED: isize = -1;
-
-        let total = GUARD_SIZE + STACK_SIZE;
-        let base = unsafe { mmap(std::ptr::null_mut(), total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
-        if base as isize == MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        // The guard goes at the *low* end: stacks grow downward, so that
-        // is the end an overrun reaches.
-        if unsafe { mprotect(base, GUARD_SIZE, PROT_NONE) } != 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { unmap(base, total) };
-            return Err(e);
-        }
-        Ok(Stack { base, total })
+        // The guard goes at the *low* end: stacks grow downward, so
+        // that is the end an overrun reaches. Which syscalls that takes
+        // is the platform layer's business, not this module's.
+        Ok(Stack { base: crate::platform::map_guarded_stack(GUARD_SIZE, STACK_SIZE)?, total: GUARD_SIZE + STACK_SIZE })
     }
 
     /// The highest usable address, aligned down to 16 bytes.
@@ -190,16 +170,9 @@ impl Stack {
     }
 }
 
-unsafe fn unmap(base: *mut u8, len: usize) {
-    unsafe extern "C" {
-        fn munmap(addr: *mut u8, len: usize) -> i32;
-    }
-    unsafe { munmap(base, len) };
-}
-
 impl Drop for Stack {
     fn drop(&mut self) {
-        unsafe { unmap(self.base, self.total) };
+        unsafe { crate::platform::unmap(self.base, self.total) };
     }
 }
 
