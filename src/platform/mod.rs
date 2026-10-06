@@ -145,14 +145,12 @@ mod os_guard {
         ("src/builtins/limits.rs", 6, "`ulimit` and `times`: resource limits, clock ticks, the umask"),
         ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
         ("src/editor.rs", 1, "reads a key from the terminal"),
-        ("src/exec.rs", 41, "the whole of job control: fds, signals, process groups, waiting"),
-        ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
+        ("src/exec.rs", 40, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/poll.rs", 6, "waits on a set of fds"),
         ("src/repl.rs", 1, "reads a key without going through the editor"),
         ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
         ("src/session.rs", 5, "the session socket: who is on the other end, and who is listening"),
         ("src/stackguard.rs", 1, "how much stack this process was given"),
-        ("src/time.rs", 3, "the wall clock, and the local timezone it is shown in"),
     ];
 
     /// How many C functions a source file declares.

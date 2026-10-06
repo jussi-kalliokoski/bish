@@ -18033,13 +18033,10 @@ mod tests {
     // Pinned to UTC so the expected strings do not depend on where this
     // runs -- the same `TZ`+`tzset` trick git.rs's own date test uses.
     fn utc_printf(format: &str, args: &[&str]) -> String {
-        unsafe extern "C" {
-            fn tzset();
-        }
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("TZ").ok();
         unsafe { std::env::set_var("TZ", "UTC0") };
-        unsafe { tzset() };
+        crate::platform::reload_timezone();
         let values: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
         let (mut idx, mut out) = (0, String::new());
         let _ = super::printf_format_once(format, &values, &mut idx, &mut out);
@@ -18047,7 +18044,7 @@ mod tests {
             Some(tz) => unsafe { std::env::set_var("TZ", tz) },
             None => unsafe { std::env::remove_var("TZ") },
         }
-        unsafe { tzset() };
+        crate::platform::reload_timezone();
         out
     }
 

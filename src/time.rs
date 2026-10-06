@@ -13,77 +13,20 @@
 // through the same raw FFI pattern the rest of this codebase uses, and
 // the formatting is written out here.
 
-// The glibc/BSD `struct tm` layout (POSIX's 9 base fields plus the
-// common tm_gmtoff/tm_zone extension both platforms agree on) --
-// localtime_r writes a full struct tm's worth of bytes into its output
-// pointer regardless of what this declares, so this has to match the
-// real platform layout size-for-size, not just the fields this code
-// actually reads.
-#[repr(C)]
-pub(crate) struct CTm {
-    tm_sec: i32,
-    tm_min: i32,
-    tm_hour: i32,
-    tm_mday: i32,
-    tm_mon: i32,
-    tm_year: i32,
-    tm_wday: i32,
-    tm_yday: i32,
-    tm_isdst: i32,
-    tm_gmtoff: i64,
-    tm_zone: *const i8,
-}
+/// C's `struct tm`, from the platform layer: the layout is the C
+/// library's, and the two OSes bish runs on happen to agree on it.
+pub(crate) use crate::platform::CTm;
 
 // `${v@P}`'s `\d`/`\t`/`\T`/`\@`/`\A`/`\D{...}` all need the current
-// local wall-clock time -- computed via the same raw libc FFI pattern
-// already used elsewhere in this file (e.g. stdin_is_tty/stdin_ready),
-// rather than pulling in a date/time crate for it.
-// The broken-down local time for an arbitrary timestamp, where
-// `local_time_now` only ever answers for "right now" -- what
-// `printf %(...)T` and `HISTTIMEFORMAT` both need.
+// local wall-clock time, and `printf %(...)T` and `HISTTIMEFORMAT` need
+// it for an arbitrary timestamp -- both from the C library, there being
+// no date crate here.
 pub(crate) fn local_time_at(epoch_secs: i64) -> CTm {
-    unsafe extern "C" {
-        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
-    }
-    let mut tm = CTm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    unsafe { localtime_r(&epoch_secs as *const i64, &mut tm as *mut CTm) };
-    tm
+    crate::platform::local_time_at(epoch_secs)
 }
 
 pub(crate) fn local_time_now() -> CTm {
-    unsafe extern "C" {
-        fn time(t: *mut i64) -> i64;
-        fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
-    }
-    let mut t: i64 = 0;
-    unsafe { time(&mut t as *mut i64) };
-    let mut tm = CTm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    unsafe { localtime_r(&t as *const i64, &mut tm as *mut CTm) };
-    tm
+    crate::platform::local_time_at(crate::platform::epoch_seconds())
 }
 
 const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

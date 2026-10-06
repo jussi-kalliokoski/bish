@@ -172,6 +172,11 @@ impl DirSnapshot {
 
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn time(t: *mut i64) -> i64;
+    fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
+    // Only `reload_timezone`, which is only a test, calls this.
+    #[cfg(test)]
+    fn tzset();
     fn flock(fd: i32, operation: i32) -> i32;
     fn geteuid() -> u32;
     fn getegid() -> u32;
@@ -534,6 +539,75 @@ pub(crate) fn lock_exclusive(fd: std::os::unix::io::RawFd) -> std::io::Result<()
 pub(crate) fn unlock(fd: std::os::unix::io::RawFd) {
     const LOCK_UN: i32 = 8;
     unsafe { flock(fd, LOCK_UN) };
+}
+
+/// C's `struct tm`: POSIX's nine fields, plus the `tm_gmtoff`/`tm_zone`
+/// extension glibc and the BSDs both have, in the order they both have
+/// it.
+///
+/// One of the few kernel-adjacent layouts that is genuinely the same on
+/// Linux and macOS, so it is here rather than in the per-OS tables. It
+/// has to match the real thing size for size whatever bish reads of it:
+/// `localtime_r` writes a whole `struct tm` into the pointer it is given.
+#[repr(C)]
+pub(crate) struct CTm {
+    pub(crate) tm_sec: i32,
+    pub(crate) tm_min: i32,
+    pub(crate) tm_hour: i32,
+    pub(crate) tm_mday: i32,
+    pub(crate) tm_mon: i32,
+    pub(crate) tm_year: i32,
+    pub(crate) tm_wday: i32,
+    pub(crate) tm_yday: i32,
+    pub(crate) tm_isdst: i32,
+    pub(crate) tm_gmtoff: i64,
+    pub(crate) tm_zone: *const i8,
+}
+
+impl Default for CTm {
+    fn default() -> CTm {
+        CTm {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: 0,
+            tm_mon: 0,
+            tm_year: 0,
+            tm_wday: 0,
+            tm_yday: 0,
+            tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: std::ptr::null(),
+        }
+    }
+}
+
+/// Now, in seconds since the epoch.
+pub(crate) fn epoch_seconds() -> i64 {
+    let mut now: i64 = 0;
+    unsafe { time(&mut now as *mut i64) };
+    now
+}
+
+/// `epoch_seconds` broken down into the local calendar, with the zone
+/// offset and abbreviation the C library has for it -- which is where
+/// bish's dates come from, there being no date crate.
+pub(crate) fn local_time_at(epoch_seconds: i64) -> CTm {
+    let mut broken_down = CTm::default();
+    unsafe { localtime_r(&epoch_seconds as *const i64, &mut broken_down as *mut CTm) };
+    broken_down
+}
+
+/// Re-reads `TZ`.
+///
+/// The C library caches the timezone, so a process that changes `TZ`
+/// after it has formatted one date is otherwise still in the old zone.
+/// A test pinning a date to UTC is the only reason bish ever changes
+/// `TZ`, so this is a test too -- a release build would otherwise report
+/// it as dead.
+#[cfg(test)]
+pub(crate) fn reload_timezone() {
+    unsafe { tzset() };
 }
 
 #[cfg(test)]

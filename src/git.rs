@@ -794,13 +794,8 @@ filename src/main.rs
         // runs the full suite with --test-threads=1 (a process-wide env
         // var like TZ isn't safe to mutate from a test that might run
         // concurrently with another one reading it).
-        unsafe extern "C" {
-            fn tzset();
-        }
-        unsafe {
-            std::env::set_var("TZ", "UTC");
-            tzset();
-        }
+        unsafe { std::env::set_var("TZ", "UTC") };
+        crate::platform::reload_timezone();
         assert_eq!(format_unix_date(0), "1970-01-01");
         // 1700000000 is a widely-cited round Unix timestamp: 2023-11-14
         // 22:13:20 UTC.
