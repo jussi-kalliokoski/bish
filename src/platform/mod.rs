@@ -73,9 +73,60 @@ mod os;
 #[path = "darwin.rs"]
 mod os;
 
+#[cfg(target_os = "linux")]
+#[path = "watch_linux.rs"]
+mod watch;
+
+#[cfg(target_os = "macos")]
+#[path = "watch_darwin.rs"]
+mod watch;
+
 mod unix;
 pub(crate) use os::*;
 pub(crate) use unix::*;
+pub(crate) use watch::DirWatch;
+
+/// One watched directory, as the OS identifies it.
+///
+/// Opaque: inotify's own watch descriptor on Linux, a number this layer
+/// hands out on macOS. The one promise about it is the one both sides
+/// keep -- the same directory added twice gives the same id, which is
+/// what lets two watched files in one directory share a watch.
+pub(crate) type WatchId = i32;
+
+/// What the OS said happened, before any of bish's own filtering.
+///
+/// `watch.rs` turns these into the events the rest of bish sees: which
+/// names a caller actually asked about, what a change to one means, and
+/// one answer per path rather than five.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawEvent {
+    pub(crate) watch: WatchId,
+    /// The entry inside the directory, or `None` for the directory
+    /// itself.
+    pub(crate) name: Option<std::ffi::OsString>,
+    pub(crate) change: RawChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawChange {
+    /// It appeared, or it was written to, or it is not the file it was.
+    /// One answer, because every caller's next move is the same: look.
+    Touched,
+    /// It is not there under that name any more.
+    Gone,
+    /// This watch is finished -- the directory it was on was deleted or
+    /// moved. The id is dead and the OS will say nothing more about it.
+    Dropped,
+    /// Events were lost, and nothing about *which* can be known.
+    ///
+    /// Linux's, and never reported on macOS: kqueue keeps one
+    /// registration per watched directory rather than a queue of
+    /// events, so there is nothing there to overflow. Hence the allow --
+    /// a variant only one OS ever constructs.
+    #[allow(dead_code)]
+    Overflowed,
+}
 
 #[cfg(test)]
 mod os_guard {
@@ -105,7 +156,6 @@ mod os_guard {
         ("src/stackguard.rs", 1, "how much stack this process was given"),
         ("src/term.rs", 5, "raw mode, and the signals that have to be handled while in it"),
         ("src/time.rs", 3, "the wall clock, and the local timezone it is shown in"),
-        ("src/watch.rs", 5, "watches a file for a change -- inotify, which macOS has no form of"),
     ];
 
     /// How many C functions a source file declares.

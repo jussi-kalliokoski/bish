@@ -1,9 +1,13 @@
-// Hand-rolled inotify(7) FFI -- no notify crate, the same
-// extern "C"-against-glibc shape as poll.rs, term.rs and pty.rs. The
-// resulting descriptor is an ordinary fd and goes into a `PollSet` like
-// any other, which is the whole reason this is worth having: waiting
-// for a file to change becomes one more thing the event loop already
-// waits on, rather than a thread or a timer that re-reads.
+// Waiting for a file to change, as one more thing the event loop
+// already waits on -- `Watcher::fd` goes into a `PollSet` like any other
+// descriptor, which is the whole reason this is worth having rather than
+// a thread or a timer that re-reads.
+//
+// What the OS provides is in `platform::DirWatch`: a pollable descriptor
+// and a stream of "this name in this directory changed" (inotify on
+// Linux, kqueue plus a directory snapshot on macOS, which has nothing
+// that names the entry for you). What is here is everything above that,
+// and none of it is the OS's business.
 //
 // **A file is watched through its directory**, not directly, and that
 // is the load-bearing decision here. A watch on a file follows the
@@ -18,50 +22,25 @@
 // being created in the first place, which an inode watch cannot do at
 // all.
 //
-// What this deliberately does not do: recurse. inotify has no recursive
-// mode -- a watcher that appears to offer one is walking the tree and
-// adding a watch per directory, then racing to add watches for
+// What this deliberately does not do: recurse. Neither OS has a
+// recursive mode -- a watcher that appears to offer one is walking the
+// tree and adding a watch per directory, then racing to add watches for
 // directories created while it walks. Every caller here wants one
 // directory or one file, so the honest interface is the one the kernel
 // actually has.
+// `fd` and `unwatch` are the half of this surface the event loop does
+// not use yet: `sync_watched_file` asks `events()` on the tick it is
+// already taking, rather than waiting on the descriptor. Both are
+// exercised by the tests below, and the allow is what keeps them --
+// including, through them, `DirWatch::fd` and `remove` in the platform
+// layer -- from being reported as dead.
 #![allow(dead_code)]
 
+use crate::platform::{DirWatch, RawChange, WatchId};
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-
-unsafe extern "C" {
-    fn inotify_init1(flags: i32) -> i32;
-    fn inotify_add_watch(fd: i32, pathname: *const u8, mask: u32) -> i32;
-    fn inotify_rm_watch(fd: i32, wd: i32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn close(fd: i32) -> i32;
-}
-
-// `inotify_init1` flags, which are the `open(2)` ones under different
-// names.
-const IN_NONBLOCK: i32 = 0o4000;
-const IN_CLOEXEC: i32 = 0o2000000;
-
-// The events worth asking for. `IN_CLOSE_WRITE` rather than `IN_MODIFY`
-// for content: a program writing a file in chunks produces a `MODIFY`
-// per chunk, so acting on those means reading a file mid-write, while
-// `CLOSE_WRITE` arrives once and after the writer let go.
-const IN_ATTRIB: u32 = 0x0000_0004;
-const IN_CLOSE_WRITE: u32 = 0x0000_0008;
-const IN_MOVED_FROM: u32 = 0x0000_0040;
-const IN_MOVED_TO: u32 = 0x0000_0080;
-const IN_CREATE: u32 = 0x0000_0100;
-const IN_DELETE: u32 = 0x0000_0200;
-const IN_DELETE_SELF: u32 = 0x0000_0400;
-const IN_MOVE_SELF: u32 = 0x0000_0800;
-const IN_Q_OVERFLOW: u32 = 0x0000_4000;
-const IN_IGNORED: u32 = 0x0000_8000;
-const IN_ISDIR: u32 = 0x4000_0000;
-
-const WATCH_MASK: u32 = IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF;
 
 /// What happened to a path.
 ///
@@ -97,28 +76,24 @@ struct Watch {
 }
 
 pub struct Watcher {
-    fd: RawFd,
-    watches: HashMap<i32, Watch>,
-    /// So watching the same path twice does not cost two entries --
-    /// inotify returns the *same* descriptor for a directory already
+    inner: DirWatch,
+    watches: HashMap<WatchId, Watch>,
+    /// So watching the same path twice does not cost two entries -- the
+    /// layer below returns the *same* id for a directory already
     /// watched, which would otherwise silently replace one caller's
     /// filter with another's.
-    by_path: HashMap<PathBuf, i32>,
+    by_path: HashMap<PathBuf, WatchId>,
 }
 
 impl Watcher {
     pub fn new() -> io::Result<Watcher> {
-        let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Watcher { fd, watches: HashMap::new(), by_path: HashMap::new() })
+        Ok(Watcher { inner: DirWatch::new()?, watches: HashMap::new(), by_path: HashMap::new() })
     }
 
     /// The descriptor to hand a `PollSet`. Readable exactly when there
     /// is at least one event waiting.
     pub fn fd(&self) -> RawFd {
-        self.fd
+        self.inner.fd()
     }
 
     /// Watches `path`: a directory in its own right, or a file through
@@ -137,12 +112,7 @@ impl Watcher {
                 (parent.to_path_buf(), Some(PathBuf::from(name)))
             }
         };
-        let mut c_path: Vec<u8> = dir.as_os_str().as_bytes().to_vec();
-        c_path.push(0);
-        let wd = unsafe { inotify_add_watch(self.fd, c_path.as_ptr(), WATCH_MASK) };
-        if wd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let wd = self.inner.add(&dir)?;
         // Two callers watching two files in one directory get one
         // kernel watch between them, so the filter has to widen to
         // cover both rather than the second one replacing the first.
@@ -167,7 +137,7 @@ impl Watcher {
             false => path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf(),
         };
         if let Some(wd) = self.by_path.remove(&dir) {
-            unsafe { inotify_rm_watch(self.fd, wd) };
+            self.inner.remove(wd);
             self.watches.remove(&wd);
         }
     }
@@ -189,58 +159,31 @@ impl Watcher {
     /// told three times, and a save that arrives as a rename plus a
     /// create is one change to anyone reading the file afterwards.
     pub fn events(&mut self) -> Vec<Event> {
-        // The buffer has to hold at least one whole event, name
-        // included, or the read fails with EINVAL rather than returning
-        // a partial one. inotify's own documented minimum is
-        // `sizeof(struct inotify_event) + NAME_MAX + 1`; this is
-        // comfortably past it and reads many events per call.
-        let mut buf = [0u8; 8192];
         let mut out: Vec<Event> = Vec::new();
-        loop {
-            let n = unsafe { read(self.fd, buf.as_mut_ptr(), buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            let mut at = 0usize;
-            while at + 16 <= n as usize {
-                let wd = i32::from_ne_bytes(buf[at..at + 4].try_into().expect("four bytes"));
-                let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().expect("four bytes"));
-                let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().expect("four bytes")) as usize;
-                let name_bytes = &buf[at + 16..(at + 16 + len).min(buf.len())];
-                // The name is NUL-padded to an alignment boundary, so
-                // the first NUL ends it.
-                let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
-                let name = std::ffi::OsStr::from_bytes(&name_bytes[..name_end]);
-                at += 16 + len;
-
-                if mask & IN_Q_OVERFLOW != 0 {
-                    out.push(Event { path: PathBuf::new(), change: Change::Overflowed });
-                    continue;
-                }
-                // The watch itself went away -- the directory was
-                // deleted or moved. Reported as the removal of what was
-                // being watched, and the entry dropped, since the
-                // descriptor is dead either way.
-                if mask & IN_IGNORED != 0 {
-                    if let Some(watch) = self.watches.remove(&wd) {
+        for raw in self.inner.drain() {
+            let name = raw.name.unwrap_or_default();
+            match raw.change {
+                RawChange::Overflowed => out.push(Event { path: PathBuf::new(), change: Change::Overflowed }),
+                // The watch is finished, so the entry goes with it, and
+                // whatever was being watched through it is as good as
+                // gone: the directory holding it was deleted or moved.
+                RawChange::Dropped => {
+                    if let Some(watch) = self.watches.remove(&raw.watch) {
                         self.by_path.remove(&watch.dir);
-                        out.push(Event { path: watch.target(name), change: Change::Removed });
+                        out.push(Event { path: watch.target(&name), change: Change::Removed });
                     }
-                    continue;
                 }
-                let Some(watch) = self.watches.get(&wd) else { continue };
-                if !watch.covers(name) {
-                    continue;
+                RawChange::Touched | RawChange::Gone => {
+                    let Some(watch) = self.watches.get(&raw.watch) else { continue };
+                    if !watch.covers(&name) {
+                        continue;
+                    }
+                    let change = match raw.change {
+                        RawChange::Gone => Change::Removed,
+                        _ => Change::Written,
+                    };
+                    out.push(Event { path: watch.target(&name), change });
                 }
-                // A directory appearing inside a watched directory is a
-                // change to that directory's listing, which is what a
-                // caller watching one asked about.
-                let change = match mask & (IN_DELETE | IN_MOVED_FROM | IN_DELETE_SELF | IN_MOVE_SELF) != 0 {
-                    true => Change::Removed,
-                    false => Change::Written,
-                };
-                let _ = mask & IN_ISDIR;
-                out.push(Event { path: watch.target(name), change });
             }
         }
         coalesce(out)
@@ -287,12 +230,6 @@ fn coalesce(events: Vec<Event>) -> Vec<Event> {
         }
     }
     out
-}
-
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        unsafe { close(self.fd) };
-    }
 }
 
 #[cfg(test)]
