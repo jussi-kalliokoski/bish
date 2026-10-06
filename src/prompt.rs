@@ -11,10 +11,6 @@
 
 use crate::exec::{self, Shell};
 
-unsafe extern "C" {
-    fn geteuid() -> u32;
-}
-
 const RESET: &str = "\x1b[0m";
 const USER_HOST_COLOR: &str = "\x1b[1;32m"; // bold green
 const ROOT_USER_HOST_COLOR: &str = "\x1b[1;31m"; // bold red, a deliberate warning color
@@ -53,7 +49,7 @@ fn prefix(shell: &Shell, is_root: bool) -> String {
 }
 
 pub fn render(shell: &Shell) -> String {
-    let is_root = unsafe { geteuid() } == 0;
+    let is_root = crate::platform::effective_user() == 0;
     let glyph_color = if shell.last_status == 0 { OK_COLOR } else { ERR_COLOR };
     let glyph = if is_root { "#" } else { "$" };
     format!("{}{glyph_color}{glyph}{RESET} ", prefix(shell, is_root))

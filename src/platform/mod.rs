@@ -142,16 +142,13 @@ mod os_guard {
     /// failure in both directions, so the table cannot drift from the
     /// tree whether a declaration was added or moved out.
     const NOT_MOVED_YET: &[(&str, usize, &str)] = &[
-        ("src/bishedit/registers.rs", 1, "whether the editor is looking at a terminal"),
         ("src/builtins/limits.rs", 6, "`ulimit` and `times`: resource limits, clock ticks, the umask"),
-        ("src/builtins/mod.rs", 4, "`test`'s own file questions: real and effective ids, access(2)"),
         ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
         ("src/editor.rs", 1, "reads a key from the terminal"),
         ("src/exec.rs", 41, "the whole of job control: fds, signals, process groups, waiting"),
         ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
         ("src/history.rs", 1, "locks the history file against another bish"),
         ("src/poll.rs", 6, "waits on a set of fds"),
-        ("src/prompt.rs", 1, "whether the prompt belongs to root"),
         ("src/repl.rs", 1, "reads a key without going through the editor"),
         ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
         ("src/session.rs", 6, "the session socket: who is on the other end, and the lock on it"),

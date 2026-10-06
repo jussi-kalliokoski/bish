@@ -171,6 +171,9 @@ impl DirSnapshot {
 }
 
 unsafe extern "C" {
+    fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn geteuid() -> u32;
+    fn getegid() -> u32;
     // `open(2)` is variadic (`int open(const char *, int, ...)`), and one
     // declaration of it for the whole directory rather than one per
     // caller: two non-variadic views of the same C function with
@@ -456,6 +459,54 @@ pub(crate) fn set_nonblocking(fd: std::os::unix::io::RawFd) {
 /// job would silently inherit it and never answer a Ctrl-C.
 pub(crate) fn reset_signal(signal_number: i32) {
     unsafe { signal(signal_number, sys::SIG_DFL) };
+}
+
+/// Which permission `is_accessible` is asking about.
+pub(crate) enum Access {
+    Read,
+    Write,
+    Execute,
+}
+
+/// Whether this process could read, write or execute `path` -- asked of
+/// the OS rather than worked out from the mode bits, because the answer
+/// depends on the effective user, the groups it is in, and whatever the
+/// filesystem thinks on top of that.
+///
+/// `R_OK`/`W_OK`/`X_OK` are 4, 2 and 1 on every Unix bish targets, so
+/// they are here rather than in the tables.
+pub(crate) fn is_accessible(path: &str, mode: Access) -> bool {
+    let mode = match mode {
+        Access::Read => 4,
+        Access::Write => 2,
+        Access::Execute => 1,
+    };
+    let Ok(path) = std::ffi::CString::new(path) else { return false };
+    unsafe { access(path.as_ptr(), mode) == 0 }
+}
+
+/// Who this process is acting as, which is the question that matters for
+/// "may I" -- not who started it.
+pub(crate) fn effective_user() -> u32 {
+    unsafe { geteuid() }
+}
+
+pub(crate) fn effective_group() -> u32 {
+    unsafe { getegid() }
+}
+
+/// Whether `fd` is a terminal.
+///
+/// `std::io::IsTerminal` rather than `isatty` directly: it is the same
+/// call underneath, and one fewer C declaration to keep right. The
+/// borrow is for the length of the question only -- nothing here takes
+/// ownership of the descriptor or closes it.
+pub(crate) fn is_terminal(fd: std::os::unix::io::RawFd) -> bool {
+    use std::io::IsTerminal;
+    // SAFETY: borrowed, not owned: the `BorrowedFd` is dropped at the end
+    // of this expression and `is_terminal` does not close what it is
+    // asked about.
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.is_terminal()
 }
 
 #[cfg(test)]

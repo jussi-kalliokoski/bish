@@ -289,9 +289,9 @@ pub(crate) fn unary(op: &str, a: &str) -> bool {
         // from the same file, and `access(2)` is the call that knows.
         // These used to answer "does it exist", which said a read-only
         // file was writable.
-        "-r" => accessible(a, R_OK),
-        "-w" => accessible(a, W_OK),
-        "-x" => accessible(a, X_OK),
+        "-r" => accessible(a, crate::platform::Access::Read),
+        "-w" => accessible(a, crate::platform::Access::Write),
+        "-x" => accessible(a, crate::platform::Access::Execute),
         "-z" => a.is_empty(),
         "-n" => !a.is_empty(),
         "-s" => std::fs::metadata(a).map(|m| m.len() > 0).unwrap_or(false),
@@ -314,36 +314,15 @@ pub(crate) fn unary(op: &str, a: &str) -> bool {
         "-R" => false,
         // `-t FD`: is that descriptor a terminal. The operand is a
         // number, not a path.
-        "-t" => a.trim().parse::<i32>().map(|fd| unsafe { isatty(fd) } == 1).unwrap_or(false),
+        "-t" => a.trim().parse::<i32>().map(crate::platform::is_terminal).unwrap_or(false),
         _ => false,
     }
 }
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
-    fn geteuid() -> u32;
-    fn getegid() -> u32;
-    fn isatty(fd: i32) -> i32;
-}
-
-#[cfg(unix)]
-const R_OK: i32 = 4;
-#[cfg(unix)]
-const W_OK: i32 = 2;
-#[cfg(unix)]
-const X_OK: i32 = 1;
-
-/// `access(2)`, which answers for the *effective* user -- see the `-r`
-/// arm above for why that is the question.
-#[cfg(unix)]
-fn accessible(a: &str, mode: i32) -> bool {
-    let Ok(path) = std::ffi::CString::new(a) else { return false };
-    unsafe { access(path.as_ptr(), mode) == 0 }
-}
-#[cfg(not(unix))]
-fn accessible(a: &str, _mode: i32) -> bool {
-    std::fs::metadata(a).is_ok()
+/// Asked of the OS, which answers for the *effective* user -- see the
+/// `-r` arm above for why that is the question.
+fn accessible(a: &str, mode: crate::platform::Access) -> bool {
+    crate::platform::is_accessible(a, mode)
 }
 
 #[cfg(unix)]
@@ -370,8 +349,8 @@ fn owned_by(a: &str, which: Owner) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(m) = std::fs::metadata(a) else { return false };
     match which {
-        Owner::User => m.uid() == unsafe { geteuid() },
-        Owner::Group => m.gid() == unsafe { getegid() },
+        Owner::User => m.uid() == crate::platform::effective_user(),
+        Owner::Group => m.gid() == crate::platform::effective_group(),
     }
 }
 #[cfg(not(unix))]

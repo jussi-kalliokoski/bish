@@ -322,10 +322,7 @@ fn write_osc52(text: &str) {
 }
 
 fn stdout_is_tty() -> bool {
-    unsafe extern "C" {
-        fn isatty(fd: i32) -> i32;
-    }
-    unsafe { isatty(1) != 0 }
+    crate::platform::is_terminal(1)
 }
 
 const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
