@@ -1,0 +1,165 @@
+//! The one place in bish that talks to the operating system.
+//!
+//! Every `extern "C"` declaration, every `#[repr(C)]` layout the kernel
+//! owns, and every constant whose value is the OS's rather than bish's
+//! belongs in this directory. `mod os_guard` below fails the build when
+//! one appears anywhere else, so the boundary is a test rather than a
+//! convention.
+//!
+//! # Why a layer at all, rather than a `cfg` at each use
+//!
+//! bish has no external crates, so every one of these is hand-written,
+//! and the OSes it runs on differ in two quite different ways.
+//!
+//! The first kind is loud: `inotify_add_watch` does not exist on macOS,
+//! and a build that calls it fails to link. That kind cannot be
+//! forgotten.
+//!
+//! The second kind is silent, and it is the reason for this directory.
+//! `TIOCGWINSZ` is `0x5413` on Linux and `0x40087468` on macOS; `VMIN`
+//! is index 6 in one `termios` and 16 in the other; `MAP_ANONYMOUS` is
+//! `0x20` against `0x1000`; `SC_CLK_TCK` is 2 against 3. Every one of
+//! them is an integer literal that compiles anywhere and is simply
+//! wrong on the other side -- raw mode that eats keystrokes, a window
+//! size of nonsense, CPU times off by a factor. Spelled out at the
+//! point of use, as bish spelled them out until now, there is nothing
+//! to review and no way to tell a ported value from an unported one.
+//! Collected in one table per OS, they can be read side by side.
+//!
+//! # The three kinds of file
+//!
+//! - `unix.rs` -- how a capability is *done* on a POSIX system, written
+//!   once for every such OS. The great majority of bish's OS use is of
+//!   this kind: a pty, a pipe, raw mode, a signal, a process group.
+//! - `sys_linux.rs` / `sys_darwin.rs` -- what that OS's own numbers and
+//!   structs *are*. Tables, not logic, and the second kind of
+//!   difference above lives here and nowhere else.
+//! - this file -- the capabilities themselves, which is all the rest of
+//!   bish may call. A new Unix is a new `sys_` table; a target that is
+//!   not a Unix at all (a browser, an embedded runtime) replaces
+//!   `unix.rs`, and this surface is the contract it has to satisfy.
+//!
+//! `mod sys_tables` fails the build when one OS's table has a name the
+//! other's does not, so a port cannot half-happen: a constant added for
+//! Linux is a failure until macOS has one too.
+
+// Nothing has moved in yet -- this commit is the boundary and its
+// enforcement. The `NOT_MOVED_YET` table below is the list of what is
+// still outside it, which is also the order the work goes in.
+
+#[cfg(test)]
+mod os_guard {
+    /// `(file, how many C functions it declares, what they reach for)`.
+    ///
+    /// Not an allow-list in the sense `exec.rs`'s own `spawn_guard` has
+    /// one -- every line here is work still to do, and the file it names
+    /// should eventually be calling `platform` instead. The counts are
+    /// what keeps it honest: a number that no longer matches is a
+    /// failure in both directions, so the table cannot drift from the
+    /// tree whether a declaration was added or moved out.
+    const NOT_MOVED_YET: &[(&str, usize, &str)] = &[
+        ("src/bishedit/registers.rs", 1, "whether the editor is looking at a terminal"),
+        ("src/builtins/limits.rs", 6, "`ulimit` and `times`: resource limits, clock ticks, the umask"),
+        ("src/builtins/mod.rs", 4, "`test`'s own file questions: real and effective ids, access(2)"),
+        ("src/coroutine.rs", 5, "a guarded stack to run a coroutine on, and the context switch itself"),
+        ("src/editor.rs", 1, "reads a key from the terminal"),
+        ("src/exec.rs", 43, "the whole of job control: fds, pipes, signals, process groups, waiting"),
+        ("src/git.rs", 1, "pins the timezone while a commit date is formatted"),
+        ("src/history.rs", 1, "locks the history file against another bish"),
+        ("src/poll.rs", 6, "waits on a set of fds"),
+        ("src/prompt.rs", 1, "whether the prompt belongs to root"),
+        ("src/pty.rs", 11, "opens a pty, sizes it, and makes it a session's controlling terminal"),
+        ("src/repl.rs", 1, "reads a key without going through the editor"),
+        ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
+        ("src/session.rs", 6, "the session socket: who is on the other end, and the lock on it"),
+        ("src/stackguard.rs", 1, "how much stack this process was given"),
+        ("src/term.rs", 5, "raw mode, and the signals that have to be handled while in it"),
+        ("src/time.rs", 3, "the wall clock, and the local timezone it is shown in"),
+        ("src/watch.rs", 5, "watches a file for a change -- inotify, which macOS has no form of"),
+    ];
+
+    /// How many C functions a source file declares.
+    ///
+    /// Read line by line rather than parsed: a declaration block holds
+    /// one `fn` per line and no braces of its own, so tracking the
+    /// block's own braces and counting `fn` inside it is enough.
+    /// Comment lines are skipped so that prose about a `{` cannot be
+    /// mistaken for one, and `extern "C" fn` -- a Rust function the OS
+    /// calls back, which is a definition and not a declaration -- is
+    /// deliberately not counted.
+    fn c_declarations(source: &str) -> usize {
+        let mut total = 0;
+        let mut depth = 0usize;
+        for line in source.lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            if depth == 0 {
+                let Some(at) = line.find("extern \"C\"") else { continue };
+                let rest = &line[at + "extern \"C\"".len()..];
+                if rest.contains("fn ") {
+                    continue;
+                }
+                depth = line[at..].matches('{').count() - line[at..].matches('}').count();
+                continue;
+            }
+            total += line.matches("fn ").count();
+            depth = depth + line.matches('{').count() - line.matches('}').count();
+        }
+        total
+    }
+
+    #[test]
+    fn every_c_declaration_is_either_in_platform_or_on_the_list() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let relative = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                // This directory is where they are supposed to be.
+                if relative.starts_with("src/platform/") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a source file is readable");
+                let count = c_declarations(&source);
+                if count > 0 {
+                    found.push((relative, count));
+                }
+            }
+        }
+        found.sort();
+
+        let mut problems: Vec<String> = Vec::new();
+        for (file, count) in &found {
+            match NOT_MOVED_YET.iter().find(|(f, ..)| f == file) {
+                None => problems.push(format!(
+                    "{file} declares {count} C function(s) of its own.\n     \
+                     The operating system is spoken to in src/platform/ and nowhere else -- add the capability there and call it from here.\n     \
+                     See src/platform/mod.rs for what belongs in which file."
+                )),
+                Some((_, listed, what)) if listed != count => problems.push(format!(
+                    "{file} declares {count} C function(s) where the table says {listed} ({what}).\n     \
+                     Moving them into src/platform/ is the point, so a smaller number is progress: update the count, or drop the line when it reaches zero.\n     \
+                     A larger one means a new declaration went in outside src/platform/."
+                )),
+                Some(_) => {}
+            }
+        }
+        for (file, _, what) in NOT_MOVED_YET {
+            if !found.iter().any(|(f, _)| f == file) {
+                problems.push(format!("{file} ({what}) declares nothing any more -- remove its line from the table."));
+            }
+        }
+        assert!(problems.is_empty(), "\n  - {}", problems.join("\n  - "));
+    }
+}

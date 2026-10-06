@@ -42,6 +42,7 @@ mod mcp;
 mod pager;
 mod parser;
 mod pathspec;
+mod platform;
 mod poll;
 mod prompt;
 mod pty;
