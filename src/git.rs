@@ -492,13 +492,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bish-git-log-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let run = |args: &[&str]| {
-            let status = Command::new("git").args(args).current_dir(&dir).stdout(Stdio::null()).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
         std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
@@ -550,13 +545,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bish-git-show-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let run = |args: &[&str]| {
-            let status = Command::new("git").args(args).current_dir(&dir).stdout(Stdio::null()).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
         std::fs::write(dir.join("keep.txt"), "one\ntwo\n").unwrap();
         std::fs::write(dir.join("moved.txt"), "a\nb\nc\nd\ne\n").unwrap();
         std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();

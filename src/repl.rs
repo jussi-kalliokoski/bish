@@ -12075,13 +12075,8 @@ mod git_show_tests {
         let dir = std::env::temp_dir().join(format!("bish-repl-git-show-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git").args(args).current_dir(&dir).stdout(std::process::Stdio::null()).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         std::fs::write(dir.join("c.bin"), b"\0\x01").unwrap();

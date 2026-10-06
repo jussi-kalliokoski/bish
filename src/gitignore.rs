@@ -564,8 +564,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("bish-gitignore-vs-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let run = |args: &[&str], dir: &std::path::Path| std::process::Command::new("git").args(args).current_dir(dir).output().expect("git");
-        run(&["init", "-q"], &root);
+        let run = |args: &[&str], dir: &std::path::Path| crate::gittest::output(dir, args);
+        crate::gittest::init(&root);
 
         let mut disagreements = Vec::new();
         for (n, (pattern, paths)) in cases.iter().enumerate() {

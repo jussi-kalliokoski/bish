@@ -24,6 +24,7 @@ mod fileops;
 mod framing;
 mod git;
 mod gitignore;
+mod gittest;
 mod glob;
 mod hexedit;
 mod history;

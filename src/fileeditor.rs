@@ -7478,13 +7478,8 @@ mod git_blame_tests {
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test User"]);
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
         std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
         run(&["add", "f.txt"]);
         run(&["commit", "-q", "-m", "initial"]);
@@ -7574,7 +7569,7 @@ mod git_blame_tests {
         }
         let dir = repo_with_history("blame-show-test");
         let rev = |name: &str| {
-            let out = std::process::Command::new("git").args(["rev-parse", name]).current_dir(&dir).output().unwrap();
+            let out = crate::gittest::output(&dir, &["rev-parse", name]);
             String::from_utf8(out.stdout).unwrap().trim()[..8].to_string()
         };
         // A line on disk that no commit has, before anything is blamed.
@@ -7622,11 +7617,6 @@ mod git_diff_tests {
         assert!(err.contains("no file name"), "{err}");
     }
 
-    fn git_run(dir: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     #[test]
     fn toggle_git_diff_toggles_on_then_off_and_marks_a_changed_line() {
         if !crate::git::available() {
@@ -7634,13 +7624,11 @@ mod git_diff_tests {
         }
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        git_run(&dir, &["init", "-q"]);
-        git_run(&dir, &["config", "user.email", "test@example.com"]);
-        git_run(&dir, &["config", "user.name", "Test User"]);
+        crate::gittest::init(&dir);
         let path = dir.join("f.txt");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-        git_run(&dir, &["add", "f.txt"]);
-        git_run(&dir, &["commit", "-q", "-m", "initial"]);
+        crate::gittest::run(&dir, &["add", "f.txt"]);
+        crate::gittest::run(&dir, &["commit", "-q", "-m", "initial"]);
         // Changed on disk and reloaded, so the committed content and the
         // buffer really do differ.
         std::fs::write(&path, "one\nCHANGED\nthree\n").unwrap();
@@ -7675,16 +7663,14 @@ mod git_diff_tests {
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-rev-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        git_run(&dir, &["init", "-q"]);
-        git_run(&dir, &["config", "user.email", "test@example.com"]);
-        git_run(&dir, &["config", "user.name", "Test User"]);
+        crate::gittest::init(&dir);
         let path = dir.join("f.txt");
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        git_run(&dir, &["add", "f.txt"]);
-        git_run(&dir, &["commit", "-q", "-m", "initial"]);
+        crate::gittest::run(&dir, &["add", "f.txt"]);
+        crate::gittest::run(&dir, &["commit", "-q", "-m", "initial"]);
         std::fs::write(&path, "one\nTWO\nthree\n").unwrap();
-        git_run(&dir, &["add", "f.txt"]);
-        git_run(&dir, &["commit", "-q", "-m", "second"]);
+        crate::gittest::run(&dir, &["add", "f.txt"]);
+        crate::gittest::run(&dir, &["commit", "-q", "-m", "second"]);
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
         // Against the index (HEAD) there is nothing to show at all...
@@ -7711,7 +7697,7 @@ mod git_diff_tests {
         }
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-git-diff-untracked-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        git_run(&dir, &["init", "-q"]);
+        crate::gittest::init(&dir);
         let path = dir.join("new.txt");
         std::fs::write(&path, "a\nb\n").unwrap();
 

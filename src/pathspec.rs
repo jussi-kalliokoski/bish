@@ -300,8 +300,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("bish-pathspec-vs-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let run = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&root).output().expect("git");
-        run(&["init", "-q"]);
+        let run = |args: &[&str]| crate::gittest::output(&root, args);
+        crate::gittest::init(&root);
         for f in files {
             let full = root.join(f);
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
