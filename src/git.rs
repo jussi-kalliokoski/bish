@@ -14,12 +14,60 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+// Every `git` this module runs, built in one place so that what it
+// prints is decided here and not by the machine bish happens to be on.
+//
+// bish parses this output -- a `--format` with 0x1f separators, a
+// porcelain status, a line-porcelain blame -- and a developer's own
+// configuration can change all of it. `log.showSignature = true`, which
+// anyone who signs their commits may well have, puts gpg's verification
+// lines in front of the commit `log` was asked to print, straight into
+// the first field bish splits out. `color.ui = always` writes escape
+// codes through output meant for a machine. `log.date` re-renders the
+// `%ad` the `:git show` header asks for. `core.quotepath` decides
+// whether a non-ASCII path arrives escaped.
+//
+// Three environment variables go the other way: `GIT_DIR`,
+// `GIT_WORK_TREE` and `GIT_INDEX_FILE` override the directory the
+// command runs in, and every process a git hook starts inherits them --
+// so a prompt drawn from a shell inside a hook, or `:git log` in an
+// editor opened from one, would answer about that repository instead of
+// the one on screen.
+//
+// What is *not* overridden is the rest: an alias, an `includeIf`, a
+// `safe.directory`, a mailmap are all the repository's own business and
+// bish asks git the same questions a terminal would.
+fn command(dir: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.current_dir(dir)
+        .stdin(Stdio::null())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        // `-c` beats every config file, including the repository's own.
+        .args([
+            "-c",
+            "color.ui=false",
+            "-c",
+            "color.status=false",
+            "-c",
+            "color.diff=false",
+            "-c",
+            "log.showSignature=false",
+            "-c",
+            "log.date=default",
+            "-c",
+            "core.quotepath=false",
+        ]);
+    git
+}
+
 // Checked fresh on every `:git` invocation rather than cached once at
 // startup -- a subprocess spawn is cheap and this only runs when a user
 // actually types a `:git` command, not on every keystroke -- so installing
 // or removing `git` mid-session is picked up immediately.
 pub fn available() -> bool {
-    Command::new("git").arg("--version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    command(Path::new(".")).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 // One command prompt's worth of "where does this repo's HEAD point, and
@@ -46,7 +94,7 @@ pub struct HeadStatus {
 // prompt.rs's own caller treats both the same (no segment shown), so
 // there's no need to tell them apart.
 pub fn head_status(dir: &Path) -> Option<HeadStatus> {
-    let output = Command::new("git").arg("status").arg("--porcelain=v2").arg("--branch").current_dir(dir).stdin(Stdio::null()).output().ok()?;
+    let output = command(dir).arg("status").arg("--porcelain=v2").arg("--branch").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -73,7 +121,7 @@ pub fn head_status(dir: &Path) -> Option<HeadStatus> {
 }
 
 fn short_head(dir: &Path) -> Option<String> {
-    let output = Command::new("git").arg("rev-parse").arg("--short").arg("HEAD").current_dir(dir).stdin(Stdio::null()).output().ok()?;
+    let output = command(dir).arg("rev-parse").arg("--short").arg("HEAD").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -108,15 +156,15 @@ pub struct BlameLine {
 pub fn blame(path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
-    let mut command = Command::new("git");
-    command.arg("blame").arg("--line-porcelain");
+    let mut blame = command(dir);
+    blame.arg("blame").arg("--line-porcelain");
     if let Some(rev) = rev {
-        command.arg(rev);
+        blame.arg(rev);
     }
     // `--` before the path, always: without it a revision and a filename
     // are told apart by guesswork, and a branch and a file can share a
     // name.
-    let output = command.arg("--").arg(filename).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
+    let output = blame.arg("--").arg(filename).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
         return Err(first_stderr_line(&output.stderr, "git blame failed"));
     }
@@ -148,21 +196,14 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
 
-    let in_repo = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
+    let in_repo = command(dir).args(["rev-parse", "--is-inside-work-tree"]).output().map_err(|e| format!("git: {e}"))?;
     if !in_repo.status.success() {
         return Err(first_stderr_line(&in_repo.stderr, "not a git repository"));
     }
     if let Some(rev) = rev {
-        let resolved = Command::new("git")
+        let resolved = command(dir)
             .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
             .arg(rev)
-            .current_dir(dir)
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -179,7 +220,7 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
     let mut spec = std::ffi::OsString::from(rev.unwrap_or(""));
     spec.push(":./");
     spec.push(filename);
-    let output = Command::new("git").arg("show").arg(&spec).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
+    let output = command(dir).arg("show").arg(&spec).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
         // Both real failures are already ruled out above, so what's left
         // is "that path isn't in there".
@@ -191,7 +232,7 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
 // One `git` call from `dir`, its stdout on success and the first line of
 // what it said on failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git").args(args).current_dir(dir).stdin(Stdio::null()).output().map_err(|e| format!("git: {e}"))?;
+    let output = command(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
         return Err(first_stderr_line(&output.stderr, "git failed"));
     }
@@ -585,6 +626,83 @@ mod tests {
 
         assert_eq!(show(&dir, "no-such-rev").unwrap_err(), "unknown revision 'no-such-rev'");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // bish parses what git prints, and a repository carries
+    // configuration of its own that changes it. `-c` on the command line
+    // outranks every config file, which is what `command` relies on.
+    #[test]
+    fn a_repositorys_own_config_cannot_reshape_what_is_parsed() {
+        if !available() {
+            return;
+        }
+        let dir = crate::tempdir::TempDir::new("git-hostile-config");
+        let dir = dir.path();
+        crate::gittest::init(dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        crate::gittest::run(dir, &["add", "."]);
+        crate::gittest::run(dir, &["commit", "-q", "-m", "only commit"]);
+        // Each of these is a real setting someone has: a date format
+        // that rewrites the `%ad` the header asks for, colour in output
+        // meant for a machine, and signature lines in front of a commit.
+        crate::gittest::run(dir, &["config", "log.date", "raw"]);
+        crate::gittest::run(dir, &["config", "color.ui", "always"]);
+        crate::gittest::run(dir, &["config", "log.showSignature", "true"]);
+
+        let entries = log(dir, None, None).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].subject, "only commit", "a colour escape would land in the subject");
+        assert_eq!(entries[0].date.len(), "2026-10-06".len(), "`--date=short` decides the date, not the repository: {:?}", entries[0].date);
+
+        let commit = show(dir, "HEAD").unwrap();
+        let date = commit.header.iter().find(|l| l.starts_with("Date:")).expect("a Date line").clone();
+        // `log.date = raw` renders the date as seconds-since-the-epoch
+        // and an offset, so a letter in the rendered part -- past the
+        // "Date:" label, which has letters of its own -- is proof the
+        // default format survived.
+        let rendered = date.trim_start_matches("Date:").trim().to_string();
+        assert!(rendered.chars().any(|c| c.is_ascii_alphabetic()), "the header date is still git's default format: {rendered:?}");
+        assert!(!commit.header.iter().any(|l| l.contains('\u{1b}')), "no escape codes anywhere in it: {:?}", commit.header);
+    }
+
+    // A git hook exports `GIT_DIR`, and every process started from one
+    // inherits it -- a shell, an editor opened from that shell, a prompt
+    // drawn in it. It overrides the directory a `git` command runs in, so
+    // without `command` dropping it, `:git log` in an editor opened from
+    // a hook would list the hook's repository.
+    #[test]
+    fn a_git_dir_in_the_environment_does_not_decide_which_repository() {
+        if !available() {
+            return;
+        }
+        let dir = crate::tempdir::TempDir::new("git-env-dir");
+        let dir = dir.path();
+        crate::gittest::init(dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        crate::gittest::run(dir, &["add", "."]);
+        crate::gittest::run(dir, &["commit", "-q", "-m", "the one bish was asked about"]);
+
+        // SAFETY: every `git` this suite runs -- bish's own `command`
+        // here and `gittest`'s fixtures -- drops these three, which is
+        // the thing being tested, so no concurrent test can be derailed
+        // by them. Restored immediately either way.
+        let restore = |name: &str, had: Option<String>| match had {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        };
+        let had_dir = std::env::var("GIT_DIR").ok();
+        let had_tree = std::env::var("GIT_WORK_TREE").ok();
+        unsafe { std::env::set_var("GIT_DIR", "/nonexistent/somewhere-else.git") };
+        unsafe { std::env::set_var("GIT_WORK_TREE", "/nonexistent") };
+        let entries = log(dir, None, None);
+        let head = head_status(dir);
+        restore("GIT_DIR", had_dir);
+        restore("GIT_WORK_TREE", had_tree);
+
+        let entries = entries.expect("the repository on screen is the one answered about");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].subject, "the one bish was asked about");
+        assert_eq!(head.expect("a prompt still has a branch to show").branch, "main");
     }
 
     // The three deletion-attachment points (start/middle/end of file),

@@ -17787,8 +17787,8 @@ mod spawn_guard {
         ("src/exec.rs", 1, "`Shell::command` itself, the one place that builds a child's environment"),
         (
             "src/git.rs",
-            8,
-            "runs `git` to answer questions the prompt and the editor ask about the repository, and to read a commit for `:git show` -- bish's own tooling, inheriting bish's own environment as any of its subprocesses does",
+            1,
+            "its own `command`, the one place that builds a `git` -- bish's own tooling rather than the script's, pinned there against a configuration that would change the output it parses",
         ),
         ("src/lspclient.rs", 1, "starts a language server for the editor, which is bish's, not the script's"),
         (
@@ -17830,6 +17830,20 @@ mod spawn_guard {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("a source file is readable");
+                // A file that is nothing but test support (`#![cfg(test)]`
+                // at the top of it, as `gittest.rs` and `tempdir.rs` are)
+                // is a test module like any other, all of it.
+                // (Its first line that is neither blank nor a comment:
+                // `//!` prose comes first in those files, and this test's
+                // own mention of the attribute a few lines up must not
+                // count as one.)
+                let opens_the_file = source.lines().find(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("//")
+                });
+                if opens_the_file == Some("#![cfg(test)]") {
+                    continue;
+                }
                 // Everything from the first test module onwards is not
                 // the shell starting anything.
                 let body = match source.find("\n#[cfg(test)]\n") {
