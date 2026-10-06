@@ -21207,7 +21207,8 @@ mod promoted_capture_tests {
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, b"payload").expect("seed");
         let mut shell = promoted_shell();
-        run_line(&mut shell, &format!("/bin/cp {} {} && /bin/mv {} {}", a.display(), b.display(), b.display(), dir.join("c").display()));
+        let (cp, mv) = (crate::toolpath::require("cp"), crate::toolpath::require("mv"));
+        run_line(&mut shell, &format!("{cp} {} {} && {mv} {} {}", a.display(), b.display(), b.display(), dir.join("c").display()));
         assert!(dir.join("c").exists(), "the second half of the chain has to run");
         assert!(!b.exists(), "and it really moved the file");
     }
@@ -21221,8 +21222,9 @@ mod promoted_capture_tests {
         // No `>` anywhere: a redirect of its own is what keeps a command
         // off the pty path in the first place, so a test written with
         // one would never reach the bug.
+        let cp = crate::toolpath::require("cp");
         let script = format!(
-            "/bin/cp {0} {1}; /bin/cp {0} {2}; /bin/cp {0} {3}",
+            "{cp} {0} {1}; {cp} {0} {2}; {cp} {0} {3}",
             seed.display(),
             dir.join("1").display(),
             dir.join("2").display(),
@@ -21262,9 +21264,9 @@ mod promoted_capture_tests {
         // what it exited with -- `$?` is what the rest of the chain
         // tests.
         let mut shell = promoted_shell();
-        run_line(&mut shell, "/bin/false; rc=$?");
+        run_line(&mut shell, &format!("{} ; rc=$?", crate::toolpath::require("false")));
         assert_eq!(value_of(&mut shell, "rc"), "1");
-        run_line(&mut shell, "/bin/true; rc=$?");
+        run_line(&mut shell, &format!("{} ; rc=$?", crate::toolpath::require("true")));
         assert_eq!(value_of(&mut shell, "rc"), "0");
     }
 

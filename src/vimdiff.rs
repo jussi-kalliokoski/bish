@@ -331,11 +331,11 @@ mod tests {
         case("shift-right-with-count", "a\nb\n", "2>>"),
     ];
 
-    fn have_vim() -> bool {
-        Path::new(VIM).exists()
+    /// The vim this machine would run, or `None` when it has none and
+    /// the corpus has nothing to compare against.
+    fn vim() -> Option<String> {
+        crate::toolpath::find("vim")
     }
-
-    const VIM: &str = "/usr/bin/vim";
 
     /// `target/<profile>/bish`, worked out from the test binary's own
     /// path -- same as `bashdiff.rs`.
@@ -642,7 +642,7 @@ mod tests {
     /// harness losing a race on a busy machine. Reporting the two
     /// together is how a loaded run used to produce a *divergence*
     /// naming content neither editor ever produced.
-    fn compare(cases: &[Case], bish: &Path) -> (Vec<Divergence>, Vec<Undriveable>) {
+    fn compare(cases: &[Case], bish: &Path, vim: &str) -> (Vec<Divergence>, Vec<Undriveable>) {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
         let mut undriveable = Vec::new();
@@ -667,7 +667,7 @@ mod tests {
                 edit(&argv, &path, c.keys, save)
             };
             let want =
-                run(vec![VIM.into(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()], ":wq\r");
+                run(vec![vim.to_string(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()], ":wq\r");
             // bish gets an extra escape first: a case that ends in
             // insert mode would otherwise type `:wq` into the buffer.
             // vim does not need it because `:wq` from insert mode is
@@ -682,7 +682,7 @@ mod tests {
                 let mut confirmed = None;
                 for _ in 0..2 {
                     let want_again = run(
-                        vec![VIM.into(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()],
+                        vec![vim.to_string(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()],
                         ":wq\r",
                     );
                     let got_again = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
@@ -734,10 +734,8 @@ mod tests {
     #[test]
     fn the_editor_agrees_with_vim() {
         let Some(bish) = bish_binary() else { return };
-        if !have_vim() {
-            return;
-        }
-        let (differing, undriveable) = compare(CASES, &bish);
+        let Some(vim) = vim() else { return };
+        let (differing, undriveable) = compare(CASES, &bish, &vim);
         assert!(
             differing.is_empty(),
             "{} of {} editor cases differ from vim:\n{}",
@@ -762,9 +760,7 @@ mod tests {
     #[test]
     fn the_known_editor_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };
-        if !have_vim() {
-            return;
-        }
+        let Some(vim) = vim() else { return };
         // A case this harness could not drive is no evidence that a
         // known divergence has been fixed -- and saying so takes both
         // halves of `compare`'s answer, not just the first. Reading
@@ -773,7 +769,7 @@ mod tests {
         // from the list, and this test then announced that
         // `cc-keeps-the-indent` matched vim now, on a run where the
         // editor had never been driven far enough to disagree.
-        let (differing, undriveable) = compare(PENDING, &bish);
+        let (differing, undriveable) = compare(PENDING, &bish, &vim);
         let differing: Vec<&str> = differing.into_iter().map(|(name, _, _)| name).collect();
         for (name, why) in DIVERGENCES {
             if let Some((_, reason)) = undriveable.iter().find(|(n, _)| n == name) {

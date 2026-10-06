@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn spawn_attached_gives_child_a_real_tty() {
         let pty = open().expect("open pty");
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = Command::new(crate::toolpath::require("sh"));
         cmd.arg("-c").arg("if [ -t 0 ] && [ -t 1 ]; then echo TTY_OK; else echo TTY_NO; fi");
         let mut child = spawn_attached(cmd, &pty.slave_path).expect("spawn attached");
 
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn master_write_is_visible_as_child_stdin() {
         let pty = open().expect("open pty");
-        let mut cmd = Command::new("/bin/sh");
+        let mut cmd = Command::new(crate::toolpath::require("sh"));
         cmd.arg("-c").arg("read line; echo \"got:$line\"");
         let mut child = spawn_attached(cmd, &pty.slave_path).expect("spawn attached");
 
