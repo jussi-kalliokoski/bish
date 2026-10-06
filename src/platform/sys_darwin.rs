@@ -112,3 +112,40 @@ pub(crate) const F_GETFL: i32 = 3;
 pub(crate) const F_SETFL: i32 = 4;
 
 pub(crate) const SIG_DFL: usize = 0;
+
+// `getrlimit`/`setrlimit` resources, and `sysconf`'s clock-tick name.
+//
+// `SC_CLK_TCK` is 3 here where Linux has 2, and asking for the wrong one
+// returns a different system property entirely -- CPU times quietly
+// divided by the wrong number.
+pub(crate) const RLIMIT_STACK: i32 = 3;
+pub(crate) const SC_CLK_TCK: i32 = 3;
+
+/// Which `RLIMIT_*` a `ulimit` flag asks about, or `None` where this OS
+/// has no such limit.
+///
+/// Darwin agrees with Linux up to `CORE` and then diverges: `MEMLOCK`,
+/// `NPROC` and `NOFILE` are 6, 7 and 8 against Linux's 8, 6 and 7, so
+/// three flags would each have asked about one of the others. The six
+/// Linux-only limits -- file locks, pending signals, message queues,
+/// nice, and the two real-time ones -- do not exist here at all, and
+/// `None` is how `ulimit` comes to leave them out of `-a` and refuse to
+/// set them, which is what bash on this OS does too.
+///
+/// `-v` is `RLIMIT_RSS`, because that is what Darwin's `RLIMIT_AS` is
+/// defined as: the same number, under two names.
+pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
+    Some(match flag {
+        't' => 0,            // CPU
+        'f' => 1,            // FSIZE
+        'd' => 2,            // DATA
+        's' => RLIMIT_STACK, // STACK
+        'c' => 4,            // CORE
+        'm' => 5,            // RSS
+        'v' => 5,            // AS, which is RSS here
+        'l' => 6,            // MEMLOCK
+        'u' => 7,            // NPROC
+        'n' => 8,            // NOFILE
+        _ => return None,
+    })
+}

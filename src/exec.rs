@@ -5745,7 +5745,7 @@ impl Shell {
             let _ = std::env::set_current_dir(d);
         }
         if let Some(m) = moved.umask {
-            unsafe { umask(m) };
+            crate::platform::set_umask(m);
         }
         if let Some(fds) = moved.fd012 {
             restore_fd012(fds);
@@ -12312,7 +12312,7 @@ impl Shell {
         for (k, v) in self.env_snapshot.iter() {
             unsafe { std::env::set_var(k, v) };
         }
-        unsafe { umask(self.umask_snapshot) };
+        crate::platform::set_umask(self.umask_snapshot);
     }
 
     // The other half of sync_real_state_in: called right after this
@@ -15011,24 +15011,10 @@ fn slice_elements(items: Vec<String>, offset: i64, length: Option<i64>) -> Resul
 // builtin already makes and it reports exactly the two numbers `time`
 // wants.
 fn child_cpu_times() -> (f64, f64) {
-    #[repr(C)]
-    struct Tms {
-        utime: i64,
-        stime: i64,
-        cutime: i64,
-        cstime: i64,
+    match crate::platform::cpu_seconds() {
+        Some((_, _, child_user, child_system)) => (child_user, child_system),
+        None => (0.0, 0.0),
     }
-    unsafe extern "C" {
-        fn times(buf: *mut Tms) -> i64;
-        fn sysconf(name: i32) -> i64;
-    }
-    const SC_CLK_TCK: i32 = 2;
-    let mut tms = Tms { utime: 0, stime: 0, cutime: 0, cstime: 0 };
-    if unsafe { times(&mut tms as *mut Tms) } == -1 {
-        return (0.0, 0.0);
-    }
-    let ticks = unsafe { sysconf(SC_CLK_TCK) }.max(1) as f64;
-    (tms.cutime as f64 / ticks, tms.cstime as f64 / ticks)
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
@@ -15171,18 +15157,12 @@ unsafe extern "C" {
     fn getppid() -> i32;
     fn getuid() -> u32;
     fn geteuid() -> u32;
-    fn umask(mask: u32) -> u32;
 }
 
-// POSIX has no query-only umask read -- `umask(new) -> previous` is the
-// only primitive -- so this immediately restores whatever it finds,
-// leaving no observable side effect (see run_umask's own identical
-// reasoning for its `umask -S`/no-args cases).
-pub(crate) fn current_umask() -> u32 {
-    let cur = unsafe { umask(0) };
-    unsafe { umask(cur) };
-    cur
-}
+/// The platform layer's, re-exported under the name the rest of this
+/// file has always used: POSIX has no query-only umask read, and what
+/// that costs is the layer's business.
+pub(crate) use crate::platform::current_umask;
 
 // run_in_child_shell's own snapshot/restore for fd 0/1/2, the real
 // process's own stdin/stdout/stderr -- see its own call site's doc

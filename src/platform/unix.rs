@@ -172,6 +172,11 @@ impl DirSnapshot {
 
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn getrlimit(resource: i32, limit: *mut ResourceLimit) -> i32;
+    fn setrlimit(resource: i32, limit: *const ResourceLimit) -> i32;
+    fn sysconf(name: i32) -> i64;
+    fn times(buf: *mut Tms) -> i64;
+    fn umask(mask: u32) -> u32;
     fn time(t: *mut i64) -> i64;
     fn localtime_r(t: *const i64, result: *mut CTm) -> *mut CTm;
     // Only `reload_timezone`, which is only a test, calls this.
@@ -608,6 +613,94 @@ pub(crate) fn local_time_at(epoch_seconds: i64) -> CTm {
 #[cfg(test)]
 pub(crate) fn reload_timezone() {
     unsafe { tzset() };
+}
+
+/// One resource limit: what this process may have now, and the most it
+/// may raise itself to.
+///
+/// `rlim_t` is 64-bit on both OSes and `RLIM_INFINITY` is its maximum on
+/// both, so this one layout serves -- it is the resource *numbers* that
+/// differ, and those are in the tables.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ResourceLimit {
+    pub(crate) soft: u64,
+    pub(crate) hard: u64,
+}
+
+/// "No limit", as both OSes spell it.
+pub(crate) const UNLIMITED: u64 = u64::MAX;
+
+/// Which `ulimit` flags this OS has a limit for, and which number each
+/// one is. `None` means this OS has no such limit, and `ulimit` leaves
+/// it out of `-a` and refuses to set it -- which is what bash on that OS
+/// does.
+pub(crate) fn resource_for_flag(flag: char) -> Option<i32> {
+    sys::rlimit_number(flag)
+}
+
+/// How much of `resource` this process may use.
+pub(crate) fn resource_limit(resource: i32) -> ResourceLimit {
+    let mut limit = ResourceLimit::default();
+    unsafe { getrlimit(resource, &mut limit) };
+    limit
+}
+
+/// How much of `resource` this process may use from now on.
+pub(crate) fn set_resource_limit(resource: i32, limit: &ResourceLimit) -> std::io::Result<()> {
+    match unsafe { setrlimit(resource, limit) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// How much stack this process was given, or `None` when there is no
+/// limit on it to find.
+pub(crate) fn stack_limit() -> Option<u64> {
+    let limit = resource_limit(sys::RLIMIT_STACK);
+    (limit.soft != UNLIMITED && limit.soft != 0).then_some(limit.soft)
+}
+
+/// `struct tms`: four clock-tick counts, this process's and its reaped
+/// children's, user and system. `clock_t` is 64-bit on both OSes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Tms {
+    pub(crate) utime: i64,
+    pub(crate) stime: i64,
+    pub(crate) cutime: i64,
+    pub(crate) cstime: i64,
+}
+
+/// CPU used so far, in seconds: this shell's own, and everything it has
+/// waited for.
+///
+/// Seconds rather than ticks, because the divisor is the OS's business:
+/// `sysconf`'s name for the tick rate is 2 on Linux and 3 on macOS, and
+/// asking for the wrong one answers about something else entirely.
+pub(crate) fn cpu_seconds() -> Option<(f64, f64, f64, f64)> {
+    let mut spent = Tms::default();
+    if unsafe { times(&mut spent as *mut Tms) } == -1 {
+        return None;
+    }
+    let ticks = unsafe { sysconf(sys::SC_CLK_TCK) }.max(1) as f64;
+    Some((spent.utime as f64 / ticks, spent.stime as f64 / ticks, spent.cutime as f64 / ticks, spent.cstime as f64 / ticks))
+}
+
+/// The current file-creation mask.
+///
+/// POSIX has no query-only read -- `umask(new)` returns the previous one
+/// and that is the only primitive -- so this sets it back immediately and
+/// leaves nothing observable behind.
+pub(crate) fn current_umask() -> u32 {
+    let current = unsafe { umask(0) };
+    unsafe { umask(current) };
+    current
+}
+
+/// Sets the file-creation mask, giving back what it was.
+pub(crate) fn set_umask(mask: u32) -> u32 {
+    unsafe { umask(mask) }
 }
 
 #[cfg(test)]

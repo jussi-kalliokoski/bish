@@ -19,13 +19,6 @@
 
 use std::cell::Cell;
 
-// Standard Linux/glibc RLIMIT_STACK -- hardcoded for the same reason
-// builtins/limits.rs hardcodes the rest of the RLIMIT_* numbers: it is
-// a stable ABI constant and libc is already linked.
-const RLIMIT_STACK: i32 = 3;
-
-const RLIM_INFINITY: u64 = u64::MAX;
-
 // What to assume when the kernel says "unlimited" or will not say. 8MiB
 // is Linux's own default and what every shell here is actually running
 // with; an unlimited stack still grows into something eventually, and a
@@ -114,19 +107,7 @@ fn budget() -> usize {
     if cached != 0 {
         return cached;
     }
-    #[repr(C)]
-    struct RLimit {
-        cur: u64,
-        max: u64,
-    }
-    unsafe extern "C" {
-        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
-    }
-    let mut lim = RLimit { cur: 0, max: 0 };
-    let total = match unsafe { getrlimit(RLIMIT_STACK, &mut lim) } {
-        0 if lim.cur != RLIM_INFINITY && lim.cur != 0 => lim.cur,
-        _ => ASSUMED_STACK,
-    };
+    let total = crate::platform::stack_limit().unwrap_or(ASSUMED_STACK);
     let value = (total / BUDGET_DENOMINATOR * BUDGET_NUMERATOR).min(usize::MAX as u64) as usize;
     BUDGET.with(|b| b.set(value));
     value

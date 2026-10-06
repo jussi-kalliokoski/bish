@@ -111,3 +111,39 @@ pub(crate) const F_SETFL: i32 = 4;
 // `signal(2)`'s "do whatever you would have done" handler, the other
 // half of `SIG_IGN`.
 pub(crate) const SIG_DFL: usize = 0;
+
+// `getrlimit`/`setrlimit` resources, and `sysconf`'s clock-tick name.
+//
+// Darwin renumbers most of these and simply does not have six of them,
+// so the mapping from `ulimit`'s own flags to resource numbers is a
+// per-OS fact rather than a shared table -- see `rlimit_number`.
+pub(crate) const RLIMIT_STACK: i32 = 3;
+pub(crate) const SC_CLK_TCK: i32 = 2;
+
+/// Which `RLIMIT_*` a `ulimit` flag asks about, or `None` where this OS
+/// has no such limit.
+///
+/// Linux's numbers, in its own order: the six after `NOFILE` are
+/// Linux-only, which is why `ulimit -a` lists more here than on a Mac --
+/// as bash's own does.
+pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
+    Some(match flag {
+        't' => 0,            // CPU
+        'f' => 1,            // FSIZE
+        'd' => 2,            // DATA
+        's' => RLIMIT_STACK, // STACK
+        'c' => 4,            // CORE
+        'm' => 5,            // RSS
+        'u' => 6,            // NPROC
+        'n' => 7,            // NOFILE
+        'l' => 8,            // MEMLOCK
+        'v' => 9,            // AS
+        'x' => 10,           // LOCKS
+        'i' => 11,           // SIGPENDING
+        'q' => 12,           // MSGQUEUE
+        'e' => 13,           // NICE
+        'r' => 14,           // RTPRIO
+        'R' => 15,           // RTTIME
+        _ => return None,
+    })
+}
