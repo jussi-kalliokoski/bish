@@ -155,3 +155,8 @@ pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
 pub(crate) type NFds = u32;
 
 pub(crate) const SIGWINCH: i32 = 28;
+
+// `fcntl(2)` commands. `F_DUPFD_CLOEXEC` is 67 here against Linux's 1030
+// -- see that table for what the wrong one costs.
+pub(crate) const F_DUPFD_CLOEXEC: i32 = 67;
+pub(crate) const F_GETFD: i32 = 1;

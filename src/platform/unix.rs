@@ -172,6 +172,7 @@ impl DirSnapshot {
 
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    fn dup(fd: i32) -> i32;
     fn poll(fds: *mut PollFd, count: sys::NFds, timeout_ms: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -811,6 +812,87 @@ pub(crate) fn duplicate_onto(from: std::os::unix::io::RawFd, to: std::os::unix::
 /// `wake`, which is what bish's handlers do.
 pub(crate) fn on_signal(signal_number: i32, handler: extern "C" fn(i32)) {
     unsafe { signal(signal_number, handler as *const () as usize) };
+}
+
+/// A second descriptor for whatever `fd` refers to, at the lowest free
+/// number. `None` on a closed or invalid one, which every caller here
+/// treats as "nothing to save".
+pub(crate) fn duplicate(fd: std::os::unix::io::RawFd) -> Option<std::os::unix::io::RawFd> {
+    match unsafe { dup(fd) } {
+        copy if copy < 0 => None,
+        copy => Some(copy),
+    }
+}
+
+/// `duplicate`, as something that closes itself.
+pub(crate) fn duplicate_as_file(fd: std::os::unix::io::RawFd) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: a fresh descriptor from `dup`, owned by nothing else.
+    duplicate(fd).map(|copy| unsafe { std::fs::File::from_raw_fd(copy) })
+}
+
+/// A close-on-exec duplicate of `fd` numbered at or above `floor` --
+/// for putting a descriptor somewhere a redirect will not land on it.
+///
+/// Close-on-exec is the point as much as the floor is: the copy only ever
+/// exists to be the *source* of a later `dup2`, and nothing started in
+/// between has any business inheriting it. The command for that is 1030
+/// on Linux and 67 on macOS.
+pub(crate) fn duplicate_above(fd: std::os::unix::io::RawFd, floor: i32) -> Option<std::os::unix::io::RawFd> {
+    match unsafe { fcntl(fd, sys::F_DUPFD_CLOEXEC, floor) } {
+        copy if copy < 0 => None,
+        copy => Some(copy),
+    }
+}
+
+/// Whether `fd` is open at all.
+///
+/// Asked rather than inferred: reading a descriptor nothing opened fails
+/// with EBADF, which from a caller's side is indistinguishable from "no
+/// input yet" -- and `read -u 9` has to tell those apart.
+pub(crate) fn is_open(fd: std::os::unix::io::RawFd) -> bool {
+    unsafe { fcntl(fd, sys::F_GETFD, 0) != -1 }
+}
+
+/// Makes `fd` non-blocking, handing back what its flags were so a caller
+/// can put them back. `None` when the flags could not be read, in which
+/// case nothing was changed.
+pub(crate) fn make_nonblocking(fd: std::os::unix::io::RawFd) -> Option<i32> {
+    let flags = unsafe { fcntl(fd, sys::F_GETFL, 0) };
+    if flags < 0 {
+        return None;
+    }
+    unsafe { fcntl(fd, sys::F_SETFL, flags | sys::O_NONBLOCK) };
+    Some(flags)
+}
+
+/// Puts back flags `make_nonblocking` handed over.
+pub(crate) fn restore_flags(fd: std::os::unix::io::RawFd, flags: i32) {
+    unsafe { fcntl(fd, sys::F_SETFL, flags) };
+}
+
+/// Writes what it can, once.
+///
+/// Deliberately not a loop and deliberately not retrying anything:
+/// `Ok(0)`, `WouldBlock` and `Interrupted` each mean something different
+/// to a pipeline stage -- park, drain the pane, or simply go round again
+/// -- and only the caller knows which.
+pub(crate) fn write_bytes(fd: std::os::unix::io::RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    let written = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+    match written {
+        n if n >= 0 => Ok(n as usize),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Clears close-on-exec, so a child *does* inherit `fd`.
+///
+/// Needed even right after a `dup2`, which clears it on the new
+/// descriptor: `dup2(fd, fd)` is a no-op per POSIX and does *not* clear
+/// it, so a redirect whose source already sits on the target number
+/// would otherwise be closed by the exec it was opened for.
+pub(crate) fn clear_cloexec(fd: std::os::unix::io::RawFd) {
+    unsafe { fcntl(fd, sys::F_SETFD, 0) };
 }
 
 #[cfg(test)]

@@ -156,3 +156,10 @@ pub(crate) type NFds = u64;
 // written out in both tables rather than shared, so one file answers
 // "which number is this signal here".
 pub(crate) const SIGWINCH: i32 = 28;
+
+// `fcntl(2)` commands beyond `F_SETFD` above. `F_DUPFD_CLOEXEC` is 1030
+// here and 67 on Darwin -- one of the quieter wrong numbers available: a
+// duplicate that is not close-on-exec leaks into every child, and the
+// call does not fail.
+pub(crate) const F_DUPFD_CLOEXEC: i32 = 1030;
+pub(crate) const F_GETFD: i32 = 1;

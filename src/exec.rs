@@ -498,19 +498,9 @@ fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
     if !crate::coroutine::in_coroutine() && !pipeline_drain_armed() {
         return op();
     }
-    unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-    }
-    const F_GETFL: i32 = 3;
-    const F_SETFL: i32 = 4;
-    const O_NONBLOCK: i32 = 0o4000;
-    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
-    if flags < 0 {
-        return op();
-    }
-    unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    let Some(was) = crate::platform::make_nonblocking(fd) else { return op() };
     let out = op();
-    unsafe { fcntl(fd, F_SETFL, flags) };
+    crate::platform::restore_flags(fd, was);
     out
 }
 
@@ -650,20 +640,17 @@ impl std::io::Read for PumpingFile {
 
 /// `write_all_parking` straight onto a descriptor.
 fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
-    unsafe extern "C" {
-        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    }
     let mut written = 0;
     while written < bytes.len() {
-        let n = briefly_nonblocking(fd, || unsafe { write(fd, bytes[written..].as_ptr(), bytes.len() - written) });
-        if n > 0 {
-            written += n as usize;
-            continue;
-        }
-        if n == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        let e = std::io::Error::last_os_error();
+        let wrote = briefly_nonblocking(fd, || crate::platform::write_bytes(fd, &bytes[written..]));
+        let e = match wrote {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                written += n;
+                continue;
+            }
+            Err(e) => e,
+        };
         match e.kind() {
             // Nothing downstream can take more yet. A coroutine parks;
             // an in-process stage empties the pane's pty, which is what
@@ -5971,32 +5958,25 @@ impl Shell {
     // shell: `{ x=1; } 3>f` left `x` unset, `{ cd /; } 3>f` stayed put,
     // and `{ exit 3; } 3>f` left only the group, so the script carried on.
     fn run_with_numbered_fds(&mut self, cmd: &parser::Command, numbered: &[Redirect], simple: &[Redirect]) -> ExecResult {
-        unsafe extern "C" {
-            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-            fn dup2(oldfd: i32, newfd: i32) -> i32;
-            fn close(fd: i32) -> i32;
-        }
-        const F_DUPFD_CLOEXEC: i32 = 1030;
         // Each target as it was: a close-on-exec copy of it when open, so
         // nothing started inside inherits the spare, or -1 when closed.
         fn save(targets: impl Iterator<Item = i32>) -> Vec<(i32, i32)> {
             let mut saved: Vec<(i32, i32)> = Vec::new();
             for fd in targets {
                 if !saved.iter().any(|(target, _)| *target == fd) {
-                    saved.push((fd, unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 10) }));
+                    saved.push((fd, crate::platform::duplicate_above(fd, 10).unwrap_or(-1)));
                 }
             }
             saved
         }
         fn restore(saved: Vec<(i32, i32)>) {
             for (fd, copy) in saved.into_iter().rev() {
-                unsafe {
-                    if copy >= 0 {
-                        dup2(copy, fd);
-                        close(copy);
-                    } else {
-                        close(fd);
+                match copy >= 0 {
+                    true => {
+                        crate::platform::duplicate_onto(copy, fd);
+                        crate::platform::close_fd(copy);
                     }
+                    false => crate::platform::close_fd(fd),
                 }
             }
         }
@@ -10106,12 +10086,9 @@ impl Shell {
             None => None,
         };
         if let Some(slave) = &stage_slave {
-            unsafe extern "C" {
-                fn dup2(oldfd: i32, newfd: i32) -> i32;
-            }
             use std::os::fd::AsRawFd;
-            unsafe { dup2(slave.as_raw_fd(), 1) };
-            unsafe { dup2(slave.as_raw_fd(), 2) };
+            crate::platform::duplicate_onto(slave.as_raw_fd(), 1);
+            crate::platform::duplicate_onto(slave.as_raw_fd(), 2);
         }
         PIPELINE_DRAIN.with(|d| *d.borrow_mut() = pane_output.take());
         scheduler.run();
@@ -10544,15 +10521,10 @@ impl Shell {
         // blocked on a full pipe until something drains it.
         let mut lastpipe_code = None;
         if lastpipe {
-            unsafe extern "C" {
-                fn dup2(oldfd: i32, newfd: i32) -> i32;
-            }
             let saved = save_fd012();
             if let Some(read_end) = prev_stdout.take() {
                 let fd = read_end;
-                unsafe {
-                    dup2(std::os::fd::AsRawFd::as_raw_fd(&fd), 0);
-                }
+                crate::platform::duplicate_onto(std::os::fd::AsRawFd::as_raw_fd(&fd), 0);
                 let result = crate::builtins::shell::run_command(self, &commands[n - 1], false);
                 lastpipe_code = Some(match result {
                     ExecResult::Exit(code) => {
@@ -10571,13 +10543,10 @@ impl Shell {
         // the pipe it reads, so they have to be running while it does.
         let mut inproc_code = None;
         if let (Some(stage), Some((stdin_fd, stdout_fd))) = (inproc_stage, inproc_stdio.take()) {
-            unsafe extern "C" {
-                fn dup2(oldfd: i32, newfd: i32) -> i32;
-            }
             use std::os::fd::AsRawFd;
             let saved = save_fd012();
             if let Some(fd) = &stdin_fd {
-                unsafe { dup2(fd.as_raw_fd(), 0) };
+                crate::platform::duplicate_onto(fd.as_raw_fd(), 0);
             }
             // The last stage has no pipe to write into, so fd 1 would
             // stay this shell's own -- the real terminal, which in a
@@ -10591,11 +10560,11 @@ impl Shell {
                 _ => None,
             };
             if let Some(slave) = &pane_slave {
-                unsafe { dup2(slave.as_raw_fd(), 1) };
-                unsafe { dup2(slave.as_raw_fd(), 2) };
+                crate::platform::duplicate_onto(slave.as_raw_fd(), 1);
+                crate::platform::duplicate_onto(slave.as_raw_fd(), 2);
             }
             if let Some(fd) = &stdout_fd {
-                unsafe { dup2(fd.as_raw_fd(), 1) };
+                crate::platform::duplicate_onto(fd.as_raw_fd(), 1);
             }
             // A virtual child rather than `run_command` directly: every
             // stage of a pipeline is a subshell in bash, so an
@@ -13312,10 +13281,6 @@ struct ResolvedRedirs {
 /// happens before the exec, and the descriptor it is duplicated onto
 /// gets its own flags.
 fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
-    unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-    }
-    const F_DUPFD_CLOEXEC: i32 = 1030;
     let mut floor = 3;
     for a in actions.iter() {
         let highest = match a {
@@ -13330,8 +13295,10 @@ fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
         if raw >= floor {
             continue;
         }
-        let moved = unsafe { fcntl(raw, F_DUPFD_CLOEXEC, floor) };
-        if moved >= 0 {
+        if let Some(moved) = crate::platform::duplicate_above(raw, floor) {
+            // SAFETY: a fresh descriptor, owned by nothing else -- and the
+            // old `file` is dropped (closed) by this assignment, which is
+            // what moving it out of the way means.
             *file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(moved) };
         }
     }
@@ -14905,13 +14872,7 @@ impl UnbufferedFd {
     // an unread line and a closed fd are otherwise the same "no input"
     // from the caller's side.
     fn is_open(fd: i32) -> bool {
-        unsafe extern "C" {
-            // Same three-argument shape the rest of this codebase
-            // declares it with (see pty.rs); F_GETFD ignores the third.
-            fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-        }
-        // F_GETFD
-        unsafe { fcntl(fd, 1, 0) != -1 }
+        crate::platform::is_open(fd)
     }
 }
 
@@ -14948,15 +14909,14 @@ impl std::io::BufRead for UnbufferedFd {
                         crate::scheduler::park_readable(self.fd);
                     }
                 }
-                let n = unsafe { libc_read(self.fd, self.byte.as_mut_ptr(), 1) };
-                if n == 1 {
-                    self.filled = true;
-                    break;
-                }
-                if n == 0 {
-                    return Ok(&[]);
-                }
-                let e = std::io::Error::last_os_error();
+                let e = match crate::platform::read_bytes(self.fd, &mut self.byte) {
+                    Ok(1) => {
+                        self.filled = true;
+                        break;
+                    }
+                    Ok(_) => return Ok(&[]),
+                    Err(e) => e,
+                };
                 match e.kind() {
                     // Nothing there *yet*: the stage upstream has not
                     // written it, and that stage is a coroutine sharing
@@ -14977,11 +14937,6 @@ impl std::io::BufRead for UnbufferedFd {
             self.filled = false;
         }
     }
-}
-
-unsafe extern "C" {
-    #[link_name = "read"]
-    fn libc_read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
 // bash's exit-status convention for a process killed by a signal is
@@ -15282,36 +15237,20 @@ pub(crate) fn restore_fd012_for_scheduler(saved: [i32; 3]) {
 // A `File` holding a duplicate of `fd` as it stands now -- the way this
 // shell names "wherever a bare `exec` just pointed this stream".
 fn dup_fd_as_file(fd: i32) -> Option<std::fs::File> {
-    unsafe extern "C" {
-        fn dup(oldfd: i32) -> i32;
-    }
-    use std::os::fd::FromRawFd;
-    match unsafe { dup(fd) } {
-        d if d < 0 => None,
-        d => Some(unsafe { std::fs::File::from_raw_fd(d) }),
-    }
+    crate::platform::duplicate_as_file(fd)
 }
 
 fn save_fd012() -> [i32; 3] {
-    unsafe extern "C" {
-        fn dup(oldfd: i32) -> i32;
-    }
-    [unsafe { dup(0) }, unsafe { dup(1) }, unsafe { dup(2) }]
+    [0, 1, 2].map(|fd| crate::platform::duplicate(fd).unwrap_or(-1))
 }
 
 fn restore_fd012(saved: [i32; 3]) {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
     for (target, fd) in saved.into_iter().enumerate() {
         if fd < 0 {
             continue;
         }
-        unsafe {
-            dup2(fd, target as i32);
-            close(fd);
-        }
+        crate::platform::duplicate_onto(fd, target as i32);
+        crate::platform::close_fd(fd);
     }
 }
 
@@ -15863,15 +15802,11 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 // path elsewhere in this file that isn't wired up to apply to the current
 // process, a separate, narrower remaining gap.
 fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
     for ef in actions {
         match ef {
             FdAction::Open { fd, file } => {
                 let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
-                if unsafe { dup2(srcfd, fd) } == -1 {
+                if !crate::platform::duplicate_onto(srcfd, fd) {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
                 clear_cloexec(fd);
@@ -15893,7 +15828,7 @@ fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
                 }
             }
             FdAction::Dup { fd, source } => {
-                if unsafe { dup2(source, fd) } == -1 {
+                if !crate::platform::duplicate_onto(source, fd) {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
                 clear_cloexec(fd);
@@ -15902,23 +15837,14 @@ fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
             // error: `{ echo a; } 3>&-` is legal in bash whether or not
             // anything ever opened fd 3, and a script that closes
             // defensively should not have to check first.
-            FdAction::Close(fd) => unsafe {
-                close(fd);
-            },
+            FdAction::Close(fd) => crate::platform::close_fd(fd),
         }
     }
     Ok(())
 }
 
-fn clear_cloexec(fd: i32) {
-    unsafe extern "C" {
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-    }
-    const F_SETFD: i32 = 2;
-    unsafe {
-        fcntl(fd, F_SETFD, 0);
-    }
-}
+/// The platform layer's, under the name this file has always used.
+use crate::platform::clear_cloexec;
 
 /// What to say and what to exit with when a command could not be
 /// spawned -- bash's three answers and its two statuses.
@@ -15996,10 +15922,6 @@ fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
 }
 
 fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
-    unsafe extern "C" {
-        fn dup2(oldfd: i32, newfd: i32) -> i32;
-        fn close(fd: i32) -> i32;
-    }
     unsafe {
         command.pre_exec(move || {
             // bish ignores SIGINT for itself (term::ignore_sigint, called
@@ -16014,22 +15936,20 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
             for ef in &actions {
                 match ef {
                     FdAction::Open { fd, file } => {
-                        if dup2(std::os::unix::io::AsRawFd::as_raw_fd(file), *fd) == -1 {
+                        if !crate::platform::duplicate_onto(std::os::unix::io::AsRawFd::as_raw_fd(file), *fd) {
                             return Err(std::io::Error::last_os_error());
                         }
                         clear_cloexec(*fd);
                     }
                     FdAction::Dup { fd, source } => {
-                        if dup2(*source, *fd) == -1 {
+                        if !crate::platform::duplicate_onto(*source, *fd) {
                             return Err(std::io::Error::last_os_error());
                         }
                         clear_cloexec(*fd);
                     }
                     // See the same arm in apply_fds_to_self: closing a
                     // descriptor nothing opened is a no-op.
-                    FdAction::Close(fd) => {
-                        close(*fd);
-                    }
+                    FdAction::Close(fd) => crate::platform::close_fd(*fd),
                 }
             }
             Ok(())
@@ -16281,15 +16201,7 @@ fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
 // typo'd fd number) rather than erroring -- matches this codebase's
 // existing tolerance for a swallowed save/restore failure elsewhere.
 fn dup_existing_fd(fd: i32) -> Option<std::fs::File> {
-    unsafe extern "C" {
-        fn dup(oldfd: i32) -> i32;
-    }
-    let new_fd = unsafe { dup(fd) };
-    if new_fd < 0 {
-        return None;
-    }
-    use std::os::unix::io::FromRawFd;
-    Some(unsafe { std::fs::File::from_raw_fd(new_fd) })
+    crate::platform::duplicate_as_file(fd)
 }
 
 fn connect_dev_socket(proto: &str, host: &str, port: &str) -> std::io::Result<std::fs::File> {
