@@ -549,16 +549,13 @@ mod cost {
     // machine's load as much as the switch. A ratio moves with both.
     #[test]
     fn a_switch_costs_far_less_than_a_syscall() {
-        unsafe extern "C" {
-            fn close(fd: i32) -> i32;
-        }
         const N: usize = 100_000;
 
         // `close(-1)` fails with EBADF without touching anything --
         // a syscall and nothing else, and not one the vDSO answers.
         let started = std::time::Instant::now();
         for _ in 0..N {
-            unsafe { close(-1) };
+            crate::platform::close_fd(-1);
         }
         let per_syscall = started.elapsed().as_nanos() as f64 / N as f64;
 

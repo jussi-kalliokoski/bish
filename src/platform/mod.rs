@@ -135,16 +135,24 @@ pub(crate) enum RawChange {
 mod os_guard {
     /// `(file, how many C functions it declares, what they reach for)`.
     ///
-    /// Not an allow-list in the sense `exec.rs`'s own `spawn_guard` has
-    /// one -- every line here is work still to do, and the file it names
-    /// should eventually be calling `platform` instead. The counts are
-    /// what keeps it honest: a number that no longer matches is a
-    /// failure in both directions, so the table cannot drift from the
-    /// tree whether a declaration was added or moved out.
-    const NOT_MOVED_YET: &[(&str, usize, &str)] = &[
-        ("src/coroutine.rs", 2, "the context switch itself, and a deliberately failing syscall in its tests"),
-        ("src/session.rs", 5, "the session socket: who is on the other end, and who is listening"),
-    ];
+    /// Empty, as of the commit that cleared the last of it: every call
+    /// into the operating system is now made from this directory. It was
+    /// a migration list -- 104 declarations across 18 files -- and the
+    /// counts were what kept it honest, a number that no longer matched
+    /// failing in both directions so the table could not drift from the
+    /// tree. It stays as the mechanism rather than the list: a new
+    /// declaration outside this directory has to be a deliberate act,
+    /// which means adding a line here and saying why.
+    const NOT_MOVED_YET: &[(&str, usize, &str)] = &[];
+
+    /// `(file, how many, why it is not the operating system)`.
+    ///
+    /// A `extern "C"` block that is not a call into the OS at all, and so
+    /// has no business in this directory. There is exactly one: bish's own
+    /// context switch, which is defined a dozen lines above its
+    /// declaration by this crate's own `global_asm!` -- the C ABI is how
+    /// Rust is told how to call it, not a syscall.
+    const NOT_THE_OS: &[(&str, usize, &str)] = &[("src/coroutine.rs", 1, "`bish_switch_context`, hand-written assembly this crate defines itself")];
 
     /// How many C functions a source file declares.
     ///
@@ -209,7 +217,7 @@ mod os_guard {
 
         let mut problems: Vec<String> = Vec::new();
         for (file, count) in &found {
-            match NOT_MOVED_YET.iter().find(|(f, ..)| f == file) {
+            match NOT_MOVED_YET.iter().chain(NOT_THE_OS).find(|(f, ..)| f == file) {
                 None => problems.push(format!(
                     "{file} declares {count} C function(s) of its own.\n     \
                      The operating system is spoken to in src/platform/ and nowhere else -- add the capability there and call it from here.\n     \
@@ -223,7 +231,7 @@ mod os_guard {
                 Some(_) => {}
             }
         }
-        for (file, _, what) in NOT_MOVED_YET {
+        for (file, _, what) in NOT_MOVED_YET.iter().chain(NOT_THE_OS) {
             if !found.iter().any(|(f, _)| f == file) {
                 problems.push(format!("{file} ({what}) declares nothing any more -- remove its line from the table."));
             }

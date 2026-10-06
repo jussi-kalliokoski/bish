@@ -53,3 +53,37 @@ pub(crate) fn anonymous_file() -> Option<std::fs::File> {
     // SAFETY: a fresh descriptor, owned by nothing else.
     Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
+
+// `getsockopt(SOL_SOCKET, SO_PEERCRED)` and the struct it fills, both
+// private: this is Linux's way of asking and Darwin has no such option.
+const SOL_SOCKET: i32 = 1;
+const SO_PEERCRED: i32 = 17;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+unsafe extern "C" {
+    fn getsockopt(socket: i32, level: i32, option: i32, value: *mut u8, length: *mut u32) -> i32;
+}
+
+/// The real user id of whoever is on the other end of an accepted
+/// UNIX-domain socket.
+///
+/// Checked once per connection, before a byte of it is trusted: defence
+/// in depth on top of the socket directory's own 0700, not a replacement
+/// for it. A shared or misconfigured runtime directory could let another
+/// local user connect at all; this is what refuses to talk to them.
+pub(crate) fn peer_user(socket: std::os::unix::io::RawFd) -> std::io::Result<u32> {
+    let mut credentials = Ucred::default();
+    let mut length = std::mem::size_of::<Ucred>() as u32;
+    let asked = unsafe { getsockopt(socket, SOL_SOCKET, SO_PEERCRED, &mut credentials as *mut Ucred as *mut u8, &mut length) };
+    match asked {
+        0 => Ok(credentials.uid),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}

@@ -173,6 +173,7 @@ impl DirSnapshot {
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
     fn dup(fd: i32) -> i32;
+    fn mkdir(path: *const i8, mode: u32) -> i32;
     fn sigaction(signal: i32, action: *const sys::SigAction, previous: *mut sys::SigAction) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn setpgid(pid: i32, pgid: i32) -> i32;
@@ -1044,6 +1045,23 @@ pub(crate) fn wait_for_child(pid: i32, block: bool) -> Waited {
             0 => Waited::Exited((status >> 8) & 0xff),
             signal_number => Waited::Killed(signal_number),
         };
+    }
+}
+
+/// Creates `path` with exactly `mode`, whatever the umask says.
+///
+/// `std::fs::create_dir` cannot: it creates with 0o777 and lets the umask
+/// subtract, so a directory that must be 0700 -- one holding a socket only
+/// this user may connect to -- would depend on whatever umask happened to
+/// be in effect. `AlreadyExists` is left for the caller to judge, because
+/// "it is already there" is not the same as "the directory I meant is
+/// already there".
+pub(crate) fn create_dir_with_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    match unsafe { mkdir(c_path.as_ptr(), mode) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
     }
 }
 

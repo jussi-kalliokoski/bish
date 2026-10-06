@@ -42,28 +42,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-unsafe extern "C" {
-    fn getuid() -> u32;
-    fn mkdir(path: *const i8, mode: u32) -> i32;
-    fn getsockopt(sockfd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
-const SOL_SOCKET: i32 = 1;
-const SO_PEERCRED: i32 = 17;
+// SIGTERM is 15 on every Unix bish targets, unlike the job-control
+// numbers; it is here rather than in the layer's tables for that reason.
 const SIGTERM: i32 = 15;
-
-// Matches glibc's `struct ucred` (Linux x86_64) field for field -- same
-// "hand it straight to the syscall" reasoning term.rs's own Termios
-// struct doc comment gives.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Ucred {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
 
 // The connecting peer's real UID for an already-`accept`ed UNIX-domain
 // stream socket -- checked once per new connection, before trusting any
@@ -73,17 +54,11 @@ struct Ucred {
 // local user's process connect at all; this is what actually refuses to
 // speak to it once it has.
 pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
-    let mut cred = Ucred::default();
-    let mut len = std::mem::size_of::<Ucred>() as u32;
-    let rc = unsafe { getsockopt(stream.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, &mut cred as *mut Ucred as *mut u8, &mut len) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
+    crate::platform::peer_user(stream.as_raw_fd())
 }
 
 fn current_uid() -> u32 {
-    unsafe { getuid() }
+    crate::platform::real_user()
 }
 
 // Where every session's socket/pidfile lives: `$XDG_RUNTIME_DIR/bish`
@@ -253,10 +228,7 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let rc = unsafe { mkdir(c_path.as_ptr(), 0o700) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
+    if let Err(err) = crate::platform::create_dir_with_mode(&dir, 0o700) {
         if err.kind() != io::ErrorKind::AlreadyExists {
             return Err(err);
         }
@@ -1685,7 +1657,7 @@ pub fn run_kill(name: &str) -> io::Result<i32> {
             return Ok(1);
         }
     };
-    if unsafe { kill(pid, SIGTERM) } != 0 {
+    if !crate::platform::send_signal(pid, SIGTERM) {
         return Err(io::Error::last_os_error());
     }
     // A daemon killed by a signal runs no cleanup of its own, so its
@@ -1766,8 +1738,8 @@ pub fn run_client(name: &str) -> io::Result<i32> {
                     }
                 }
             } else if fd == 0 {
-                let n = unsafe { read(0, buf.as_mut_ptr(), buf.len()) };
-                if n <= 0 {
+                let Ok(n) = crate::platform::read_bytes(0, &mut buf) else { break 'relay };
+                if n == 0 {
                     break 'relay;
                 }
                 // Ctrl+Space (0x00), unaccompanied by anything else in
@@ -1782,7 +1754,7 @@ pub fn run_client(name: &str) -> io::Result<i32> {
                 if n == 1 && buf[0] == 0x00 {
                     break 'relay;
                 }
-                let msg = Message::Bytes(buf[..n as usize].to_vec());
+                let msg = Message::Bytes(buf[..n].to_vec());
                 if stream.write_all(&msg.encode()).is_err() {
                     break 'relay;
                 }

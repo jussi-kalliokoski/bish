@@ -57,3 +57,27 @@ pub(crate) fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
 pub(crate) fn anonymous_file() -> Option<std::fs::File> {
     super::unix::unlinked_temp_file("capture")
 }
+
+unsafe extern "C" {
+    fn getpeereid(socket: i32, user: *mut u32, group: *mut u32) -> i32;
+}
+
+/// The real user id of whoever is on the other end of an accepted
+/// UNIX-domain socket.
+///
+/// macOS has no `SO_PEERCRED` -- it has `getpeereid(2)`, which answers
+/// the same question in one call and gives the group as well, which bish
+/// does not need. (`LOCAL_PEERCRED` exists too and fills an `xucred`
+/// whose layout has changed between releases; the dedicated call is both
+/// simpler and stable.)
+///
+/// Same purpose as the Linux half: defence in depth on top of the socket
+/// directory's own 0700, checked before a byte from the peer is trusted.
+pub(crate) fn peer_user(socket: std::os::unix::io::RawFd) -> std::io::Result<u32> {
+    let mut user = 0u32;
+    let mut group = 0u32;
+    match unsafe { getpeereid(socket, &mut user, &mut group) } {
+        0 => Ok(user),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
