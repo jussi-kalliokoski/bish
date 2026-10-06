@@ -26,3 +26,65 @@ pub(crate) const MAP_ANON: i32 = 0x20;
 pub(crate) const O_CLOEXEC: i32 = 0o2000000;
 pub(crate) const F_SETFD: i32 = 2;
 pub(crate) const FD_CLOEXEC: i32 = 1;
+
+// `termios`, as glibc lays it out on Linux: four 32-bit flag words, a
+// line discipline byte that only Linux has, 32 control characters, and
+// the two speeds. `repr(C)` then reproduces the padding a C compiler
+// would insert, so it can be handed straight to tcgetattr/tcsetattr.
+pub(crate) type Flag = u32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Termios {
+    pub(crate) c_iflag: Flag,
+    pub(crate) c_oflag: Flag,
+    pub(crate) c_cflag: Flag,
+    pub(crate) c_lflag: Flag,
+    pub(crate) c_line: u8,
+    pub(crate) c_cc: [u8; 32],
+    pub(crate) c_ispeed: Flag,
+    pub(crate) c_ospeed: Flag,
+}
+
+// Input, output, control and local flags. Every one of these is a
+// different number on Darwin, and nothing but a terminal behaving oddly
+// would say so.
+pub(crate) const IGNBRK: Flag = 0o0000001;
+pub(crate) const BRKINT: Flag = 0o0000002;
+pub(crate) const PARMRK: Flag = 0o0000010;
+pub(crate) const ISTRIP: Flag = 0o0000040;
+pub(crate) const INLCR: Flag = 0o0000100;
+pub(crate) const IGNCR: Flag = 0o0000200;
+pub(crate) const ICRNL: Flag = 0o0000400;
+pub(crate) const IXON: Flag = 0o0002000;
+pub(crate) const OPOST: Flag = 0o0000001;
+pub(crate) const CSIZE: Flag = 0o0000060;
+pub(crate) const CS8: Flag = 0o0000060;
+pub(crate) const ISIG: Flag = 0o0000001;
+pub(crate) const ICANON: Flag = 0o0000002;
+pub(crate) const ECHO: Flag = 0o0000010;
+pub(crate) const IEXTEN: Flag = 0o0100000;
+
+// Indices into `c_cc`, and the ones most likely to be got wrong: 6 and 5
+// here, 16 and 17 on Darwin. A raw mode that wrote them at the wrong
+// index would set two unrelated control characters and leave the read
+// behaviour alone, which looks like a terminal that will not answer.
+pub(crate) const VMIN: usize = 6;
+pub(crate) const VTIME: usize = 5;
+
+// `tcsetattr`: apply this now rather than after the output drains.
+pub(crate) const TCSANOW: i32 = 0;
+
+// Signal numbers. Four of these agree with Darwin's and one does not:
+// `SIGTSTP` is 20 here and 18 there, where 20 is `SIGCHLD` -- so a
+// suspend-self written with this number would reap a child instead of
+// stopping the shell.
+pub(crate) const SIGHUP: i32 = 1;
+pub(crate) const SIGINT: i32 = 2;
+pub(crate) const SIGTSTP: i32 = 20;
+pub(crate) const SIGTTIN: i32 = 21;
+pub(crate) const SIGTTOU: i32 = 22;
+
+// `signal(2)`'s "ignore this" handler, as a plain number because that is
+// what the C declaration takes.
+pub(crate) const SIG_IGN: usize = 1;

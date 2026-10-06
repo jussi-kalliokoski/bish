@@ -30,3 +30,63 @@ pub(crate) const MAP_ANON: i32 = 0x1000;
 pub(crate) const O_CLOEXEC: i32 = 0x100_0000;
 pub(crate) const F_SETFD: i32 = 2;
 pub(crate) const FD_CLOEXEC: i32 = 1;
+
+// `termios`, as macOS lays it out: the flag words and the speeds are
+// `unsigned long` here, not 32-bit, there is no line-discipline byte at
+// all, and `c_cc` holds 20 entries rather than 32. A struct of Linux's
+// shape handed to `tcsetattr` on this OS would be read as nonsense from
+// the second field onwards.
+pub(crate) type Flag = u64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Termios {
+    pub(crate) c_iflag: Flag,
+    pub(crate) c_oflag: Flag,
+    pub(crate) c_cflag: Flag,
+    pub(crate) c_lflag: Flag,
+    pub(crate) c_cc: [u8; 20],
+    pub(crate) c_ispeed: Flag,
+    pub(crate) c_ospeed: Flag,
+}
+
+// From <sys/termios.h>. These are the BSD numbers, and they are not
+// Linux's: `ISIG` is 0x80 against 1, `ICANON` 0x100 against 2, `IEXTEN`
+// 0x400 against 0o100000. `ECHO` happens to agree at 8, which is exactly
+// the sort of coincidence that makes a half-ported table look right.
+pub(crate) const IGNBRK: Flag = 0x0000_0001;
+pub(crate) const BRKINT: Flag = 0x0000_0002;
+pub(crate) const PARMRK: Flag = 0x0000_0008;
+pub(crate) const ISTRIP: Flag = 0x0000_0020;
+pub(crate) const INLCR: Flag = 0x0000_0040;
+pub(crate) const IGNCR: Flag = 0x0000_0080;
+pub(crate) const ICRNL: Flag = 0x0000_0100;
+pub(crate) const IXON: Flag = 0x0000_0200;
+pub(crate) const OPOST: Flag = 0x0000_0001;
+pub(crate) const CSIZE: Flag = 0x0000_0300;
+pub(crate) const CS8: Flag = 0x0000_0300;
+pub(crate) const ISIG: Flag = 0x0000_0080;
+pub(crate) const ICANON: Flag = 0x0000_0100;
+pub(crate) const ECHO: Flag = 0x0000_0008;
+pub(crate) const IEXTEN: Flag = 0x0000_0400;
+
+// Indices into `c_cc`: 16 and 17 here against Linux's 6 and 5. See the
+// Linux table for what writing them at the wrong index looks like.
+pub(crate) const VMIN: usize = 16;
+pub(crate) const VTIME: usize = 17;
+
+pub(crate) const TCSANOW: i32 = 0;
+
+// Signal numbers. BSD renumbered the job-control signals: `SIGTSTP` is
+// 18 here where Linux has 20 (which is `SIGCHLD` on this OS), and
+// `SIGSTOP`/`SIGCONT`/`SIGCHLD` are shuffled the same way. The three
+// bish needs that do agree -- HUP, INT, TTIN, TTOU -- are written out
+// here too rather than shared, because a table that holds only the
+// differences is a table that has to be read twice.
+pub(crate) const SIGHUP: i32 = 1;
+pub(crate) const SIGINT: i32 = 2;
+pub(crate) const SIGTSTP: i32 = 18;
+pub(crate) const SIGTTIN: i32 = 21;
+pub(crate) const SIGTTOU: i32 = 22;
+
+pub(crate) const SIG_IGN: usize = 1;

@@ -1,70 +1,31 @@
-// Raw termios control, hand-rolled against glibc's Linux x86_64 struct
-// layout (no libc crate -- this project stays dependency-free). Shared by
-// the interactive line editor (editor.rs) and `read -s` (exec.rs).
+// The terminal, as bish needs it to behave: raw mode for anything that
+// draws its own line, echo off for `read -s`, and the handful of signals
+// an interactive shell has an opinion about.
+//
+// What the OS provides is in `platform`: the terminal's own mode, and
+// deriving raw or cooked or echoless from it. Which bits those are, and
+// what a `termios` even looks like, differ between the OSes bish runs on
+// and are not this file's business. What is here is when to ask for
+// which, and the escape sequences that have nothing to do with the
+// kernel at all.
 
+use crate::platform::{self, TerminalMode};
 use std::io::{self, Write};
 
-// Matches glibc's `struct termios` (bits/termios.h) on Linux x86_64 field
-// for field; repr(C) then reproduces the same padding/alignment a C
-// compiler would insert, so this can be handed straight to tcgetattr/
-// tcsetattr.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Termios {
-    c_iflag: u32,
-    c_oflag: u32,
-    c_cflag: u32,
-    c_lflag: u32,
-    c_line: u8,
-    c_cc: [u8; 32],
-    c_ispeed: u32,
-    c_ospeed: u32,
-}
-
-const ICANON: u32 = 0o0000002;
-const ECHO: u32 = 0o0000010;
-const ISIG: u32 = 0o0000001;
-const IEXTEN: u32 = 0o0100000;
-const IGNBRK: u32 = 0o0000001;
-const BRKINT: u32 = 0o0000002;
-const PARMRK: u32 = 0o0000010;
-const ISTRIP: u32 = 0o0000040;
-const INLCR: u32 = 0o0000100;
-const IGNCR: u32 = 0o0000200;
-const ICRNL: u32 = 0o0000400;
-const IXON: u32 = 0o0002000;
-const OPOST: u32 = 0o0000001;
-const CSIZE: u32 = 0o0000060;
-const CS8: u32 = 0o0000060;
-
-const VMIN: usize = 6;
-const VTIME: usize = 5;
-
-const TCSANOW: i32 = 0;
-
-unsafe extern "C" {
-    fn tcgetattr(fd: i32, termios_p: *mut Termios) -> i32;
-    fn tcsetattr(fd: i32, optional_actions: i32, termios_p: *const Termios) -> i32;
-    fn raise(sig: i32) -> i32;
-}
-
-// Linux signal numbers (stable/standard across architectures -- safe to
-// hardcode rather than pulling in exec.rs's trap-oriented signal tables).
-pub const SIGINT: i32 = 2;
+// The signal numbers, from the platform layer rather than written out
+// here: BSD renumbered the job-control ones, so `SIGTSTP` is not the
+// same number on macOS as on Linux. Re-exported under this module's own
+// name because this is where the rest of bish has always asked.
+pub const SIGINT: i32 = platform::SIGINT;
 // Not yet called from anywhere -- session.rs's own daemonize (a
 // follow-up commit, once there's an actual accept loop to daemonize
 // into) is the first real caller. Same "land the seam, wire it in
 // later" pattern pty.rs's own module doc comment already names.
 #[allow(dead_code)]
-pub const SIGHUP: i32 = 1;
-pub const SIGTSTP: i32 = 20;
-pub const SIGTTIN: i32 = 21;
-pub const SIGTTOU: i32 = 22;
-const SIG_IGN: usize = 1;
-
-unsafe extern "C" {
-    fn signal(signum: i32, handler: usize) -> usize;
-}
+pub const SIGHUP: i32 = platform::SIGHUP;
+pub const SIGTSTP: i32 = platform::SIGTSTP;
+pub const SIGTTIN: i32 = platform::SIGTTIN;
+pub const SIGTTOU: i32 = platform::SIGTTOU;
 
 // Makes the shell itself immune to SIGINT for the rest of the process's
 // life, the same trick real interactive shells use instead of process-
@@ -77,9 +38,7 @@ unsafe extern "C" {
 // pre_exec hook, or that child would silently inherit "ignore SIGINT" and
 // never respond to Ctrl-C. Call once, at interactive startup.
 pub fn ignore_sigint() {
-    unsafe {
-        signal(SIGINT, SIG_IGN);
-    }
+    platform::ignore_signal(SIGINT);
 }
 
 // A detached `bish session` daemon must survive the terminal that
@@ -94,9 +53,7 @@ pub fn ignore_sigint() {
 // inherited-across-fork/exec caveat as ignore_sigint above.
 #[allow(dead_code)]
 pub fn ignore_sighup() {
-    unsafe {
-        signal(SIGHUP, SIG_IGN);
-    }
+    platform::ignore_signal(SIGHUP);
 }
 
 // Real job control (M11): every job-control shell ignores SIGTTIN/SIGTTOU
@@ -119,10 +76,8 @@ pub fn ignore_sighup() {
 // ignore_sigint applies to these too -- see exec.rs's pre_exec hooks for
 // job-controlled children, which reset them back to SIG_DFL.
 pub fn ignore_tty_signals() {
-    unsafe {
-        signal(SIGTTIN, SIG_IGN);
-        signal(SIGTTOU, SIG_IGN);
-    }
+    platform::ignore_signal(SIGTTIN);
+    platform::ignore_signal(SIGTTOU);
 }
 
 // Suspends the *shell itself* (not a child job) via SIGTSTP, exactly like
@@ -133,9 +88,7 @@ pub fn ignore_tty_signals() {
 // SIGTSTP. Returns once something (`fg` in the invoking shell, `kill
 // -CONT`, ...) resumes this process.
 pub fn suspend_self() {
-    unsafe {
-        raise(SIGTSTP);
-    }
+    platform::raise_signal(SIGTSTP);
 }
 
 // Real-terminal mouse reporting (SGR extended coordinates, mode 1006,
@@ -233,7 +186,7 @@ impl Drop for BracketedPasteGuard {
 // the tty to translate "\n").
 pub struct RawGuard {
     fd: i32,
-    saved: Termios,
+    saved: TerminalMode,
     // Whether this guard also turned on real mouse reporting (see
     // `enable_with_mouse`) and so owes turning it back off on drop.
     // `enable`'s plain callers (drive_fg_job, which manages mouse
@@ -257,11 +210,7 @@ pub struct RawGuard {
 /// not dead, it just is not part of the shell.
 #[cfg(test)]
 pub(crate) fn is_raw(fd: i32) -> bool {
-    let mut current: Termios = unsafe { std::mem::zeroed() };
-    if unsafe { tcgetattr(fd, &mut current) } != 0 {
-        return false;
-    }
-    current.c_lflag & ICANON == 0
+    platform::terminal_mode(fd).is_some_and(|mode| !platform::is_canonical(&mode))
 }
 
 impl RawGuard {
@@ -292,14 +241,10 @@ impl RawGuard {
     }
 
     fn enable_impl(fd: i32, mouse: bool) -> io::Result<RawGuard> {
-        let mut saved: Termios = unsafe { std::mem::zeroed() };
-        if unsafe { tcgetattr(fd, &mut saved) } != 0 {
+        let Some(saved) = platform::terminal_mode(fd) else {
             return Err(io::Error::last_os_error());
-        }
-        let raw = derive_raw(&saved);
-        if unsafe { tcsetattr(fd, TCSANOW, &raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        };
+        platform::set_terminal_mode(fd, &platform::raw_mode(&saved))?;
         if mouse {
             print!("{MOUSE_REPORTING_ENABLE}");
             let _ = io::stdout().flush();
@@ -337,11 +282,8 @@ impl RawGuard {
     // specific bits raw mode turns off, never assumes a stored snapshot
     // is still the right baseline to return to.
     pub fn suspend_raw(&self) {
-        let Some(current) = query(self.fd) else { return };
-        let cooked = derive_cooked(&current);
-        unsafe {
-            tcsetattr(self.fd, TCSANOW, &cooked);
-        }
+        let Some(current) = platform::terminal_mode(self.fd) else { return };
+        let _ = platform::set_terminal_mode(self.fd, &platform::cooked_mode(&current));
     }
 
     // The inverse of `suspend_raw` -- re-derives raw settings fresh from
@@ -350,58 +292,9 @@ impl RawGuard {
     // not be this session's real cooked baseline at all in a nested
     // invocation).
     pub fn resume_raw(&self) {
-        let Some(current) = query(self.fd) else { return };
-        let raw = derive_raw(&current);
-        unsafe {
-            tcsetattr(self.fd, TCSANOW, &raw);
-        }
+        let Some(current) = platform::terminal_mode(self.fd) else { return };
+        let _ = platform::set_terminal_mode(self.fd, &platform::raw_mode(&current));
     }
-}
-
-fn query(fd: i32) -> Option<Termios> {
-    let mut current: Termios = unsafe { std::mem::zeroed() };
-    if unsafe { tcgetattr(fd, &mut current) } != 0 {
-        return None;
-    }
-    Some(current)
-}
-
-// The raw-mode derivation `enable_impl` applies once at construction,
-// factored out so `RawGuard::resume_raw` can re-derive the identical
-// settings without duplicating the flag arithmetic.
-fn derive_raw(base: &Termios) -> Termios {
-    let mut raw = *base;
-    raw.c_iflag &= !(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    raw.c_oflag &= !OPOST;
-    raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cflag &= !CSIZE;
-    raw.c_cflag |= CS8;
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    raw
-}
-
-// NOT the literal bit-for-bit inverse of derive_raw: raw mode clears
-// IGNCR alongside ICRNL (both off, so a bare CR passes through
-// untranslated and unconsumed either way), but IGNCR and ICRNL aren't
-// independent -- POSIX has IGNCR take priority, discarding CR entirely
-// before ICRNL ever gets a say. Turning *both* back on (the naive
-// symmetric inverse, tried first here and caught by interactive
-// testing) silently ate every Enter keystroke: a script's own `read`
-// would echo whatever was typed but never see a line terminator at
-// all, hanging forever on something that looked like it should have
-// worked. Real cooked mode leaves IGNCR/INLCR/ISTRIP/PARMRK/IGNBRK/
-// BRKINT alone -- only ICANON/ECHO/ISIG/IEXTEN, OPOST, and ICRNL/IXON
-// are what actually need forcing back on for kernel-driven line
-// editing/echo to behave normally, applied to whatever the *current*
-// termios is rather than a potentially-stale stored snapshot (see
-// suspend_raw's own doc comment for why that distinction matters).
-fn derive_cooked(base: &Termios) -> Termios {
-    let mut cooked = *base;
-    cooked.c_iflag |= ICRNL | IXON;
-    cooked.c_oflag |= OPOST;
-    cooked.c_lflag |= ECHO | ICANON | IEXTEN | ISIG;
-    cooked
 }
 
 impl Drop for RawGuard {
@@ -410,9 +303,7 @@ impl Drop for RawGuard {
             print!("{MOUSE_REPORTING_DISABLE}");
             let _ = io::stdout().flush();
         }
-        unsafe {
-            tcsetattr(self.fd, TCSANOW, &self.saved);
-        }
+        let _ = platform::set_terminal_mode(self.fd, &self.saved);
     }
 }
 
@@ -430,28 +321,22 @@ impl Drop for RawGuard {
 // line from scratch.
 pub struct NoEchoGuard {
     fd: i32,
-    saved: Termios,
+    saved: TerminalMode,
 }
 
 impl NoEchoGuard {
     pub fn enable(fd: i32) -> io::Result<NoEchoGuard> {
-        let Some(saved) = query(fd) else {
+        let Some(saved) = platform::terminal_mode(fd) else {
             return Err(io::Error::last_os_error());
         };
-        let mut silent = saved;
-        silent.c_lflag &= !ECHO;
-        if unsafe { tcsetattr(fd, TCSANOW, &silent) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        platform::set_terminal_mode(fd, &platform::echoless_mode(&saved))?;
         Ok(NoEchoGuard { fd, saved })
     }
 }
 
 impl Drop for NoEchoGuard {
     fn drop(&mut self) {
-        unsafe {
-            tcsetattr(self.fd, TCSANOW, &self.saved);
-        }
+        let _ = platform::set_terminal_mode(self.fd, &self.saved);
     }
 }
 
@@ -490,21 +375,11 @@ pub fn stdin_ready(timeout_ms: i32) -> bool {
     crate::poll::poll_one(0, timeout_ms)
 }
 
-unsafe extern "C" {
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-}
-
 fn read_one_byte() -> Option<u8> {
     let mut b = [0u8; 1];
-    loop {
-        let n = unsafe { read(0, b.as_mut_ptr(), 1) };
-        if n < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return None;
-        }
-        return if n == 0 { None } else { Some(b[0]) };
+    match platform::read_bytes(0, &mut b) {
+        Ok(1) => Some(b[0]),
+        _ => None,
     }
 }
 

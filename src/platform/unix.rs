@@ -170,6 +170,141 @@ impl DirSnapshot {
     }
 }
 
+unsafe extern "C" {
+    fn tcgetattr(fd: i32, mode: *mut sys::Termios) -> i32;
+    fn tcsetattr(fd: i32, actions: i32, mode: *const sys::Termios) -> i32;
+    fn raise(signal: i32) -> i32;
+    fn signal(signal: i32, handler: usize) -> usize;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
+/// How a terminal is behaving: what to put back, and what to derive the
+/// next mode from.
+///
+/// Opaque on purpose. Which bits mean what is this layer's business, and
+/// a caller that could reach the flags would be a caller with a reason
+/// to know a number that differs per OS.
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalMode(sys::Termios);
+
+/// How `fd`'s terminal is behaving right now, or `None` if it is not a
+/// terminal at all.
+pub(crate) fn terminal_mode(fd: i32) -> Option<TerminalMode> {
+    // SAFETY: a `Termios` of zeroes is a valid one to be written over,
+    // and `tcgetattr` writes the whole of it or fails.
+    let mut mode: sys::Termios = unsafe { std::mem::zeroed() };
+    match unsafe { tcgetattr(fd, &mut mode) } {
+        0 => Some(TerminalMode(mode)),
+        _ => None,
+    }
+}
+
+/// Makes `fd`'s terminal behave as `mode` says, at once rather than
+/// after whatever is queued has drained.
+pub(crate) fn set_terminal_mode(fd: i32, mode: &TerminalMode) -> std::io::Result<()> {
+    match unsafe { tcsetattr(fd, sys::TCSANOW, &mode.0) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Whether the line discipline is still holding typed bytes until a
+/// newline -- that is, whether the terminal is *not* in raw mode.
+///
+/// `ICANON` is the bit that decides it. On a pty the two ends share one
+/// set of these, so asking this of the *master* is how the side driving
+/// it can tell that the program on the slave has taken the terminal --
+/// which is what the vim corpus waits for before it types anything, and
+/// its only caller. A test, therefore, so a release build does not
+/// report code that is not dead but is not part of the shell either.
+#[cfg(test)]
+pub(crate) fn is_canonical(mode: &TerminalMode) -> bool {
+    mode.0.c_lflag & sys::ICANON != 0
+}
+
+/// Raw mode, derived from whatever the terminal is doing now: no line
+/// buffering (`ICANON` off), no echo (bish draws the line itself), no
+/// signals from control characters (`ISIG` off -- the editor reads those
+/// as plain bytes and decides for itself), and no output post-processing
+/// (`OPOST` off, so a caller writes "\r\n" rather than relying on the
+/// terminal to translate).
+pub(crate) fn raw_mode(from: &TerminalMode) -> TerminalMode {
+    let mut raw = from.0;
+    raw.c_iflag &= !(sys::IGNBRK | sys::BRKINT | sys::PARMRK | sys::ISTRIP | sys::INLCR | sys::IGNCR | sys::ICRNL | sys::IXON);
+    raw.c_oflag &= !sys::OPOST;
+    raw.c_lflag &= !(sys::ECHO | sys::ICANON | sys::IEXTEN | sys::ISIG);
+    raw.c_cflag &= !sys::CSIZE;
+    raw.c_cflag |= sys::CS8;
+    raw.c_cc[sys::VMIN] = 1;
+    raw.c_cc[sys::VTIME] = 0;
+    TerminalMode(raw)
+}
+
+/// Cooked mode, derived the same way -- and deliberately *not* the
+/// bit-for-bit inverse of `raw_mode`.
+///
+/// Raw mode clears `IGNCR` alongside `ICRNL` (with both off a bare CR
+/// passes through untranslated either way), but the two are not
+/// independent: POSIX has `IGNCR` take priority and discard CR entirely
+/// before `ICRNL` gets a say. Turning *both* back on -- the naive
+/// symmetric inverse, tried first and caught interactively -- silently
+/// ate every Enter: a script's `read` echoed what was typed and never
+/// saw a line terminator, hanging on something that looked like it
+/// should work. Real cooked mode leaves IGNCR/INLCR/ISTRIP/PARMRK/
+/// IGNBRK/BRKINT alone; only ICANON/ECHO/ISIG/IEXTEN, OPOST and
+/// ICRNL/IXON have to be forced back on for kernel-driven line editing
+/// and echo to behave.
+pub(crate) fn cooked_mode(from: &TerminalMode) -> TerminalMode {
+    let mut cooked = from.0;
+    cooked.c_iflag |= sys::ICRNL | sys::IXON;
+    cooked.c_oflag |= sys::OPOST;
+    cooked.c_lflag |= sys::ECHO | sys::ICANON | sys::IEXTEN | sys::ISIG;
+    TerminalMode(cooked)
+}
+
+/// The terminal exactly as it is, minus the echo -- not raw mode: the
+/// line discipline still edits and buffers a line, it just does not show
+/// it. `read -s`'s own contract.
+pub(crate) fn echoless_mode(from: &TerminalMode) -> TerminalMode {
+    let mut silent = from.0;
+    silent.c_lflag &= !sys::ECHO;
+    TerminalMode(silent)
+}
+
+/// Makes this process ignore `signal` for the rest of its life.
+///
+/// The disposition is inherited by every forked child *and* survives
+/// exec: POSIX resets a real handler function to the default across an
+/// exec, and explicitly leaves "ignore" in place. So every site that
+/// forks a real child has to put it back by hand, or that child would
+/// silently ignore it too.
+pub(crate) fn ignore_signal(signal_number: i32) {
+    unsafe { signal(signal_number, sys::SIG_IGN) };
+}
+
+/// Sends `signal` to this process.
+pub(crate) fn raise_signal(signal_number: i32) {
+    unsafe { raise(signal_number) };
+}
+
+/// Reads whatever is there, retrying an interrupted read.
+///
+/// `Ok(0)` is end of input. A read cut short by a signal is not an
+/// answer about the file at all, so it is taken again rather than
+/// reported -- which is what every caller here would do with it.
+pub(crate) fn read_bytes(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let failure = std::io::Error::last_os_error();
+        if failure.kind() != std::io::ErrorKind::Interrupted {
+            return Err(failure);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};

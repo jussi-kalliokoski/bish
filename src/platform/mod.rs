@@ -85,6 +85,9 @@ mod unix;
 pub(crate) use os::*;
 pub(crate) use unix::*;
 pub(crate) use watch::DirWatch;
+// The signal numbers bish names. Facts about the OS, and two of them
+// differ: see either `sys_` table.
+pub(crate) use sys::{SIGHUP, SIGINT, SIGTSTP, SIGTTIN, SIGTTOU};
 
 /// One watched directory, as the OS identifies it.
 ///
@@ -154,7 +157,6 @@ mod os_guard {
         ("src/scheduler.rs", 3, "hands a coroutine's stage its own fds"),
         ("src/session.rs", 6, "the session socket: who is on the other end, and the lock on it"),
         ("src/stackguard.rs", 1, "how much stack this process was given"),
-        ("src/term.rs", 5, "raw mode, and the signals that have to be handled while in it"),
         ("src/time.rs", 3, "the wall clock, and the local timezone it is shown in"),
     ];
 
