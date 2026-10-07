@@ -1785,8 +1785,48 @@ y
         path.exists().then_some(path)
     }
 
-    fn have_bash() -> bool {
-        Command::new("bash").arg("-c").arg(":").status().is_ok_and(|s| s.success())
+    /// The oldest bash worth comparing against.
+    ///
+    /// 3.2 is what Apple still ships -- it is from 2007, predates a third
+    /// of what this corpus exercises (`declare -A`, `mapfile`, `coproc`,
+    /// `;&`, `${v@Q}`, negative substring offsets, `wait -n`) and would
+    /// report hundreds of divergences that are bash's age rather than
+    /// bish's behaviour. Comparing against it would not be a weaker
+    /// oracle, it would be a misleading one.
+    const OLDEST_USABLE_BASH: u32 = 4;
+
+    /// What the oracle is spawned as: a bare name, resolved through the
+    /// PATH each case is given.
+    ///
+    /// Deliberately not the path `oracle_bash` resolved, though it is the
+    /// same binary: bash puts its own `argv[0]` in front of every error
+    /// it reports, so spawning it as `/usr/bin/bash` makes it say
+    /// `/usr/bin/bash: line 1: ...` where the corpus -- which compares
+    /// what an error said about the input, not what the shell calls
+    /// itself -- normalises `bash: ` away. Found by doing it the other
+    /// way: 56 cases "differed" on nothing but that prefix.
+    fn oracle() -> &'static std::ffi::OsStr {
+        std::ffi::OsStr::new("bash")
+    }
+
+    /// The bash this corpus compares against, or `None` when this machine
+    /// has none worth comparing against.
+    ///
+    /// Resolved on PATH rather than assumed to be `/bin/bash`, and the
+    /// version *asked* rather than inferred from the OS: a Mac with a
+    /// modern bash installed has it ahead of the system one on PATH, and
+    /// then the corpus runs there like anywhere else. Worked out once per
+    /// test binary, since every case would otherwise pay for it.
+    fn oracle_bash() -> Option<&'static std::path::Path> {
+        static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                let path = crate::toolpath::find("bash")?;
+                let version = Command::new(&path).arg("-c").arg("echo ${BASH_VERSINFO[0]}").output().ok()?;
+                let major: u32 = String::from_utf8_lossy(&version.stdout).trim().parse().ok()?;
+                (major >= OLDEST_USABLE_BASH).then(|| PathBuf::from(path))
+            })
+            .as_deref()
     }
 
     // Both shells get the same scratch directory as HOME and cwd, so
@@ -2067,8 +2107,8 @@ y
             // the same way for the comparison to mean anything.
             let merged = !options.is_empty();
             let want = match merged {
-                true => run_merged(std::ffi::OsStr::new("bash"), &[], case.script, &dir),
-                false => run(std::ffi::OsStr::new("bash"), case.script, &dir),
+                true => run_merged(oracle(), &[], case.script, &dir),
+                false => run(oracle(), case.script, &dir),
             };
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
@@ -2107,10 +2147,44 @@ y
     /// `$(external)` coming back empty, and every command after an
     /// external one being dropped -- and every one of them was found by
     /// hand, because all 488 cases ran the other way.
+    /// Losing the oracle quietly is the failure this guards against.
+    ///
+    /// Every corpus test here returns early when there is no bash worth
+    /// comparing against, and a run that skips 733 cases while still
+    /// reporting `ok` is the worst way for a comparison corpus to fail:
+    /// nothing is red, and the thing that was being checked simply is not
+    /// checked any more. So the absence has to be deliberate somewhere,
+    /// and this is where.
+    ///
+    /// macOS is where it is accepted for now: the system bash is 3.2,
+    /// older than a third of what the corpus exercises, and bish is
+    /// therefore not compared against bash there at all. Installing a
+    /// modern one (Homebrew puts it ahead of the system bash on PATH) is
+    /// all it takes for the corpus to start running there.
+    ///
+    /// Anywhere else, a missing or too-old bash fails the suite rather
+    /// than shrinking it. `BISH_NO_BASH_oracle()=1` accepts it for a
+    /// deliberate run without one -- a minimal container, say.
+    #[test]
+    fn the_corpus_goes_unrun_only_where_that_is_accepted() {
+        if oracle_bash().is_some() || std::env::var_os("BISH_NO_BASH_oracle()").is_some() {
+            return;
+        }
+        // macOS is the one machine where going without is accepted, so
+        // there is nothing to report there.
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        panic!(
+            "no bash of version {OLDEST_USABLE_BASH} or newer on PATH, so every case comparing bish against bash was skipped.\n     \
+             Install one, or set BISH_NO_BASH_oracle()=1 to accept a run without the oracle."
+        );
+    }
+
     #[test]
     fn bish_agrees_with_bash_in_a_pane() {
         let Some(bish) = bish_binary() else { return };
-        if !have_bash() {
+        if oracle_bash().is_none() {
             return;
         }
         let cases = pane_cases();
@@ -2176,7 +2250,7 @@ y
     #[test]
     fn the_known_pane_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };
-        if !have_bash() {
+        if oracle_bash().is_none() {
             return;
         }
         let differing: Vec<&str> = compare_with(&pane_cases(), &bish, &["--promoted"]).into_iter().map(|(name, _, _)| name).collect();
@@ -2202,7 +2276,7 @@ y
     #[test]
     fn bish_agrees_with_bash() {
         let Some(bish) = bish_binary() else { return };
-        if !have_bash() {
+        if oracle_bash().is_none() {
             return;
         }
         let differing = compare(CASES, &bish);
@@ -2235,7 +2309,7 @@ y
     #[test]
     fn bish_agrees_with_bash_as_a_login_shell() {
         let Some(bish) = bish_binary() else { return };
-        if !have_bash() {
+        if oracle_bash().is_none() {
             return;
         }
         let root = std::env::temp_dir().join(format!("bish-bashdiff-login-{}", std::process::id()));
@@ -2248,7 +2322,7 @@ y
                 std::fs::remove_dir_all(&dir).ok();
                 outcome
             };
-            let want = answer(std::ffi::OsStr::new("bash"));
+            let want = answer(oracle());
             let got = answer(bish.as_os_str());
             if want.timed_out || got.timed_out || want.text != got.text {
                 differing.push((case.name, want.text, got.text));
@@ -2381,7 +2455,7 @@ y
     #[test]
     fn the_known_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };
-        if !have_bash() {
+        if oracle_bash().is_none() {
             return;
         }
         let differing: Vec<&str> = compare(PENDING, &bish).into_iter().map(|(name, _, _)| name).collect();
