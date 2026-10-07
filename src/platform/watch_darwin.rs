@@ -121,7 +121,7 @@ impl DirWatch {
         }
         let mut c_path: Vec<u8> = dir.as_os_str().as_bytes().to_vec();
         c_path.push(0);
-        let fd = unsafe { c_open(c_path.as_ptr() as *const i8, O_EVTONLY | O_CLOEXEC, 0) };
+        let fd = unsafe { c_open(c_path.as_ptr() as *const i8, O_EVTONLY | O_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }

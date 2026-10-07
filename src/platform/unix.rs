@@ -185,7 +185,7 @@ unsafe extern "C" {
     fn gethostname(buf: *mut u8, len: usize) -> i32;
     fn poll(fds: *mut PollFd, count: sys::NFds, timeout_ms: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     fn getrlimit(resource: i32, limit: *mut ResourceLimit) -> i32;
     fn setrlimit(resource: i32, limit: *const ResourceLimit) -> i32;
     fn sysconf(name: i32) -> i64;
@@ -199,13 +199,18 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn geteuid() -> u32;
     fn getegid() -> u32;
-    // `open(2)` is variadic (`int open(const char *, int, ...)`), and one
-    // declaration of it for the whole directory rather than one per
-    // caller: two non-variadic views of the same C function with
-    // different argument counts is a hazard, and the compiler says so.
-    // The mode is read only for `O_CREAT`, which nothing here passes.
+    // `open(2)` is variadic -- `int open(const char *, int, ...)` -- and
+    // declared that way: rustc 1.99 refuses a non-variadic view of it
+    // outright (`invalid_runtime_symbol_definitions`), and it is right to.
+    // On Apple's arm64 ABI a variadic argument is passed differently from
+    // a fixed one, so the mode of a hypothetical `O_CREAT` call would have
+    // gone to the wrong place. Nothing here passes one, so nothing here
+    // passes a mode: that is what the `...` means.
+    //
+    // One declaration for the whole directory, too. Two differing views of
+    // the same C function is a hazard rather than a style difference.
     #[link_name = "open"]
-    pub(super) fn c_open(path: *const i8, flags: i32, mode: i32) -> i32;
+    pub(super) fn c_open(path: *const i8, flags: i32, ...) -> i32;
     fn posix_openpt(flags: i32) -> i32;
     fn grantpt(fd: i32) -> i32;
     fn unlockpt(fd: i32) -> i32;
@@ -219,7 +224,7 @@ unsafe extern "C" {
     fn tcsetattr(fd: i32, actions: i32, mode: *const sys::Termios) -> i32;
     fn raise(signal: i32) -> i32;
     fn signal(signal: i32, handler: usize) -> usize;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
 }
 
 /// How a terminal is behaving: what to put back, and what to derive the
@@ -327,7 +332,7 @@ pub(crate) fn raise_signal(signal_number: i32) {
 /// reported -- which is what every caller here would do with it.
 pub(crate) fn read_bytes(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
-        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+        let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n >= 0 {
             return Ok(n as usize);
         }
@@ -407,7 +412,7 @@ pub(crate) fn attach_to_pty_slave(slave_path: &std::ffi::CStr) -> std::io::Resul
         if setsid() < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let slave = c_open(slave_path.as_ptr(), sys::O_RDWR, 0);
+        let slave = c_open(slave_path.as_ptr(), sys::O_RDWR);
         if slave < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -780,7 +785,7 @@ pub(crate) fn wake_pipe() -> std::io::Result<(std::os::unix::io::RawFd, std::os:
 /// formatting, no locks. A full pipe means a wake-up is already queued,
 /// which is as good as having written another.
 pub(crate) fn wake(fd: std::os::unix::io::RawFd) {
-    unsafe { write(fd, [0u8].as_ptr(), 1) };
+    unsafe { write(fd, [0u8].as_ptr().cast(), 1) };
 }
 
 /// Closes a raw descriptor this layer handed out.
@@ -868,7 +873,7 @@ pub(crate) fn restore_flags(fd: std::os::unix::io::RawFd, flags: i32) {
 /// to a pipeline stage -- park, drain the pane, or simply go round again
 /// -- and only the caller knows which.
 pub(crate) fn write_bytes(fd: std::os::unix::io::RawFd, bytes: &[u8]) -> std::io::Result<usize> {
-    let written = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+    let written = unsafe { write(fd, bytes.as_ptr().cast(), bytes.len()) };
     match written {
         n if n >= 0 => Ok(n as usize),
         _ => Err(std::io::Error::last_os_error()),

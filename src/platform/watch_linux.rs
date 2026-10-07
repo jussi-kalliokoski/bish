@@ -16,7 +16,7 @@ unsafe extern "C" {
     fn inotify_init1(flags: i32) -> i32;
     fn inotify_add_watch(fd: i32, pathname: *const u8, mask: u32) -> i32;
     fn inotify_rm_watch(fd: i32, wd: i32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
     fn close(fd: i32) -> i32;
 }
 
@@ -91,7 +91,7 @@ impl DirWatch {
         let mut buf = [0u8; 8192];
         let mut out: Vec<RawEvent> = Vec::new();
         loop {
-            let n = unsafe { read(self.fd, buf.as_mut_ptr(), buf.len()) };
+            let n = unsafe { read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
             }
