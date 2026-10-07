@@ -777,7 +777,7 @@ impl Matcher {
             // speculated is already on screen and must not be sent
             // twice.
             None => {
-                let all: Vec<Key> = self.buffer.drain(..).collect();
+                let all = std::mem::take(&mut self.buffer);
                 let already = std::mem::take(&mut self.speculated);
                 Dispatch { revert: 0, keys: all[already.min(all.len())..].to_vec() }
             }

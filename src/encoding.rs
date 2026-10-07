@@ -183,8 +183,12 @@ fn push16(out: &mut Vec<u8>, unit: u16, big_endian: bool) {
 /// half a code unit is a truncated file, and inventing the other half
 /// would put a character in the buffer the file does not have.
 fn from_utf16(bytes: &[u8], little_endian: bool) -> String {
+    // `as_chunks`, so each pair is a `[u8; 2]` the compiler knows the
+    // length of rather than a slice it has to be indexed out of. Its
+    // remainder -- a trailing odd byte, which is half a code unit -- is
+    // dropped, exactly as `chunks_exact` dropped it.
     let units: Vec<u16> =
-        bytes.chunks_exact(2).map(|p| if little_endian { u16::from_le_bytes([p[0], p[1]]) } else { u16::from_be_bytes([p[0], p[1]]) }).collect();
+        bytes.as_chunks::<2>().0.iter().map(|pair| if little_endian { u16::from_le_bytes(*pair) } else { u16::from_be_bytes(*pair) }).collect();
     String::from_utf16_lossy(&units)
 }
 
