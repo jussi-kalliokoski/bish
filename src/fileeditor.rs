@@ -5273,6 +5273,16 @@ mod macro_tests {
             vk.feed(key);
         }
         assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("g"));
+
+        // Backspace is editing the pattern, so the highlight follows it
+        // back. This read `ga<BS>` before -- the transcript this comes
+        // from had gained the key's name instead of losing a character --
+        // so nothing matched and the highlight went out while the pattern
+        // underneath was still perfectly good.
+        vk.feed(Key::Char('a'));
+        assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("ga"));
+        vk.feed(Key::Backspace);
+        assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("g"));
     }
 
     // `insert_with`, but driving a buffer the caller prepared -- a

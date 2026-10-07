@@ -750,6 +750,16 @@ pub struct VimKeys {
     /// and whether each copy after the first starts a line of its own --
     /// `3ihi<Esc>` and `3oX<Esc>`. Set by the command that opens the
     /// excursion, spent on the escape that closes it.
+    // Where a pending search's pattern begins inside `current_input`.
+    //
+    // The transcript is appended to before a key is dispatched, so a
+    // search's own editing keys land in it as their labels -- `<BS>`
+    // rather than one character less. For a search the transcript *is*
+    // the pattern being edited, so it is rebuilt from this point on every
+    // keystroke instead. Same shape as `insert_text_start` below, and for
+    // the same reason: the keys before it belong to the command that
+    // opened this, and only what follows is the text.
+    search_input_start: usize,
     insert_repeat: Option<(usize, bool)>,
     /// Where in `current_change` the text typed during the open
     /// excursion starts.
@@ -822,6 +832,7 @@ impl VimKeys {
             last_completed: String::new(),
             current_change: Vec::new(),
             last_change: Vec::new(),
+            search_input_start: 0,
             insert_repeat: None,
             insert_text_start: 0,
             capturing_insert: false,
@@ -1747,6 +1758,23 @@ impl VimKeys {
         KeyOutcome::None
     }
 
+    /// Starts a `/` or `?` search, remembering where its pattern begins
+    /// in the transcript.
+    fn open_search(&mut self, forward: bool) -> KeyOutcome {
+        self.search_input_start = self.current_input.chars().count();
+        self.show_search(forward, String::new())
+    }
+
+    /// Holds `text` as the pending search and makes the transcript show
+    /// it, which for a search is the whole of what the status line has to
+    /// say: whatever opened the search, then the pattern as it stands.
+    fn show_search(&mut self, forward: bool, text: String) -> KeyOutcome {
+        let opened: String = self.current_input.chars().take(self.search_input_start).collect();
+        self.current_input = opened + &text;
+        self.pending = Pending::Search { forward, text };
+        KeyOutcome::Pending
+    }
+
     fn feed_fresh(&mut self, key: Key) -> KeyOutcome {
         match key {
             Key::Char(c) if c.is_ascii_digit() => {
@@ -1832,14 +1860,11 @@ impl VimKeys {
                 self.pending = Pending::BracketClose;
                 KeyOutcome::Pending
             }
-            Key::Char('/') => {
-                self.pending = Pending::Search { forward: true, text: String::new() };
-                KeyOutcome::Pending
-            }
-            Key::Char('?') => {
-                self.pending = Pending::Search { forward: false, text: String::new() };
-                KeyOutcome::Pending
-            }
+            // The `/` or `?` is already in the transcript (every key is,
+            // before it is dispatched), so the pattern starts right after
+            // it -- and a count typed before it stays where it is.
+            Key::Char('/') => self.open_search(true),
+            Key::Char('?') => self.open_search(false),
             Key::Char('n') => self.emit_last_search(true),
             Key::Char('N') => self.emit_last_search(false),
             Key::Char('*') => {
@@ -2334,20 +2359,19 @@ impl VimKeys {
             Key::Backspace if text.is_empty() => self.abort(),
             Key::Backspace => {
                 text.pop();
-                self.pending = Pending::Search { forward, text };
-                KeyOutcome::Pending
+                self.show_search(forward, text)
             }
             Key::Char(c) => {
                 text.push(c);
-                self.pending = Pending::Search { forward, text };
-                KeyOutcome::Pending
+                self.show_search(forward, text)
             }
             _ => {
                 // Ignore anything else while typing a search string rather
                 // than aborting it -- a stray unrecognized key shouldn't
-                // discard what's already been typed.
-                self.pending = Pending::Search { forward, text };
-                KeyOutcome::Pending
+                // discard what's already been typed. It leaves no mark on
+                // the transcript either, which `show_search` is what makes
+                // true.
+                self.show_search(forward, text)
             }
         }
     }
@@ -3276,6 +3300,44 @@ mod tests {
         // stays until the next sequence starts resolving
         vk.feed(Key::Char('j'));
         assert_eq!(vk.last_motion_display(), "j");
+    }
+
+    // The status line shows what has been typed toward the command in
+    // progress, and for a search that is the pattern itself -- which is
+    // the thing being edited. Backspace used to *extend* it with `<BS>`:
+    // the transcript is appended to before the key is dispatched, so the
+    // pattern lost its character and the display gained three.
+    #[test]
+    fn a_searchs_display_is_the_pattern_being_typed() {
+        let mut vk = VimKeys::new();
+        vk.feed(Key::Char('/'));
+        vk.feed(Key::Char('a'));
+        vk.feed(Key::Char('b'));
+        assert_eq!(vk.pending_display(), "/ab");
+
+        vk.feed(Key::Backspace);
+        assert_eq!(vk.pending_display(), "/a", "backspace shortens the pattern rather than naming itself");
+
+        // A key the search ignores does not leave a mark either: it is
+        // deliberately not an abort (nobody wants a stray Ctrl-F to
+        // discard a half-typed pattern), so it must not be mistaken for
+        // part of the pattern.
+        vk.feed(Key::CtrlF);
+        assert_eq!(vk.pending_display(), "/a");
+
+        // And what the search is *for* still matches the display.
+        vk.feed(Key::Char('c'));
+        assert_eq!(vk.pending_display(), "/ac");
+        assert_eq!(vk.feed(Key::Enter), KeyOutcome::Motion(Motion::SearchForward("ac".to_string()), None));
+
+        // A count before the search is part of what was typed, and stays.
+        let mut counted = VimKeys::new();
+        counted.feed(Key::Char('3'));
+        counted.feed(Key::Char('?'));
+        counted.feed(Key::Char('x'));
+        counted.feed(Key::Char('y'));
+        counted.feed(Key::Backspace);
+        assert_eq!(counted.pending_display(), "3?x");
     }
 
     #[test]
