@@ -91,6 +91,84 @@ pub(crate) fn find_word_start(chars: &[char], cursor: usize) -> usize {
     i
 }
 
+/// Where the alternative under the cursor starts inside a word with an
+/// unclosed `{`, and how much of the word before it every alternative
+/// inherits.
+///
+/// `mv somedir/{old,ne` is completing `ne`, and what `ne` *means* is
+/// `somedir/ne`: the text in front of the brace belongs to every
+/// alternative in the list, which is the whole point of writing it that
+/// way. So completion there has two halves -- the inherited text, which
+/// decides what to look for, and the alternative, which is the only part
+/// a candidate may replace.
+///
+/// Returns `(end of the inherited text, start of this alternative)` as
+/// char indices into `word`, or `None` when the cursor is not inside a
+/// brace list at all -- including when one opened and closed again
+/// (`{old,new}ex`), where the whole word is being completed as usual.
+///
+/// Two things it deliberately does not understand, both documented
+/// rather than handled: a `${...}` inside a brace list (its closing brace
+/// is counted as the list's), and quoting, which this module does not
+/// model anywhere -- see `is_word_char`.
+fn brace_alternative(word: &[char]) -> Option<(usize, usize)> {
+    // One entry per brace still open, holding where its current
+    // alternative starts -- so a nested list's alternative is the one
+    // being typed, and closing it hands the enclosing one back.
+    let mut open: Vec<usize> = Vec::new();
+    let mut inherited = 0;
+    let mut i = 0;
+    while i < word.len() {
+        match word[i] {
+            // Whatever follows a backslash is literal, brace included.
+            '\\' => i += 1,
+            // `${v}` is a parameter expansion, not a list of one.
+            '$' if word.get(i + 1) == Some(&'{') => i += 1,
+            '{' => {
+                if open.is_empty() {
+                    inherited = i;
+                }
+                open.push(i + 1);
+            }
+            '}' => {
+                open.pop();
+            }
+            ',' => {
+                if let Some(alternative) = open.last_mut() {
+                    *alternative = i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.last().map(|alternative| (inherited, *alternative))
+}
+
+/// Re-roots candidates built for the inherited-plus-alternative text
+/// onto the alternative alone, which is all the editor will replace.
+///
+/// `somedir/new.txt` becomes `new.txt`, and the fuzzy-match positions
+/// come down with it: the ones inside the inherited text have nothing
+/// left to point at, and the rest have moved.
+fn strip_inherited(candidates: Vec<CompletionCandidate>, inherited: &str) -> Vec<CompletionCandidate> {
+    let skipped = inherited.chars().count();
+    candidates
+        .into_iter()
+        .filter_map(|c| {
+            let display: String = c.display.chars().skip(skipped).collect();
+            // A candidate that does not start with the inherited text is
+            // not an answer to this alternative -- `file_candidates`
+            // builds every one of its own from that text, so this only
+            // ever drops something a registered spec invented.
+            c.display.starts_with(inherited).then(|| CompletionCandidate {
+                display,
+                matched_positions: c.matched_positions.iter().filter(|p| **p >= skipped).map(|p| p - skipped).collect(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CmdRole {
     Command,
@@ -585,21 +663,38 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         let chars: Vec<char> = req.line.chars().collect();
         let cursor = req.cursor.min(chars.len());
         let word_start = find_word_start(&chars, cursor);
-        let prefix: String = chars[word_start..cursor].iter().collect();
+        let word = &chars[word_start..cursor];
         let prefix_text: String = chars[..word_start].iter().collect();
 
+        // The role is the *word's*, decided from the text in front of the
+        // whole word -- a brace list does not make `mv somedir/{a,b` the
+        // second argument of `mv`.
         let role = classify_word_role(&prefix_text);
+
+        // Inside an unclosed brace, only the alternative under the cursor
+        // is being completed, and it inherits whatever stands in front of
+        // the brace. Everything below then works on the two joined, which
+        // is the text the shell will expand this to.
+        let (replacing_from, prefix, inherited) = match brace_alternative(word) {
+            Some((inherited_end, alternative)) => {
+                let inherited: String = word[..inherited_end].iter().collect();
+                let typed: String = word[alternative..].iter().collect();
+                (word_start + alternative, format!("{inherited}{typed}"), inherited)
+            }
+            None => (word_start, word.iter().collect(), String::new()),
+        };
+        let word_start = replacing_from;
         if let CmdRole::Argument { command, .. } = &role
             && let Some(candidates) = self.registered_spec_candidates(command.as_deref(), &prefix)
         {
-            return CompletionResult { word_start, candidates };
+            return CompletionResult { word_start, candidates: strip_inherited(candidates, &inherited) };
         }
         // After a user's own `complete` spec (which owns a command
         // outright, per real bash) but before the generic flag/
         // subcommand/file fallbacks, since those know nothing about a
         // builtin whose arguments bish itself defines.
         if let Some(candidates) = builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names) {
-            return CompletionResult { word_start, candidates };
+            return CompletionResult { word_start, candidates: strip_inherited(candidates, &inherited) };
         }
 
         let candidates = match role {
@@ -619,7 +714,7 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
             CmdRole::Argument { .. } => self.file_candidates(&prefix),
         };
 
-        CompletionResult { word_start, candidates }
+        CompletionResult { word_start, candidates: strip_inherited(candidates, &inherited) }
     }
 }
 
@@ -1200,6 +1295,77 @@ mod tests {
     // Real temp-dir fixture, self-cleaning: one subdirectory and one
     // regular file sharing a prefix, confirming both the prefix filter and
     // the directory-gets-a-trailing-slash convention.
+    // `mv somedir/{old,new}` is how a rename gets typed, and until now
+    // Tab inside it was dead: the word under the cursor was
+    // `somedir/{old,ne`, which is not a path and never matches one. bash
+    // behaves the same way -- `{` and `,` are not word-break characters
+    // there either -- so this is bish being better rather than bish
+    // catching up.
+    #[test]
+    fn a_brace_alternative_completes_against_the_path_the_brace_sits_in() {
+        let dir = crate::tempdir::TempDir::new("completion-brace");
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("somedir")).unwrap();
+        std::fs::write(dir.join("somedir/old-notes.txt"), b"hi").unwrap();
+        std::fs::write(dir.join("somedir/new-notes.txt"), b"hi").unwrap();
+        std::fs::write(dir.join("elsewhere.txt"), b"hi").unwrap();
+        let provider = ShellCompletionProvider {
+            cwd: Some(dir),
+            known_functions: None,
+            completions: None,
+            default_completion: None,
+            action_ctx: None,
+            functions_preamble: None,
+            honor_gitignore: false,
+            fignore: Vec::new(),
+            force_fignore: true,
+            hl_names: Vec::new(),
+        };
+        let at = |line: &str| {
+            let result = provider.complete(CompletionRequest { line, cursor: line.chars().count() });
+            (result.word_start, display_names(result.candidates))
+        };
+
+        // Right after the opening brace, and after the comma: both are
+        // completed against `somedir/`, and the candidate is only the
+        // alternative -- the editor replaces `ol`, not the whole word, so
+        // a candidate carrying `somedir/` again would double it.
+        assert_eq!(at("mv somedir/{ol"), ("mv somedir/{".chars().count(), vec!["old-notes.txt".to_string()]));
+        // Fuzzily, as everywhere else here: `somedir/ne` matches the old
+        // file too (an `n` and an `e` in "notes"), exactly as it would
+        // without a brace in the line. What matters is that both answers
+        // are re-rooted onto the alternative and the best one is first.
+        let (from, names) = at("mv somedir/{old-notes.txt,ne");
+        assert_eq!(from, "mv somedir/{old-notes.txt,".chars().count());
+        assert_eq!(names.first().map(String::as_str), Some("new-notes.txt"), "{names:?}");
+        assert!(names.iter().all(|n| !n.contains('/')), "every candidate replaces the alternative alone: {names:?}");
+
+        // The text before the brace need not end in a slash: `{` splits a
+        // word, it does not have to split a path.
+        std::fs::write(dir.join("prefix-one"), b"hi").unwrap();
+        assert_eq!(at("cat prefix{-o"), ("cat prefix{".chars().count(), vec!["-one".to_string()]));
+
+        // A closed brace is not a brace context: the whole word is being
+        // completed, as it always was.
+        assert_eq!(at("cat else"), (4, vec!["elsewhere.txt".to_string()]));
+        assert_eq!(at("cat {a,b}else"), (4, Vec::<String>::new()), "nothing is named `{{a,b}}else`");
+    }
+
+    // `${` opens a parameter expansion, not a list of alternatives. The
+    // two look alike one character in, and reading one as the other would
+    // have `cat ${HOM` offering the files in this directory.
+    #[test]
+    fn a_parameter_expansion_is_not_a_brace_list() {
+        assert_eq!(super::brace_alternative(&"somedir/{old,ne".chars().collect::<Vec<_>>()), Some((8, 13)));
+        assert_eq!(super::brace_alternative(&"${HOM".chars().collect::<Vec<_>>()), None);
+        assert_eq!(super::brace_alternative(&"${HOME}/pro".chars().collect::<Vec<_>>()), None);
+        // Escaped, so literal -- and so not an opening brace either.
+        assert_eq!(super::brace_alternative(&r"a\{b".chars().collect::<Vec<_>>()), None);
+        // Nested: the alternative is the innermost list's, and the
+        // inherited text is still everything before the outer one.
+        assert_eq!(super::brace_alternative(&"p{a,{b,c".chars().collect::<Vec<_>>()), Some((1, 7)), "the `c` after the inner comma");
+    }
+
     #[test]
     fn file_candidates_lists_a_real_directory_with_prefix_filter_and_dir_slash() {
         let dir = std::env::temp_dir().join(format!("bish-completion-files-test-{}", std::process::id()));
