@@ -503,6 +503,12 @@ pub struct Screen {
 
     state: ParserState,
     csi_raw: String,
+    // The OSC string as it arrives, and what the last title-setting one
+    // said. Kept beside the grids rather than in one of them: a title
+    // belongs to the terminal, and switching to the alternate screen
+    // does not change what the window is called.
+    osc_raw: String,
+    title: String,
     osc_prev_was_esc: bool,
     dcs_prev_was_esc: bool,
 
@@ -532,6 +538,8 @@ impl Screen {
             shifted_out: false,
             state: ParserState::Ground,
             csi_raw: String::new(),
+            osc_raw: String::new(),
+            title: String::new(),
             osc_prev_was_esc: false,
             dcs_prev_was_esc: false,
             utf8_buf: Vec::new(),
@@ -1242,16 +1250,57 @@ impl Screen {
         }
     }
 
+    // How much of an OSC string is kept. A title is a handful of
+    // characters; this is room for a long path and then some, and a
+    // bound so that a program emitting an unterminated OSC -- or a
+    // binary file catted into a pane -- cannot grow this without end.
+    // Past it the bytes are still read, so the terminator is still found
+    // and the grid is still safe; they are simply not kept.
+    const OSC_LIMIT: usize = 1024;
+
     fn feed_osc(&mut self, b: u8) {
-        if b == 0x07 {
-            self.state = ParserState::Ground;
-            return;
-        }
-        if self.osc_prev_was_esc && b == b'\\' {
+        let terminated = b == 0x07 || (self.osc_prev_was_esc && b == b'\\');
+        if terminated {
+            // The ESC of an ST is already in the string; the `\` is not.
+            if self.osc_prev_was_esc {
+                self.osc_raw.pop();
+            }
+            self.apply_osc();
+            self.osc_raw.clear();
+            self.osc_prev_was_esc = false;
             self.state = ParserState::Ground;
             return;
         }
         self.osc_prev_was_esc = b == 0x1B;
+        if self.osc_raw.len() < Self::OSC_LIMIT {
+            self.osc_raw.push(b as char);
+        }
+    }
+
+    /// What a finished OSC string asks for.
+    ///
+    /// Only the title is acted on. `0` sets the icon name and the title
+    /// together and `2` sets the title, which is one thing as far as
+    /// anything here is concerned; `1` sets the icon name alone and is
+    /// deliberately ignored, since nothing in bish shows an icon and a
+    /// program that sets one has not said what the window is called.
+    /// Everything else -- a clipboard write, a colour query, a
+    /// hyperlink -- is skipped exactly as the whole of OSC used to be.
+    fn apply_osc(&mut self) {
+        let Some((command, text)) = self.osc_raw.split_once(';') else { return };
+        if matches!(command, "0" | "2") {
+            // A control character in a title is not a title: it would be
+            // drawn into the tab bar, or into the real terminal's own
+            // title, as an instruction. Same guard, and the same reason,
+            // as the prompt's own `safe_text`.
+            self.title = crate::term::safe_text(text);
+        }
+    }
+
+    /// What the program in this screen last called itself, or empty if it
+    /// has not said.
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     fn feed_dcs(&mut self, b: u8) {
@@ -1599,6 +1648,52 @@ mod tests {
         let mut s = Screen::new(1, 10);
         s.feed(b"\x1b]0;window title\x07hi");
         assert_eq!(text_row(&s, 0), "hi");
+    }
+
+    // What a program in a pane calls itself -- which is what the tab bar
+    // and the fuzzy opener have to show for it, and what bish passes on
+    // to the real terminal for the pane it is showing.
+    #[test]
+    fn a_program_can_say_what_it_is_called() {
+        let mut s = Screen::new(1, 10);
+        assert_eq!(s.title(), "", "nothing said yet");
+
+        // `0` is icon-and-title, `2` is title: one thing, here.
+        s.feed(b"\x1b]0;vim README.md\x07");
+        assert_eq!(s.title(), "vim README.md");
+        s.feed(b"\x1b]2;~/bish\x07");
+        assert_eq!(s.title(), "~/bish");
+
+        // A string terminator rather than a bell ends it just as well,
+        // and the ESC of the ST is not part of the title.
+        s.feed(b"\x1b]2;cargo test\x1b\\");
+        assert_eq!(s.title(), "cargo test");
+
+        // `1` is the icon name alone: nothing here shows an icon, and a
+        // program that sets one has not said what it is called.
+        s.feed(b"\x1b]1;icon only\x07");
+        assert_eq!(s.title(), "cargo test");
+
+        // Nor does anything else OSC carries -- a clipboard write is not
+        // a title.
+        s.feed(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(s.title(), "cargo test");
+
+        // A title cannot name itself a terminal command: this would
+        // otherwise be drawn into the tab bar, and passed on to the real
+        // terminal, as an instruction.
+        s.feed(b"\x1b]2;evil\x1b[2Jtitle\x07");
+        assert_eq!(s.title(), "evil\u{FFFD}[2Jtitle");
+
+        // One a program never terminates leaves the grid alone and the
+        // last real title standing, however long it is.
+        let mut runaway = Screen::new(1, 10);
+        runaway.feed(b"\x1b]2;fine\x07");
+        runaway.feed(b"\x1b]2;");
+        runaway.feed(&vec![b'x'; 8000]);
+        runaway.feed(b"\x07hi");
+        assert_eq!(text_row(&runaway, 0), "hi");
+        assert_eq!(runaway.title().chars().count(), Screen::OSC_LIMIT - "2;".len(), "kept up to the bound and no further");
     }
 
     #[test]
