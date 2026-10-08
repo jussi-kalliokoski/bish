@@ -1203,7 +1203,7 @@ fn fit_left(s: &str, width: usize) -> String {
 // into `s` (`fuzzy::FuzzyMatch::positions`' own convention); a cluster
 // counts as matched when its own first char is one of them. Returns the
 // pieces plus the display width they actually consumed.
-fn fit_marked(s: &str, positions: &[usize], width: usize) -> (Vec<(String, bool)>, usize) {
+pub(crate) fn fit_marked(s: &str, positions: &[usize], width: usize) -> (Vec<(String, bool)>, usize) {
     let chars: Vec<char> = s.chars().collect();
     let truncating = str_width(s) > width;
     let budget = if truncating { width.saturating_sub(1) } else { width };

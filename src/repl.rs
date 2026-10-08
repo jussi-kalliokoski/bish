@@ -1115,6 +1115,23 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     compositor_redraw(app);
                 }
             }
+            Ok(ReadOutcome::Opener { text, cursor }) => {
+                // The opener paints inside one pane's rectangle, which
+                // only means anything once the compositor owns the
+                // screen -- the same reason normal mode promotes below.
+                ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
+                match run_opener(app) {
+                    Some(target) => act_on_opener_choice(app, target, &text),
+                    // Put away without picking anything: the line is
+                    // handed back exactly as it was, down to the cursor.
+                    None => {
+                        pending_initial = Some((text, cursor));
+                        if app.sinks_are_grid {
+                            compositor_redraw(app);
+                        }
+                    }
+                }
+            }
             Ok(ReadOutcome::NormalMode { text, cursor, wheel }) => {
                 ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                 match run_normal_mode_navigation(app, session_id, None, NavStart::Prompt { text, cursor, wheel }, None) {
@@ -9053,6 +9070,135 @@ fn terminal_title(app: &App) -> String {
     window_title(&pane_title, window.name.as_deref(), &cwd, &home)
 }
 
+/// Everything Ctrl+T offers, in the order the opener keeps its groups in:
+/// the panes that are open, then the files git tracks, then the
+/// directories they are in.
+///
+/// Gathered fresh each time it is asked for. A pane list is only true for
+/// as long as nobody splits anything, and `git ls-files` is one process
+/// -- cheaper than being wrong about what is open.
+fn opener_items(app: &App) -> Vec<crate::opener::Item> {
+    use crate::opener::{Item, Target};
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut items = Vec::new();
+    for window in &app.windows {
+        for (at, pane) in window.panes.iter().enumerate() {
+            let Some(session) = app.sessions.get(&pane.owning_session()) else { continue };
+            // The window's own `[id]` from the tab bar, with the pane's
+            // place in it only when there is more than one -- a number
+            // that says "pane 1 of 1" is a number to read and discard.
+            let id = match window.panes.len() > 1 {
+                true => format!("[{}.{}]", window.id, at + 1),
+                false => format!("[{}]", window.id),
+            };
+            // All three of what a pane can be known by, so any of them
+            // finds it: what somebody called the window, what the program
+            // in it calls itself, and where it is.
+            let title = session.screen.borrow().title().to_string();
+            let cwd = prompt::display_path(&session.shell.cwd.to_string_lossy(), &home);
+            let text = match (&window.name, title.is_empty()) {
+                (Some(name), true) => format!("{id} {name}  {cwd}"),
+                (Some(name), false) => format!("{id} {name}  {title}  {cwd}"),
+                (None, true) => format!("{id} {cwd}"),
+                (None, false) => format!("{id} {title}  {cwd}"),
+            };
+            items.push(Item { target: Target::Pane { window: window.id, pane: pane.id }, text });
+        }
+    }
+    // Outside a repository there is nothing to add, which is not an error
+    // -- the panes are still the answer to most of what Ctrl+T is for.
+    let cwd = app.sessions.get(&app.windows[app.current_window].owning_session()).map(|s| s.shell.cwd.clone()).unwrap_or_default();
+    let Ok(files) = crate::git::tracked_files(&cwd) else { return items };
+    // The trailing slash the file browser uses, so a directory reads as
+    // one next to the files above it.
+    let directories: Vec<Item> = crate::git::tracked_directories(&files)
+        .into_iter()
+        .map(|d| Item { target: Target::Directory(PathBuf::from(&d)), text: format!("{d}/") })
+        .collect();
+    items.extend(files.into_iter().map(|f| Item { target: Target::File(PathBuf::from(&f)), text: f }));
+    items.extend(directories);
+    items
+}
+
+/// Ctrl+T's loop: the opener, until it is given something to do or put
+/// away. Returns what to do, which is the caller's to carry out -- this
+/// only owns the terminal while the list is on screen.
+fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
+    use crate::opener::Outcome;
+    let items = opener_items(app);
+    let chosen = {
+        let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
+        // What capture reports while this is open -- see `OVERLAYS`.
+        let _overlay = OverlayOpen::new();
+        // One pane's rectangle, not the whole screen: the neighbours are
+        // painted once and then left alone, the same arrangement the
+        // pager and the commit list already use.
+        let mut rect = app.focused_pane_rect();
+        compositor_redraw(app);
+        let mut view = crate::opener::Opener::new(items, rect.rows, rect.cols);
+        let mut last_size = (app.term_rows, app.term_cols);
+        loop {
+            let frame = view.render(rect);
+            record_paint(rect, &frame);
+            print!("{frame}");
+            let _ = io::stdout().flush();
+            let key = match editor::read_key_idle(&mut || {
+                service_background_jobs(app);
+            }) {
+                Ok(Some(k)) => k,
+                Ok(None) | Err(_) => break None,
+            };
+            if (app.term_rows, app.term_cols) != last_size {
+                last_size = (app.term_rows, app.term_cols);
+                rect = app.focused_pane_rect();
+                compositor_redraw(app);
+                view.resize(rect.rows, rect.cols);
+            }
+            match view.handle_key(key) {
+                Outcome::Continue => {}
+                Outcome::Close => break None,
+                Outcome::Open(index) => break Some(view.item(index).target.clone()),
+            }
+        }
+    };
+    print!("{}", term::MOUSE_REPORTING_ENABLE);
+    let _ = io::stdout().flush();
+    chosen
+}
+
+/// Carries out what the opener was told to do.
+///
+/// A pane is somewhere that already exists, so going there is a focus
+/// change and nothing more. A file or a directory is not, so it gets a
+/// window of its own -- `window new` with the command that opens it,
+/// which is the same path `::bish window new -- cmd` already takes.
+fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, text: &str) {
+    use crate::opener::Target;
+    match target {
+        Target::Pane { window, pane } => {
+            let Some(at) = app.windows.iter().position(|w| w.id == window) else { return };
+            if let Some(session) = app.sessions.get_mut(&app.windows[app.current_window].owning_session()) {
+                freeze_input_with_text(session, text);
+            }
+            app.current_window = at;
+            if app.windows[at].panes.iter().any(|p| p.id == pane) {
+                // Going to a pane is how you get a minimized one back.
+                restore_if_minimized(&mut app.windows[at], pane);
+                app.windows[at].focused_pane = pane;
+            }
+            compositor_redraw(app);
+        }
+        Target::File(path) => {
+            let command = format!("e {}", exec::shell_quote(&path.to_string_lossy()));
+            apply_window_action(app, WindowAction::New { name: None, command: Some(command) });
+        }
+        Target::Directory(path) => {
+            let command = format!("cd {}", exec::shell_quote(&path.to_string_lossy()));
+            apply_window_action(app, WindowAction::New { name: None, command: Some(command) });
+        }
+    }
+}
+
 /// Keeps the real terminal's title in step with what bish is showing.
 ///
 /// Called wherever the tab bar is recomputed, since the two answer the
@@ -12834,6 +12980,13 @@ fn run_command_mode(
             // already inside the scrollback view, so a notch has no
             // second view to open.
             Ok(ReadOutcome::NormalMode { text, cursor, wheel: _ }) => {
+                pending_initial = Some((text, cursor));
+            }
+            // And the same for Ctrl+T: the opener's whole vocabulary is
+            // "go to this pane" or "open this in a window of its own",
+            // and a colon line is in the middle of saying something about
+            // the pane it is already in. Whatever was typed stays put.
+            Ok(ReadOutcome::Opener { text, cursor }) => {
                 pending_initial = Some((text, cursor));
             }
             // Same reasoning as NormalMode just above: click-to-focus

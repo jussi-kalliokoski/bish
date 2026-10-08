@@ -1110,14 +1110,14 @@ mod tests {
 
     #[test]
     fn the_control_keys_bish_binds_to_nothing_are_still_mappable() {
-        // These three have no meaning of their own anywhere in bish
-        // (`<C-g>` was a fourth until it became the detach gesture),
-        // which is exactly why someone would map them -- `<C-s>` for
-        // "save" most of all. They used not to decode at all, so the
-        // mapping was refused as an unknown name and the diagnosis
-        // ("flow control eats <C-s>") was wrong twice over: bish's raw
-        // mode already clears IXON.
-        for (spelling, key) in [("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS), ("<C-t>", Key::CtrlT)] {
+        // These two have no meaning of their own anywhere in bish --
+        // `<C-g>` and `<C-t>` were on this list until they became the
+        // detach gesture and the opener -- which is exactly why someone
+        // would map them, `<C-s>` for "save" most of all. They used not
+        // to decode at all, so the mapping was refused as an unknown
+        // name and the diagnosis ("flow control eats <C-s>") was wrong
+        // twice over: bish's raw mode already clears IXON.
+        for (spelling, key) in [("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS)] {
             assert_eq!(parse_keys(spelling), Ok(vec![key]), "{spelling}");
             assert_eq!(format_keys(&[key]), spelling);
             assert!(is_mappable(key));

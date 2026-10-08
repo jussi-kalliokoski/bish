@@ -1573,6 +1573,17 @@ pub enum ReadOutcome {
         text: String,
         cursor: usize,
     },
+    // Ctrl+T -- the fuzzy opener (repl.rs's run_opener), over the panes
+    // that are open and the files and directories git tracks. Bubbled up
+    // rather than handled here for the same reason NormalMode is: the
+    // list is made of windows and repositories, neither of which this
+    // crate knows exist. `text`/`cursor` are what had been typed, handed
+    // back through `read_line`'s own `initial` so that closing the opener
+    // without picking anything leaves the line exactly as it was.
+    Opener {
+        text: String,
+        cursor: usize,
+    },
     // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
     // that parameter's own doc comment) -- command mode's own toggle for
     // showing its whole command+output transcript. Whatever was typed so
@@ -2340,6 +2351,10 @@ pub fn read_line(
                 drop(guard.take());
                 return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: None });
             }
+            Key::CtrlT => {
+                drop(guard.take());
+                return Ok(ReadOutcome::Opener { text: ed.as_string(), cursor: ed.cursor });
+            }
             // A wheel notch is the other way into the same view. Only
             // reachable at a *promoted* prompt, and not by this arm's
             // doing: an unpromoted one never turns mouse reporting on, so
@@ -2482,10 +2497,9 @@ pub fn read_line(
             // Decoded so `::bish map` can bind them, and bound to
             // nothing here -- the same place every other unbound key
             // lands. Ctrl+G used to be among them, and is the detach
-            // gesture now.
+            // gesture now; so was Ctrl+T, which opens the fuzzy opener.
             | Key::CtrlQ
             | Key::CtrlS
-            | Key::CtrlT
             | Key::Unknown => {}
         }
         // Recomputed fresh every iteration -- see compute_suggestion's

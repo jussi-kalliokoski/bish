@@ -300,6 +300,42 @@ pub struct LogEntry {
     pub subject: String,
 }
 
+/// Every file git tracks at or below `dir`, as paths relative to `dir`.
+///
+/// Relative to `dir` rather than to the top level because this is a list
+/// to put in front of somebody: a path they can read, and the one they
+/// would have typed from where they are. `git ls-files` already answers
+/// that way when run from a subdirectory.
+///
+/// Nothing here consults `.gitignore`: an ignored file is by definition
+/// not tracked, so the question never comes up.
+pub fn tracked_files(dir: &Path) -> Result<Vec<String>, String> {
+    // -z because a tracked filename may contain a newline, and git's
+    // default quoting of one would hand back a path that no longer opens.
+    Ok(git(dir, &["ls-files", "-z"])?.split(|b| *b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect())
+}
+
+/// The directories those files are in, nearest the top first.
+///
+/// Derived from the file list rather than asked for, because git does not
+/// track directories at all -- a directory exists exactly as long as
+/// something in it does, which makes the parents of the tracked files the
+/// honest answer to "which directories does git know about".
+pub fn tracked_directories(files: &[String]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        let mut path = std::path::Path::new(file);
+        while let Some(parent) = path.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            seen.insert(parent.to_string_lossy().into_owned());
+            path = parent;
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// The commits reachable from `rev` (HEAD without one), newest first:
 /// every one that touched `path`, followed back through its renames, or
 /// every one there is without a path.
@@ -555,6 +591,34 @@ mod tests {
         assert_eq!(log(&dir, None, Some("no-such-rev")).unwrap_err(), "unknown revision 'no-such-rev'");
         let entry = &log(&dir, None, None).unwrap()[0];
         assert_eq!((entry.hash.len(), entry.author.as_str()), (40, "Test User"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tracked_files_are_listed_from_where_you_are_and_their_directories_derived() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-tracked-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src/platform")).unwrap();
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
+        for path in ["README.md", "src/repl.rs", "src/platform/unix.rs"] {
+            std::fs::write(dir.join(path), "x\n").unwrap();
+        }
+        // Not added, so not tracked, and nothing to do with .gitignore.
+        std::fs::write(dir.join("src/scratch.rs"), "x\n").unwrap();
+        run(&["add", "README.md", "src/repl.rs", "src/platform/unix.rs"]);
+        run(&["commit", "-q", "-m", "initial"]);
+
+        let files = tracked_files(&dir).unwrap();
+        assert_eq!(files, ["README.md", "src/platform/unix.rs", "src/repl.rs"]);
+        assert_eq!(tracked_directories(&files), ["src", "src/platform"], "every parent, and the top level is not one of them");
+        // From a subdirectory: the paths somebody standing there would
+        // type, and only what is at or below them.
+        assert_eq!(tracked_files(&dir.join("src")).unwrap(), ["platform/unix.rs", "repl.rs"]);
+        assert!(tracked_directories(&["README.md".to_string()]).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
