@@ -1828,11 +1828,19 @@ y
         // actually set here), then an attempt to trap it: accepted with a
         // successful status, and with no effect whatsoever.
         let script = r#"trap 'echo t' INT; trap -p; trap 'echo h' HUP; echo "status=$?"; trap -p HUP"#;
-        let got = run_with_sighup_ignored(bish.as_os_str(), script);
+        let dir = std::env::temp_dir().join(format!("bish-entry-ignored-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = run_with_sighup_ignored(bish.as_os_str(), script, &dir);
         assert_eq!(got, "trap -- '' SIGHUP\ntrap -- 'echo t' SIGINT\nstatus=0\ntrap -- '' SIGHUP\n");
         if let Some(bash) = oracle_bash() {
-            assert_eq!(got, run_with_sighup_ignored(bash.as_os_str(), script), "bish and bash must say the same thing about an inherited ignore");
+            assert_eq!(
+                got,
+                run_with_sighup_ignored(bash.as_os_str(), script, &dir),
+                "bish and bash must say the same thing about an inherited ignore"
+            );
         }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `run_with`, with SIGHUP already ignored when the shell starts.
@@ -1842,14 +1850,23 @@ y
     /// shell's -- and SIG_IGN is one of the two dispositions that survive
     /// `exec` at all, which is the whole reason the rule being tested
     /// exists.
-    fn run_with_sighup_ignored(shell: &std::ffi::OsStr, script: &str) -> String {
+    ///
+    /// `dir` is the shell's HOME and its cwd, for the reason `run_with`
+    /// gives: a shell that can see the machine's own configuration is a
+    /// test that can fail for reasons that have nothing to do with the
+    /// shell. Leaving HOME unset is not neutral -- it sends the shell to
+    /// look the answer up for itself, and it finds the real one.
+    fn run_with_sighup_ignored(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> String {
         let mut command = Command::new(shell);
         command
             .arg("-c")
             .arg(script)
+            .current_dir(dir)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
             .env("LC_ALL", "C")
+            .env("HOME", dir)
+            .env("PS1", "$ ")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1873,8 +1890,13 @@ y
                 Ok(())
             });
         }
-        let out = command.spawn().and_then(|child| wait_with_timeout(child, CASE_TIMEOUT)).expect("the shell under test must run");
-        format!("{}{}", String::from_utf8_lossy(&out.0.stdout), String::from_utf8_lossy(&out.0.stderr))
+        let (out, timed_out) = command.spawn().and_then(|child| wait_with_timeout(child, CASE_TIMEOUT)).expect("the shell under test must run");
+        // Said out loud rather than folded into the text: a killed shell
+        // reports whatever it printed first, which would come back here as
+        // an ordinary mismatch and send the next reader looking at the
+        // listing code.
+        assert!(!timed_out, "{shell:?} did not finish within {CASE_TIMEOUT:?}");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
     }
 
     fn bish_binary() -> Option<PathBuf> {
