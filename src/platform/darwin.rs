@@ -81,3 +81,18 @@ pub(crate) fn peer_user(socket: std::os::unix::io::RawFd) -> std::io::Result<u32
         _ => Err(std::io::Error::last_os_error()),
     }
 }
+
+/// Whatever has to stay open beside a fresh pty's master for it to be
+/// usable before a child has opened the slave.
+///
+/// Here, the slave itself. Every ioctl on a macOS master fails with
+/// ENOTTY until the slave has been opened, and the slave's last close
+/// resets the terminal, size included -- so the resize every caller
+/// does between opening a pty and spawning onto it is refused, and the
+/// child starts on a 0x0 terminal. Held until the child has its own
+/// copy; close-on-exec (std's default) and `O_NOCTTY` so that it is
+/// never anyone's controlling terminal or inheritance by accident.
+pub(crate) fn pty_keepalive(slave_path: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).write(true).custom_flags(sys::O_NOCTTY).open(slave_path).map(Some)
+}

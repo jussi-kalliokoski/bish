@@ -37,11 +37,17 @@ pub(crate) use crate::platform::Winsize;
 pub struct Pty {
     pub master: File,
     pub slave_path: String,
+    /// Whatever the OS needs held open for the master to answer before
+    /// a child has attached -- see `platform::pty_keepalive`. Dropped
+    /// with the rest of the `Pty`, by which point the child holds its
+    /// own.
+    _keepalive: Option<File>,
 }
 
 pub fn open() -> io::Result<Pty> {
     let (master, slave_path) = platform::open_pty()?;
-    Ok(Pty { master, slave_path })
+    let _keepalive = platform::pty_keepalive(&slave_path)?;
+    Ok(Pty { master, slave_path, _keepalive })
 }
 
 // Spawns `cmd` with its stdin/stdout/stderr replaced by a freshly-opened

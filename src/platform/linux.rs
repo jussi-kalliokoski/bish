@@ -87,3 +87,12 @@ pub(crate) fn peer_user(socket: std::os::unix::io::RawFd) -> std::io::Result<u32
         _ => Err(std::io::Error::last_os_error()),
     }
 }
+
+/// Whatever has to stay open beside a fresh pty's master for it to be
+/// usable before a child has opened the slave.
+///
+/// Nothing, here: a Linux pty answers on the master from the moment it
+/// exists. See darwin.rs for the OS where that is not so.
+pub(crate) fn pty_keepalive(_slave_path: &str) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
