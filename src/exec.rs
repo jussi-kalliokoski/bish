@@ -3884,9 +3884,24 @@ impl Shell {
         }
         if name != "theme"
             && let Some(BishOptValue::Str(active)) = self.bishopts.get("theme")
-            && let Some(v) = self.themes.get(active).and_then(|theme| theme.opts.get(name))
         {
-            return Some(v.clone());
+            if let Some(v) = self.themes.get(active).and_then(|theme| theme.opts.get(name)) {
+                return Some(v.clone());
+            }
+            // Then a theme bish ships, which is a tier below a declared
+            // one *per name* rather than wholesale: declaring a theme
+            // called `kaamos` that sets one colour leaves the other
+            // twenty-two to the shipped one, so liking a theme except
+            // for its comments is one line rather than a theme of your
+            // own. Parsed on the way out, like a registered default
+            // below, and `expect`-free because an unparseable colour in
+            // BUILTIN_THEMES is a bug a test catches rather than
+            // something a user can reach.
+            if let Some(text) = crate::theme::builtin(active).and_then(|t| t.opts.iter().find(|(n, _)| *n == name)).map(|(_, css)| *css)
+                && let Ok(parsed) = crate::csscolor::parse_terminal_list(text)
+            {
+                return Some(BishOptValue::Color(text.to_string(), parsed));
+            }
         }
         Some(match default {
             BishOptDefault::Bool(b) => BishOptValue::Bool(b),
@@ -3943,7 +3958,12 @@ impl Shell {
             Some(text) => text.clone(),
             None => {
                 let BishOptValue::Str(active) = self.bishopts.get("theme")? else { return None };
-                self.themes.get(active)?.hl.get(name)?.clone()
+                // A declared theme first, then a shipped one -- the same
+                // per-name precedence `bishopt_value` documents.
+                match self.themes.get(active).and_then(|theme| theme.hl.get(name)) {
+                    Some(text) => text.clone(),
+                    None => crate::theme::builtin(active)?.hl.iter().find(|(n, _)| *n == name)?.1.to_string(),
+                }
             }
         };
         let candidates = crate::csscolor::parse_terminal_list(&text).ok()?;
@@ -3958,10 +3978,15 @@ impl Shell {
     /// with no arguments lists.
     pub fn hl_colors(&self) -> Vec<(String, String)> {
         let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        if let Some(BishOptValue::Str(active)) = self.bishopts.get("theme")
-            && let Some(theme) = self.themes.get(active)
-        {
-            out.extend(theme.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(BishOptValue::Str(active)) = self.bishopts.get("theme") {
+            // Bottom tier first, so a declared theme's own entries land
+            // on top of the shipped ones name by name.
+            if let Some(shipped) = crate::theme::builtin(active) {
+                out.extend(shipped.hl.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            }
+            if let Some(theme) = self.themes.get(active) {
+                out.extend(theme.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
         }
         // Anything set directly wins over the theme, same as a bishopt.
         out.extend(self.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -17289,7 +17314,7 @@ pub fn bish_subcommands() -> &'static [&'static str] {
 // subcommand that takes something other than a fixed word.
 pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
     match sub {
-        "theme" => &["begin", "end"],
+        "theme" => crate::builtins::bish::THEME_SUBCOMMANDS,
         "window" | "win" => &["next", "previous", "new", "rename", "ls", "select"],
         "hook" => &["ls", "add", "rm", "help"],
         "lsp" => &["ls", "add", "rm", "status", "log", "restart", "help"],
@@ -17327,7 +17352,7 @@ pub fn lsp_apply_edits_values() -> &'static [&'static str] {
 // KNOWN_BISHOPTS and are printed alongside, so none of that is repeated
 // here.
 const BISHOPT_HELP: &[(&str, &str)] = &[
-    ("theme", "The active `::bish theme` declaration, if any."),
+    ("theme", "The active theme: a `::bish theme` declaration or one bish ships. `::bish theme list` names them."),
     ("ui_col_directory", "Interface colour: directories in the file browser."),
     ("ui_col_symlink", "Interface colour: symlinks in the file browser."),
     ("ui_col_archive", "Interface colour: archives in the file browser."),
@@ -18868,6 +18893,98 @@ mod tests {
     // depend on which registry a *different* option came from), so these
     // set/read it directly rather than needing their own parallel entry
     // in TEST_BISHOPTS.
+    // `::bish theme list` is the only way to find out what the names
+    // are, so it has to name the shipped ones with nothing configured at
+    // all -- which is exactly the state somebody asking is in.
+    #[test]
+    fn theme_list_names_the_shipped_themes_and_marks_the_active_one() {
+        let mut shell = Shell::new();
+        let buf = Rc::new(RefCell::new(String::new()));
+        shell.set_sink_capture(buf.clone());
+        let listing = |sh: &mut Shell| {
+            buf.borrow_mut().clear();
+            assert_eq!(crate::builtins::bish::run_bish(sh, &strs(&["theme", "list"])).status(), 0);
+            buf.borrow().clone()
+        };
+        let text = listing(&mut shell);
+        assert!(text.contains("revontulet"), "{text:?}");
+        assert!(text.contains("kaamos"), "{text:?}");
+        assert!(!text.contains('*'), "nothing is active yet: {text:?}");
+
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "kaamos"]), KNOWN_BISHOPTS), 0);
+        let text = listing(&mut shell);
+        assert!(text.lines().any(|l| l.starts_with("* kaamos")), "{text:?}");
+        assert!(text.lines().any(|l| l.starts_with("  revontulet")), "{text:?}");
+
+        // A declared theme of its own name joins the list; one that
+        // shadows a shipped name stays a single row and says so.
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "paper"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
+        let text = listing(&mut shell);
+        assert_eq!(text.lines().count(), 3, "{text:?}");
+        assert!(text.lines().any(|l| l.starts_with("  paper\tdeclared")), "{text:?}");
+    }
+
+    // The themes bish ships are a tier below a declared one and above a
+    // registered default, and the tier is per *name* -- which is the
+    // whole point: liking a shipped theme except for one colour should
+    // not mean copying the other forty.
+    #[test]
+    fn a_shipped_theme_colours_what_a_declared_one_leaves_alone() {
+        let mut shell = Shell::new();
+        // Nothing active: a shipped theme is inert until named, exactly
+        // as a declared one is.
+        assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor), None);
+        assert_eq!(shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory"), shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory"));
+        let registered = shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory");
+
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "kaamos"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor), Some(vt100::Color::Rgb(0x6E, 0x0D, 0x91)));
+        // The scheme's own sixteen-slot reduction of itself, on a
+        // terminal that cannot do better.
+        assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Ansi16), Some(vt100::Color::Indexed(5)));
+        // A chrome option too, and it is no longer the registered one.
+        let active = shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory");
+        assert_ne!(active, registered, "a shipped theme has to beat a registered default");
+        assert_eq!(
+            active,
+            Some(BishOptValue::Color(
+                "#0B0DA0, -bish-bright-blue".to_string(),
+                crate::csscolor::parse_terminal_list("#0B0DA0, -bish-bright-blue").unwrap()
+            ))
+        );
+
+        // A declared theme of the same name wins for what it mentions
+        // and leaves the rest shipped.
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "kaamos"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "keyword", "#010203"])), 0);
+        assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
+        assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor), Some(vt100::Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            shell.hl_color_for("comment", crate::csscolor::ColorSupport::Truecolor),
+            Some(vt100::Color::Rgb(0x14, 0x7B, 0x7C)),
+            "a name the declaration never mentioned still comes from the shipped theme"
+        );
+        // And the listing says the same thing, bottom tier first.
+        let colours: std::collections::HashMap<String, String> = shell.hl_colors().into_iter().collect();
+        assert_eq!(colours.get("keyword").map(String::as_str), Some("#010203"));
+        assert_eq!(colours.get("comment").map(String::as_str), Some("#147B7C, -bish-cyan"));
+
+        // Switching skies moves every colour that was not spoken for.
+        assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "revontulet"]), KNOWN_BISHOPTS), 0);
+        assert_eq!(shell.hl_color_for("comment", crate::csscolor::ColorSupport::Truecolor), Some(vt100::Color::Rgb(0x11, 0x71, 0x72)));
+        assert_eq!(
+            shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor),
+            Some(vt100::Color::Rgb(0xCB, 0x5E, 0xFB)),
+            "the kaamos declaration does not follow"
+        );
+        // A name nothing has ever said anything about is still unset:
+        // the shipped themes are not a registry of defaults.
+        assert_eq!(shell.hl_color_for("something_no_one_has_named", crate::csscolor::ColorSupport::Truecolor), None);
+    }
+
     #[test]
     fn bish_theme_declares_a_named_theme_without_applying_its_opts_live() {
         let mut shell = Shell::new();

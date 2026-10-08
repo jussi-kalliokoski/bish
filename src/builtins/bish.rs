@@ -17,7 +17,11 @@ use crate::exec::{
 const BISH_SUBCOMMANDS: &[&str] = &["theme", "window", "hook", "hl", "lsp", "map"];
 const HOOK_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "help"];
 const LSP_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "status", "log", "restart", "help"];
-const THEME_SUBCOMMANDS: &[&str] = &["begin", "end"];
+// `pub(crate)` so `exec::bish_sub_subcommands` can hand completion this
+// very list rather than a second copy of it: the two drifted apart the
+// moment `list` was added, offering a subcommand the dispatcher had and
+// the menu did not.
+pub(crate) const THEME_SUBCOMMANDS: &[&str] = &["begin", "end", "list"];
 // Long forms only. The one-letter aliases (`s`, `v`, `h`, `=`) are real
 // spellings but useless as suggestions: at a one-edit threshold every
 // mistyped single character is a near miss for most of them, so the
@@ -563,6 +567,7 @@ pub(crate) fn run_bish_theme(sh: &mut Shell, args: &[String]) -> i32 {
     match args {
         [sub] if sub == "begin" => run_bish_theme_begin(sh),
         [sub] if sub == "end" => run_bish_theme_end(sh),
+        [sub] if sub == "list" => run_bish_theme_list(sh),
         [] => {
             sh_eprintln!(sh, "bish: ::bish theme: missing subcommand (expected: {})", listed(THEME_SUBCOMMANDS));
             2
@@ -1050,6 +1055,43 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
 // had captured so far the moment `end` ran, with no way back --
 // there's no real use for nesting this anyway (a theme is a flat set
 // of opts, not something that composes from an inner declaration).
+// `::bish theme list` -- what there is to switch to.
+//
+// Shipped themes and declared ones in one list, because the only thing a
+// reader wants from it is a name they can put in `bishopt --set theme`,
+// and which of the two kinds it came from is the second question. The
+// active one is marked, since a theme is exactly the sort of setting
+// somebody checks because they cannot remember whether it took.
+//
+// A declared theme of a shipped theme's name appears once, as declared:
+// it is one name, and the shipped colours it does not mention still show
+// through (see `Shell::bishopt_value`).
+pub(crate) fn run_bish_theme_list(sh: &mut Shell) -> i32 {
+    // Empty when nothing is active, which is the default -- an empty
+    // name can never match one of these, so no special case is needed.
+    let active = sh.bishopt_str("theme");
+    let mut declared: Vec<&String> = sh.themes.keys().collect();
+    declared.sort();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for theme in crate::theme::BUILTIN_THEMES {
+        let about = match declared.iter().any(|n| n.as_str() == theme.name) {
+            true => format!("declared, over the one bish ships -- {}", theme.about),
+            false => theme.about.to_string(),
+        };
+        rows.push((theme.name.to_string(), about));
+    }
+    for name in declared {
+        if crate::theme::builtin(name).is_none() {
+            rows.push((name.clone(), "declared".to_string()));
+        }
+    }
+    for (name, about) in rows {
+        let mark = if name == active { "*" } else { " " };
+        sh_println!(sh, "{mark} {name}\t{about}");
+    }
+    0
+}
+
 pub(crate) fn run_bish_theme_begin(sh: &mut Shell) -> i32 {
     if sh.pending_theme.is_some() {
         sh_eprintln!(sh, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
