@@ -8958,10 +8958,15 @@ fn yank_selections(buf: &impl BisheditBuffer, selections: &[motion::MotionRange]
 // bar without holding a live borrow of `sessions` for its whole poll
 // loop (see that call site's comment for why it can't).
 fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
-    // Same abbreviation the prompt itself uses (~-substitution, parent
-    // components shortened to their first character) -- computed once
-    // per redraw rather than per window, since it only depends on $HOME.
+    // The same path the prompt shows (`$HOME` as `~`) -- read once per
+    // redraw rather than per window, since it only depends on $HOME.
     let home = std::env::var("HOME").unwrap_or_default();
+    // A tab's share of the bar, less what `tab_segment_text` spends on
+    // the id and the spaces around it. The path no longer arrives
+    // pre-abbreviated, so this is where a window's label is made to fit
+    // -- and a bar of full paths would otherwise run off the end of the
+    // line instead of ending at it.
+    let label_budget = tab_label_budget(app.term_cols, app.windows.len());
     app.windows
         .iter()
         .enumerate()
@@ -8970,10 +8975,13 @@ fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
             // bish what a window is *for*, that is more useful than
             // where it happens to be.
             let label = match &w.name {
-                Some(name) => name.clone(),
+                // A name is a name: it gets cut at the end like any
+                // other text, there being no structure in it to give up
+                // first.
+                Some(name) => prompt::ellipsize_end(name, label_budget),
                 None => {
                     let cwd = app.sessions[&w.owning_session()].shell.cwd.to_string_lossy();
-                    prompt::shorten_path(&cwd, &home)
+                    prompt::fit_path(&prompt::display_path(&cwd, &home), label_budget)
                 }
             };
             // tmux's own marker for the same thing, and for the same
@@ -11085,7 +11093,7 @@ fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
         .map(|(i, window)| exec::WindowInfo {
             id: window.id,
             name: window.name.clone(),
-            cwd: app.sessions.get(&window.owning_session()).map(|s| prompt::shorten_path(&s.shell.cwd.to_string_lossy(), &home)).unwrap_or_default(),
+            cwd: app.sessions.get(&window.owning_session()).map(|s| prompt::display_path(&s.shell.cwd.to_string_lossy(), &home)).unwrap_or_default(),
             panes: window.panes.len(),
             current: i == app.current_window,
         })
@@ -11095,6 +11103,17 @@ fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
 // The visible text of one tab's own segment -- shared by render_tab_bar
 // and tab_bar_regions so the rendered tab bar and its hit-test column
 // ranges (see hit_test_click) can never drift apart from each other.
+/// What one tab's label may take: its share of the bar, less what the
+/// segment spends on the window id and the spaces around it, and less
+/// one more so the bar ends before the line does rather than on it.
+///
+/// Its own function so the arithmetic can be read and tested without an
+/// `App` to hand.
+fn tab_label_budget(term_cols: usize, windows: usize) -> usize {
+    let share = term_cols / windows.max(1);
+    share.saturating_sub(tab_segment_text(0, "").chars().count() + 1)
+}
+
 fn tab_segment_text(id: u32, cwd: &str) -> String {
     format!(" [{}] {} ", id, cwd)
 }
@@ -16259,6 +16278,31 @@ mod compositor_diff_tests {
         let out = diff_frames(&prev, &new, 2, 5);
         assert!(out.contains("\x1b[1;1H"), "{out:?}");
         assert!(out.contains(&vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, new.cells[0].attrs)), "{out:?}");
+    }
+
+    // A window's label is a path now, not a pre-abbreviated one, so the
+    // bar is where it is made to fit -- a bar of full paths would run off
+    // the end of the line instead of ending at it.
+    #[test]
+    fn a_tabs_label_is_fitted_to_its_share_of_the_bar() {
+        // `" [0]  "` -- the id, its brackets and the spaces either side --
+        // plus the column that keeps the bar off the line's own end.
+        assert_eq!(tab_label_budget(80, 1), 80 - 7);
+        assert_eq!(tab_label_budget(80, 2), 40 - 7);
+        assert_eq!(tab_label_budget(80, 8), 10 - 7);
+        // Narrower than the decoration: nothing left for a label, and no
+        // underflow either.
+        assert_eq!(tab_label_budget(4, 2), 0);
+
+        let deep = prompt::display_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi");
+        let one = prompt::fit_path(&deep, tab_label_budget(80, 1));
+        let four = prompt::fit_path(&deep, tab_label_budget(80, 4));
+        // One tab has room for the path as it is.
+        assert_eq!(one, deep);
+        assert_eq!(four, "~/…/billing", "a quarter of the bar still says which directory it is");
+        for (label, windows) in [(one, 1), (four, 4)] {
+            assert!(editor::visible_len(&tab_segment_text(1, &label)) <= 80 / windows, "{windows} tabs: {label:?} does not fit its share");
+        }
     }
 
     #[test]

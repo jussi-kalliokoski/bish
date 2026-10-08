@@ -1,9 +1,10 @@
-// Default interactive prompt: "user@host:path_abbr (branch)<terminator> "
+// Default interactive prompt: "user@host:path (branch)<terminator> "
 // (no space before the terminator, matching classic `\u@\h:\w\$ ` PS1
-// style), where path_abbr abbreviates parent path components to their
-// first character *and an ellipsis*, spelling out only the final one
-// (e.g. "~/D…/P…/bish") -- a name cut down to `D` would read as a
-// directory actually called that,
+// style). The path is shown as it is until the width says otherwise, at
+// which point whole directories are left out and, only if that is still
+// not enough, the survivors are abbreviated to what they start with and
+// an ellipsis (e.g. "~/…/D…/bish") -- a name cut down to `D` would read
+// as a directory actually called that,
 // and the terminator glyph is "$" for a normal user or "#" for root. The
 // `(branch)` segment (git::head_status) only appears inside a real git
 // repo, colored green when the tree is clean, yellow-with-a-trailing-`*`
@@ -56,7 +57,7 @@ fn width(text: &str) -> usize {
 ///
 /// The ellipsis is a column of its own, so a budget of 1 is the ellipsis
 /// alone -- which is still the honest answer: something was there.
-fn ellipsize_end(text: &str, budget: usize) -> String {
+pub(crate) fn ellipsize_end(text: &str, budget: usize) -> String {
     if width(text) <= budget {
         return text.to_string();
     }
@@ -79,17 +80,24 @@ fn ellipsize_end(text: &str, budget: usize) -> String {
 
 /// The path, fitted by leaving out whole directories from the middle.
 ///
-/// Directories are dropped before any name is cut, and the ones nearest
-/// the end are kept: the immediate parents of where you are say more
-/// about it than the top of the tree does. An ellipsis stands in for
-/// whatever was left out, so the path never reads as a real one it is
-/// not. Only when the frame alone -- the root, the gap and the final
-/// directory -- will not fit does the final name itself get cut, which
-/// is the last thing anyone wants to lose.
+/// Four things it will do, in that order, so that the cheapest loss
+/// always comes first:
 ///
-/// Takes the already-abbreviated display path (see `shorten_path`),
-/// whose parents are single characters, so this bites only on a tree
-/// deep enough that even those do not fit.
+/// 1. nothing, when the path already fits;
+/// 2. leave out directories, keeping as many of the ones nearest the end
+///    as will fit *in full* -- an ellipsis of its own standing in for
+///    those left out, since the immediate parents of where you are say
+///    more about it than the top of the tree does;
+/// 3. when not even one full name will fit, abbreviate the survivors to
+///    what each starts with instead -- `b…/s…/billing` says there were
+///    two levels where leaving them out says there were none, and this
+///    is the only thing abbreviating is for;
+/// 4. cut the final directory's own name, which is the last thing anyone
+///    wants to lose and so the last thing this takes.
+///
+/// Abbreviating is deliberately late. It used to happen to every parent
+/// always, whatever the width, which cost a column per level for
+/// information nobody had asked to lose.
 pub(crate) fn fit_path(display: &str, budget: usize) -> String {
     if width(display) <= budget {
         return display.to_string();
@@ -101,15 +109,29 @@ pub(crate) fn fit_path(display: &str, budget: usize) -> String {
     }
     let (base, last) = (parts[0], parts[parts.len() - 1]);
     let middle = &parts[1..parts.len() - 1];
-    // As many of the middle directories as fit, counting from the end --
-    // `keep` of 0 is the root, the gap and the final one.
-    for keep in (0..middle.len()).rev() {
-        let kept: String = middle[middle.len() - keep..].iter().map(|p| format!("{p}/")).collect();
-        let candidate = format!("{base}/\u{2026}/{kept}{last}");
-        if width(&candidate) <= budget {
-            return candidate;
+
+    // Full names first, as many of them as fit; only when not one of
+    // them will fit does abbreviating buy a level or two instead. A name
+    // is worth more than a count of levels: `…/services/billing` says
+    // where you are, where `…/c…/a…/b…/s…/billing` says how deep you are
+    // and leaves you guessing -- so the second shape is what happens
+    // when there is no room for the first, not an upgrade over it.
+    for abbreviated in [false, true] {
+        for keep in (1..middle.len()).rev() {
+            let names: String = middle[middle.len() - keep..]
+                .iter()
+                .map(|p| match abbreviated {
+                    true => format!("{}/", abbreviate_parent(p)),
+                    false => format!("{p}/"),
+                })
+                .collect();
+            let candidate = format!("{base}/\u{2026}/{names}{last}");
+            if width(&candidate) <= budget {
+                return candidate;
+            }
         }
     }
+
     let frame = format!("{base}/\u{2026}/");
     // Strictly less: the final name needs a column of its own, even when
     // all that fits in it is the ellipsis.
@@ -214,7 +236,7 @@ fn git_segment(cwd: &std::path::Path, budget: Option<usize>) -> String {
 
 fn prefix(shell: &Shell, is_root: bool, cols: usize) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
-    let path = shorten_path(&shell.cwd.to_string_lossy(), &home);
+    let path = display_path(&shell.cwd.to_string_lossy(), &home);
     let host = format!("{}@{}", username(), exec::get_hostname());
     // Each component against its own bound, each in the way that loses
     // the least of what it is for: a path gives up whole directories, a
@@ -264,19 +286,20 @@ pub fn continuation() -> String {
     "\x1b[2m…\x1b[0m ".to_string()
 }
 
-// pub: repl.rs's tab bar reuses this directly (see its own tab_bar_
-// snapshot) so a window's path there always reads exactly like the
-// prompt's own -- same abbreviation, same "~" home substitution --
-// rather than showing the full, unshortened path.
-// The result is display text and only display text (it is abbreviated,
-// so it never round-trips back into a real path), which is why the
+// The path as a prompt shows it: `$HOME` as `~`, and nothing else
+// changed. Shortening it is `fit_path`'s job, and happens only as far as
+// the width actually requires -- see that function.
+//
+// pub: repl.rs's tab bar and `window ls` both reuse this, so a window's
+// path reads exactly like the prompt's own.
+// The result is display text and only display text, which is why the
 // control-character guard belongs here rather than on the caller: a
 // directory called `sub<ESC>[2Jdir` would otherwise clear the terminal
 // on every prompt redraw -- that is, on every keystroke. The prompt is
 // built as a raw SGR string rather than as cells, so it does not pass
 // through `render_linked`'s own gate.
-pub fn shorten_path(cwd: &str, home: &str) -> String {
-    crate::term::safe_text(&shorten_path_raw(cwd, home))
+pub fn display_path(cwd: &str, home: &str) -> String {
+    crate::term::safe_text(&display_path_raw(cwd, home))
 }
 
 /// One parent directory, down to what it starts with -- and an ellipsis
@@ -302,7 +325,7 @@ fn abbreviate_parent(name: &str) -> String {
     out
 }
 
-fn shorten_path_raw(cwd: &str, home: &str) -> String {
+fn display_path_raw(cwd: &str, home: &str) -> String {
     let (base, rest) = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
         ("~".to_string(), cwd[home.len()..].trim_start_matches('/').to_string())
     } else {
@@ -311,42 +334,37 @@ fn shorten_path_raw(cwd: &str, home: &str) -> String {
     if rest.is_empty() {
         return base;
     }
-    let mut out = base;
-    let parts: Vec<&str> = rest.split('/').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if !out.ends_with('/') {
-            out.push('/');
-        }
-        if i + 1 == parts.len() {
-            out.push_str(part); // final component: full name
-        } else {
-            out.push_str(&abbreviate_parent(part));
-        }
+    match base.ends_with('/') {
+        true => format!("{base}{rest}"),
+        false => format!("{base}/{rest}"),
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // The path gives up whole directories before it gives up any name,
-    // and the ones it keeps are the ones nearest where you are.
-    // The path gives up whole directories before it gives up any name,
-    // and the ones it keeps are the ones nearest where you are.
+    // The path gives up as little as it can, in this order: whole
+    // directories first, then abbreviating the ones that survive, and
+    // only last the name of the directory you are actually in.
     #[test]
     fn a_path_leaves_out_middle_directories_before_cutting_a_name() {
-        let deep = shorten_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi");
-        assert_eq!(deep, "~/w…/c…/a…/b…/s…/billing");
+        let deep = display_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi");
+        assert_eq!(deep, "~/work/clients/acme/backend/services/billing");
 
-        // Room for everything: untouched.
-        assert_eq!(fit_path(&deep, 40), deep);
+        // Room for everything: untouched, every name in full.
+        assert_eq!(fit_path(&deep, 60), deep);
 
-        // Tighter, and the middle goes first -- from the top of the tree
+        // Tighter, and whole directories go -- from the top of the tree
         // down, so the immediate parents survive longest. The `…` segment
-        // is directories left out entirely; a `b…` is one directory whose
-        // name was cut.
-        assert_eq!(fit_path(&deep, 22), "~/…/a…/b…/s…/billing");
+        // is the directories left out entirely.
+        assert_eq!(fit_path(&deep, 40), "~/…/acme/backend/services/billing");
+        assert_eq!(fit_path(&deep, 30), "~/…/backend/services/billing");
+        assert_eq!(fit_path(&deep, 20), "~/…/services/billing");
+
+        // Then, and only then, the survivors are abbreviated -- which
+        // keeps more levels than dropping them would: `b…/s…/billing`
+        // says there were two where `billing` alone says there were none.
         assert_eq!(fit_path(&deep, 19), "~/…/b…/s…/billing");
         assert_eq!(fit_path(&deep, 15), "~/…/s…/billing");
         assert_eq!(fit_path(&deep, 12), "~/…/billing");
@@ -404,10 +422,11 @@ mod tests {
     #[test]
     fn neither_fitter_ever_exceeds_its_budget() {
         let paths = [
-            shorten_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi"),
-            shorten_path("/home/jussi", "/home/jussi"),
-            shorten_path("/usr/local/share", ""),
-            shorten_path("/a/b/c", ""),
+            display_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi"),
+            display_path("/home/jussi", "/home/jussi"),
+            display_path("/usr/local/share", ""),
+            display_path("/a/b/c", ""),
+            display_path("/home/jussi/.config/bish", "/home/jussi"),
         ];
         let branches = ["main", "feature/auth/oauth-callback-fix", "a/muchlonger/tip", "release/2026/10/08/hotfix"];
         for budget in 1..=48 {
@@ -436,14 +455,14 @@ mod tests {
     }
 
     #[test]
-    fn shorten_path_abbreviates_all_but_the_last_component() {
-        assert_eq!(shorten_path("/home/jussi/bish/src", "/home/jussi"), "~/b…/src");
-        assert_eq!(shorten_path("/home/jussi", "/home/jussi"), "~");
-        assert_eq!(shorten_path("/usr/local/share", ""), "/u…/l…/share");
-        assert_eq!(shorten_path("/home/jussi/.config/bish", "/home/jussi"), "~/.c…/bish");
-        // Nothing was cut from a name that is already one character, so
-        // nothing says it was.
-        assert_eq!(shorten_path("/a/b/c", ""), "/a/b/c");
+    fn a_display_path_is_the_path_with_home_as_a_tilde() {
+        // Nothing is abbreviated here: shortening is `fit_path`'s, and
+        // only as far as a width requires.
+        assert_eq!(display_path("/home/jussi/bish/src", "/home/jussi"), "~/bish/src");
+        assert_eq!(display_path("/home/jussi", "/home/jussi"), "~");
+        assert_eq!(display_path("/usr/local/share", ""), "/usr/local/share");
+        assert_eq!(display_path("/home/jussi/.config/bish", "/home/jussi"), "~/.config/bish");
+        assert_eq!(display_path("/a/b/c", ""), "/a/b/c");
     }
 
     // The prompt is built as a raw SGR string, not as cells, so nothing
@@ -452,8 +471,8 @@ mod tests {
     // that is, on every keystroke -- until this guard.
     #[test]
     fn a_directory_cannot_name_itself_a_terminal_command() {
-        let out = shorten_path("/tmp/sub\x1b[2Jdir", "");
+        let out = display_path("/tmp/sub\x1b[2Jdir", "");
         assert!(!out.contains("\x1b[2J"), "{out:?}");
-        assert_eq!(out, "/t…/sub\u{FFFD}[2Jdir");
+        assert_eq!(out, "/tmp/sub\u{FFFD}[2Jdir");
     }
 }
