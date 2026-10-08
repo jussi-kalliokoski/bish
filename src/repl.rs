@@ -686,15 +686,15 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         {
             session.shell.run_prompt_command();
         }
+        let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
         let prompt_str = {
             let session = &app.sessions[&session_id];
-            if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() }
+            if session.buffer.is_empty() { prompt::render(&session.shell, width) } else { prompt::continuation() }
         };
         // What the second and later lines of a paste get drawn under --
         // they are continuation lines, whatever the line this read
         // started on was.
         let continuation_str = prompt::continuation();
-        let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
         // A standalone snapshot, not a live borrow: on_idle below needs
         // its own mutable borrow of `app.sessions` (to service other
         // app.windows' jobs), which would conflict with holding this
@@ -4144,7 +4144,10 @@ fn refresh_diagnostics_title(app: &mut App, diagnostics: &[lint::Diagnostic]) {
 // returns there. Same reasoning, and the same "safe here, not for the
 // real terminal" caveat, as the Line-outcome handler's own echo fix.
 fn freeze_idle_prompt(session: &mut SessionState) {
-    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
+    // The pane's own grid, which is the line this is about to be drawn
+    // into -- not the terminal, which may be several panes wide.
+    let cols = session.screen.borrow().size().1;
+    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell, cols) } else { prompt::continuation() };
     let framed = format!("\r\x1b[K{}", prompt_str);
     session.screen.borrow_mut().feed(framed.as_bytes());
 }
@@ -4160,7 +4163,8 @@ fn freeze_idle_prompt(session: &mut SessionState) {
 // cursor correctly -- this function only feeds bytes into the grid, it
 // doesn't touch any ScreenBuffer itself).
 fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
-    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell) } else { prompt::continuation() };
+    let cols = session.screen.borrow().size().1;
+    let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell, cols) } else { prompt::continuation() };
     let framed = format!("\r\x1b[K{}{}", prompt_str, text);
     session.screen.borrow_mut().feed(framed.as_bytes());
     prompt_str

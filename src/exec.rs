@@ -17131,6 +17131,16 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // lets the dividers have the whole split if that is what the pane
     // count comes to.
     ("divider_budget", BishOptDefault::Int(25, 0..=100)),
+    // What each of the default prompt's three components may take of the
+    // line, as a percentage. Independent maxima rather than a partition:
+    // a component only gives anything up when it is itself long, so these
+    // do not have to sum to a hundred. `0` is no limit, as `wrap_column`
+    // spells off. The path gets the largest share because it is the part
+    // that is different every time; `user@host` the smallest because it
+    // is the part that never changes.
+    ("prompt_host_budget", BishOptDefault::Int(25, 0..=100)),
+    ("prompt_cwd_budget", BishOptDefault::Int(40, 0..=100)),
+    ("prompt_git_budget", BishOptDefault::Int(25, 0..=100)),
     // vim's own `relativenumber`: number each line by its distance from
     // the cursor's, which is what makes `12j` or `d8k` something you
     // read off the screen instead of counting.
@@ -17311,6 +17321,12 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("lsp_timeout_ms", "How long to wait for a language server to answer a question like hover."),
     ("hyperlinks", "Emit OSC 8 terminal hyperlinks for URLs, links and resolved paths."),
     ("divider_budget", "How much of a split its pane dividers may take, as a percentage, before panes fold away."),
+    ("prompt_host_budget", "How much of the line the prompt's `user@host` may take, as a percentage. 0 for no limit."),
+    ("prompt_cwd_budget", "How much of the line the prompt's path may take, as a percentage, before whole directories are left out. 0 for no limit."),
+    (
+        "prompt_git_budget",
+        "How much of the line the prompt's git branch may take, as a percentage, before its segments are shortened. 0 for no limit.",
+    ),
     ("relativenumber", "Number lines by their distance from the cursor's."),
     ("ignorecase", "Ignore case when searching, unless smartcase says otherwise."),
     ("inlayhints", "Draw the language server's inline parameter-name and inferred-type hints."),
