@@ -475,6 +475,9 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
     // normally since exec() resets a *caught* signal like this back to
     // default. See term::ignore_sigint's doc comment.
     term::ignore_sigint();
+    // Borrowed, and given back at the end of this function: the title
+    // the terminal had before bish started is the terminal's own.
+    term::push_window_title();
     exec::install_winch_handler();
     // This loop *is* the window manager, so `::bish window`'s
     // action-producing subcommands mean something at its prompts -- see
@@ -687,6 +690,11 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             session.shell.run_prompt_command();
         }
         let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
+        // Once per prompt: an unsplit window draws itself without the
+        // compositor, so `compositor_redraw`'s own sync never fires here
+        // -- and a `cd` between two prompts is exactly what a title is
+        // for.
+        sync_terminal_title(app);
         let prompt_str = {
             let session = &app.sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell, width) } else { prompt::continuation() }
@@ -1350,6 +1358,10 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                                     // session/pane triggered it.
                                     ExecResult::Exit(code) => {
                                         session::stop_listening();
+                                        // The terminal's own title, given back:
+                                        // this path never reaches the end of
+                                        // `run`.
+                                        term::pop_window_title();
                                         std::process::exit(code)
                                     }
                                     _ => {}
@@ -1471,6 +1483,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
     if let Some(lsp) = app.sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().shutdown_all();
     }
+    term::pop_window_title();
 }
 
 // `e DIR` -- a directory argument isn't a buffer to open, it's a place
@@ -1921,6 +1934,7 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
     let mut job = app.job_frames.remove(&job_frame_id).expect("Frame::Job always has a live app.job_frames entry");
     let focused_screen = app.sessions[&session_id].screen.clone();
     let mut tab_bar = tab_bar_line(app);
+    sync_terminal_title(app);
     let mut layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
     // Persists across every drive_fg_job call in this loop (reset to None
     // -- forcing the next redraw back to a full repaint -- only on
@@ -2069,6 +2083,7 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                 // (TIOCSWINSZ delivers SIGWINCH to its own process group).
                 layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
                 tab_bar = tab_bar_line(app);
+                sync_terminal_title(app);
                 // The geometry frame_cache's own cells describe is no longer
                 // even the right shape -- render_compositor_frame_diff's own
                 // stale check would catch a rows/cols mismatch anyway, but
@@ -4228,6 +4243,7 @@ fn refresh_divider_budget(sessions: &HashMap<SessionId, SessionState>, window: &
 
 fn compositor_redraw(app: &App) {
     let tab_bar = tab_bar_line(app);
+    sync_terminal_title(app);
     let layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
     render_compositor_frame(&layout, &tab_bar, app.term_rows);
 }
@@ -9000,6 +9016,50 @@ fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
 
 fn tab_bar_line(app: &App) -> String {
     render_tab_bar(&tab_bar_snapshot(app))
+}
+
+/// What the real terminal should call itself, given what bish knows
+/// about the focused window.
+///
+/// A program that has said what it is gets passed through untouched:
+/// `vim README.md` is what vim asked its window to be called, and bish
+/// is the window manager here, not the author of that name. With nothing
+/// said, bish names it -- `bish: ` and whatever the tab bar shows for
+/// the focused window, which is its name if it has one and where it is
+/// otherwise. The prefix is there so that a terminal tab running bish is
+/// recognisable among a row of them.
+fn window_title(pane_title: &str, window_name: Option<&str>, cwd: &str, home: &str) -> String {
+    if !pane_title.is_empty() {
+        return pane_title.to_string();
+    }
+    match window_name {
+        Some(name) => format!("bish: {name}"),
+        None => format!("bish: {}", prompt::display_path(cwd, home)),
+    }
+}
+
+/// What the real terminal should call itself right now.
+fn terminal_title(app: &App) -> String {
+    let window = &app.windows[app.current_window];
+    let pane_title = window
+        .panes
+        .iter()
+        .find(|p| p.id == window.focused_pane)
+        .and_then(|p| app.sessions.get(&p.owning_session()))
+        .map(|session| session.screen.borrow().title().to_string())
+        .unwrap_or_default();
+    let cwd = app.sessions.get(&window.owning_session()).map(|s| s.shell.cwd.to_string_lossy().to_string()).unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    window_title(&pane_title, window.name.as_deref(), &cwd, &home)
+}
+
+/// Keeps the real terminal's title in step with what bish is showing.
+///
+/// Called wherever the tab bar is recomputed, since the two answer the
+/// same question about the same window; `term::set_window_title` is what
+/// keeps it from being written on every redraw.
+fn sync_terminal_title(app: &App) {
+    term::set_window_title(&terminal_title(app));
 }
 
 // Runs whatever `::bish hook` has attached to `event` for this buffer's
@@ -14498,6 +14558,10 @@ fn run_command_mode(
                                     // was produced.
                                     ExecResult::Exit(code) => {
                                         session::stop_listening();
+                                        // The terminal's own title, given back:
+                                        // this path never reaches the end of
+                                        // `run`.
+                                        term::pop_window_title();
                                         std::process::exit(code)
                                     }
                                     _ => {
@@ -16307,6 +16371,29 @@ mod compositor_diff_tests {
         for (label, windows) in [(one, 1), (four, 4)] {
             assert!(editor::visible_len(&tab_segment_text(1, &label)) <= 80 / windows, "{windows} tabs: {label:?} does not fit its share");
         }
+    }
+
+    // The terminal's own title answers the same question the tab bar
+    // does -- which window is this -- except that a program in the pane
+    // may already have answered it.
+    #[test]
+    fn a_program_that_named_its_window_keeps_that_name() {
+        // vim said so; bish has nothing to add.
+        assert_eq!(window_title("README.md (~/bish) - VIM", None, "/home/jussi/bish", "/home/jussi"), "README.md (~/bish) - VIM");
+        // Said so *and* the window has a name of its own: the program
+        // wins, because it is what is actually on screen.
+        assert_eq!(window_title("htop", Some("monitors"), "/home/jussi", "/home/jussi"), "htop");
+        // Nothing said: the window's own name, prefixed so that a tab
+        // running bish is recognisable among a row of them.
+        assert_eq!(window_title("", Some("monitors"), "/home/jussi/bish", "/home/jussi"), "bish: monitors");
+        // Nothing said and no name: where it is.
+        assert_eq!(window_title("", None, "/home/jussi/bish", "/home/jussi"), "bish: ~/bish");
+        assert_eq!(window_title("", None, "/usr/local/bin", "/home/jussi"), "bish: /usr/local/bin");
+        // Unlike the tab bar, a title has no budget to fit -- the
+        // terminal shortens it however its own tabs need, and it is the
+        // only one that knows how much room they have.
+        let deep = "/home/jussi/work/clients/acme/backend/services/billing";
+        assert_eq!(window_title("", None, deep, "/home/jussi"), format!("bish: {}", prompt::display_path(deep, "/home/jussi")));
     }
 
     #[test]

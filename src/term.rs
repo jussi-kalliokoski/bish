@@ -143,6 +143,58 @@ pub fn set_hover_tracking(on: bool) {
     let _ = io::stdout().flush();
 }
 
+/// What the real terminal calls itself.
+///
+/// Emitted only when it changes, and process-global for the same reason
+/// `set_hover_tracking` is: there is one terminal, and what it is called
+/// is not anybody's local variable. Nothing is sent when stdout is not a
+/// terminal -- a title written into a pipe is bytes in somebody's data.
+///
+/// `safe_text` because a title arriving from a program in a pane is that
+/// program's text, and `evil<ESC>[2J` in it would be an instruction to
+/// the real terminal rather than a name.
+pub fn set_window_title(title: &str) {
+    static CURRENT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    if !crate::platform::is_terminal(1) {
+        return;
+    }
+    let title = safe_text(title);
+    let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    if *current == title {
+        return;
+    }
+    // OSC 2 sets the window title alone. OSC 0 would set the icon name
+    // with it, which is a second thing to have changed on the way out
+    // for no gain.
+    print!("\x1b]2;{title}\x07");
+    let _ = io::stdout().flush();
+    *current = title;
+}
+
+/// Remembers the terminal's own title, so bish can give it back.
+///
+/// xterm's title stack (`CSI 22;2t` to push, `CSI 23;2t` to pop), which
+/// every terminal worth naming either implements or ignores -- and an
+/// ignored push leaves the title exactly as bish would have left it
+/// anyway, which is why this is worth doing unconditionally rather than
+/// probing for support.
+pub fn push_window_title() {
+    if !crate::platform::is_terminal(1) {
+        return;
+    }
+    print!("\x1b[22;2t");
+    let _ = io::stdout().flush();
+}
+
+/// Gives the terminal its own title back, on the way out.
+pub fn pop_window_title() {
+    if !crate::platform::is_terminal(1) {
+        return;
+    }
+    print!("\x1b[23;2t");
+    let _ = io::stdout().flush();
+}
+
 pub const HOVER_TRACKING_ENABLE: &str = "\x1b[?1003h";
 pub const HOVER_TRACKING_DISABLE: &str = "\x1b[?1003l";
 
