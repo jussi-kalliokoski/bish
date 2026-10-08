@@ -247,8 +247,10 @@ impl Capture {
                 // No anonymous file: fall back to a named temporary,
                 // which this Capture then owns and removes on drop.
                 None => {
+                    // Read as well as write: `take_text` reads the
+                    // result back through this same descriptor.
                     let p = proc_sub_temp_path();
-                    (std::fs::File::create(&p).ok()?, Some(p))
+                    (std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&p).ok()?, Some(p))
                 }
             };
             let mut file = file;
