@@ -216,8 +216,13 @@ unsafe extern "C" {
     fn unlockpt(fd: i32) -> i32;
     fn ptsname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
     fn setsid() -> i32;
-    fn ioctl(fd: i32, request: u64, arg: usize) -> i32;
-    fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    // Variadic for the same reason `open` is, and here it is not
+    // hypothetical: on Apple's arm64 a fixed third argument goes in a
+    // register while the callee reads its variadic one off the stack, so
+    // `F_SETFL` set whatever happened to be there rather than
+    // `O_NONBLOCK`, and every ioctl's pointer was garbage.
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    pub(super) fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
     fn close(fd: i32) -> i32;
     fn tcgetattr(fd: i32, mode: *mut sys::Termios) -> i32;

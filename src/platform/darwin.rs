@@ -6,11 +6,11 @@
 //! does not have.
 
 use super::sys;
+use super::unix::fcntl;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 unsafe extern "C" {
     fn pipe(fds: *mut i32) -> i32;
-    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
 }
 
 /// A pipe whose two ends are close-on-exec.
