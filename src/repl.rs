@@ -9149,9 +9149,33 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
     items
 }
 
+/// Where the opener's dialog goes: the middle of the terminal, sized to
+/// what it has to show.
+///
+/// Centred on the whole screen rather than placed in a pane, because
+/// going to another pane is not something the pane you are in is doing --
+/// the question "where do you want to be" belongs to no window, and a
+/// dialog that opened inside one read as that pane's own view of the
+/// world.
+///
+/// Three quarters of the width, up to a hundred columns, which is enough
+/// for the longest path in a repository of any size without becoming a
+/// wall. The height is what the list needs -- the four rows the frame
+/// spends on its border, the query and the keys, plus a row per item --
+/// capped at two rows short of the screen -- which, centred, leaves a row
+/// clear at the top and the pinned tab bar visible at the bottom, so it
+/// still says which window you are picking from. Fixed once when it
+/// opens, from every item rather than the matching ones, so the dialog
+/// does not resize under the hand with every character typed.
+fn opener_dialog_rect(items: usize, term_rows: usize, term_cols: usize) -> Rect {
+    let cols = (term_cols * 3 / 4).clamp(24, 100).min(term_cols);
+    let rows = (items + 4).clamp(5, term_rows.saturating_sub(2).max(5)).min(term_rows);
+    Rect { row: (term_rows - rows) / 2, col: (term_cols - cols) / 2, rows, cols }
+}
+
 /// Ctrl+T's loop: the opener, until it is given something to do or put
 /// away. Returns what to do, which is the caller's to carry out -- this
-/// only owns the terminal while the list is on screen.
+/// only owns the terminal while the dialog is on screen.
 fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
     use crate::opener::Outcome;
     let items = opener_items(app);
@@ -9159,10 +9183,12 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
         let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
         // What capture reports while this is open -- see `OVERLAYS`.
         let _overlay = OverlayOpen::new();
-        // One pane's rectangle, not the whole screen: the neighbours are
-        // painted once and then left alone, the same arrangement the
-        // pager and the commit list already use.
-        let mut rect = app.focused_pane_rect();
+        let item_count = items.len();
+        let mut rect = opener_dialog_rect(item_count, app.term_rows, app.term_cols);
+        // Everything under the dialog is painted once and then left
+        // alone: the dialog fills every cell of its own rectangle, so
+        // what it covers stays covered, and putting it away is one more
+        // compositor_redraw.
         compositor_redraw(app);
         let mut view = crate::opener::Opener::new(items, rect.rows, rect.cols);
         let mut last_size = (app.term_rows, app.term_cols);
@@ -9179,7 +9205,7 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
             };
             if (app.term_rows, app.term_cols) != last_size {
                 last_size = (app.term_rows, app.term_cols);
-                rect = app.focused_pane_rect();
+                rect = opener_dialog_rect(item_count, app.term_rows, app.term_cols);
                 compositor_redraw(app);
                 view.resize(rect.rows, rect.cols);
             }
@@ -16566,6 +16592,33 @@ mod compositor_diff_tests {
         assert_eq!(four, "~/…/billing", "a quarter of the bar still says which directory it is");
         for (label, windows) in [(one, 1), (four, 4)] {
             assert!(editor::visible_len(&tab_segment_text(1, &label)) <= 80 / windows, "{windows} tabs: {label:?} does not fit its share");
+        }
+    }
+
+    // The dialog is the shell's, not a pane's, so it is placed against
+    // the terminal rather than against anything inside it.
+    #[test]
+    fn the_opener_dialog_is_centred_and_leaves_the_tab_bar_showing() {
+        // 80x24, a long list: three quarters of the width, and two rows
+        // short of the height -- which centres to one clear row above and
+        // the tab bar's own row below.
+        let r = opener_dialog_rect(143, 24, 80);
+        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 10, 22, 60));
+        assert_eq!(r.row + r.rows, 23, "the last row is the tab bar's");
+        // A short list gets a short dialog, still centred.
+        let r = opener_dialog_rect(2, 24, 80);
+        assert_eq!((r.row, r.col, r.rows, r.cols), (9, 10, 6, 60));
+        // Wide terminal: capped, so the dialog does not become a wall.
+        let r = opener_dialog_rect(143, 50, 200);
+        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 50, 48, 100));
+        // Narrow terminal: the floor wins, up to the width there is.
+        assert_eq!(opener_dialog_rect(143, 10, 30).cols, 24);
+        assert_eq!(opener_dialog_rect(143, 10, 20).cols, 20, "never wider than the terminal");
+        // Absurdly small, which is the only thing that has to be true
+        // here: it fits, and the arithmetic does not wrap.
+        for (rows, cols) in [(4, 10), (1, 1), (0, 0), (2, 3)] {
+            let r = opener_dialog_rect(143, rows, cols);
+            assert!(r.row + r.rows <= rows && r.col + r.cols <= cols, "{rows}x{cols} -> {:?}", (r.row, r.col, r.rows, r.cols));
         }
     }
 

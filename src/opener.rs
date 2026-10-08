@@ -96,7 +96,8 @@ impl Opener {
         // Sanitised here, once, so that the text matched, the text shown
         // and the positions tying them together are all the same string.
         let items = items.into_iter().map(|i| Item { text: crate::term::safe_text(&i.text), ..i }).collect();
-        // One row for the query, one for the keys.
+        // Four rows go to the frame: its two borders, the query and the
+        // keys.
         let mut opener = Opener {
             items,
             query: String::new(),
@@ -104,7 +105,7 @@ impl Opener {
             matches: Vec::new(),
             selected: 0,
             top: 0,
-            height: rows.saturating_sub(2).max(1),
+            height: rows.saturating_sub(4).max(1),
             cols,
         };
         opener.refilter();
@@ -112,7 +113,7 @@ impl Opener {
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.height = rows.saturating_sub(2).max(1);
+        self.height = rows.saturating_sub(4).max(1);
         self.cols = cols;
         self.reveal();
     }
@@ -197,67 +198,112 @@ impl Opener {
     pub fn render(&self, rect: Rect) -> String {
         let width = crate::bishedit::unicode_width::str_width;
         let at = |row: usize| format!("\x1b[{};{}H", rect.row + row + 1, rect.col + 1);
+        // Inside the border. Every row below writes exactly `rect.cols`
+        // columns, border included, so the dialog covers what is under it
+        // rather than letting it show through.
         let mut out = String::new();
+        // A frame spends a column on each of its sides, so below two
+        // columns there is no frame to draw -- and whatever this is
+        // standing in a rectangle that narrow, it is not somewhere to
+        // pick from. Blanked rather than drawn, because the one rule this
+        // function cannot break is writing outside the rectangle it was
+        // given.
+        if self.cols < 2 {
+            for row in 0..rect.rows {
+                out.push_str(&at(row));
+                out.push_str(&" ".repeat(self.cols));
+            }
+            return out;
+        }
+        let inner = self.cols - 2;
+
+        // The glyphs the hover popup and the completion list already use
+        // for a box that floats over real content -- but not their
+        // reverse video: this box has a row picked out inside it, and
+        // that is what reverse video means here.
+        let title = fit_or_empty(" open ", inner.saturating_sub(2));
+        let fill = match title.is_empty() {
+            true => "─".repeat(inner),
+            false => format!("─{title}{}", "─".repeat(inner - 1 - width(&title))),
+        };
+        out.push_str(&at(0));
+        out.push_str(&format!("╭{fill}╮"));
 
         // The query line, with how much of the list survives it on the
         // right -- dropped rather than crowding the query out when the
-        // pane is too narrow for both.
+        // dialog is too narrow for both.
         let count = format!("{}/{}", self.view.len(), self.items.len());
-        let (room, tail) = match self.cols > width(&count) + 1 {
-            true => (self.cols - width(&count) - 1, format!(" \x1b[2m{count}\x1b[0m")),
-            false => (self.cols, String::new()),
+        let (room, tail) = match inner > width(&count) + 1 {
+            true => (inner - width(&count) - 1, format!(" \x1b[2m{count}\x1b[0m")),
+            false => (inner, String::new()),
         };
         let typed = keep_end(&format!("> {}", self.query), room);
-        out.push_str(&at(0));
-        out.push_str(&format!("\x1b[1m{}\x1b[0m{tail}", fit(&typed, room)));
+        out.push_str(&at(1));
+        out.push_str(&format!("│\x1b[1m{}\x1b[0m{tail}│", fit(&typed, room)));
 
         // Narrow enough and the verb is what gives way: a row with no
         // room for its name says nothing at all.
-        let verb_width = VERB_WIDTH.min(self.cols);
-        let gutter = GUTTER.min(self.cols - verb_width);
-        let name_width = self.cols - verb_width - gutter;
+        let verb_width = VERB_WIDTH.min(inner);
+        let gutter = GUTTER.min(inner - verb_width);
+        let name_width = inner - verb_width - gutter;
         for row in 0..self.height {
-            out.push_str(&at(row + 1));
-            let Some(&index) = self.view.get(self.top + row) else {
-                out.push_str(&" ".repeat(self.cols));
-                continue;
-            };
-            let item = &self.items[index];
-            let focused = self.top + row == self.selected;
-            if focused {
-                out.push_str("\x1b[7m");
-            }
-            // The verb is dim and the name is not, so the eye runs down
-            // the names; the reverse video of the row picked out has to
-            // be re-asserted after the dim ends, since ending an
-            // attribute here means a reset.
-            out.push_str(&fit(item.target.verb(), verb_width));
-            out.push_str(&" ".repeat(gutter));
-            let (pieces, used) = fit_marked(&item.text, &self.matches[self.top + row], name_width);
-            for (cluster, matched) in pieces {
-                // Underlined, not coloured: the row picked out is
-                // already reverse video, and a colour on top of that is
-                // a second thing to read.
-                match matched {
-                    true => out.push_str(&format!("\x1b[4m{cluster}\x1b[24m")),
-                    false => out.push_str(&cluster),
+            out.push_str(&at(row + 2));
+            out.push('│');
+            match self.view.get(self.top + row) {
+                None => out.push_str(&" ".repeat(inner)),
+                Some(&index) => {
+                    let item = &self.items[index];
+                    let focused = self.top + row == self.selected;
+                    if focused {
+                        out.push_str("\x1b[7m");
+                    }
+                    // The verb is dim and the name is not, so the eye
+                    // runs down the names; the reverse video of the row
+                    // picked out has to be re-asserted after the dim
+                    // ends, since ending an attribute here means a reset.
+                    out.push_str(&fit(item.target.verb(), verb_width));
+                    out.push_str(&" ".repeat(gutter));
+                    let (pieces, used) = fit_marked(&item.text, &self.matches[self.top + row], name_width);
+                    for (cluster, matched) in pieces {
+                        // Underlined, not coloured: the row picked out is
+                        // already reverse video, and a colour on top of
+                        // that is a second thing to read.
+                        match matched {
+                            true => out.push_str(&format!("\x1b[4m{cluster}\x1b[24m")),
+                            false => out.push_str(&cluster),
+                        }
+                    }
+                    out.push_str(&" ".repeat(name_width - used));
+                    out.push_str("\x1b[0m");
                 }
             }
-            out.push_str(&" ".repeat(name_width - used));
-            out.push_str("\x1b[0m");
+            out.push('│');
         }
 
-        out.push_str(&at(rect.rows.saturating_sub(1)));
         let hint = match self.view.is_empty() && !self.items.is_empty() {
             true => "no match  Esc clears",
             false => "Enter open  C-n/C-p move  Esc close",
         };
-        out.push_str(&format!("\x1b[2m{}\x1b[0m", fit(hint, self.cols)));
+        out.push_str(&at(rect.rows.saturating_sub(2)));
+        out.push_str(&format!("│\x1b[2m{}\x1b[0m│", fit(hint, inner)));
+        out.push_str(&at(rect.rows.saturating_sub(1)));
+        out.push_str(&format!("╰{}╯", "─".repeat(inner)));
         // Left where it is being typed, and visible: this is an input
-        // line, so the cursor belongs in it rather than parked on the
-        // row picked out.
-        out.push_str(&format!("\x1b[{};{}H\x1b[?25h", rect.row + 1, rect.col + 1 + width(&typed).min(room)));
+        // line, so the cursor belongs in it rather than parked on the row
+        // picked out. Two columns in: past the border, past the `>`.
+        out.push_str(&format!("\x1b[{};{}H\x1b[?25h", rect.row + 2, rect.col + 2 + width(&typed).min(room)));
         out
+    }
+}
+
+/// `text` if it fits in `width`, nothing at all if it does not.
+///
+/// For the title in the border: a box too narrow to name is drawn
+/// unnamed, rather than with a word cut down to a letter and a half.
+fn fit_or_empty(text: &str, width: usize) -> String {
+    match crate::bishedit::unicode_width::str_width(text) <= width {
+        true => text.to_string(),
+        false => String::new(),
     }
 }
 
@@ -359,7 +405,9 @@ mod tests {
     #[test]
     fn moving_stops_at_either_end_and_the_row_picked_stays_on_screen() {
         let many: Vec<Item> = (0..50).map(|i| Item { target: Target::File(PathBuf::from(format!("f{i}"))), text: format!("f{i}") }).collect();
-        let mut o = Opener::new(many, 7, 40);
+        // Nine rows of dialog: two borders, the query, the keys, and five
+        // of list.
+        let mut o = Opener::new(many, 9, 40);
         o.handle_key(Key::CtrlP);
         assert_eq!((o.selected, o.top), (0, 0), "nothing above the best match");
         for _ in 0..60 {
@@ -367,10 +415,10 @@ mod tests {
         }
         assert_eq!((o.selected, o.top), (49, 45), "nothing below the last, and it is on screen");
         o.handle_key(Key::PageUp);
-        assert_eq!((o.selected, o.top), (44, 44), "a page is the five rows this pane shows");
-        // A pane with room for one row has to scroll to the row picked
-        // out, which the five-row view already had on screen.
-        o.resize(3, 40);
+        assert_eq!((o.selected, o.top), (44, 44), "a page is the five rows this dialog shows");
+        // A dialog with room for one row has to scroll to the row picked
+        // out, which the five-row one already had on screen.
+        o.resize(5, 40);
         assert_eq!((o.selected, o.top), (44, 44));
         o.handle_key(Key::CtrlN);
         assert_eq!((o.selected, o.top), (45, 45));
