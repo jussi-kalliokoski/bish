@@ -1,7 +1,9 @@
 // Default interactive prompt: "user@host:path_abbr (branch)<terminator> "
 // (no space before the terminator, matching classic `\u@\h:\w\$ ` PS1
 // style), where path_abbr abbreviates parent path components to their
-// first character, spelling out only the final one (e.g. "~/D/P/bish"),
+// first character *and an ellipsis*, spelling out only the final one
+// (e.g. "~/D…/P…/bish") -- a name cut down to `D` would read as a
+// directory actually called that,
 // and the terminator glyph is "$" for a normal user or "#" for root. The
 // `(branch)` segment (git::head_status) only appears inside a real git
 // repo, colored green when the tree is clean, yellow-with-a-trailing-`*`
@@ -128,10 +130,12 @@ pub(crate) fn fit_path(display: &str, budget: usize) -> String {
 /// keeps at least a character, because `f/a/thing` still says there were
 /// two levels above it where dropping them says there were none.
 ///
-/// Only the final segment carries an ellipsis: the earlier ones are
-/// abbreviated the way this prompt's own path abbreviates a parent
-/// directory, which is to say silently, and the `/`s are what make that
-/// legible.
+/// Every segment that loses characters says so with an ellipsis, the
+/// final one included. A segment cut silently claims to be a name it is
+/// not -- `f/a/thing` reads as a branch filed under `f` and `a` -- so a
+/// segment that has to be cut needs two columns: one character and the
+/// mark. Which is why the floor below is two, for a name long enough to
+/// need it.
 pub(crate) fn fit_branch(branch: &str, budget: usize) -> String {
     if width(branch) <= budget {
         return branch.to_string();
@@ -141,17 +145,20 @@ pub(crate) fn fit_branch(branch: &str, budget: usize) -> String {
         return ellipsize_end(branch, budget);
     }
     let separators = parts.len() - 1;
-    // One column per segment is the floor, and under it this shape
-    // cannot be drawn at all.
-    if separators + parts.len() > budget {
+    // The floor per segment: a name that fits in one column keeps it, and
+    // one that does not needs two -- a character and the ellipsis that
+    // says there was more. Under that there is no honest shape to draw.
+    let floor: Vec<usize> = parts.iter().map(|p| width(p).min(2)).collect();
+    let floors: usize = floor.iter().sum();
+    if separators + floors > budget {
         return ellipsize_end(branch, budget);
     }
     let last = parts.len() - 1;
-    let mut share = vec![1usize; parts.len()];
-    let mut spare = budget - separators - parts.len();
+    let mut share = floor.clone();
+    let mut spare = budget - separators - floors;
 
     // The branch itself first, up to its own length.
-    let wanted = width(parts[last]).saturating_sub(1).min(spare);
+    let wanted = width(parts[last]).saturating_sub(share[last]).min(spare);
     share[last] += wanted;
     spare -= wanted;
 
@@ -177,14 +184,8 @@ pub(crate) fn fit_branch(branch: &str, budget: usize) -> String {
         if i > 0 {
             out.push('/');
         }
-        match i == last {
-            // The branch keeps its marker: this is the name being cut.
-            true => out.push_str(&ellipsize_end(part, share[i])),
-            false => out.extend(part.chars().scan(0usize, |taken, c| {
-                *taken += char_width(c);
-                (*taken <= share[i]).then_some(c)
-            })),
-        }
+        // Every segment, the namespace included, says when it was cut.
+        out.push_str(&ellipsize_end(part, share[i]));
     }
     out
 }
@@ -278,6 +279,29 @@ pub fn shorten_path(cwd: &str, home: &str) -> String {
     crate::term::safe_text(&shorten_path_raw(cwd, home))
 }
 
+/// One parent directory, down to what it starts with -- and an ellipsis
+/// saying so.
+///
+/// The ellipsis is the whole point. `~/w/c/billing` reads as a tree with
+/// directories called `w` and `c` in it, which is a claim about the
+/// filesystem rather than about what was left out; `~/w…/c…/billing`
+/// says what happened. A name that is already one character is shown as
+/// itself, because nothing was cut from it.
+///
+/// Hidden directories keep their dot: `.config` is `.c…`, since the dot
+/// is what distinguishes it from `config` next to it.
+fn abbreviate_parent(name: &str) -> String {
+    let keep = match name.starts_with('.') {
+        true => 2,
+        false => 1,
+    };
+    let mut out: String = name.chars().take(keep).collect();
+    if name.chars().count() > keep {
+        out.push('\u{2026}');
+    }
+    out
+}
+
 fn shorten_path_raw(cwd: &str, home: &str) -> String {
     let (base, rest) = if !home.is_empty() && (cwd == home || cwd.starts_with(&format!("{home}/"))) {
         ("~".to_string(), cwd[home.len()..].trim_start_matches('/').to_string())
@@ -295,12 +319,8 @@ fn shorten_path_raw(cwd: &str, home: &str) -> String {
         }
         if i + 1 == parts.len() {
             out.push_str(part); // final component: full name
-        } else if part.starts_with('.') && part.len() > 1 {
-            // keep the leading dot visible for hidden dirs, e.g. ".config" -> ".c"
-            out.push('.');
-            out.push(part.chars().nth(1).unwrap());
-        } else if let Some(c) = part.chars().next() {
-            out.push(c);
+        } else {
+            out.push_str(&abbreviate_parent(part));
         }
     }
     out
@@ -312,18 +332,23 @@ mod tests {
 
     // The path gives up whole directories before it gives up any name,
     // and the ones it keeps are the ones nearest where you are.
+    // The path gives up whole directories before it gives up any name,
+    // and the ones it keeps are the ones nearest where you are.
     #[test]
     fn a_path_leaves_out_middle_directories_before_cutting_a_name() {
         let deep = shorten_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi");
-        assert_eq!(deep, "~/w/c/a/b/s/billing");
+        assert_eq!(deep, "~/w…/c…/a…/b…/s…/billing");
 
         // Room for everything: untouched.
         assert_eq!(fit_path(&deep, 40), deep);
 
         // Tighter, and the middle goes first -- from the top of the tree
-        // down, so the immediate parents survive longest.
-        assert_eq!(fit_path(&deep, 18), "~/…/a/b/s/billing");
-        assert_eq!(fit_path(&deep, 16), "~/…/b/s/billing");
+        // down, so the immediate parents survive longest. The `…` segment
+        // is directories left out entirely; a `b…` is one directory whose
+        // name was cut.
+        assert_eq!(fit_path(&deep, 22), "~/…/a…/b…/s…/billing");
+        assert_eq!(fit_path(&deep, 19), "~/…/b…/s…/billing");
+        assert_eq!(fit_path(&deep, 15), "~/…/s…/billing");
         assert_eq!(fit_path(&deep, 12), "~/…/billing");
 
         // Only once the frame itself is all that fits does the final
@@ -348,22 +373,55 @@ mod tests {
 
         // The last segment is served first, so it is whole while there is
         // room for it -- and the namespace shares what is left evenly
-        // rather than the first segment taking it all.
-        assert_eq!(fit_branch(branch, 26), "fea/aut/oauth-callback-fix");
-        assert_eq!(fit_branch(branch, 22), "f/a/oauth-callback-fix");
+        // rather than the first segment taking it all. Every segment that
+        // lost characters says so.
+        // `auth` fits whole in the four columns its share came to, so it
+        // carries no mark -- the mark appears exactly where something was
+        // removed, which is the whole point of it.
+        assert_eq!(fit_branch(branch, 28), "fea…/auth/oauth-callback-fix");
+        assert_eq!(fit_branch(branch, 26), "fe…/au…/oauth-callback-fix");
 
         // Then the branch itself starts giving way, and the namespace
-        // still keeps a character each: `f/a/` says there were two levels
-        // above this where dropping them would say there were none.
-        assert_eq!(fit_branch(branch, 16), "f/a/oauth-callb…");
-        assert_eq!(fit_branch(branch, 8), "f/a/oau…");
+        // still keeps a character and its mark each: `f…/a…/` says there
+        // were two levels above this, and that both were cut.
+        assert_eq!(fit_branch(branch, 20), "f…/a…/oauth-callbac…");
+        assert_eq!(fit_branch(branch, 12), "f…/a…/oauth…");
 
-        // Under one column per segment there is no such shape to draw.
-        assert_eq!(fit_branch(branch, 4), "fea…");
+        // Under two columns for a name that has to be cut there is no
+        // honest shape left, so the whole thing is cut as one.
+        assert_eq!(fit_branch(branch, 7), "featur…");
 
         // Evenness is about the segments that still want columns: a short
-        // one stops taking and the rest get its share.
-        assert_eq!(fit_branch("a/muchlonger/tip", 14), "a/muchlong/tip");
+        // one stops taking and the rest get its share. `a` is whole at one
+        // column, so it carries no mark.
+        assert_eq!(fit_branch("a/muchlonger/tip", 14), "a/muchlon…/tip");
+    }
+
+    // The contract both fitters owe, at every width: never wider than the
+    // budget, and never empty. Checked across the range rather than at
+    // the handful of widths the cases above name, because an off-by-one
+    // in a fitter is exactly the kind of thing a chosen example misses.
+    #[test]
+    fn neither_fitter_ever_exceeds_its_budget() {
+        let paths = [
+            shorten_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi"),
+            shorten_path("/home/jussi", "/home/jussi"),
+            shorten_path("/usr/local/share", ""),
+            shorten_path("/a/b/c", ""),
+        ];
+        let branches = ["main", "feature/auth/oauth-callback-fix", "a/muchlonger/tip", "release/2026/10/08/hotfix"];
+        for budget in 1..=48 {
+            for path in &paths {
+                let fitted = fit_path(path, budget);
+                assert!(width(&fitted) <= budget, "{path:?} at {budget}: {fitted:?} is {} wide", width(&fitted));
+                assert!(!fitted.is_empty(), "{path:?} at {budget} came back empty");
+            }
+            for branch in branches {
+                let fitted = fit_branch(branch, budget);
+                assert!(width(&fitted) <= budget, "{branch:?} at {budget}: {fitted:?} is {} wide", width(&fitted));
+                assert!(!fitted.is_empty(), "{branch:?} at {budget} came back empty");
+            }
+        }
     }
 
     // A budget is a share of the line, so the same prompt gives up more
@@ -379,10 +437,13 @@ mod tests {
 
     #[test]
     fn shorten_path_abbreviates_all_but_the_last_component() {
-        assert_eq!(shorten_path("/home/jussi/bish/src", "/home/jussi"), "~/b/src");
+        assert_eq!(shorten_path("/home/jussi/bish/src", "/home/jussi"), "~/b…/src");
         assert_eq!(shorten_path("/home/jussi", "/home/jussi"), "~");
-        assert_eq!(shorten_path("/usr/local/share", ""), "/u/l/share");
-        assert_eq!(shorten_path("/home/jussi/.config/bish", "/home/jussi"), "~/.c/bish");
+        assert_eq!(shorten_path("/usr/local/share", ""), "/u…/l…/share");
+        assert_eq!(shorten_path("/home/jussi/.config/bish", "/home/jussi"), "~/.c…/bish");
+        // Nothing was cut from a name that is already one character, so
+        // nothing says it was.
+        assert_eq!(shorten_path("/a/b/c", ""), "/a/b/c");
     }
 
     // The prompt is built as a raw SGR string, not as cells, so nothing
@@ -393,6 +454,6 @@ mod tests {
     fn a_directory_cannot_name_itself_a_terminal_command() {
         let out = shorten_path("/tmp/sub\x1b[2Jdir", "");
         assert!(!out.contains("\x1b[2J"), "{out:?}");
-        assert_eq!(out, "/t/sub\u{FFFD}[2Jdir");
+        assert_eq!(out, "/t…/sub\u{FFFD}[2Jdir");
     }
 }
