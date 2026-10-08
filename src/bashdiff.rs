@@ -1810,6 +1810,73 @@ y
     /// it `cargo test` leaves this binary at whatever `cargo build`
     /// last made, and a corpus can pass against a shell that no longer
     /// exists.
+    // A signal ignored before the shell started is the shell's to report
+    // and not to change. Both halves are bash's behaviour and both are
+    // checked here against the real thing.
+    //
+    // Not an ordinary corpus case, because the setup is outside the
+    // script: the disposition has to already be SIG_IGN when the shell is
+    // exec'd, which is what `nohup` does to SIGHUP and what this does by
+    // hand. That is also how the gap was found -- one suite run launched
+    // under nohup, reporting it as three unrelated `trap` cases differing
+    // from bash -- and a case the corpus can only see by accident is a
+    // case worth pinning on purpose.
+    #[test]
+    fn a_signal_ignored_before_the_shell_started_is_listed_and_cannot_be_trapped() {
+        let Some(bish) = bish_binary() else { return };
+        // The listing first (HUP is signal 1, so it sorts above the trap
+        // actually set here), then an attempt to trap it: accepted with a
+        // successful status, and with no effect whatsoever.
+        let script = r#"trap 'echo t' INT; trap -p; trap 'echo h' HUP; echo "status=$?"; trap -p HUP"#;
+        let got = run_with_sighup_ignored(bish.as_os_str(), script);
+        assert_eq!(got, "trap -- '' SIGHUP\ntrap -- 'echo t' SIGINT\nstatus=0\ntrap -- '' SIGHUP\n");
+        if let Some(bash) = oracle_bash() {
+            assert_eq!(got, run_with_sighup_ignored(bash.as_os_str(), script), "bish and bash must say the same thing about an inherited ignore");
+        }
+    }
+
+    /// `run_with`, with SIGHUP already ignored when the shell starts.
+    ///
+    /// The disposition is set in the child between fork and exec, which is
+    /// the only window where it is this process's business and not the
+    /// shell's -- and SIG_IGN is one of the two dispositions that survive
+    /// `exec` at all, which is the whole reason the rule being tested
+    /// exists.
+    fn run_with_sighup_ignored(shell: &std::ffi::OsStr, script: &str) -> String {
+        let mut command = Command::new(shell);
+        command
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        use std::os::unix::process::CommandExt;
+        let sighup = crate::term::SIGHUP;
+        // Put back by hand, because this test process is a Rust program
+        // and its runtime ignored SIGPIPE before `main` (see
+        // `record_signals_ignored_at_entry`). Without this the child
+        // inherits that too, and the comparison below stops being about
+        // one signal -- bash would list the inherited `SIGPIPE` and bish,
+        // for the reason that function documents, would not. Resolved
+        // before `pre_exec` so the closure only makes syscalls.
+        let sigpipe = crate::exec::signal_number("PIPE").expect("every platform names PIPE");
+        // SAFETY: two sigaction calls, which are async-signal-safe and
+        // allocate nothing -- the same bar every other pre_exec hook in
+        // this codebase meets (see exec.rs's own setpgid hook).
+        unsafe {
+            command.pre_exec(move || {
+                crate::platform::default_signal(sigpipe);
+                crate::platform::ignore_signal(sighup);
+                Ok(())
+            });
+        }
+        let out = command.spawn().and_then(|child| wait_with_timeout(child, CASE_TIMEOUT)).expect("the shell under test must run");
+        format!("{}{}", String::from_utf8_lossy(&out.0.stdout), String::from_utf8_lossy(&out.0.stderr))
+    }
+
     fn bish_binary() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let path = exe.parent()?.parent()?.join("bish");

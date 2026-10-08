@@ -9257,9 +9257,7 @@ impl Shell {
                     {
                         sh_println!(self, "trap -- {} EXIT", crate::serialize::quote_literal(code));
                     }
-                    let mut entries: Vec<(i32, TrapAction)> = self.traps.iter().map(|(k, v)| (*k, v.clone())).collect();
-                    entries.sort_by_key(|(n, _)| *n);
-                    for (n, action) in entries {
+                    for (n, action) in trap_signal_listing(&self.traps, ignored_at_entry_list()) {
                         if !asked(&signal_name(n)) && !asked(&n.to_string()) {
                             continue;
                         }
@@ -15081,7 +15079,7 @@ enum PseudoTrap {
     Return = 2,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum TrapAction {
     Ignore,
     Run(String),
@@ -15310,7 +15308,22 @@ static IGNORED_AT_ENTRY: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::ne
 /// first shell exists, and a `Shell` built later (a subshell, a test)
 /// must see the same answer rather than whatever is current by then.
 pub fn record_signals_ignored_at_entry() {
-    let _ = IGNORED_AT_ENTRY.set(SIGNAL_NAMES.iter().filter(|(_, num)| crate::platform::is_signal_ignored(*num)).map(|(_, num)| *num).collect());
+    // SIGPIPE is never on this list, however it reads right now. Rust's
+    // runtime sets it to SIG_IGN before `main` is entered (the same fact
+    // `PIPE_WRITE_FAILED` below is built on), discarding the disposition
+    // bish was started with -- so by the time anything here can look,
+    // "ignored" says only that bish is a Rust program. Reporting that as
+    // an inherited ignore cost `trap '' PIPE` and `trap 'cmd' PIPE`
+    // outright: both were silently refused, and `trap` listed a
+    // `SIGPIPE` nobody had asked for, where bash lists nothing.
+    //
+    // The price is that a genuine `trap '' PIPE; exec bish` is invisible
+    // here where bash sees it. There is no way to tell the two apart
+    // after the fact: the only process that could have is this one,
+    // before its own runtime started.
+    let pipe = signal_number("PIPE");
+    let _ = IGNORED_AT_ENTRY
+        .set(SIGNAL_NAMES.iter().map(|(_, num)| *num).filter(|num| Some(*num) != pipe && crate::platform::is_signal_ignored(*num)).collect());
 }
 
 /// Whether `trap` has to leave this one alone. False for every signal
@@ -15318,6 +15331,30 @@ pub fn record_signals_ignored_at_entry() {
 /// `Shell` directly and never go through `main`.
 fn ignored_at_entry(signum: i32) -> bool {
     IGNORED_AT_ENTRY.get().is_some_and(|ignored| ignored.contains(&signum))
+}
+
+fn ignored_at_entry_list() -> &'static [i32] {
+    IGNORED_AT_ENTRY.get().map(|v| v.as_slice()).unwrap_or_default()
+}
+
+/// The signal half of what `trap`/`trap -p` prints, by signal number.
+///
+/// The signals ignored at entry belong in it: `trap` reports what this
+/// shell would do with each signal, and for those the answer is "nothing,
+/// and that cannot be changed" -- which is exactly what `trap -- '' SIG`
+/// says. bash lists them, and a script reading its own `trap -p` back is
+/// entitled to the same answer from both shells.
+///
+/// They cannot collide with a real trap: `trap` refuses to record one for
+/// a signal on this list (see `ignored_at_entry`), so the union is never
+/// ambiguous. Sorted by number afterwards rather than appended, because
+/// an inherited ignore is not later news than a trap set here -- bash
+/// interleaves them, so `trap 'x' INT` with HUP ignored prints HUP first.
+fn trap_signal_listing(traps: &std::collections::HashMap<i32, TrapAction>, ignored: &[i32]) -> Vec<(i32, TrapAction)> {
+    let mut entries: Vec<(i32, TrapAction)> = traps.iter().map(|(k, v)| (*k, v.clone())).collect();
+    entries.extend(ignored.iter().filter(|n| !traps.contains_key(n)).map(|n| (*n, TrapAction::Ignore)));
+    entries.sort_by_key(|(n, _)| *n);
+    entries
 }
 
 // SIGWINCH (terminal resize) tracking for the M9 compositor. Deliberately
@@ -17813,6 +17850,35 @@ mod tests {
         }
         crate::platform::reload_timezone();
         out
+    }
+
+    // `trap`'s listing is what a script reads its own traps back out of,
+    // and bash puts an inherited ignore in it among the traps set here
+    // rather than at either end.
+    #[test]
+    fn the_trap_listing_interleaves_inherited_ignores_with_traps_by_signal_number() {
+        let number = |name: &str| super::signal_number(name).expect("a signal every platform names");
+        let (hup, int, usr1) = (number("HUP"), number("INT"), number("USR1"));
+        let mut traps = std::collections::HashMap::new();
+        traps.insert(usr1, TrapAction::Run("echo t".to_string()));
+        traps.insert(int, TrapAction::Ignore);
+
+        // HUP is 1, INT is 2, USR1 is well above both: the inherited one
+        // is not appended, it takes its place in the order.
+        let listing = super::trap_signal_listing(&traps, &[hup]);
+        assert_eq!(
+            listing,
+            vec![(hup, TrapAction::Ignore), (int, TrapAction::Ignore), (usr1, TrapAction::Run("echo t".to_string()))],
+            "by signal number, inherited ignore included"
+        );
+        // Nothing inherited is the ordinary case, and the one every unit
+        // test here is in.
+        assert_eq!(super::trap_signal_listing(&traps, &[]).len(), 2);
+        // A signal cannot be both: `trap` refuses to record one for a
+        // signal ignored at entry, so there is no second entry to drop
+        // -- but if that ever changed, the trap is what is reported.
+        let listing = super::trap_signal_listing(&traps, &[int, usr1]);
+        assert_eq!(listing, vec![(int, TrapAction::Ignore), (usr1, TrapAction::Run("echo t".to_string()))]);
     }
 
     #[test]
