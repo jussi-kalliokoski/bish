@@ -2163,11 +2163,11 @@ y
     /// all it takes for the corpus to start running there.
     ///
     /// Anywhere else, a missing or too-old bash fails the suite rather
-    /// than shrinking it. `BISH_NO_BASH_oracle()=1` accepts it for a
+    /// than shrinking it. `BISH_NO_BASH_ORACLE=1` accepts it for a
     /// deliberate run without one -- a minimal container, say.
     #[test]
     fn the_corpus_goes_unrun_only_where_that_is_accepted() {
-        if oracle_bash().is_some() || std::env::var_os("BISH_NO_BASH_oracle()").is_some() {
+        if oracle_bash().is_some() || std::env::var_os("BISH_NO_BASH_ORACLE").is_some() {
             return;
         }
         // macOS is the one machine where going without is accepted, so
@@ -2177,7 +2177,7 @@ y
         }
         panic!(
             "no bash of version {OLDEST_USABLE_BASH} or newer on PATH, so every case comparing bish against bash was skipped.\n     \
-             Install one, or set BISH_NO_BASH_oracle()=1 to accept a run without the oracle."
+             Install one, or set BISH_NO_BASH_ORACLE=1 to accept a run without the oracle."
         );
     }
 
