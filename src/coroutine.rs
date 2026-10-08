@@ -58,6 +58,24 @@ struct Context {
     stack_pointer: *mut u8,
 }
 
+// Declares `bish_switch_context` as a global the rest of the binary can
+// call but nothing outside it can see. ELF and Mach-O spell that
+// differently, and Mach-O also puts an underscore in front of every C
+// symbol name, so the extern below only finds it under `_bish...`.
+#[cfg(target_vendor = "apple")]
+macro_rules! switch_context_label {
+    () => {
+        ".globl _bish_switch_context\n.private_extern _bish_switch_context\n_bish_switch_context:"
+    };
+}
+
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! switch_context_label {
+    () => {
+        ".globl bish_switch_context\n.hidden bish_switch_context\nbish_switch_context:"
+    };
+}
+
 // x86_64 System V: rbx, rbp and r12-r15 are callee-saved, so a function
 // that switches stacks has to preserve them across the switch the same
 // way any other function would. They are pushed onto the outgoing stack
@@ -69,9 +87,7 @@ struct Context {
 // would be, so the first switch into a coroutine "returns" into it.
 #[cfg(target_arch = "x86_64")]
 std::arch::global_asm!(
-    ".globl bish_switch_context",
-    ".hidden bish_switch_context",
-    "bish_switch_context:",
+    switch_context_label!(),
     "push rbp",
     "push rbx",
     "push r12",
@@ -94,9 +110,7 @@ std::arch::global_asm!(
 // stack pointers, pop, return through the link register.
 #[cfg(target_arch = "aarch64")]
 std::arch::global_asm!(
-    ".globl bish_switch_context",
-    ".hidden bish_switch_context",
-    "bish_switch_context:",
+    switch_context_label!(),
     "sub sp, sp, #0xa0",
     "stp x19, x20, [sp, #0x00]",
     "stp x21, x22, [sp, #0x10]",
