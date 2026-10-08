@@ -118,6 +118,8 @@ pub(crate) const SIG_DFL: usize = 0;
 // so the mapping from `ulimit`'s own flags to resource numbers is a
 // per-OS fact rather than a shared table -- see `rlimit_number`.
 pub(crate) const RLIMIT_STACK: i32 = 3;
+// "No limit": every bit of `rlim_t` set.
+pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
 pub(crate) const SC_CLK_TCK: i32 = 2;
 
 /// Which `RLIMIT_*` a `ulimit` flag asks about, or `None` where this OS

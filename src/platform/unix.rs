@@ -622,9 +622,9 @@ pub(crate) fn reload_timezone() {
 /// One resource limit: what this process may have now, and the most it
 /// may raise itself to.
 ///
-/// `rlim_t` is 64-bit on both OSes and `RLIM_INFINITY` is its maximum on
-/// both, so this one layout serves -- it is the resource *numbers* that
-/// differ, and those are in the tables.
+/// `rlim_t` is 64-bit on both OSes, so this one layout serves -- it is
+/// the resource numbers and `RLIM_INFINITY` that differ, and those are
+/// in the tables.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ResourceLimit {
@@ -632,8 +632,8 @@ pub(crate) struct ResourceLimit {
     pub(crate) hard: u64,
 }
 
-/// "No limit", as both OSes spell it.
-pub(crate) const UNLIMITED: u64 = u64::MAX;
+/// "No limit", as this OS spells it.
+pub(crate) const UNLIMITED: u64 = sys::RLIM_INFINITY;
 
 /// Which `ulimit` flags this OS has a limit for, and which number each
 /// one is. `None` means this OS has no such limit, and `ulimit` leaves

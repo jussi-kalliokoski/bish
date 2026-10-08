@@ -119,6 +119,10 @@ pub(crate) const SIG_DFL: usize = 0;
 // returns a different system property entirely -- CPU times quietly
 // divided by the wrong number.
 pub(crate) const RLIMIT_STACK: i32 = 3;
+// "No limit" keeps the top bit clear here -- `(1 << 63) - 1`, not the
+// all-ones Linux uses -- so a limit read back as Linux's would print as
+// a number nobody has, and setting Linux's would be refused.
+pub(crate) const RLIM_INFINITY: u64 = (1 << 63) - 1;
 pub(crate) const SC_CLK_TCK: i32 = 3;
 
 /// Which `RLIMIT_*` a `ulimit` flag asks about, or `None` where this OS
