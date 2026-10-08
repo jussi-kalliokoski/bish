@@ -1321,8 +1321,18 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
-            // A tilde prefix ends at `/` or at the end of the word.
-            if matches!(probe.peek().copied(), None | Some('/') | Some(' ') | Some('\t') | Some('\n') | Some(':')) {
+            // A tilde prefix ends at `/`, at `:` (so `PATH=~/a:~/b` has
+            // two of them), or at the end of the word -- and a word ends
+            // at a metacharacter as much as at a space, which this used
+            // to miss. `echo ~;` printed a literal `~`, and so did
+            // `cd ~; pwd` and `echo ~ &&`: every shape where the tilde
+            // is the last thing in the word and the word is ended by an
+            // operator rather than by whitespace.
+            let ends_the_prefix = |c: Option<char>| match c {
+                None | Some('/') | Some(':') => true,
+                Some(c) => c.is_whitespace() || is_metacharacter(c),
+            };
+            if ends_the_prefix(probe.peek().copied()) {
                 for _ in 0..consumed {
                     self.advance();
                 }
@@ -1405,8 +1415,8 @@ impl<'a> Lexer<'a> {
                 // replacement: `${s//:/a|b}` replaced with `a`, and
                 // `${s//|/x}` searched for the empty string and so
                 // matched everywhere.
-                Some('|') | Some('&') | Some(';') | Some('<') | Some('>') | Some('#') | Some('(') | Some(')') if !literal_ws => break,
-                Some(c @ ('|' | '&' | ';' | '<' | '>' | '(' | ')')) => {
+                Some(c) if !literal_ws && (is_metacharacter(c) || c == '#') => break,
+                Some(c) if is_metacharacter(c) => {
                     self.advance();
                     buf.push(c);
                 }
@@ -1849,6 +1859,16 @@ pub struct SpannedResult {
 // A plain shell identifier -- what may sit in front of a `[subscript]=`
 // in an assignment. Deliberately not `is_valid_ident` from parser.rs:
 // the lexer does not depend on the parser.
+/// The characters that end a word wherever one is being read.
+///
+/// `#` is deliberately absent: it only ends a word where a word could
+/// *begin* (it opens a comment there), and is an ordinary character
+/// inside one -- `echo a#b` is one word, and `printf %q` relies on it.
+/// The two places that care add it themselves.
+fn is_metacharacter(c: char) -> bool {
+    matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
+}
+
 fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')

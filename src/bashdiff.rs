@@ -914,6 +914,18 @@ b
         case("brace-range", r#"echo {1..5} {a..e} {1..9..3}"#),
         case("brace-nested", r#"echo {a,b{1,2}}"#),
         case("tilde", r#"echo ~ | grep -c /"#),
+        // A word ends at an operator as much as at a space, and a tilde
+        // that is the whole of the last word in a command is where that
+        // shows: `cd ~; pwd` is how anyone types it. Compared against
+        // `$HOME` rather than printed, so the case says nothing about
+        // where the corpus put the directory.
+        case("tilde-before-semicolon", r#"[ "$(echo ~;)" = "$HOME" ] && echo expanded || echo literal"#),
+        case("tilde-before-and", r#"[ "$(echo ~&&true)" = "$HOME" ] && echo expanded || echo literal"#),
+        case("tilde-before-pipe", r#"[ "$(echo ~|cat)" = "$HOME" ] && echo expanded || echo literal"#),
+        case("tilde-then-cd-semicolon", r#"[ "$(cd ~; pwd)" = "$HOME" ] && echo expanded || echo literal"#),
+        case("tilde-in-a-for-list", r#"for i in ~; do [ "$i" = "$HOME" ] && echo expanded || echo literal; done"#),
+        // ...and `#` still does not end one, mid-word.
+        case("tilde-then-hash-is-literal", r#"echo ~#"#),
         // -- builtins -------------------------------------------------
         case("echo-flags", r#"echo -n a; echo; echo -e 'a\tb'"#),
         case("printf-recycle", r#"printf '%s-%s\n' a b c d"#),
