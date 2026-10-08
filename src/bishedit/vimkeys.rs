@@ -116,6 +116,17 @@ pub enum KeyOutcome {
     /// to the 5th tab" (count `Some(5)`), while bare `<C-w>gg`/`<C-w>G`
     /// (count `None`) default to the first/last tab respectively.
     Window(WindowCmd, Option<usize>),
+    /// `<C-t>`: the fuzzy opener (repl.rs's `run_opener`) over the panes
+    /// that are open and the files and directories git tracks. A
+    /// frontend outcome for the same reason `Window` is -- it acts on
+    /// window/pane state, not on a `Buffer` -- but not a `<C-w>`
+    /// command, because it is not window *management*: it is a way to
+    /// get somewhere, which is why it has a key of its own.
+    ///
+    /// Takes no count. vim spends Normal-mode `CTRL-T` on the tag stack,
+    /// which bish has nothing to pop (its own "go back" is the jumplist,
+    /// `<C-o>`/`<Tab>` just below), so the key was free.
+    Opener,
     /// `i`/`a`/`I`/`A`/`s`/`S`/`C`: vim's canonical normal-to-insert entry
     /// commands. Not a `Motion` -- these don't move a cursor by themselves,
     /// they tell the caller "stop navigating, resume editing text, and use
@@ -1614,6 +1625,13 @@ impl VimKeys {
         KeyOutcome::OpenLine { above }
     }
 
+    fn emit_opener(&mut self) -> KeyOutcome {
+        self.count = None;
+        self.pending = Pending::None;
+        self.last_completed = std::mem::take(&mut self.current_input);
+        KeyOutcome::Opener
+    }
+
     fn emit_reselect_visual(&mut self) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1889,6 +1907,7 @@ impl VimKeys {
                 self.pending = Pending::Window;
                 KeyOutcome::Pending
             }
+            Key::CtrlT => self.emit_opener(),
             Key::CtrlO => self.emit_jump(false),
             // `Ctrl-I` is indistinguishable from Tab at the raw-byte level
             // in a standard terminal (both are 0x09 -- editor.rs's own key
@@ -2485,6 +2504,7 @@ pub fn describe_outcome(outcome: &KeyOutcome) -> String {
     match outcome {
         Motion(m, count) => format!("{}{}", crate::bishedit::motion::describe_motion(m), n(count)),
         Window(cmd, count) => format!("window {}{}", describe_window_cmd(cmd), n(count)),
+        Opener => "opener".to_string(),
         EnterInsert(cmd) => format!("insert {}", describe_insert_cmd(cmd)),
         Operator(op, m, count, register) => {
             format!("{} {}{}{}", describe_op(op), crate::bishedit::motion::describe_motion(m), n(count), reg(register))
@@ -4044,6 +4064,22 @@ mod tests {
         // Still in Visual mode -- an ignored `v`/`V` doesn't cancel it.
         assert!(vk.is_visual());
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (2, 3))));
+    }
+
+    // Ctrl+T asks for the opener from a pane's Normal mode, the way it
+    // already does at the prompt -- the gesture should not depend on
+    // which of the two you happen to be looking at.
+    #[test]
+    fn ctrl_t_asks_for_the_opener_and_takes_no_count() {
+        let mut vk = VimKeys::new();
+        assert_eq!(vk.feed(Key::CtrlT), KeyOutcome::Opener);
+        // A count typed before it is spent, not carried: there is no
+        // "third opener" to ask for.
+        assert_eq!(vk.feed(Key::Char('3')), KeyOutcome::Pending);
+        assert_eq!(vk.feed(Key::CtrlT), KeyOutcome::Opener);
+        assert_eq!(vk.take_count(), None);
+        // And it leaves no half-typed command behind it.
+        assert_eq!(vk.feed(Key::Char('j')), KeyOutcome::Motion(Motion::Down, None));
     }
 
     #[test]

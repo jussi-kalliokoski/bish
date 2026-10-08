@@ -3028,7 +3028,18 @@ fn run_line_normal_mode(
                         }
                     }
                     KeyOutcome::Undo(_) | KeyOutcome::Redo(_) | KeyOutcome::UndoSeq { .. } => {}
-                    KeyOutcome::Window(..) | KeyOutcome::Join { .. } | KeyOutcome::OpenLine { .. } | KeyOutcome::Pending | KeyOutcome::None => {}
+                    // `Opener` sits with `Window` for the same reason:
+                    // this mode is line-local by design (see this
+                    // function's own doc comment), and both of those are
+                    // about panes and windows. Ctrl+T means the opener at
+                    // the prompt itself and in a pane's Normal mode,
+                    // which is where there is something to open it over.
+                    KeyOutcome::Window(..)
+                    | KeyOutcome::Opener
+                    | KeyOutcome::Join { .. }
+                    | KeyOutcome::OpenLine { .. }
+                    | KeyOutcome::Pending
+                    | KeyOutcome::None => {}
                 }
             }
         }
@@ -3735,6 +3746,7 @@ fn run_one_shot_normal_command(
                     // single-line reason `run_line_normal_mode`'s own arm
                     // documents.
                     KeyOutcome::Window(..)
+                    | KeyOutcome::Opener
                     | KeyOutcome::EnterVisual(_)
                     | KeyOutcome::ReselectVisual
                     | KeyOutcome::SwapVisualEnds

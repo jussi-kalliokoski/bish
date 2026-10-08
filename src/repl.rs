@@ -1121,7 +1121,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 // screen -- the same reason normal mode promotes below.
                 ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                 match run_opener(app) {
-                    Some(target) => act_on_opener_choice(app, target, &text),
+                    Some(target) => act_on_opener_choice(app, target, Some(&text)),
                     // Put away without picking anything: the line is
                     // handed back exactly as it was, down to the cursor.
                     None => {
@@ -2237,6 +2237,19 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
                 compositor_redraw(app);
             }
             hexedit::HexOutcome::Quit => break true,
+            // Same shape as `Window` just below, down to the "it may
+            // turn out to be a no-op, so check whether this frame is
+            // still on top" test: putting the opener away leaves this
+            // view exactly where it was.
+            hexedit::HexOutcome::Opener => {
+                if let Some(target) = run_opener(app) {
+                    act_on_opener_choice(app, target, None);
+                }
+                if app.windows[app.current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
+                    break false;
+                }
+                compositor_redraw(app);
+            }
             hexedit::HexOutcome::Window(cmd, count) => {
                 dispatch_window_cmd(app, cmd, count);
                 // A `<C-w>` that turned out to be a no-op from this
@@ -8902,6 +8915,22 @@ fn run_normal_mode_navigation(
                 dispatch_window_cmd(app, cmd, count);
                 return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
             }
+            // Ctrl+T. Picking something changes which pane is focused or
+            // makes a window, so there is nothing here left to resume
+            // and this leaves exactly as a `<C-w>` does. Putting the
+            // opener away without picking anything changed nothing, so
+            // the view comes straight back -- the opener painted over
+            // this pane's rectangle, which is what the redraw is for.
+            KeyOutcome::Opener => match run_opener(app) {
+                Some(target) => {
+                    act_on_opener_choice(app, target, None);
+                    return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
+                }
+                None => {
+                    compositor_redraw(app);
+                    render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
+                }
+            },
             // Rendered on every keystroke, not just a resolved Motion --
             // the status bar needs to show a pending count/prefix (e.g.
             // "20g" mid-`20gg`) and a search's in-progress text live, not
@@ -9172,13 +9201,27 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
 /// change and nothing more. A file or a directory is not, so it gets a
 /// window of its own -- `window new` with the command that opens it,
 /// which is the same path `::bish window new -- cmd` already takes.
-fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, text: &str) {
+///
+/// `typed` is whatever was in a live prompt line when Ctrl+T was pressed,
+/// and `None` when there was no such line (a pane's Normal mode, the hex
+/// view). The difference matters only on the way out of a shell prompt:
+/// read_line draws that line straight to the screen and never through
+/// any grid, so leaving it behind without recording it means the repaint
+/// blanks the row it was echoed on -- the same reason click-to-focus
+/// freezes it. With no line being typed there is nothing to record
+/// beyond the idle prompt every other focus change already freezes.
+fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, typed: Option<&str>) {
     use crate::opener::Target;
     match target {
         Target::Pane { window, pane } => {
             let Some(at) = app.windows.iter().position(|w| w.id == window) else { return };
-            if let Some(session) = app.sessions.get_mut(&app.windows[app.current_window].owning_session()) {
-                freeze_input_with_text(session, text);
+            match typed {
+                Some(text) => {
+                    if let Some(session) = app.sessions.get_mut(&app.windows[app.current_window].owning_session()) {
+                        freeze_input_with_text(session, text);
+                    }
+                }
+                None => freeze_focused_idle_prompt(app),
             }
             app.current_window = at;
             if app.windows[at].panes.iter().any(|p| p.id == pane) {

@@ -1369,7 +1369,7 @@ impl HexSession {
             KeyOutcome::AddSurround { .. } | KeyOutcome::DeleteSurround { .. } | KeyOutcome::ChangeSurround { .. } => {
                 self.status = Some("surround has no meaning in a byte buffer".to_string())
             }
-            KeyOutcome::Window(..) => unreachable!("bubbled up before this match"),
+            KeyOutcome::Window(..) | KeyOutcome::Opener => unreachable!("bubbled up before this match"),
         }
         None
     }
@@ -1550,6 +1550,12 @@ pub enum HexOutcome {
     Continue,
     Quit,
     Window(WindowCmd, Option<usize>),
+    /// Ctrl+T: the fuzzy opener, over panes and what git tracks.
+    ///
+    /// Reported for the same reason `Window` is -- what it offers and
+    /// what it does with a choice are both the window manager's, not
+    /// this view's.
+    Opener,
     /// Ctrl-L on the colon line: repaint everything, this pane's
     /// neighbours and the tab bar included.
     ///
@@ -1679,6 +1685,12 @@ impl HexSession {
         }
 
         let outcome = self.vk.feed(key);
+        // Reported before anything is applied, like `Window` and for the
+        // same reason: the opener is made of panes and repositories, and
+        // this view can see neither.
+        if matches!(outcome, KeyOutcome::Opener) {
+            return HexOutcome::Opener;
+        }
         let window = self.handle_outcome(outcome, layout.rows.min(rect.rows));
         // A motion in Visual mode keeps the selection live; anything that
         // committed an operator already ended it inside `handle_outcome`.
