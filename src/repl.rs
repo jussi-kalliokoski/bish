@@ -1399,7 +1399,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     // always renders through the compositor/pane-rect
                     // system from the start, one code path, no separate
                     // "plain unpromoted real terminal" branch to
-                    // maintain -- same reasoning Ctrl+Space's own
+                    // maintain -- same reasoning Ctrl+G's own
                     // normal-mode navigation already established.
                     ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                     let args = app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
@@ -1976,7 +1976,7 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                 // Normal mode, not command mode directly -- matches what the
                 // detach key already does from a genuinely idle prompt (see
                 // editor::ReadOutcome::NormalMode), rather than a second,
-                // inconsistent "Ctrl+Space sometimes means normal mode,
+                // inconsistent "Ctrl+G sometimes means normal mode,
                 // sometimes means command mode" behavior depending on what
                 // happened to be running. `:` still reaches command mode from
                 // here (run_normal_mode_navigation's own doc comment), so
@@ -3247,7 +3247,7 @@ fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
 // promoted, same as any other captured output).
 // One-time transition, shared by two independent triggers: every
 // window-family command (via apply_window_action -- see its own former
-// comment, preserved in spirit here) and, as of bishedit, Ctrl+Space
+// comment, preserved in spirit here) and, as of bishedit, Ctrl+G
 // entering normal-mode navigation (run_normal_mode_navigation), which
 // bypasses the command-dispatch path entirely and so has to trigger this
 // itself rather than relying on exec.rs's run_window having already done
@@ -3700,7 +3700,7 @@ fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
     // render blank (see freeze_idle_prompt's own doc comment). Only
     // when it's genuinely idle at its own prompt (top frame a Session):
     // splitting can also be reached right after detaching from a job
-    // (M10c's Ctrl+Space drops into command mode without popping the
+    // (M10c's Ctrl+G drops into command mode without popping the
     // Frame::Job -- see run_fg_job_frame's Detached arm), and that
     // pane's grid is already being live-written by the still-running
     // job (service_background_jobs) -- freezing a prompt there would
@@ -4156,7 +4156,7 @@ fn freeze_idle_prompt(session: &mut SessionState) {
 // in-progress, not-yet-submitted buffer content -- right after the
 // prompt, so run_normal_mode_navigation's pane view shows exactly what's
 // already been typed instead of just the bare prompt (see editor::
-// ReadOutcome::NormalMode's own doc comment: Ctrl+Space is no longer
+// ReadOutcome::NormalMode's own doc comment: Ctrl+G is no longer
 // empty-buffer-only). Returns the prompt string it used, so the caller
 // can compute `editor::visible_len` on it to know which column `text`
 // actually starts at (needed to position the resulting ScreenBuffer's
@@ -4236,7 +4236,7 @@ fn compositor_redraw(app: &App) {
 enum FgOutcome {
     // The job itself exited or was killed (e.g. by a forwarded Ctrl-C).
     Exited(i32),
-    // The user hit the detach key (see the Ctrl+Space comment below)
+    // The user hit the detach key (see the Ctrl+G comment below)
     // instead of the job exiting. The job is left completely untouched --
     // still running, still the top Frame::Job of whatever window it
     // belongs to -- it's the caller's job to decide what to do next (M10c:
@@ -4260,7 +4260,7 @@ enum FgOutcome {
     // all, and gets forwarded there before resuming; a hit elsewhere
     // (the tab bar, a different pane) switches focus there instead,
     // leaving the job running in the background -- the same outcome
-    // Ctrl+Space's own Detached already produces, just reached by a
+    // Ctrl+G's own Detached already produces, just reached by a
     // click instead of a keystroke.
     MouseClick(editor::MouseEvent),
     // This job's own screen (the same Rc<RefCell<vt100::Screen>> as
@@ -4397,12 +4397,12 @@ fn decode_fg_click(seq: &[u8]) -> Option<editor::MouseEvent> {
 // this one owns the terminal, the same way editor::read_line's own
 // on_idle does for a window sitting at a plain prompt.
 //
-// A raw NUL byte (Ctrl+Space in most terminals) is intercepted before
-// being forwarded and means "detach": plan.md long anticipated Ctrl+Space
-// as a control-mode trigger alongside ':', and reusing it here for
-// "hand control back to the window manager without touching the job"
-// keeps that a single, consistent gesture rather than inventing a second
-// one. Still no detach-and-*resume*-a-*stopped* job (matching this
+// Ctrl+G (0x07), or a raw NUL byte (Ctrl+Space, where a terminal still
+// sends it), is intercepted before being forwarded and means "detach":
+// plan.md long anticipated a single control-mode trigger alongside ':',
+// and reusing this one for "hand control back to the window manager
+// without touching the job" keeps that one gesture rather than inventing
+// a second. Still no detach-and-*resume*-a-*stopped* job (matching this
 // codebase's existing "no SIGTSTP/Ctrl-Z, no genuine Stopped jobs" scope,
 // see exec.rs's run_bg doc comment) -- detaching here never stops the
 // job, it just stops *this shell* from actively watching it, exactly
@@ -4501,7 +4501,11 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         if ready {
             let n = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
             if n > 0 {
-                if n == 1 && buf[0] == 0 {
+                // Ctrl+G (0x07), or the NUL that Ctrl+Space sends where a
+                // terminal still sends it -- the gesture arrives here as a
+                // raw byte, a job holding the terminal meaning nothing has
+                // decoded it into a `Key`.
+                if n == 1 && matches!(buf[0], 0x07 | 0x00) {
                     break FgOutcome::Detached;
                 }
                 // Ctrl-Z (0x1a): explicitly signaled rather than
@@ -4877,7 +4881,7 @@ fn service_background_jobs(app: &mut App) -> bool {
             // holds it (re-inserting on the way out), so the lookup below
             // already misses for a job someone else is reading -- the
             // skip that used to be here was belt-and-braces, and it cost
-            // the one case it actually covered. Ctrl+Space out of a
+            // the one case it actually covered. Ctrl+G out of a
             // running job and normal mode owns that pane while nothing
             // reads its pty: the job stalled the moment its buffer
             // filled, and everything it had said appeared in one lump
@@ -6296,10 +6300,10 @@ fn status_pill(text: &str) -> String {
 }
 
 // How to leave. Normal mode over a shell pane is entered with
-// Ctrl+Space and left with `i` (or any other insert command) or `:q` --
+// Ctrl+G and left with `i` (or any other insert command) or `:q` --
 // notably *not* Escape, which here only clears a selection, and not
 // `q`, which starts recording a macro. None of that is guessable, and
-// someone who hit Ctrl+Space without meaning to has nothing at all to go
+// someone who hit Ctrl+G without meaning to has nothing at all to go
 // on, so the mode line says it outright for as long as the mode is up.
 // The short form is for panes too narrow to fit the sentence.
 const NORMAL_MODE_EXIT_HINT: &str = "i or :q to return to the prompt";
@@ -6535,7 +6539,7 @@ enum PendingView {
     Transcript,
 }
 
-// bishedit M1's first (and, so far, only) consumer: Ctrl+Space
+// bishedit M1's first (and, so far, only) consumer: Ctrl+G
 // (editor::ReadOutcome::NormalMode, unconditional now -- see its own doc
 // comment) enters this -- read-only cursor navigation over the focused
 // pane's own rendered content (scrollback included), vim's normal-mode
@@ -6567,7 +6571,7 @@ enum PendingView {
 // return to the live prompt, same as `ZZ` -- but per this session's own
 // "as if we were just looking around" design, they act on `initial_text`/
 // `initial_cursor` (a snapshot of exactly what was typed and where the
-// cursor was the *moment* Ctrl+Space was pressed), never on wherever
+// cursor was the *moment* Ctrl+G was pressed), never on wherever
 // this function's own navigation cursor has since wandered off to in the
 // scrollback. So freely glancing around at prior output, then pressing
 // e.g. `A`, always resumes editing at the end of the *original* line --
@@ -6580,7 +6584,7 @@ enum PendingView {
 // Action, or KeyOutcome::Window) does not -- there's no per-session slot
 // to stash "unsubmitted line text" in for whatever window ends up
 // focused, so it's simply not carried over (matches today's behavior:
-// before this session, Ctrl+Space was empty-buffer-only, so a focus
+// before this session, Ctrl+G was empty-buffer-only, so a focus
 // change never had anything to lose in the first place).
 //
 // Not yet resumable via the Frame stack (see plan.md's own scoping
@@ -6597,7 +6601,7 @@ enum PendingView {
 // comment) and what its own `NavExit` return values actually mean once
 // it's done.
 enum NavStart {
-    // Ctrl+Space from a live shell prompt, mid-typing `text` with the
+    // Ctrl+G from a live shell prompt, mid-typing `text` with the
     // cursor at `cursor` -- resumable (see `NavExit::Resume`).
     //
     // `wheel` is set instead when a wheel notch is what opened this view
@@ -6606,7 +6610,7 @@ enum NavStart {
     // be swallowed, and a wheel that opens a view without moving it is
     // exactly what "the wheel doesn't work" looks like.
     Prompt { text: String, cursor: usize, wheel: Option<editor::MouseEvent> },
-    // Ctrl+Space detaching a running foreground job -- read-only, same
+    // Ctrl+G detaching a running foreground job -- read-only, same
     // as `Prompt`, but nothing to resume into (this pane's top frame
     // stays `Frame::Job`, not a live prompt, so a caller-side "resume
     // this text" would have nothing to apply it to).
@@ -7118,7 +7122,7 @@ fn run_normal_mode_navigation(
             // prompt has only ever been drawn straight to the real
             // terminal by editor::read_line, never captured into its own
             // grid -- fine as long as nothing needs to read that grid
-            // back, which is exactly what's about to happen. Ctrl+Space
+            // back, which is exactly what's about to happen. Ctrl+G
             // doesn't change focus (unlike those other call sites), so
             // without this the very first entry into normal mode in a
             // session that's never lost focus before would render as a
@@ -8424,7 +8428,7 @@ fn run_normal_mode_navigation(
             }
             // `ReadOnly`: hands typing back to the live prompt's own
             // editor (`apply_insert_cmd` against `original_chars`,
-            // `NavExit::Resume` -- the mechanism that makes Ctrl+Space
+            // `NavExit::Resume` -- the mechanism that makes Ctrl+G
             // feel like a temporary excursion out of Insert mode).
             // `Editable`: there's no live prompt underneath to resume --
             // this pane's own Normal mode already *is* the resting
@@ -12614,7 +12618,7 @@ fn run_command_mode(
     // act on.
     editing: Option<&mut TextBuffer>,
     // Seeds the very first prompt with already-typed text, cursor at its
-    // end -- Ctrl+Space mid-typing (below) uses this to carry the
+    // end -- Ctrl+G mid-typing (below) uses this to carry the
     // in-progress line into command mode's own next prompt rather than
     // losing it. `None` (every other call site) starts with the ordinary
     // empty buffer.
@@ -12633,7 +12637,7 @@ fn run_command_mode(
     // since history::expand trims before it looks for one.
     let mut buffer_unrecorded = false;
     let mut transcript_visible = false;
-    // Set from `seed` on the very first iteration, or by Ctrl+Space
+    // Set from `seed` on the very first iteration, or by Ctrl+G
     // below (see that arm's own comment) on any later one -- consumed by
     // the very next read_line call, then left None again either way.
     let mut pending_initial: Option<(String, usize)> = seed.map(|s| {
@@ -12759,7 +12763,7 @@ fn run_command_mode(
             // Entering bishedit normal mode from inside command mode
             // isn't a thing (you're already navigating a screen, not a
             // live prompt) -- but unlike DirNav, this can no longer just
-            // be ignored outright: Ctrl+Space is unconditional now (see
+            // be ignored outright: Ctrl+G is unconditional now (see
             // its own doc comment), so simply dropping `text`/`cursor`
             // here would silently discard whatever had already been
             // typed the instant this fired mid-line. Feeding it back as
@@ -16425,7 +16429,7 @@ mod normal_mode_status_tests {
 
     #[test]
     fn the_mode_line_always_says_how_to_get_back_out() {
-        // The whole point: Ctrl+Space into normal mode over a shell pane
+        // The whole point: Ctrl+G into normal mode over a shell pane
         // is not something Escape or `q` gets you out of, so the way out
         // has to be on screen rather than known in advance.
         let buf = nav_buffer(10, b"$ echo hi\r\n");

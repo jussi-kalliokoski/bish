@@ -536,7 +536,7 @@ pub enum Endian {
 // What repl.rs's `hex_frames` side table actually holds, exactly as
 // `fileeditor::EditSession` is what `edit_frames` holds -- the whole
 // live view, so a mid-typed nibble, an in-progress Visual selection or
-// an undo history all survive a Ctrl+Space detach and come back intact.
+// an undo history all survive a Ctrl+G detach and come back intact.
 pub struct HexSession {
     buf: HexBuffer,
     vk: VimKeys,

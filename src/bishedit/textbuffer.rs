@@ -142,7 +142,7 @@ pub struct TextBuffer {
     disk_hash: Option<u64>,
     // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
     // along with the buffer exactly like `selections` does (survives a
-    // Ctrl+Space detach/reattach, since both live on the one thing that
+    // Ctrl+G detach/reattach, since both live on the one thing that
     // does), cleared by `:diag clear` or implicitly by any real edit (see
     // insert_text/delete_range/join_lines below): a lint::Diagnostic's
     // start/end are char offsets into this buffer's *current* text, so
@@ -287,7 +287,7 @@ pub struct TextBuffer {
     // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
     // (see bishedit::undo's own module doc comment for why). Rides along
     // with the buffer exactly like `selections`/`diagnostics` (survives a
-    // Ctrl+Space detach/reattach), seeded with this buffer's own starting
+    // Ctrl+G detach/reattach), seeded with this buffer's own starting
     // content in `new_unnamed`/`open` below. Checkpointed by
     // `checkpoint_undo` -- see its own doc comment for exactly when that
     // gets called and why that's what defines one undo-able "group".

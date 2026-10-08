@@ -37,7 +37,7 @@ use crate::window::Rect;
 // What `repl.rs`'s `edit_frames` side table actually holds -- not just a
 // bare `TextBuffer`, so a mid-typed count/prefix or an in-progress
 // Visual selection survives a detach, matching how a real `Frame::Job`'s
-// own live state already does the same across Ctrl+Space.
+// own live state already does the same across Ctrl+G.
 pub struct EditSession {
     pub buffer: TextBuffer,
     pub vk: VimKeys,
@@ -1285,11 +1285,11 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
 // repositioning needed at all). Always returns to Normal mode in the
 // caller (the one real Normal-mode loop, `repl.rs`'s
 // `run_normal_mode_navigation`) once this returns -- Escape/Ctrl-C/
-// Ctrl+Space all mean exactly the same thing here (leave Insert mode),
+// Ctrl+G all mean exactly the same thing here (leave Insert mode),
 // and EOF does too (nothing sensible to keep typing into). Unlike a live
 // shell prompt's own Insert-mode-to-Normal-mode transition, there's no
 // second "which mode am I actually in" question to answer afterward:
-// this pane's own Normal mode is already the one true one, so Ctrl+Space
+// this pane's own Normal mode is already the one true one, so Ctrl+G
 // has nothing further to detach *to* -- it used to jump straight past
 // Normal mode to inspecting/switching other windows in one keystroke;
 // now it just means "stop typing," and reaching another window from here
@@ -1811,9 +1811,9 @@ pub(crate) fn run_insert_mode(
             //
             // Ctrl-C is a plain alias for Escape throughout this editor
             // (see the identical treatment in the unified Normal mode's
-            // own Visual-mode handling); Ctrl+Space is too, here (see
+            // own Visual-mode handling); Ctrl+G is too, here (see
             // this function's own doc comment).
-            Key::CtrlSpace | Key::Escape | Key::CtrlC => {
+            Key::CtrlG | Key::CtrlSpace | Key::Escape | Key::CtrlC => {
                 // The `'^'` mark records the exact position insert mode
                 // left off at (so `gi` resumes appending from the same
                 // spot, one-past-the-last-character included) -- captured
@@ -5489,6 +5489,26 @@ def",
 
     fn chars(text: &str) -> Vec<Key> {
         text.chars().map(Key::Char).collect()
+    }
+
+    // Ctrl+G is the detach gesture now, and in Insert mode -- where
+    // there is nothing left to detach *to* -- it means what Escape means,
+    // as Ctrl+C and the old Ctrl+Space already did. Ctrl+Space still
+    // works where a terminal sends it; macOS and the Linux input methods
+    // take it for switching input source before the terminal sees it,
+    // which is why the gesture moved.
+    #[test]
+    fn ctrl_g_leaves_insert_mode_as_escape_does_and_so_does_ctrl_space() {
+        for leave in [Key::CtrlG, Key::CtrlSpace, Key::Escape, Key::CtrlC] {
+            let mut keys = chars("hi");
+            keys.push(leave);
+            keys.extend(chars("x"));
+            let buf = insert_with(None, &keys, &[]);
+            // Insert mode has returned by the time the `x` arrives, so it
+            // is never inserted -- which is the whole test: a key that had
+            // not ended Insert mode would leave "hix" behind.
+            assert_eq!(text_of(&buf), "hi", "{leave:?} should have left insert mode");
+        }
     }
 
     #[test]

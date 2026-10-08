@@ -225,7 +225,7 @@ pub(crate) fn run_fg(sh: &mut Shell, args: &[String]) -> ExecResult {
                 // handler, since a stopped process runs *no* code at
                 // all until continued -- which looked like the whole
                 // shell hanging, unrecoverable short of the
-                // undiscoverable Ctrl+Space detach. This job's own
+                // undiscoverable Ctrl+G detach. This job's own
                 // pgid always equals its own (single) pid -- see
                 // Job::pgid's doc comment on why pty-attached jobs
                 // don't separately store one -- so send_signal_to_pgrp

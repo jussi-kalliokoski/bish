@@ -49,7 +49,7 @@ pub(crate) type HexFrameId = u32;
 // not Copy) matters for how cheaply `window fg` can duplicate a Session
 // frame onto another window's stack. Edit is `e`'s own equivalent of
 // Job -- a builtin editor session (fileeditor::EditSession) that can
-// likewise be detached (Ctrl+Space) and resumed later, holding an id
+// likewise be detached (Ctrl+G) and resumed later, holding an id
 // into `edit_frames` for exactly the same Copy-ness reason (a
 // TextBuffer's own content is definitely not Copy either). Diagnostics
 // is different from all three: it's never the *only* frame a pane ever

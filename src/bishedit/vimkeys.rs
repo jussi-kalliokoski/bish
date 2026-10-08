@@ -464,7 +464,7 @@ pub enum InsertCmd {
     /// slice. `apply_insert_cmd` treats it the same as `Before` (insert
     /// right where the cursor already is): a reasonable fallback for the
     /// single-line contexts that call it (the shell's own line editor,
-    /// the pane-scrollback Ctrl+Space excursion), where "the last insert
+    /// the pane-scrollback Ctrl+G excursion), where "the last insert
     /// position" isn't a concept those contexts track. `fileeditor.rs`'s
     /// own `TextBuffer`-aware `resolve_insert_start` resolves it for
     /// real, via `Buffer::get_mark('^')`.
@@ -477,7 +477,7 @@ pub enum InsertCmd {
 /// yet -- see bishedit's own module doc comment) or to `editor::LineEditor`
 /// specifically, so every frontend that wants real insert-entry semantics
 /// (editor.rs's own line-local Ctrl-E mode, applied to the *live* cursor;
-/// repl.rs's full-pane Ctrl+Space mode, applied to a *frozen original*
+/// repl.rs's full-pane Ctrl+G mode, applied to a *frozen original*
 /// cursor a navigation excursion doesn't move) shares this one
 /// implementation instead of each re-deriving the same seven cases.
 pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<char>, usize) {

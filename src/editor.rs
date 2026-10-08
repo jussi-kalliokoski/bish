@@ -39,10 +39,14 @@ use crate::vt100;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
     Char(char),
-    // Raw NUL (0x00) -- most terminals send this for Ctrl+Space. This
-    // codebase's existing convention for "step back a level" (see
-    // drive_fg_job's job-detach handling); reused here as the gesture that
-    // enters bishedit's normal-mode navigation over the current pane.
+    // Raw NUL (0x00) -- most terminals send this for Ctrl+Space, which
+    // was this gesture's only spelling until `Key::CtrlG` took over as
+    // the one bish asks for. Still accepted wherever it arrives: a
+    // terminal that sends it is a terminal someone may still be pressing
+    // it on. What it does *not* do is arrive reliably -- macOS binds
+    // Ctrl+Space to switching input source, and ibus and fcitx do the
+    // same on Linux, so the key often never reaches bish at all. That is
+    // why the gesture moved.
     CtrlSpace,
     Enter,
     Backspace,
@@ -1365,7 +1369,7 @@ fn redraw_with_completion_row(
 // unicode_width::char_width), not a flat 1 -- the cwd embedded in the
 // default prompt is real, user-controlled path text, wide CJK
 // characters/emoji included, not just ASCII.
-// pub(crate): repl.rs's own freeze-with-text helper (Ctrl+Space with
+// pub(crate): repl.rs's own freeze-with-text helper (Ctrl+G with
 // in-progress text) reuses this to know how many *visible* columns a
 // colored prompt occupies, so it can position the frozen row's
 // ScreenBuffer cursor at the right column rather than guessing.
@@ -1523,7 +1527,7 @@ pub enum ReadOutcome {
     // comment. Never fires with anything typed (see read_line's own
     // handling), so there's no "what happens to the buffer" question.
     DirNav(DirNav),
-    // Ctrl+Space -- unconditional now, regardless of what's been typed
+    // Ctrl+G -- unconditional now, regardless of what's been typed
     // (previously gated to an empty buffer only, the same "don't discard
     // in-progress typing" reasoning DirNav above still uses). Enters
     // bishedit's normal-mode navigation over the current pane's own
@@ -1531,7 +1535,7 @@ pub enum ReadOutcome {
     // *only* way into command mode now (via normal mode's own ':',
     // matching real vim) since the old direct ':'-at-the-shell-prompt
     // shortcut was retired. `text`/`cursor` are `ed.as_string()`/
-    // `ed.cursor` at the moment Ctrl+Space was pressed, so the caller can
+    // `ed.cursor` at the moment Ctrl+G was pressed, so the caller can
     // both show what's already been typed in its pane view and hand it
     // back (via `read_line`'s own `initial` parameter) to whatever
     // `read_line` call eventually resumes editing -- nothing is silently
@@ -1540,7 +1544,7 @@ pub enum ReadOutcome {
     // *original* cursor (not wherever normal mode's own navigation cursor
     // wanders off to -- see run_normal_mode_navigation's own doc comment).
     // `wheel` is the notch that asked for this, when a wheel is what
-    // opened it rather than Ctrl+Space. A promoted prompt has mouse
+    // opened it rather than Ctrl+G. A promoted prompt has mouse
     // reporting on (see repl.rs's prompt_claims_mouse), so the terminal
     // no longer scrolls its own scrollback -- and bish's scrollback view
     // *is* normal mode, so a notch means "show me that". Carried rather
@@ -1634,7 +1638,7 @@ pub enum DirNav {
 // column while redrawing during typing, never to reposition the row
 // itself (single-line editing, see this function's own scope note).
 // `initial`: text + cursor to preload the buffer with instead of starting
-// empty -- used to resume editing after a Ctrl+Space excursion into
+// empty -- used to resume editing after a Ctrl+G excursion into
 // normal-mode navigation (see `ReadOutcome::NormalMode`'s own doc
 // comment) without losing whatever had already been typed. `None` for
 // every ordinary call (a fresh prompt has nothing to preload).
@@ -1751,7 +1755,7 @@ pub fn read_line(
     // Normal mode (run_line_normal_mode, below) should draw its live
     // `/`/`?` search input at the terminal's shared global status row
     // (`repl::render_global_status_row`/`command_mode_row` -- the same
-    // row `:` command mode and Ctrl+Space's own Normal-mode status line
+    // row `:` command mode and Ctrl+G's own Normal-mode status line
     // already use) instead of substituting it in place of the prompt --
     // both dimensions are needed since that row spans the *terminal's*
     // full width, not this call's own `col_origin`/`width` (which, for a
@@ -2329,7 +2333,10 @@ pub fn read_line(
             // now (used to be empty-buffer-only, matching DirNav above) --
             // see ReadOutcome::NormalMode's own doc comment for why that
             // gating is gone.
-            Key::CtrlSpace => {
+            // Ctrl+G is the gesture; Ctrl+Space is the spelling it had
+            // before, kept because a terminal that sends NUL is a
+            // terminal someone may still be pressing it on.
+            Key::CtrlG | Key::CtrlSpace => {
                 drop(guard.take());
                 return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: None });
             }
@@ -2451,7 +2458,7 @@ pub fn read_line(
                 return Ok(ReadOutcome::Mouse { event: ev, text: ed.as_string(), cursor: ed.cursor });
             }
             // PageUp/PageDown: no meaning at the live prompt itself (no
-            // scrollback view to page through here -- that's Ctrl+Space's
+            // scrollback view to page through here -- that's Ctrl+G's
             // own Normal-mode navigation's job), same as a real bash
             // readline prompt not binding them either.
             // A closing paste bracket with no opener is a stray: this
@@ -2474,8 +2481,8 @@ pub fn read_line(
             | Key::CtrlV
             // Decoded so `::bish map` can bind them, and bound to
             // nothing here -- the same place every other unbound key
-            // lands.
-            | Key::CtrlG
+            // lands. Ctrl+G used to be among them, and is the detach
+            // gesture now.
             | Key::CtrlQ
             | Key::CtrlS
             | Key::CtrlT
@@ -2528,7 +2535,7 @@ enum LineNormalExit {
 // `render_normal_mode_frame` do in repl.rs's own full-pane Normal mode,
 // so a search in progress here replaces the prompt text outright instead
 // (plain, not reverse-video -- distinguishes it from the ordinary mode
-// indicator, matching how the Ctrl+Space status bar already shows it).
+// indicator, matching how the Ctrl+G status bar already shows it).
 //
 // "Active" pattern, one rule for both the prompt text and the
 // highlighting: the in-progress `/`/`?` text while one is being typed
@@ -2651,11 +2658,11 @@ fn pad_to_width(text: &str, cols: usize) -> String {
 // Ctrl-E: a lightweight, line-local vim Normal mode over the buffer
 // currently being typed -- no promotion, no pane/scrollback, works
 // identically whether the terminal is split or not (unlike repl.rs's
-// full-pane Ctrl+Space mode). Fully vim-authentic: motions and
+// full-pane Ctrl+G mode). Fully vim-authentic: motions and
 // insert-entry commands (`i`/`a`/`I`/`A`/`s`/`S`/`C`) both act on the
 // *live*, currently-navigated cursor, since this is a tight single-line
 // loop with immediate rendering -- there's no "look around elsewhere,
-// resume later" excursion the way Ctrl+Space's full-pane mode has (see
+// resume later" excursion the way Ctrl+G's full-pane mode has (see
 // that mode's own doc comment in repl.rs for why *it* instead resolves
 // insert-entry against a frozen original cursor). Ctrl-E itself is *not*
 // special-cased here as a "toggle back to insert" -- only entering this
@@ -3083,7 +3090,7 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit
 // The `y{motion}`/`yy` glue: generic over any `bishedit::Buffer`, so this
 // is shared not just by run_line_normal_mode/run_one_shot_normal_command
 // below (both drive a `LineBuffer`) but by repl.rs's own ScreenBuffer-based
-// Ctrl+Space normal mode too (yank-only there -- see that call site). `put`
+// Ctrl+G normal mode too (yank-only there -- see that call site). `put`
 // stays private to this file: it works on a `LineEditor`'s own buffer
 // directly (not through `Buffer`), and only the LineBuffer-driven contexts
 // ever have something real to put into -- see repl.rs's own doc comment on

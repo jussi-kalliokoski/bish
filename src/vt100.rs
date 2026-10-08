@@ -571,7 +571,7 @@ impl Screen {
         // space appearing at the bottom. Real terminals restore on growth
         // the same way. The whole document (scrollback followed by the
         // grid) is unchanged by the move either way, which is what keeps
-        // Ctrl+Space's own scrollback view consistent across it.
+        // Ctrl+G's own scrollback view consistent across it.
         let restored_count = grew_by.min(self.scrollback.len());
         if restored_count > 0 {
             let mut restored: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(restored_count);

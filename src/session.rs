@@ -1522,7 +1522,8 @@ fn key_bytes(arg: &str) -> Vec<u8> {
                 if c.is_ascii_alphabetic() {
                     return vec![(c.to_ascii_lowercase() as u8) - b'a' + 1];
                 }
-                // C-Space is NUL, which is also bish's own detach key.
+                // C-Space is NUL, which bish still accepts as its detach
+                // key (Ctrl+G is the one it asks for).
                 if c == '@' {
                     return vec![0];
                 }
@@ -1742,16 +1743,17 @@ pub fn run_client(name: &str) -> io::Result<i32> {
                 if n == 0 {
                     break 'relay;
                 }
-                // Ctrl+Space (0x00), unaccompanied by anything else in
-                // this same read -- consistent with bish's own existing
+                // Ctrl+G (0x07), or the NUL that Ctrl+Space sends where
+                // a terminal still sends it, unaccompanied by anything
+                // else in this same read -- consistent with bish's own
                 // in-process detach binding (see Frame's own doc comment
                 // in repl.rs), reused here for the same underlying
                 // concept rather than inventing a second one. A real
-                // multi-byte paste that happens to start with a NUL is
+                // multi-byte paste that happens to start with either is
                 // vanishingly unlikely and not specially guarded against
                 // here, same tradeoff editor.rs's own single-byte
                 // control-key decoding already accepts elsewhere.
-                if n == 1 && buf[0] == 0x00 {
+                if n == 1 && matches!(buf[0], 0x07 | 0x00) {
                     break 'relay;
                 }
                 let msg = Message::Bytes(buf[..n].to_vec());

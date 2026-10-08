@@ -4465,7 +4465,7 @@ impl Shell {
     // knows the terminal's real size (repl.rs queries TIOCGWINSZ and
     // pins the tab bar to the actual last row); nothing here needs to.
     // pub(crate): also called directly by repl.rs's bishedit normal-mode
-    // entry (Ctrl+Space), which bypasses run_window/the command-dispatch
+    // entry (Ctrl+G), which bypasses run_window/the command-dispatch
     // path entirely -- see repl.rs's ensure_promoted.
     pub(crate) fn promote_if_needed(&mut self) {
         if self.promoted.get() {
