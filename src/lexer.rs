@@ -1290,55 +1290,74 @@ impl<'a> Lexer<'a> {
     // an unquoted space there is pattern content (`${s#hello }`), not a
     // word boundary. False (the normal command-line case) still breaks the
     // word on whitespace.
+    /// Takes a tilde prefix at the current position, if there is one, and
+    /// pushes it as a `Chunk::Tilde` -- flushing whatever plain text is
+    /// already collected first, since a tilde can begin partway through a
+    /// word (`PATH=~/bin`, `x=a:~/b`).
+    ///
+    /// Answers whether it took one, which the `=` arm uses to decide
+    /// nothing and the tests use to ask directly.
+    fn take_tilde_prefix(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> bool {
+        if self.chars.peek().copied() != Some('~') {
+            return false;
+        }
+        let mut probe = self.chars.clone();
+        probe.next();
+        let mut name = String::new();
+        let mut consumed = 1;
+        match probe.peek().copied() {
+            Some(c @ ('+' | '-')) => {
+                name.push(c);
+                consumed += 1;
+                probe.next();
+            }
+            _ => {
+                while let Some(c) = probe.peek().copied() {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                        name.push(c);
+                        consumed += 1;
+                        probe.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // A tilde prefix ends at `/`, at `:` (so `PATH=~/a:~/b` has two of
+        // them), or at the end of the word -- and a word ends at a
+        // metacharacter as much as at a space, which this used to miss.
+        // `echo ~;` printed a literal `~`, and so did `cd ~; pwd` and
+        // `echo ~ &&`: every shape where the tilde is the last thing in
+        // the word and the word is ended by an operator rather than by
+        // whitespace.
+        let ends_the_prefix = match probe.peek().copied() {
+            None | Some('/') | Some(':') => true,
+            Some(c) => c.is_whitespace() || is_metacharacter(c),
+        };
+        if !ends_the_prefix {
+            return false;
+        }
+        for _ in 0..consumed {
+            self.advance();
+        }
+        if !buf.is_empty() {
+            chunks.push(Chunk::Str(std::mem::take(buf)));
+        }
+        chunks.push(Chunk::Tilde { name });
+        true
+    }
+
     fn read_word(&mut self, relaxed: bool, literal_ws: bool) -> Result<(Vec<Chunk>, bool), String> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
         let mut plain = true;
 
-        // Tilde expansion at the very start of a word: `~`, `~/...`,
-        // `~user`, and bash's `~+`/`~-` for `$PWD`/`$OLDPWD`. The name
-        // is resolved at expansion time, not here -- see Chunk::Tilde.
-        if self.chars.peek().copied() == Some('~') {
-            let mut probe = self.chars.clone();
-            probe.next();
-            let mut name = String::new();
-            let mut consumed = 1;
-            match probe.peek().copied() {
-                Some(c @ ('+' | '-')) => {
-                    name.push(c);
-                    consumed += 1;
-                    probe.next();
-                }
-                _ => {
-                    while let Some(c) = probe.peek().copied() {
-                        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                            name.push(c);
-                            consumed += 1;
-                            probe.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            // A tilde prefix ends at `/`, at `:` (so `PATH=~/a:~/b` has
-            // two of them), or at the end of the word -- and a word ends
-            // at a metacharacter as much as at a space, which this used
-            // to miss. `echo ~;` printed a literal `~`, and so did
-            // `cd ~; pwd` and `echo ~ &&`: every shape where the tilde
-            // is the last thing in the word and the word is ended by an
-            // operator rather than by whitespace.
-            let ends_the_prefix = |c: Option<char>| match c {
-                None | Some('/') | Some(':') => true,
-                Some(c) => c.is_whitespace() || is_metacharacter(c),
-            };
-            if ends_the_prefix(probe.peek().copied()) {
-                for _ in 0..consumed {
-                    self.advance();
-                }
-                chunks.push(Chunk::Tilde { name });
-            }
-        }
+        // Tilde expansion at the start of a word: `~`, `~/...`, `~user`,
+        // and bash's `~+`/`~-` for `$PWD`/`$OLDPWD`. The name is resolved
+        // at expansion time, not here -- see Chunk::Tilde. An
+        // assignment's value is the other place one can begin; see the
+        // `=` and `:` arms in the loop below.
+        self.take_tilde_prefix(&mut chunks, &mut buf);
 
         // `m[x y]=1`: an associative array's key may contain spaces, and
         // the assignment is still one word. Set while inside those
@@ -1348,6 +1367,9 @@ impl<'a> Lexer<'a> {
         // test builtin).
         // Depth rather than a flag, so `a[b[0]]=1` closes correctly.
         let mut in_assign_subscript = 0u32;
+        // Set once this word's own `=` has gone by, which is what makes a
+        // later `:` a place a tilde prefix may begin.
+        let mut assignment_value = false;
 
         loop {
             match self.chars.peek().copied() {
@@ -1415,6 +1437,26 @@ impl<'a> Lexer<'a> {
                 // replacement: `${s//:/a|b}` replaced with `a`, and
                 // `${s//|/x}` searched for the empty string and so
                 // matched everywhere.
+                // `x=~/y`, and `m[k]=~`, and `x+=~`: an assignment's
+                // value is the second place a tilde prefix can begin.
+                // The name has to be a real one and unquoted -- bash
+                // leaves `--opt=~/y`, `9x=~/y` and `"a"=~/b` alone, and
+                // so does this: a quoted run would have pushed a chunk
+                // of its own by now, and `is_assignment_target` answers
+                // for the rest.
+                Some('=') if in_assign_subscript == 0 && chunks.is_empty() && is_assignment_target(&buf) => {
+                    buf.push(self.advance().expect("peeked"));
+                    assignment_value = true;
+                    self.take_tilde_prefix(&mut chunks, &mut buf);
+                }
+                // ...and after every unquoted `:` in one, which is what
+                // makes `PATH=~/bin:~/sbin` two expansions rather than
+                // one. Only inside an assignment: `echo a:~/b` is `a:~/b`
+                // in bash, tilde untouched.
+                Some(':') if assignment_value => {
+                    buf.push(self.advance().expect("peeked"));
+                    self.take_tilde_prefix(&mut chunks, &mut buf);
+                }
                 Some(c) if !literal_ws && (is_metacharacter(c) || c == '#') => break,
                 Some(c) if is_metacharacter(c) => {
                     self.advance();
@@ -1867,6 +1909,22 @@ pub struct SpannedResult {
 /// The two places that care add it themselves.
 fn is_metacharacter(c: char) -> bool {
     matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
+}
+
+/// Whether `text` is the name part of an assignment, as bash decides it:
+/// an identifier, optionally subscripted, optionally appending.
+///
+/// `x`, `x+`, `m[k]`, `m[k]+` -- and not `--opt`, `9x` or `a-b`, none of
+/// which bash treats as an assignment either, so a tilde after their `=`
+/// stays literal.
+fn is_assignment_target(text: &str) -> bool {
+    let text = text.strip_suffix('+').unwrap_or(text);
+    match text.split_once('[') {
+        // A subscript this lexer already decided was an assignment's (see
+        // `subscript_is_an_assignment`), so only its name needs checking.
+        Some((name, subscript)) => subscript.ends_with(']') && is_ident(name),
+        None => is_ident(text),
+    }
 }
 
 fn is_ident(s: &str) -> bool {
@@ -2828,6 +2886,43 @@ mod tests {
     // `\303\244` is the two bytes of `ä`, not the two characters
     // U+00C3 U+00A4. That is the form `printf %q` writes a non-ASCII
     // string in, and this is the reading end of that round trip.
+    // The chunk shape itself, independent of what expansion later does
+    // with it: an assignment's value carries a `Tilde` chunk per prefix,
+    // and a word bash would not call an assignment carries none.
+    #[test]
+    fn an_assignments_value_gets_a_tilde_chunk_and_a_flag_does_not() {
+        let tildes = |src: &str| {
+            let toks = super::Lexer::new(src).tokenize().expect("lexes");
+            let chunks = toks
+                .into_iter()
+                .find_map(|(tok, _)| match tok {
+                    super::Tok::Word(chunks, _) => Some(chunks),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no word in {src:?}"));
+            chunks
+                .iter()
+                .map(|c| match c {
+                    super::Chunk::Tilde { name } => format!("~{name}"),
+                    super::Chunk::Str(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(tildes("x=~/y"), vec!["x=", "~", "/y"]);
+        assert_eq!(tildes("p=~/a:~/b"), vec!["p=", "~", "/a:", "~", "/b"]);
+        assert_eq!(tildes("x+=~"), vec!["x+=", "~"]);
+        assert_eq!(tildes("m[k]=~"), vec!["m[k]=", "~"]);
+        assert_eq!(tildes("~-"), vec!["~-"]);
+
+        // Not assignments, so not expanded -- bash agrees on all four.
+        assert_eq!(tildes("--opt=~/y"), vec!["--opt=~/y"]);
+        assert_eq!(tildes("9x=~/y"), vec!["9x=~/y"]);
+        assert_eq!(tildes("a:~/b"), vec!["a:~/b"]);
+        assert_eq!(tildes("x==~/y"), vec!["x==~/y"]);
+    }
+
     #[test]
     fn ansi_c_quoting_reads_the_escapes_printf_q_writes() {
         let read = |body: &str| words_of(&format!("x $'{body}'")).pop().unwrap_or_default();

@@ -926,6 +926,25 @@ b
         case("tilde-in-a-for-list", r#"for i in ~; do [ "$i" = "$HOME" ] && echo expanded || echo literal; done"#),
         // ...and `#` still does not end one, mid-word.
         case("tilde-then-hash-is-literal", r#"echo ~#"#),
+        // An assignment's value is the other place a tilde prefix can
+        // begin: after the `=`, and after every unquoted `:` in it, which
+        // is what makes `PATH=~/bin:~/sbin` work. Compared against
+        // `$HOME` for the same reason as the cases above.
+        case("tilde-in-an-assignment", r#"x=~/y; [ "$x" = "$HOME/y" ] && echo expanded || echo literal"#),
+        case("tilde-after-a-colon-in-an-assignment", r#"p=~/a:~/b; [ "$p" = "$HOME/a:$HOME/b" ] && echo expanded || echo literal"#),
+        case("tilde-in-an-appending-assignment", r#"x=1; x+=:~/y; [ "$x" = "1:$HOME/y" ] && echo expanded || echo literal"#),
+        case("tilde-in-a-subscripted-assignment", r#"declare -A m; m[k]=~/y; [ "${m[k]}" = "$HOME/y" ] && echo expanded || echo literal"#),
+        case("tilde-in-an-exported-assignment", r#"export e=~/z; [ "$e" = "$HOME/z" ] && echo expanded || echo literal"#),
+        case("tilde-in-a-local-assignment", r#"f() { local v=~/l; [ "$v" = "$HOME/l" ] && echo expanded || echo literal; }; f"#),
+        case("tilde-in-an-assignment-shaped-argument", r#"[ "$(echo x=~/y)" = "x=$HOME/y" ] && echo expanded || echo literal"#),
+        // And the four shapes bash leaves alone, which say nothing about
+        // any path and so can simply be printed: a flag is not a name, a
+        // name does not start with a digit, a quoted name is not one
+        // either, and a `:` outside an assignment is just a colon.
+        case("tilde-after-a-flag-equals-is-literal", r#"echo --opt=~/y"#),
+        case("tilde-after-a-digit-name-is-literal", r#"echo 9x=~/y"#),
+        case("tilde-after-a-quoted-name-is-literal", r#"echo "a"=~/b"#),
+        case("tilde-after-a-colon-outside-an-assignment-is-literal", r#"echo a:~/b"#),
         // -- builtins -------------------------------------------------
         case("echo-flags", r#"echo -n a; echo; echo -e 'a\tb'"#),
         case("printf-recycle", r#"printf '%s-%s\n' a b c d"#),
