@@ -702,7 +702,12 @@ pub fn split_args(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        while matches!(chars.get(i), Some(' ') | Some('\t')) {
+        // Any whitespace, not just space and tab: an unquoted argument
+        // below ends at any of it, so a separator this loop did not skip
+        // would end the next argument before its first character -- an
+        // empty argument and no progress, forever. A page with CRLF line
+        // endings has a `\r` on every request line, and macOS ships one.
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
             i += 1;
         }
         if i >= chars.len() {

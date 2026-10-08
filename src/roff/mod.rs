@@ -286,6 +286,15 @@ mod tests {
         assert_tree(".IR a b c\n", "p: _a_b_c_\n");
     }
 
+    // Regression: a request line ending in `\r\n` split its arguments
+    // forever, one empty argument at a time, until the machine ran out of
+    // memory. macOS ships a page written that way.
+    #[test]
+    fn a_request_line_with_crlf_line_endings_parses() {
+        let doc = parse(".Sh NAME\r\n.Nm foo\r\n");
+        assert!(!doc.section("NAME").is_empty());
+    }
+
     #[test]
     fn a_font_escape_stays_in_effect_across_lines() {
         assert_tree(
