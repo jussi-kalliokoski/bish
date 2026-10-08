@@ -112,7 +112,7 @@ impl Watcher {
                 (parent.to_path_buf(), Some(PathBuf::from(name)))
             }
         };
-        let wd = self.inner.add(&dir)?;
+        let wd = self.inner.add(&dir, only.as_deref().map(Path::as_os_str))?;
         // Two callers watching two files in one directory get one
         // kernel watch between them, so the filter has to widen to
         // cover both rather than the second one replacing the first.

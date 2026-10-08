@@ -65,7 +65,12 @@ impl DirWatch {
     /// Watches `dir`. The same directory added twice gives the same id,
     /// which is the kernel's own behaviour here and the contract the
     /// macOS side has to keep too.
-    pub(crate) fn add(&mut self, dir: &Path) -> io::Result<WatchId> {
+    ///
+    /// `file` is the entry the caller is after, if it is after one.
+    /// Nothing here needs it: a directory watch already reports writes
+    /// to every file in it, by name. It is macOS's kqueue that does not
+    /// -- see watch_darwin.rs.
+    pub(crate) fn add(&mut self, dir: &Path, _file: Option<&std::ffi::OsStr>) -> io::Result<WatchId> {
         let mut c_path: Vec<u8> = dir.as_os_str().as_bytes().to_vec();
         c_path.push(0);
         let wd = unsafe { inotify_add_watch(self.fd, c_path.as_ptr(), WATCH_MASK) };

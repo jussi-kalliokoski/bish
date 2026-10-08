@@ -14,11 +14,25 @@
 //! names come from. The cost is a `read_dir` per event -- not per poll,
 //! and not per tick -- and above this nothing can tell the difference.
 //!
+//! A directory's own events are not enough on their own, either: one
+//! fires when an entry is added, removed or renamed, and *not* when a
+//! file already in it is written in place -- which is how most saves
+//! happen. So a file the caller named is watched as well, through a
+//! descriptor of its own, and an event on it means the same rescan. That
+//! descriptor follows the inode, which is exactly what the directory
+//! watch exists to get past; so after every rescan a named file whose
+//! inode has changed (a rename over it, a delete and recreate) gets a
+//! fresh descriptor, and one that has only just appeared gets its first.
+//!
 //! Two differences that are real and not papered over:
 //!
-//! - One open descriptor per watched directory, where inotify has one
-//!   for the whole set. Both callers in bish watch one file at a time,
-//!   so this is a handful of descriptors.
+//! - One open descriptor per watched directory and per named file in it,
+//!   where inotify has one for the whole set. Both callers in bish watch
+//!   one file at a time, so this is a handful of descriptors. A file in
+//!   a directory watched in its own right, and named by nobody, is
+//!   reported when it appears, goes or is replaced, but not when it is
+//!   written in place: watching every file in an arbitrary directory is
+//!   a descriptor per file, without bound.
 //! - Two writes inside one snapshot interval that leave the size,
 //!   inode and modification time identical are invisible here. bish's
 //!   own caller hashes the file before it says anything (see
@@ -29,6 +43,7 @@
 use super::unix::{DirSnapshot, EntryChange, c_open};
 use super::{RawChange, RawEvent, WatchId};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
@@ -89,6 +104,10 @@ struct Watched {
     dir: PathBuf,
     fd: RawFd,
     seen: DirSnapshot,
+    /// The files in it someone named, each with the descriptor watching
+    /// it and the inode that descriptor is on -- `None` while the file
+    /// does not exist.
+    files: HashMap<OsString, Option<(RawFd, u64)>>,
 }
 
 pub(crate) struct DirWatch {
@@ -115,17 +134,39 @@ impl DirWatch {
     /// Watches `dir`, giving back the same id for a directory already
     /// watched -- inotify's own behaviour, which callers above rely on to
     /// merge two files in one directory into one watch.
-    pub(crate) fn add(&mut self, dir: &Path) -> io::Result<WatchId> {
-        if let Some((id, _)) = self.watched.iter().find(|(_, w)| w.dir == dir) {
-            return Ok(*id);
+    ///
+    /// `file` is the entry in it the caller is after, if any -- watched
+    /// on its own as well, since nothing about the directory changes
+    /// when that file is written in place.
+    pub(crate) fn add(&mut self, dir: &Path, file: Option<&OsStr>) -> io::Result<WatchId> {
+        let id = match self.watched.iter().find(|(_, w)| w.dir == dir) {
+            Some((id, _)) => *id,
+            None => {
+                let fd = self.register(dir, self.next)?;
+                let id = self.next;
+                self.next += 1;
+                self.watched.insert(id, Watched { dir: dir.to_path_buf(), fd, seen: DirSnapshot::of(dir), files: HashMap::new() });
+                id
+            }
+        };
+        if let Some(name) = file
+            && let Some(watched) = self.watched.get_mut(&id)
+        {
+            watched.files.entry(name.to_os_string()).or_insert(None);
+            self.refresh_files(id);
         }
-        let mut c_path: Vec<u8> = dir.as_os_str().as_bytes().to_vec();
+        Ok(id)
+    }
+
+    /// Opens `path` for events only and registers it with the queue,
+    /// reporting as `id`.
+    fn register(&self, path: &Path, id: WatchId) -> io::Result<RawFd> {
+        let mut c_path: Vec<u8> = path.as_os_str().as_bytes().to_vec();
         c_path.push(0);
         let fd = unsafe { c_open(c_path.as_ptr() as *const i8, O_EVTONLY | O_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let id = self.next;
         // EV_CLEAR, so an event is reported once rather than every time
         // the queue is read until something resets it.
         let change = KEvent { ident: fd as u64, filter: EVFILT_VNODE, flags: EV_ADD | EV_CLEAR, fflags: WATCH_FFLAGS, data: 0, udata: id as u64 };
@@ -135,16 +176,42 @@ impl DirWatch {
             unsafe { close(fd) };
             return Err(failure);
         }
-        self.next += 1;
-        self.watched.insert(id, Watched { dir: dir.to_path_buf(), fd, seen: DirSnapshot::of(dir) });
-        Ok(id)
+        Ok(fd)
+    }
+
+    /// Points each named file's descriptor at whatever is under that
+    /// name now: a fresh one for a file that appeared or was replaced,
+    /// none for one that is gone.
+    fn refresh_files(&mut self, id: WatchId) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(watched) = self.watched.get(&id) else { return };
+        let mut updates = Vec::new();
+        for (name, current) in &watched.files {
+            let path = watched.dir.join(name);
+            let inode = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
+            if inode == current.map(|(_, ino)| ino) {
+                continue;
+            }
+            let fresh = match inode {
+                Some(ino) => self.register(&path, id).ok().map(|fd| (fd, ino)),
+                None => None,
+            };
+            updates.push((name.clone(), *current, fresh));
+        }
+        let Some(watched) = self.watched.get_mut(&id) else { return };
+        for (name, stale, fresh) in updates {
+            if let Some((fd, _)) = stale {
+                unsafe { close(fd) };
+            }
+            watched.files.insert(name, fresh);
+        }
     }
 
     /// Closing the descriptor is what deregisters it: kqueue drops a
     /// registration when its file closes.
     pub(crate) fn remove(&mut self, watch: WatchId) {
         if let Some(gone) = self.watched.remove(&watch) {
-            unsafe { close(gone.fd) };
+            close_all(&gone);
         }
     }
 
@@ -164,10 +231,12 @@ impl DirWatch {
                     continue;
                 }
                 let id = event.udata as WatchId;
+                let on_directory = self.watched.get(&id).is_some_and(|w| w.fd as u64 == event.ident);
                 // The directory itself is gone, so the registration is
                 // finished with it -- the same end inotify reports as
-                // `IN_IGNORED`.
-                if event.fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE) != 0 {
+                // `IN_IGNORED`. The same flags on a named file only mean
+                // that file went, which the rescan below reports.
+                if on_directory && event.fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE) != 0 {
                     out.push(RawEvent { watch: id, name: None, change: RawChange::Dropped });
                     self.remove(id);
                     continue;
@@ -185,6 +254,7 @@ impl DirWatch {
                     out.push(RawEvent { watch: id, name: Some(name), change });
                 }
                 watched.seen = now;
+                self.refresh_files(id);
             }
             if (n as usize) < events.len() {
                 break;
@@ -194,10 +264,17 @@ impl DirWatch {
     }
 }
 
+fn close_all(watched: &Watched) {
+    for (fd, _) in watched.files.values().flatten() {
+        unsafe { close(*fd) };
+    }
+    unsafe { close(watched.fd) };
+}
+
 impl Drop for DirWatch {
     fn drop(&mut self) {
         for watched in self.watched.values() {
-            unsafe { close(watched.fd) };
+            close_all(watched);
         }
         unsafe { close(self.kq) };
     }
