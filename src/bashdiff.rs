@@ -1002,6 +1002,15 @@ b
         case("export-f", r#"f() { :; }; export -f f; echo $?; export -f nosuch_zz; echo $?"#),
         case("read-t0", r#"read -t 0 < /dev/null; echo $?"#),
         case("set-o", r#"set -C -o pipefail; set -o > oo; grep -E '^(noclobber|pipefail|xtrace) ' oo"#),
+        // `set -n`: the one flag whose whole job is that what follows
+        // does not happen. Every case here is about something *not*
+        // appearing, which is why the first of them names what should.
+        case("noexec-stops-what-follows", r#"echo before; set -n; echo after"#),
+        case("noexec-cannot-be-undone", r#"echo before; set -n; set +n; echo after"#),
+        case("noexec-by-its-long-name", r#"echo before; set -o noexec; echo after"#),
+        case("noexec-skips-a-whole-construct", r#"echo before; set -n; for i in 1 2 3; do echo "$i"; done; echo after"#),
+        case("noexec-skips-a-trap", r#"echo before; trap 'echo trapped' EXIT; set -n; echo after"#),
+        case("noexec-leaves-the-status-alone", r#"true; set -n; false; echo "never=$?""#),
         case("ulimit-p", r#"ulimit -p"#),
         // -- roadmap 10: what bish used to accept and bash never did --
         case("readonly-array", r#"readonly a=(1); echo "[${a[*]}]"; a+=(2); echo "rc=$?""#),

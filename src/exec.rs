@@ -1933,6 +1933,22 @@ pub struct Shell {
     // about coproc specifically; `read -u FD` is the one thing that reads
     // through this table directly (see run_single's "read" arm).
     coproc_fds: std::collections::HashMap<i32, KeptFd>,
+    // `set -n`/`-o noexec`, and `bish -n`: read and parse, run nothing.
+    //
+    // A syntax check, and the one shell flag whose whole value is that
+    // it does *not* run the thing you pointed it at -- which is why it
+    // had to be more than accepted. `n` has been in `SET_FLAGS` since
+    // that list was written, so `set -n` was taken without complaint
+    // and then dropped by `apply_shell_flag`'s catch-all: a script that
+    // asked not to run ran.
+    //
+    // Honoured only when this shell is not interactive, which is bash's
+    // own rule and not a simplification -- a prompt that parsed your
+    // line and declined to run it would have no way left to say `set
+    // +n`, since that command would not run either. Non-interactively
+    // that irreversibility is the point: once it is on, nothing turns
+    // it off, because nothing runs.
+    opt_noexec: bool,
     // `set -e`/`-u`/`-x`/`-o pipefail`/`-f`.
     opt_errexit: bool,
     opt_nounset: bool,
@@ -2380,6 +2396,7 @@ impl Shell {
             function_depth: 0,
             nesting_unwind: false,
             coproc_fds: std::collections::HashMap::new(),
+            opt_noexec: false,
             opt_errexit: false,
             opt_nounset: false,
             opt_xtrace: false,
@@ -2756,6 +2773,7 @@ impl Shell {
             function_depth: 0,
             nesting_unwind: false,
             coproc_fds: std::collections::HashMap::new(),
+            opt_noexec: self.opt_noexec,
             opt_errexit: self.opt_errexit,
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
@@ -2995,6 +3013,20 @@ impl Shell {
     // the root session at interactive startup, matching that; every
     // `window new` virtual child then inherits it automatically the same
     // way it inherits every other opt_* flag (see new_virtual_child).
+    /// This shell is one somebody is typing at.
+    ///
+    /// Separate from `enable_monitor_mode` because the two answer
+    /// different questions and want different moments. Monitor mode is
+    /// about the terminal -- process groups, tty signals -- and is set
+    /// once the prompt owns it. This is about *who is reading the file*,
+    /// and the rc is a file an interactive shell reads: bash's own rules
+    /// key off that, so a `set -n` in a bashrc is discarded rather than
+    /// silently truncating the rest of it, and a readonly violation
+    /// there does not kill the shell the way it kills a script.
+    pub fn mark_interactive(&mut self) {
+        self.interactive = true;
+    }
+
     pub fn enable_monitor_mode(&mut self) {
         self.opt_monitor = true;
         self.interactive = true;
@@ -4730,6 +4762,12 @@ impl Shell {
     pub(crate) fn apply_shell_flag(&mut self, c: char, on: bool) {
         match c {
             'e' => self.opt_errexit = on,
+            // Discarded outright when an interactive shell is the one
+            // running it, which is what bash does: `set +o` there still
+            // reports `noexec` off afterwards, and `$-` never grows an
+            // `n`. An invocation `-n` is applied before any prompt
+            // exists and so is kept -- also bash's answer.
+            'n' if !self.interactive => self.opt_noexec = on,
             'T' => self.opt_functrace = on,
             'E' => self.opt_errtrace = on,
             'u' => self.opt_nounset = on,
@@ -4757,6 +4795,7 @@ impl Shell {
     pub(crate) fn shell_option_enabled(&self, name: &str) -> Option<bool> {
         Some(match name {
             "pipefail" => self.opt_pipefail,
+            "noexec" => self.opt_noexec,
             "errexit" => self.opt_errexit,
             "functrace" => self.opt_functrace,
             "errtrace" => self.opt_errtrace,
@@ -4773,6 +4812,7 @@ impl Shell {
     pub(crate) fn apply_shell_option(&mut self, name: &str, on: bool) {
         match name {
             "pipefail" => self.opt_pipefail = on,
+            "noexec" if !self.interactive => self.opt_noexec = on,
             "errexit" => self.opt_errexit = on,
             "functrace" => self.opt_functrace = on,
             "errtrace" => self.opt_errtrace = on,
@@ -4886,6 +4926,19 @@ impl Shell {
         let parsed_with = source.is_some().then(|| self.alias_epoch());
         for (index, item) in prog.iter().enumerate() {
             self.current_line = item.line;
+            // `set -n`. Everything has already been parsed -- which is
+            // the whole of what this flag asks for -- so there is
+            // nothing left to do but not run it. Ahead of the signal
+            // check and the debug hook deliberately: a trap handler is
+            // code, and `-n` means no code.
+            //
+            // `break` rather than `continue` because nothing can turn
+            // it off from here: `set +n` would have to run first. The
+            // status left behind is whatever the statement before it
+            // produced, which for `bish -n` is the 0 this started with.
+            if self.opt_noexec && !self.interactive {
+                break;
+            }
             if let Some(exit) = self.check_pending_signals() {
                 return exit;
             }
@@ -12146,6 +12199,7 @@ impl Shell {
                 for (on, c) in [
                     (self.opt_errexit, 'e'),
                     (self.opt_noglob, 'f'),
+                    (self.opt_noexec, 'n'),
                     (self.opt_monitor, 'm'),
                     (self.opt_nounset, 'u'),
                     (self.opt_xtrace, 'x'),
@@ -16993,7 +17047,7 @@ pub(crate) fn shopt_default_on(name: &str) -> Option<bool> {
 // actually gate real bish behavior, same "don't advertise a name that
 // does nothing" principle KNOWN_BISHOPTS follows for its own registry.
 pub(crate) const SET_O_OPTIONS: &[&str] =
-    &["errexit", "errtrace", "functrace", "monitor", "noclobber", "noglob", "nounset", "pipefail", "posix", "xtrace"];
+    &["errexit", "errtrace", "functrace", "monitor", "noclobber", "noexec", "noglob", "nounset", "pipefail", "posix", "xtrace"];
 
 // A bishopt option's type, plus its own default value -- for Str and
 // Color that's the literal default text (parsed the same way a `--set`
@@ -18884,6 +18938,64 @@ mod tests {
         assert_eq!(child.bishopts, parent.bishopts);
         crate::builtins::bish::run_bishopt(&mut child, &strs(&["--set", "greeting", "yo"]), &test_bishopts());
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
+    }
+
+    // `set -n` is the flag whose point is that nothing happens, which
+    // makes it the one flag a shell can appear to support by doing
+    // nothing at all. It did: `n` has been in SET_FLAGS since that list
+    // was written, so `set -n` was accepted and then dropped on the
+    // floor, and a script that asked not to run ran.
+    #[test]
+    fn noexec_parses_a_script_and_runs_none_of_it() {
+        let mut shell = Shell::new();
+        let out = Rc::new(RefCell::new(String::new()));
+        shell.set_sink_capture(out.clone());
+
+        // Everything before it runs; nothing after it does, including a
+        // construct and an EXIT trap registered before the flag.
+        shell.run_source_here("echo before; trap 'echo trapped' EXIT; set -n; echo after; for i in 1 2; do echo $i; done", "<test>");
+        assert_eq!(out.borrow().as_str(), "before\n");
+
+        // Recorded where a script can see it, which is what `$-` and
+        // `set -o` are for.
+        assert_eq!(shell.shell_option_enabled("noexec"), Some(true));
+        assert!(shell.lookup_var("-").contains('n'), "$- must carry the flag: {:?}", shell.lookup_var("-"));
+
+        // And it cannot be undone, because undoing it is itself a
+        // command: the `set +n` above never ran.
+        out.borrow_mut().clear();
+        shell.run_source_here("set +n; echo back", "<test>");
+        assert_eq!(out.borrow().as_str(), "", "nothing can run, including the thing that would turn it off");
+        assert_eq!(shell.shell_option_enabled("noexec"), Some(true));
+    }
+
+    // bash ignores `set -n` from a shell somebody is typing at, and not
+    // as a courtesy: a prompt that parsed your line and declined to run
+    // it has no way left to accept `set +n`. It does not merely decline
+    // to honour it -- it does not record it, so `set +o` still says off
+    // and `$-` never grows an `n`.
+    #[test]
+    fn an_interactive_shell_discards_noexec_rather_than_storing_it() {
+        let mut shell = Shell::new();
+        shell.mark_interactive();
+        let out = Rc::new(RefCell::new(String::new()));
+        shell.set_sink_capture(out.clone());
+
+        shell.run_source_here("set -n; echo still running", "<test>");
+        assert_eq!(out.borrow().as_str(), "still running\n");
+        assert_eq!(shell.shell_option_enabled("noexec"), Some(false), "not stored, so `set +o` agrees");
+        assert!(!shell.lookup_var("-").contains('n'), "{:?}", shell.lookup_var("-"));
+        // The long name is the same answer; it is one flag.
+        shell.run_source_here("set -o noexec; echo also running", "<test>");
+        assert_eq!(shell.shell_option_enabled("noexec"), Some(false));
+
+        // A flag given at invocation is kept, though -- it is applied
+        // before any prompt exists, which is also bash's answer: `bash
+        // -ni -c` runs nothing.
+        let mut invoked = Shell::new();
+        invoked.apply_shell_flag('n', true);
+        invoked.mark_interactive();
+        assert_eq!(invoked.shell_option_enabled("noexec"), Some(true), "the flag survives; honouring it is the loop's decision");
     }
 
     // `::bish theme begin`/`end`'s own tests -- every `bishopt --set`

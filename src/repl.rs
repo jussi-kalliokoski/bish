@@ -467,6 +467,9 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
     // and looked for all the world like a config that had stopped
     // working. Every way into the interactive shell goes through here,
     // so this is the one place it cannot be forgotten from.
+    // Before the rc, not after: the rc is a file an interactive shell is
+    // reading. See Shell::mark_interactive.
+    shell.mark_interactive();
     if load_rc {
         load_config(&mut shell);
     }

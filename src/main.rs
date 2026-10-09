@@ -368,6 +368,22 @@ mod tests {
         assert_eq!(inv.interactive, Some(false), "-c is not interactive");
     }
 
+    // `bish -n script.sh` is a syntax check that runs nothing, and the
+    // whole of its plumbing is that the letter reaches
+    // `apply_shell_flag` like any other -- so this is the test that it
+    // is not swallowed on the way (`-s`, `-i`, `-l`, `-c` and `-o` all
+    // are, each for its own reason).
+    #[test]
+    fn n_reaches_the_shell_as_an_ordinary_flag() {
+        assert_eq!(parse(&["-n", "s.sh"]).set_flags, vec![('n', true)]);
+        assert_eq!(parse(&["-n", "s.sh"]).operands, vec!["s.sh".to_string()]);
+        // And in a cluster, where `c` ends it: `bish -nc 'echo hi'`
+        // parses the command and runs none of it.
+        let inv = parse(&["-nc", "echo hi"]);
+        assert_eq!(inv.set_flags, vec![('n', true)]);
+        assert_eq!(inv.command.as_deref(), Some("echo hi"));
+    }
+
     #[test]
     fn set_flags_and_options_come_through() {
         let inv = parse(&["-euo", "pipefail", "-c", "true"]);
