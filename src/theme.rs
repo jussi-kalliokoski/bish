@@ -258,14 +258,22 @@ pub fn builtin(name: &str) -> Option<&'static Builtin> {
 //   yellow. It is the one of the four that gives up a hue it had.
 const REVONTULET_HL: &[(&str, &str)] = &[
     ("comment", "#117172, -bish-cyan"),
+    // A flag is the scheme's "unit" -- the suffix on a number, the
+    // quiet step of the data family -- which is what its own shell
+    // specimen paints `-euo` and `--seed` with. A subcommand is a call,
+    // and a path that resolves is the module step, "a path to somewhere
+    // else", which is what `ui_col_link` already took.
+    ("flag", "#A68017, -bish-yellow"),
     ("format_specifier", "#FC80C7, -bish-bright-magenta"),
     ("invalid_command", "#FB4264, -bish-red"),
     ("key", "#FDC943, -bish-bright-yellow"),
     ("keyword", "#CB5EFB, -bish-magenta"),
+    ("link", "#3462F9, -bish-blue"),
     ("number", "#DAA922, -bish-yellow"),
     ("operator", "#B3B9CC, -bish-white"),
     ("redirect", "#D88DFC, -bish-magenta"),
     ("string", "#61C721, -bish-green"),
+    ("subcommand", "#6993FB, -bish-blue"),
     ("substitution", "#FB3BB7, -bish-bright-magenta"),
     ("variable", "#FC80C7, -bish-bright-magenta"),
     // The LSP 3.16 semantic-token legend, by the names a server
@@ -325,14 +333,17 @@ const REVONTULET_OPTS: &[(&str, &str)] = &[
 // of bright, because on a light ground darker is louder.
 const KAAMOS_HL: &[(&str, &str)] = &[
     ("comment", "#147B7C, -bish-cyan"),
+    ("flag", "#866710, -bish-yellow"),
     ("format_specifier", "#600643, -bish-bright-magenta"),
     ("invalid_command", "#8B0C2D, -bish-red"),
     ("key", "#503D05, -bish-bright-yellow"),
     ("keyword", "#6E0D91, -bish-magenta"),
+    ("link", "#1E41F8, -bish-blue"),
     ("number", "#6A510A, -bish-yellow"),
     ("operator", "#424756, -bish-white"),
     ("redirect", "#51076B, -bish-magenta"),
     ("string", "#275808, -bish-green"),
+    ("subcommand", "#1215D6, -bish-blue"),
     ("substitution", "#830C5C, -bish-bright-magenta"),
     ("variable", "#600643, -bish-bright-magenta"),
     ("class", "#562504, -bish-bright-red"),

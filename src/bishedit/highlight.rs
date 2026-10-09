@@ -767,12 +767,29 @@ pub fn resolve_style(kind: HighlightKind, overrides: Option<&ColorOverrides>) ->
 // makes a language server's semantic token types settable before
 // anything here knows about them.
 //
-// Deliberately doesn't cover every HighlightKind: Flag/Subcommand/Link
-// use vt100::Color::Default (whatever the terminal's own default
-// foreground is, not a real color) rather than one of default_style's
-// Indexed picks, and a CSS colour can only ever produce a concrete one
-// -- there is no "inherit the terminal's default" to name, so those
-// three simply aren't made configurable this way.
+// Flag/Subcommand/Link are in it even though they draw in the
+// terminal's own foreground (vt100::Color::Default) rather than a colour
+// of their own. They were left out for years on the grounds that a CSS
+// colour can only ever produce a concrete one, and there is no way to
+// write "inherit the terminal's default" -- which was decisive while
+// these were `syn_col_*` bishopts, because a KNOWN_BISHOPTS entry has to
+// carry a default that parses. It stopped being decisive when syntax
+// colours moved to `::bish hl`, whose namespace is open and has no
+// registered defaults at all: a name nobody has set produces no override
+// (see the `filter_map` in repl.rs's own hl_colors reader), which is
+// exactly what "inherit" was asking for, and `::bish hl --unset` goes
+// back to it. So they cost nothing until somebody names them, and a
+// theme can now colour a flag -- which is the one thing a shell has a
+// lot of.
+//
+// The old rule still holds where it came from, and theme.rs still
+// applies it: `ui_col_*` is a closed registry with a parseable default
+// per option, which is why LineNumber and Divider have no option there.
+//
+// Markdown's Emphasis/Strong/Struck stay out, for a different reason
+// that has not expired: what they mean *is* the weight or the slant (see
+// their own doc comment), so a colour for them would say a second thing
+// where the document said one.
 pub const HL_NAMES: &[(HighlightKind, &str)] = &[
     (HighlightKind::Keyword, "keyword"),
     (HighlightKind::Operator, "operator"),
@@ -785,6 +802,9 @@ pub const HL_NAMES: &[(HighlightKind, &str)] = &[
     (HighlightKind::FormatSpecifier, "format_specifier"),
     (HighlightKind::InvalidCommand, "invalid_command"),
     (HighlightKind::Key, "key"),
+    (HighlightKind::Flag, "flag"),
+    (HighlightKind::Subcommand, "subcommand"),
+    (HighlightKind::Link, "link"),
 ];
 
 // The `HighlightKind` a language server's semantic token type falls
@@ -2023,32 +2043,30 @@ mod tests {
     }
 
     #[test]
-    fn hl_names_never_covers_a_kind_that_uses_the_terminals_own_default_color() {
-        // Flag/Subcommand/Link all render via vt100::Color::Default in
-        // default_style -- there's no CSS color that means "inherit the
-        // terminal's own default foreground", so none of them should be
-        // bishopt-configurable this way (see HL_NAMES' own doc
-        // comment).
-        for uncolorable in [
-            HighlightKind::Flag,
-            HighlightKind::Subcommand,
-            HighlightKind::Link,
-            HighlightKind::Emphasis,
-            HighlightKind::Strong,
-            HighlightKind::Struck,
-        ] {
-            assert!(!HL_NAMES.iter().any(|(k, _)| *k == uncolorable));
+    fn hl_names_covers_every_kind_a_colour_could_mean_anything_for() {
+        // Markdown's three text styles stay out: what they mean *is* the
+        // weight or the slant, so a colour for them would say a second
+        // thing where the document said one. The only reason left for
+        // keeping a kind out of this table -- see its own doc comment
+        // for the one that expired.
+        for attribute_only in [HighlightKind::Emphasis, HighlightKind::Strong, HighlightKind::Struck] {
+            assert!(!HL_NAMES.iter().any(|(k, _)| *k == attribute_only), "{attribute_only:?}");
         }
-        // The same rule stated from the other side, so a kind added to
-        // the table later can't quietly register a color option for
-        // something that has no color to override.
-        for (kind, option) in HL_NAMES {
-            assert_ne!(default_style(*kind).0, vt100::Color::Default, "{option}");
+        // The three that used to be out are in, and still draw in the
+        // terminal's own foreground until a theme says otherwise. The
+        // assertion is on the *default*, which is what keeps this from
+        // being the commit that quietly gives every flag a colour on a
+        // fresh install: an open namespace means absence is "inherit",
+        // so a kind in this table and a kind with a colour of its own
+        // are two different questions.
+        for inherits in [HighlightKind::Flag, HighlightKind::Subcommand, HighlightKind::Link] {
+            assert!(HL_NAMES.iter().any(|(k, _)| *k == inherits), "{inherits:?}");
+            assert_eq!(default_style(inherits).0, vt100::Color::Default, "{inherits:?} must still inherit with nothing set");
         }
-        // Bump when a colorable kind is genuinely added (and give it its
-        // own entry in exec.rs's KNOWN_BISHOPTS too, or the option name
-        // here resolves to nothing).
-        assert_eq!(HL_NAMES.len(), 11);
+        // Bump when a kind is genuinely added -- and give it a colour in
+        // every theme bish ships, which theme.rs's own guard will insist
+        // on anyway.
+        assert_eq!(HL_NAMES.len(), 14);
     }
 
     fn tok(word: &str) -> Tok {
