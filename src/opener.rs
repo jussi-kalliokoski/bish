@@ -53,6 +53,44 @@ impl Target {
     }
 }
 
+/// Where a chosen file or directory opens.
+///
+/// A pane is not one of these: it is somewhere that already exists, so
+/// `go` goes there and there is nothing to decide. These are about what
+/// a choice *makes*, which is why Ctrl+T offers them at all -- the
+/// question "open it where" has four answers and no good default for
+/// everybody, and it is the same question whichever file you are about
+/// to pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// A window of its own -- `::bish window new`, a tab in the bar.
+    Tab,
+    /// The pane you are already in.
+    Here,
+    /// A new pane beside this one -- `::bish window vsplit`.
+    VSplit,
+    /// A new pane below this one -- `::bish window split`.
+    HSplit,
+}
+
+impl Destination {
+    /// Every destination, in the order Ctrl+T cycles them.
+    pub const ALL: [Destination; 4] = [Destination::Tab, Destination::Here, Destination::VSplit, Destination::HSplit];
+
+    /// The one word that names it, three times over: what
+    /// `opener_target` is set to, what `opener_targets` globs against,
+    /// and what the dialog says it is going to do. One spelling, so
+    /// what you read in the border is what you would type.
+    pub fn name(self) -> &'static str {
+        match self {
+            Destination::Tab => "tab",
+            Destination::Here => "here",
+            Destination::VSplit => "vsplit",
+            Destination::HSplit => "hsplit",
+        }
+    }
+}
+
 pub struct Item {
     pub target: Target,
     /// What the query is matched against, and what the row shows.
@@ -81,6 +119,12 @@ pub struct Opener {
     top: usize,
     height: usize,
     cols: usize,
+    /// The destinations Ctrl+T cycles, in `Destination::ALL`'s order.
+    /// Never empty: an `opener_targets` glob that matches nothing would
+    /// otherwise leave the dialog unable to open anything at all, which
+    /// is a worse answer to a typo than ignoring it.
+    destinations: Vec<Destination>,
+    at: usize,
 }
 
 // The verb column, plus the gutter after it.
@@ -88,7 +132,7 @@ const VERB_WIDTH: usize = 4;
 const GUTTER: usize = 2;
 
 impl Opener {
-    pub fn new(items: Vec<Item>, rows: usize, cols: usize) -> Opener {
+    pub fn new(items: Vec<Item>, destinations: Vec<Destination>, start: Destination, rows: usize, cols: usize) -> Opener {
         // A pane's text is whatever the program in it called itself, and
         // a path's is whatever somebody named a file: both are spliced
         // into the terminal's own escape stream a few lines down, where
@@ -98,6 +142,11 @@ impl Opener {
         let items = items.into_iter().map(|i| Item { text: crate::term::safe_text(&i.text), ..i }).collect();
         // Four rows go to the frame: its two borders, the query and the
         // keys.
+        let destinations = match destinations.is_empty() {
+            true => vec![start],
+            false => destinations,
+        };
+        let at = destinations.iter().position(|d| *d == start).unwrap_or(0);
         let mut opener = Opener {
             items,
             query: String::new(),
@@ -107,6 +156,8 @@ impl Opener {
             top: 0,
             height: rows.saturating_sub(4).max(1),
             cols,
+            destinations,
+            at,
         };
         opener.refilter();
         opener
@@ -116,6 +167,11 @@ impl Opener {
         self.height = rows.saturating_sub(4).max(1);
         self.cols = cols;
         self.reveal();
+    }
+
+    /// Where a choice would open right now.
+    pub fn destination(&self) -> Destination {
+        self.destinations[self.at]
     }
 
     pub fn item(&self, index: usize) -> &Item {
@@ -187,9 +243,14 @@ impl Opener {
                 self.query.clear();
                 self.refilter();
             }
-            // Ctrl+T again puts it away, since that is the gesture that
-            // asked for it.
-            Key::Escape | Key::CtrlC | Key::CtrlT => return Outcome::Close,
+            // Ctrl+T again asks the same question again: *where*. It
+            // used to close the dialog, which Escape already did -- and
+            // the key that opened the thing is a better place to put
+            // "open it somewhere else" than a second key nobody would
+            // find. A no-op when one destination is enabled, since the
+            // list wraps onto itself.
+            Key::CtrlT => self.at = (self.at + 1) % self.destinations.len(),
+            Key::Escape | Key::CtrlC => return Outcome::Close,
             _ => {}
         }
         Outcome::Continue
@@ -221,7 +282,16 @@ impl Opener {
         // for a box that floats over real content -- but not their
         // reverse video: this box has a row picked out inside it, and
         // that is what reverse video means here.
-        let title = fit_or_empty(" open ", inner.saturating_sub(2));
+        // The destination goes in the border rather than the hint row
+        // because it is not advice, it is what Enter is about to do --
+        // and it is the one thing in here that changes without the list
+        // changing with it. Too narrow to name it, and the box is named
+        // alone rather than half-named.
+        let title = fit_or_empty(&format!(" open \u{b7} {} ", self.destination().name()), inner.saturating_sub(2));
+        let title = match title.is_empty() {
+            true => fit_or_empty(" open ", inner.saturating_sub(2)),
+            false => title,
+        };
         let fill = match title.is_empty() {
             true => "─".repeat(inner),
             false => format!("─{title}{}", "─".repeat(inner - 1 - width(&title))),
@@ -281,11 +351,16 @@ impl Opener {
         }
 
         let hint = match self.view.is_empty() && !self.items.is_empty() {
-            true => "no match  Esc clears",
-            false => "Enter open  C-n/C-p move  Esc close",
+            true => "no match  Esc clears".to_string(),
+            // `C-t` is only worth a column when there is somewhere else
+            // for it to go.
+            false => match self.destinations.len() > 1 {
+                true => "Enter open  C-n/C-p move  C-t where  Esc close".to_string(),
+                false => "Enter open  C-n/C-p move  Esc close".to_string(),
+            },
         };
         out.push_str(&at(rect.rows.saturating_sub(2)));
-        out.push_str(&format!("│\x1b[2m{}\x1b[0m│", fit(hint, inner)));
+        out.push_str(&format!("│\x1b[2m{}\x1b[0m│", fit(&hint, inner)));
         out.push_str(&at(rect.rows.saturating_sub(1)));
         out.push_str(&format!("╰{}╯", "─".repeat(inner)));
         // Left where it is being typed, and visible: this is an input
@@ -346,6 +421,12 @@ mod tests {
         ]
     }
 
+    // Every destination enabled, starting where the shipped default
+    // does -- the shape a `*` glob produces.
+    fn opener(items: Vec<Item>, rows: usize, cols: usize) -> Opener {
+        Opener::new(items, Destination::ALL.to_vec(), Destination::Tab, rows, cols)
+    }
+
     fn texts(o: &Opener) -> Vec<&str> {
         o.view.iter().map(|&i| o.items[i].text.as_str()).collect()
     }
@@ -361,7 +442,7 @@ mod tests {
     // not climb above the pane that merely contains the same letters.
     #[test]
     fn the_groups_stay_in_order_however_well_a_later_one_matches() {
-        let mut o = Opener::new(items(), 10, 60);
+        let mut o = opener(items(), 10, 60);
         assert_eq!(
             texts(&o),
             vec!["[0] vim repl.rs  ~/bish", "[2] ~/work/notes", "src/repl.rs", "src/opener.rs", "src/"],
@@ -373,14 +454,14 @@ mod tests {
         assert!(matches!(o.item(0).target, Target::Pane { window: 0, pane: 1 }));
         // Within a group, rank: "opener" matches one file and not the
         // other, and the directory that also matches stays below both.
-        let mut o = Opener::new(items(), 10, 60);
+        let mut o = opener(items(), 10, 60);
         typed(&mut o, "sop");
         assert_eq!(texts(&o), vec!["src/opener.rs"]);
     }
 
     #[test]
     fn typing_narrows_and_backspace_widens_with_the_pick_back_at_the_top() {
-        let mut o = Opener::new(items(), 10, 60);
+        let mut o = opener(items(), 10, 60);
         o.handle_key(Key::CtrlN);
         assert_eq!(o.selected, 1);
         typed(&mut o, "src");
@@ -396,10 +477,82 @@ mod tests {
         assert_eq!(o.handle_key(Key::Escape), Outcome::Continue);
         assert_eq!(texts(&o).len(), 5);
         assert_eq!(o.handle_key(Key::Escape), Outcome::Close);
-        assert_eq!(o.handle_key(Key::CtrlT), Outcome::Close, "the gesture that asked for it puts it away");
         typed(&mut o, "src");
         o.handle_key(Key::CtrlU);
         assert_eq!(texts(&o).len(), 5);
+    }
+
+    // Ctrl+T inside the dialog answers the question it opened: where.
+    #[test]
+    fn the_key_that_opened_it_cycles_where_a_choice_would_go() {
+        let mut o = opener(items(), 10, 60);
+        assert_eq!(o.destination(), Destination::Tab);
+        for expected in [Destination::Here, Destination::VSplit, Destination::HSplit, Destination::Tab] {
+            assert_eq!(o.handle_key(Key::CtrlT), Outcome::Continue);
+            assert_eq!(o.destination(), expected, "the cycle wraps in ALL's own order");
+        }
+        // It changes where, not what: the list and the pick are untouched.
+        typed(&mut o, "src");
+        o.handle_key(Key::CtrlN);
+        let before: Vec<String> = texts(&o).iter().map(|s| (*s).to_string()).collect();
+        let row = o.selected;
+        o.handle_key(Key::CtrlT);
+        assert_eq!((texts(&o), o.selected), (before.iter().map(String::as_str).collect::<Vec<_>>(), row));
+
+        // Only some destinations enabled: the cycle visits exactly
+        // those, and `start` picks where it begins rather than the
+        // table's own first entry.
+        let two = vec![Destination::Here, Destination::HSplit];
+        let mut o = Opener::new(items(), two, Destination::HSplit, 10, 60);
+        assert_eq!(o.destination(), Destination::HSplit);
+        o.handle_key(Key::CtrlT);
+        assert_eq!(o.destination(), Destination::Here);
+        o.handle_key(Key::CtrlT);
+        assert_eq!(o.destination(), Destination::HSplit);
+
+        // One enabled: the key is still accepted and still does
+        // nothing, which is what a list of one wrapping onto itself
+        // means -- and is better than the key closing the dialog by
+        // surprise, which is what it used to do.
+        let mut o = Opener::new(items(), vec![Destination::Tab], Destination::Tab, 10, 60);
+        assert_eq!(o.handle_key(Key::CtrlT), Outcome::Continue);
+        assert_eq!(o.destination(), Destination::Tab);
+
+        // A start nothing enabled, and no enabled list at all: both are
+        // misconfiguration, and neither may leave the dialog with
+        // nowhere to open anything.
+        let o = Opener::new(items(), vec![Destination::VSplit], Destination::Tab, 10, 60);
+        assert_eq!(o.destination(), Destination::VSplit);
+        let o = Opener::new(items(), Vec::new(), Destination::HSplit, 10, 60);
+        assert_eq!(o.destination(), Destination::HSplit);
+    }
+
+    // The destination is what Enter is about to do, so the dialog has to
+    // say which one is live without being asked.
+    #[test]
+    fn the_border_names_the_destination_and_the_keys_mention_the_toggle() {
+        let mut o = opener(items(), 10, 60);
+        let frame = o.render(Rect { row: 0, col: 0, rows: 10, cols: 60 });
+        assert!(frame.contains("open \u{b7} tab"), "{frame:?}");
+        assert!(frame.contains("C-t where"), "{frame:?}");
+        o.handle_key(Key::CtrlT);
+        let frame = o.render(Rect { row: 0, col: 0, rows: 10, cols: 60 });
+        assert!(frame.contains("open \u{b7} here"), "{frame:?}");
+        assert!(!frame.contains("open \u{b7} tab"), "{frame:?}");
+
+        // With one destination there is nothing to toggle, so the keys
+        // row does not offer a key that would do nothing.
+        let o = Opener::new(items(), vec![Destination::Tab], Destination::Tab, 10, 60);
+        let frame = o.render(Rect { row: 0, col: 0, rows: 10, cols: 60 });
+        assert!(frame.contains("open \u{b7} tab"), "{frame:?}");
+        assert!(!frame.contains("C-t"), "{frame:?}");
+
+        // Too narrow for both words: the box keeps its own name rather
+        // than showing half of the destination's.
+        let o = opener(items(), 10, 14);
+        let frame = o.render(Rect { row: 0, col: 0, rows: 10, cols: 14 });
+        assert!(frame.contains("open"), "{frame:?}");
+        assert!(!frame.contains("tab"), "{frame:?}");
     }
 
     #[test]
@@ -407,7 +560,7 @@ mod tests {
         let many: Vec<Item> = (0..50).map(|i| Item { target: Target::File(PathBuf::from(format!("f{i}"))), text: format!("f{i}") }).collect();
         // Nine rows of dialog: two borders, the query, the keys, and five
         // of list.
-        let mut o = Opener::new(many, 9, 40);
+        let mut o = opener(many, 9, 40);
         o.handle_key(Key::CtrlP);
         assert_eq!((o.selected, o.top), (0, 0), "nothing above the best match");
         for _ in 0..60 {
@@ -430,7 +583,7 @@ mod tests {
     // being open.
     #[test]
     fn a_hostile_name_cannot_paint_with_the_terminals_own_escapes() {
-        let o = Opener::new(vec![Item { target: Target::Pane { window: 0, pane: 1 }, text: "evil\x1b[2J\u{7}name".to_string() }], 5, 40);
+        let o = opener(vec![Item { target: Target::Pane { window: 0, pane: 1 }, text: "evil\x1b[2J\u{7}name".to_string() }], 5, 40);
         assert_eq!(o.items[0].text, "evil\u{fffd}[2J\u{fffd}name");
         let frame = o.render(Rect { row: 0, col: 0, rows: 5, cols: 40 });
         assert!(frame.contains("evil\u{fffd}[2J\u{fffd}name"), "{frame:?}");
@@ -470,7 +623,7 @@ mod tests {
     #[test]
     fn no_row_is_wider_than_the_rect() {
         for cols in [1, 2, 4, 6, 8, 20, 40, 60] {
-            let mut o = Opener::new(items(), 6, cols);
+            let mut o = opener(items(), 6, cols);
             typed(&mut o, "sr");
             let frame = o.render(Rect { row: 3, col: 5, rows: 6, cols });
             // Every run between two cursor placements is one row's text.

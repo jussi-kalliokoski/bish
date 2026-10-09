@@ -1124,7 +1124,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 // screen -- the same reason normal mode promotes below.
                 ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                 match run_opener(app) {
-                    Some(target) => act_on_opener_choice(app, target, Some(&text)),
+                    Some((target, destination)) => act_on_opener_choice(app, target, destination, Some(&text)),
                     // Put away without picking anything: the line is
                     // handed back exactly as it was, down to the cursor.
                     None => {
@@ -2245,8 +2245,8 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
             // still on top" test: putting the opener away leaves this
             // view exactly where it was.
             hexedit::HexOutcome::Opener => {
-                if let Some(target) = run_opener(app) {
-                    act_on_opener_choice(app, target, None);
+                if let Some((target, destination)) = run_opener(app) {
+                    act_on_opener_choice(app, target, destination, None);
                 }
                 if app.windows[app.current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
                     break false;
@@ -2993,14 +2993,27 @@ fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
 // back" shape `NavExit::OpenAt` produces for `gd`, reached from the
 // location pane instead of from the navigation loop.
 fn open_location_frame(app: &mut App, path: &Path, line: usize, character: usize, encoding: crate::lsp::PositionEncoding) {
+    open_file_frame(app, path, Some((line, character, encoding)));
+}
+
+/// `open_location_frame` without a position: the file, on the focused
+/// pane's stack, at the top.
+///
+/// `at` is a language server's own answer about where to land, which is
+/// the only thing that needs translating out of its coordinates. The
+/// opener has no such answer and wants none -- "open this file" means
+/// its first line.
+fn open_file_frame(app: &mut App, path: &Path, at: Option<(usize, usize, crate::lsp::PositionEncoding)>) {
     let pane_id = app.windows[app.current_window].focused_pane;
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
     match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
         Ok(mut opened) => {
-            let starts = fileeditor::line_starts_of(&opened.buffer);
-            let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
-            let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
-            opened.buffer.set_cursor(row, col);
+            if let Some((line, character, encoding)) = at {
+                let starts = fileeditor::line_starts_of(&opened.buffer);
+                let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
+                let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
+                opened.buffer.set_cursor(row, col);
+            }
             let id = app.next_edit_frame_id;
             app.next_edit_frame_id += 1;
             app.edit_frames.insert(id, opened);
@@ -8925,8 +8938,8 @@ fn run_normal_mode_navigation(
             // the view comes straight back -- the opener painted over
             // this pane's rectangle, which is what the redraw is for.
             KeyOutcome::Opener => match run_opener(app) {
-                Some(target) => {
-                    act_on_opener_choice(app, target, None);
+                Some((target, destination)) => {
+                    act_on_opener_choice(app, target, destination, None);
                     return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                 }
                 None => {
@@ -9152,6 +9165,32 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
     items
 }
 
+/// The destinations Ctrl+T will offer, and the one it starts on.
+///
+/// `opener_targets` is a glob over their names, exactly as `tabular` is
+/// a glob over language names -- so `*` is all four, `*split` is the two
+/// that make a pane, and `tab` pins it to one and takes the key out of
+/// service (the cycle wraps onto itself).
+///
+/// Neither option can be set to nothing useful. A glob that matches no
+/// name at all falls back to the whole set rather than leaving the
+/// dialog unable to open anything, and a `opener_target` that names
+/// nothing -- or names something the glob excluded -- starts on the
+/// first destination that survived. Both are visible in the dialog's own
+/// border the first time the key is pressed, which is a better
+/// diagnosis than a message at startup.
+fn opener_destinations(shell: &exec::Shell) -> (Vec<crate::opener::Destination>, crate::opener::Destination) {
+    use crate::opener::Destination;
+    let glob = shell.bishopt_str("opener_targets");
+    let mut enabled: Vec<Destination> = Destination::ALL.into_iter().filter(|d| crate::glob::matches(&glob, d.name())).collect();
+    if enabled.is_empty() {
+        enabled = Destination::ALL.to_vec();
+    }
+    let wanted = shell.bishopt_str("opener_target");
+    let start = enabled.iter().copied().find(|d| d.name() == wanted).unwrap_or(enabled[0]);
+    (enabled, start)
+}
+
 /// Where the opener's dialog goes: the middle of the terminal, sized to
 /// what it has to show.
 ///
@@ -9192,9 +9231,14 @@ fn opener_dialog_rect(items: usize, term_rows: usize, term_cols: usize) -> Rect 
 /// Ctrl+T's loop: the opener, until it is given something to do or put
 /// away. Returns what to do, which is the caller's to carry out -- this
 /// only owns the terminal while the dialog is on screen.
-fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
+fn run_opener(app: &mut App) -> Option<(crate::opener::Target, crate::opener::Destination)> {
     use crate::opener::Outcome;
     let items = opener_items(app);
+    let session = app.windows[app.current_window].owning_session();
+    let (destinations, start) = match app.sessions.get(&session) {
+        Some(state) => opener_destinations(&state.shell),
+        None => (crate::opener::Destination::ALL.to_vec(), crate::opener::Destination::Tab),
+    };
     let chosen = {
         let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
         // What capture reports while this is open -- see `OVERLAYS`.
@@ -9206,7 +9250,7 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
         // what it covers stays covered, and putting it away is one more
         // compositor_redraw.
         compositor_redraw(app);
-        let mut view = crate::opener::Opener::new(items, rect.rows, rect.cols);
+        let mut view = crate::opener::Opener::new(items, destinations, start, rect.rows, rect.cols);
         let mut last_size = (app.term_rows, app.term_cols);
         loop {
             let frame = view.render(rect);
@@ -9228,7 +9272,7 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
             match view.handle_key(key) {
                 Outcome::Continue => {}
                 Outcome::Close => break None,
-                Outcome::Open(index) => break Some(view.item(index).target.clone()),
+                Outcome::Open(index) => break Some((view.item(index).target.clone(), view.destination())),
             }
         }
     };
@@ -9252,8 +9296,8 @@ fn run_opener(app: &mut App) -> Option<crate::opener::Target> {
 /// blanks the row it was echoed on -- the same reason click-to-focus
 /// freezes it. With no line being typed there is nothing to record
 /// beyond the idle prompt every other focus change already freezes.
-fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, typed: Option<&str>) {
-    use crate::opener::Target;
+fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, destination: crate::opener::Destination, typed: Option<&str>) {
+    use crate::opener::{Destination, Target};
     match target {
         Target::Pane { window, pane } => {
             let Some(at) = app.windows.iter().position(|w| w.id == window) else { return };
@@ -9273,15 +9317,54 @@ fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, typed: Opt
             }
             compositor_redraw(app);
         }
-        Target::File(path) => {
-            let command = format!("e {}", exec::shell_quote(&path.to_string_lossy()));
-            apply_window_action(app, WindowAction::New { name: None, command: Some(command) });
-        }
+        // A file opens in the editor and a directory by `cd`, and the
+        // destination decides where that happens. `tab` and the two
+        // splits are the same `window new`/`window split` a person
+        // would have typed, command included, which is why they need no
+        // code of their own here.
+        //
+        // `here` is the one that differs between the two kinds. A file
+        // goes straight onto the focused pane's own frame stack, so it
+        // opens over whatever that pane is showing -- including another
+        // editor, which is the case queueing a command line could not
+        // serve: the line would have waited for a prompt that is not
+        // coming until you leave. A directory has no frame to be; `cd`
+        // is a thing a shell does, so it is queued for the pane's shell
+        // exactly as if it had been typed there.
+        Target::File(path) => match destination {
+            Destination::Here => open_file_frame(app, &path, None),
+            _ => open_with(app, destination, format!("e {}", exec::shell_quote(&path.to_string_lossy()))),
+        },
         Target::Directory(path) => {
             let command = format!("cd {}", exec::shell_quote(&path.to_string_lossy()));
-            apply_window_action(app, WindowAction::New { name: None, command: Some(command) });
+            match destination {
+                Destination::Here => queue_pending_input(app, Some(command)),
+                _ => open_with(app, destination, command),
+            }
         }
     }
+}
+
+/// Runs `command` in a window or pane of its own, whichever the
+/// destination asked for.
+///
+/// `Here` never reaches this: it is the one destination that makes
+/// nothing, and the two kinds of item answer it differently.
+fn open_with(app: &mut App, destination: crate::opener::Destination, command: String) {
+    use crate::opener::Destination;
+    let action = match destination {
+        Destination::Tab => WindowAction::New { name: None, command: Some(command) },
+        // `horizontal` names the dividing line, and these two name the
+        // arrangement of the panes -- the opposite pairing, which is
+        // bish's own (see WindowAction::Split). `vsplit` stacks them
+        // vertically, which is what `::bish window vsplit` does, and
+        // the spelling is borrowed from that command so the dialog and
+        // the command cannot come to mean different things.
+        Destination::VSplit => WindowAction::Split { horizontal: true, command: Some(command) },
+        Destination::HSplit => WindowAction::Split { horizontal: false, command: Some(command) },
+        Destination::Here => return,
+    };
+    apply_window_action(app, action);
 }
 
 /// Keeps the real terminal's title in step with what bish is showing.
@@ -16613,6 +16696,38 @@ mod compositor_diff_tests {
 
     // The dialog is the shell's, not a pane's, so it is placed against
     // the terminal rather than against anything inside it.
+    // Both halves of "which destinations, starting where", including
+    // every way the two options can disagree with each other.
+    #[test]
+    fn the_opener_offers_the_destinations_the_glob_matches() {
+        use crate::opener::Destination;
+        let read = |opts: &str| {
+            let mut shell = exec::Shell::new();
+            shell.run_source_here(opts, "<test>");
+            opener_destinations(&shell)
+        };
+        // Shipped: all four, starting on a tab, which is what the
+        // opener did before it could be asked.
+        assert_eq!(read(""), (Destination::ALL.to_vec(), Destination::Tab));
+        // A glob over their names, as `tabular` globs over languages.
+        assert_eq!(
+            read("bishopt --set opener_targets '*split'"),
+            (vec![Destination::VSplit, Destination::HSplit], Destination::VSplit),
+            "the start falls to the first survivor when the one asked for was excluded"
+        );
+        assert_eq!(read("bishopt --set opener_targets here"), (vec![Destination::Here], Destination::Here));
+        // The start on its own.
+        assert_eq!(read("bishopt --set opener_target hsplit").1, Destination::HSplit);
+        assert_eq!(read("bishopt --set opener_target here; bishopt --set opener_targets '*'").1, Destination::Here);
+        // Neither option can brick the dialog. A glob matching nothing
+        // is a typo, and a dialog that cannot open anything is a worse
+        // answer to it than ignoring it; a start naming nothing lands
+        // on the first thing that is enabled.
+        assert_eq!(read("bishopt --set opener_targets nosuchthing"), (Destination::ALL.to_vec(), Destination::Tab));
+        assert_eq!(read("bishopt --set opener_target nosuchthing").1, Destination::Tab);
+        assert_eq!(read("bishopt --set opener_target nope; bishopt --set opener_targets hsplit"), (vec![Destination::HSplit], Destination::HSplit));
+    }
+
     #[test]
     fn the_opener_dialog_stays_inside_what_the_compositor_repaints() {
         // 80x24, a long list: three quarters of the width, and two rows

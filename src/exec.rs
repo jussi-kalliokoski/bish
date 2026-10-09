@@ -1319,12 +1319,24 @@ pub enum WindowAction {
     // index -- ids are stable identifiers, indices shift as windows
     // close.
     FgSession(u32),
-    // `window split`/`s` (horizontal divider, panes stacked top/bottom)
-    // or `window vsplit`/`v` (vertical divider, panes side by side):
-    // divides the focused pane of the current window in two, the new
-    // half holding a freshly cloned session (same session-cloning
-    // primitive `New` already uses) and taking focus. See repl.rs's
-    // PaneLayout for how the split tree itself is represented.
+    // `window split`/`s` or `window vsplit`/`v`: divides the focused
+    // pane of the current window in two, the new half holding a freshly
+    // cloned session (same session-cloning primitive `New` already
+    // uses) and taking focus. See repl.rs's PaneLayout for how the
+    // split tree itself is represented.
+    //
+    // `horizontal` names the dividing LINE's own orientation -- true is
+    // a horizontal line, so the panes stack top and bottom. The two
+    // commands are named the other way round, by how the *panes* end up
+    // arranged, which is how people read the words: `vsplit` is panes
+    // arranged vertically (stacked, `horizontal: true`) and `split` is
+    // side by side (`horizontal: false`). See the dispatch in
+    // builtins/bish.rs, which says the same thing from the other end.
+    //
+    // This comment used to pair them the other way round -- `split`
+    // stacked, `vsplit` side by side -- which was true of neither the
+    // dispatch nor the screen. Checked against both before rewriting
+    // it.
     Split {
         horizontal: bool,
         // A command to run in the new pane's shell as if it had been
@@ -17208,6 +17220,27 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // (bishedit::tabular::style says which have one), so matching
     // everything means "wherever this is implemented, use it".
     ("tabular", BishOptDefault::Str("*")),
+    // Where Ctrl+T's opener puts what you pick, and which of those
+    // answers it will offer. `opener_target` is where it starts;
+    // `opener_targets` is a glob over the same four names, as `tabular`
+    // just above globs over languages, and it decides what Ctrl+T
+    // cycles through inside the dialog.
+    //
+    // Four names: `tab` (a window of its own), `here` (the pane you are
+    // in), `vsplit` (a new pane below it, as `::bish window vsplit`) and
+    // `hsplit` (beside it, as `::bish window split`). Both split names
+    // follow bish's own: they describe how the panes end up arranged,
+    // so `vsplit` stacks them vertically. A name neither
+    // option recognises falls back rather than erroring, because the
+    // dialog shows which destination is live in its own border -- a
+    // wrong value is visible the first time you press the key, which is
+    // a better diagnosis than a message at startup nobody reads.
+    //
+    // `tab` by default, which is what the opener did before it could be
+    // asked, and `*` so the key cycles all four until somebody says
+    // otherwise.
+    ("opener_target", BishOptDefault::Str("tab")),
+    ("opener_targets", BishOptDefault::Str("*")),
     // The other place columns have to line up, and the one where the
     // text is bish's rather than the file's: a table in a rendered
     // markdown document (`:preview`, `:help`). On, a table too wide for
@@ -17431,6 +17464,8 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("extends", "Shown in the last column when a line continues off the right edge."),
     ("precedes", "Shown in the first column when a line continues off the left edge."),
     ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
+    ("opener_target", "Where Ctrl+T's opener starts: `tab`, `here`, `vsplit` (stacked) or `hsplit` (side by side)."),
+    ("opener_targets", "Which of those Ctrl+T cycles through, as a glob over their names."),
     ("table_wrap", "Fit a rendered markdown table to the pane by wrapping its cells. Off, it keeps its full width and the pager scrolls sideways."),
     ("gitignore", "Honour `.gitignore`: the browser and completion leave ignored files out."),
     ("lsp", "Use the language servers registered with `::bish lsp add`."),
