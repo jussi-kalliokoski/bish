@@ -9165,15 +9165,28 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
 /// for the longest path in a repository of any size without becoming a
 /// wall. The height is what the list needs -- the four rows the frame
 /// spends on its border, the query and the keys, plus a row per item --
-/// capped at two rows short of the screen -- which, centred, leaves a row
-/// clear at the top and the pinned tab bar visible at the bottom, so it
-/// still says which window you are picking from. Fixed once when it
-/// opens, from every item rather than the matching ones, so the dialog
-/// does not resize under the hand with every character typed.
+/// and is fixed once when it opens, counting every item rather than the
+/// matching ones, so the dialog does not resize under the hand with
+/// every character typed.
+///
+/// Centred in the *content area* rather than on the terminal, and that
+/// is not a nicety. Two rows below it belong to somebody else: the
+/// global status row that normal mode and command mode write their mode
+/// line to, and the pinned tab bar. `compositor_redraw` repaints the
+/// content area and the tab bar and leaves the status row alone --
+/// nothing owns it between excursions -- so a dialog that reached onto
+/// it left its own bottom border behind when it closed, with nothing
+/// that would ever paint over it. Staying inside what the compositor
+/// repaints means putting the dialog away needs no cleanup at all.
+///
+/// Two further rows of margin where the screen has them, so the box
+/// reads as floating over the panes rather than replacing them -- the
+/// same reason it is inset horizontally.
 fn opener_dialog_rect(items: usize, term_rows: usize, term_cols: usize) -> Rect {
+    let content = content_rows(term_rows);
     let cols = (term_cols * 3 / 4).clamp(24, 100).min(term_cols);
-    let rows = (items + 4).clamp(5, term_rows.saturating_sub(2).max(5)).min(term_rows);
-    Rect { row: (term_rows - rows) / 2, col: (term_cols - cols) / 2, rows, cols }
+    let rows = (items + 4).clamp(5, content.saturating_sub(2).max(5)).min(content);
+    Rect { row: (content - rows) / 2, col: (term_cols - cols) / 2, rows, cols }
 }
 
 /// Ctrl+T's loop: the opener, until it is given something to do or put
@@ -16601,27 +16614,41 @@ mod compositor_diff_tests {
     // The dialog is the shell's, not a pane's, so it is placed against
     // the terminal rather than against anything inside it.
     #[test]
-    fn the_opener_dialog_is_centred_and_leaves_the_tab_bar_showing() {
+    fn the_opener_dialog_stays_inside_what_the_compositor_repaints() {
         // 80x24, a long list: three quarters of the width, and two rows
-        // short of the height -- which centres to one clear row above and
-        // the tab bar's own row below.
+        // short of the content area, centred in it.
         let r = opener_dialog_rect(143, 24, 80);
-        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 10, 22, 60));
-        assert_eq!(r.row + r.rows, 23, "the last row is the tab bar's");
+        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 10, 20, 60));
         // A short list gets a short dialog, still centred.
         let r = opener_dialog_rect(2, 24, 80);
-        assert_eq!((r.row, r.col, r.rows, r.cols), (9, 10, 6, 60));
+        assert_eq!((r.row, r.col, r.rows, r.cols), (8, 10, 6, 60));
         // Wide terminal: capped, so the dialog does not become a wall.
         let r = opener_dialog_rect(143, 50, 200);
-        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 50, 48, 100));
+        assert_eq!((r.row, r.col, r.rows, r.cols), (1, 50, 46, 100));
         // Narrow terminal: the floor wins, up to the width there is.
         assert_eq!(opener_dialog_rect(143, 10, 30).cols, 24);
         assert_eq!(opener_dialog_rect(143, 10, 20).cols, 20, "never wider than the terminal");
-        // Absurdly small, which is the only thing that has to be true
-        // here: it fits, and the arithmetic does not wrap.
+
+        // The property the dialog's own bottom border was left behind
+        // for: the last two rows of the terminal are the global status
+        // row and the pinned tab bar, and `compositor_redraw` paints
+        // neither the first of those nor anything below the content
+        // area -- so a dialog that reaches there is a dialog that never
+        // gets cleaned up.
+        for term_rows in 1..=60 {
+            let r = opener_dialog_rect(143, term_rows, 80);
+            assert!(
+                r.row + r.rows <= content_rows(term_rows),
+                "{term_rows} rows: the dialog ends at {} and the content area at {}",
+                r.row + r.rows,
+                content_rows(term_rows)
+            );
+            assert!(r.rows >= 1 && r.cols >= 1, "{term_rows} rows: nothing to draw");
+        }
+        // Absurdly narrow, which only has to not wrap the arithmetic.
         for (rows, cols) in [(4, 10), (1, 1), (0, 0), (2, 3)] {
             let r = opener_dialog_rect(143, rows, cols);
-            assert!(r.row + r.rows <= rows && r.col + r.cols <= cols, "{rows}x{cols} -> {:?}", (r.row, r.col, r.rows, r.cols));
+            assert!(r.col + r.cols <= cols, "{rows}x{cols} -> {:?}", (r.row, r.col, r.rows, r.cols));
         }
     }
 
