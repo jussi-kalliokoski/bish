@@ -248,9 +248,11 @@ impl Capture {
                 // which this Capture then owns and removes on drop.
                 None => {
                     // Read as well as write: `take_text` reads the
-                    // result back through this same descriptor.
-                    let p = proc_sub_temp_path();
-                    (std::fs::File::options().read(true).write(true).create(true).truncate(true).open(&p).ok()?, Some(p))
+                    // result back through this same descriptor -- and
+                    // O_EXCL, so a name planted in advance is never the
+                    // one opened (see `exclusive_temp_file`).
+                    let (f, p) = crate::platform::exclusive_temp_file("procsub")?;
+                    (f, Some(p))
                 }
             };
             let mut file = file;
@@ -6330,7 +6332,13 @@ impl Shell {
         // when it does not.
         let mut stdin = match capture_file() {
             Some(f) => f,
-            None => std::fs::File::options().read(true).write(true).create(true).truncate(true).open(proc_sub_temp_path())?,
+            None => {
+                let (f, path) = crate::platform::exclusive_temp_file("procsub").ok_or_else(|| std::io::Error::other("no temporary file"))?;
+                // The name has done its job; the descriptor is what the
+                // child is handed.
+                let _ = std::fs::remove_file(&path);
+                f
+            }
         };
         stdin.write_all(input.as_bytes())?;
         stdin.seek(SeekFrom::Start(0))?;
@@ -15986,38 +15994,44 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
 /// makes inline -- given a name here because a filter needs two of them
 /// and writing that dance twice more would be three copies.
 struct Captured {
-    mem: Option<std::fs::File>,
+    /// The only handle on the stream. Anonymous, or a named file whose
+    /// name is kept solely so it can be removed afterwards.
+    file: std::fs::File,
     path: Option<std::path::PathBuf>,
 }
 
 impl Captured {
     fn open() -> std::io::Result<Captured> {
+        // An anonymous file where the kernel gives one, and a named file
+        // created with O_EXCL where it does not. Either way what is kept
+        // is the *descriptor*: this used to keep only the fallback's
+        // path and then open it again by name, twice -- once to hand the
+        // child a writer and once to read the answer back -- and each of
+        // those was a name another user could have replaced with a
+        // symlink in between. A descriptor cannot be redirected after
+        // the fact, so the path that remains is only something to
+        // remove.
         match capture_file() {
-            Some(f) => Ok(Captured { mem: Some(f), path: None }),
-            None => Ok(Captured { mem: None, path: Some(proc_sub_temp_path()) }),
+            Some(f) => Ok(Captured { file: f, path: None }),
+            None => {
+                let (file, path) = crate::platform::exclusive_temp_file("procsub").ok_or_else(|| std::io::Error::other("no capture file"))?;
+                Ok(Captured { file, path: Some(path) })
+            }
         }
     }
 
     /// The handle to hand the child. Separate from the one kept here,
     /// since reading the result back needs its own cursor.
     fn writer(&self) -> std::io::Result<std::fs::File> {
-        match (&self.mem, &self.path) {
-            (Some(f), _) => f.try_clone(),
-            (_, Some(p)) => std::fs::File::create(p),
-            _ => Err(std::io::Error::other("no capture file")),
-        }
+        self.file.try_clone()
     }
 
     fn read(self) -> String {
-        match (self.mem, self.path) {
-            (Some(f), _) => read_capture(f),
-            (_, Some(p)) => {
-                let text = std::fs::read_to_string(&p).unwrap_or_default();
-                let _ = std::fs::remove_file(&p);
-                text
-            }
-            _ => String::new(),
+        let text = read_capture(self.file);
+        if let Some(path) = self.path {
+            let _ = std::fs::remove_file(&path);
         }
+        text
     }
 }
 
@@ -16038,21 +16052,33 @@ fn read_capture(mut f: std::fs::File) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn proc_sub_temp_path() -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("bish-procsub-{}-{}", std::process::id(), n))
-}
-
+/// A here-document's body, as a descriptor a command can read.
+///
+/// An anonymous file -- the same `capture_file` uses, which is a
+/// `memfd` on Linux and an immediately-unlinked file on macOS. It has no
+/// name at any point, which is the whole reason to use it here.
+///
+/// What this replaced wrote `$TMPDIR/bish-herestring-<pid>-<counter>`
+/// with `fs::write` and then re-opened it *by that name*. Every part of
+/// that was a hazard on a shared `/tmp`: the name was predictable from
+/// `/proc`, `fs::write` follows a symlink, so a pre-planted one let any
+/// local user have a here-doc truncate and overwrite any file its
+/// author could write; and the gap between the write and the re-open
+/// let the same user substitute the file the command then read as its
+/// stdin. Demonstrated, not theorised: a symlink planted at that name
+/// overwrote a file of 25 bytes with the here-doc's body.
+///
+/// A name with `O_EXCL` behind it would have closed the symlink half --
+/// `platform::unlinked_temp_file` has done exactly that, next door, the
+/// whole time -- but no name at all closes both halves and there is
+/// nothing left to race.
 fn here_string_file(content: &str) -> Result<std::fs::File, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("bish-herestring-{}-{}", std::process::id(), n));
-    std::fs::write(&path, content).map_err(|e| format!("here-string: {}", e))?;
-    let f = std::fs::File::open(&path).map_err(|e| format!("here-string: {}", e))?;
-    let _ = std::fs::remove_file(&path);
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = crate::platform::anonymous_file().ok_or_else(|| "here-string: no temporary file available".to_string())?;
+    f.write_all(content.as_bytes()).map_err(|e| format!("here-string: {}", e))?;
+    // The command reads from the start; this descriptor is sitting at
+    // the end of what was just written.
+    f.seek(SeekFrom::Start(0)).map_err(|e| format!("here-string: {}", e))?;
     Ok(f)
 }
 
@@ -18973,6 +18999,41 @@ mod tests {
         assert_eq!(child.bishopts, parent.bishopts);
         crate::builtins::bish::run_bishopt(&mut child, &strs(&["--set", "greeting", "yo"]), &test_bishopts());
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
+    }
+
+    // The exploit this closed, as a test: plant a symlink where the old
+    // implementation would have written, and see whether a here-document
+    // overwrites what it points at.
+    //
+    // The names are guessed the way an attacker would have to -- this
+    // process's own pid and a counter from zero -- and a spread of them
+    // is planted because the counter was process-global and some other
+    // test may have moved it. Any one of them landing is the bug.
+    #[test]
+    fn a_here_document_cannot_be_aimed_at_a_file_by_planting_a_symlink() {
+        use std::io::Read;
+        let dir = std::env::temp_dir();
+        let victim = dir.join(format!("bish-herestring-victim-{}", std::process::id()));
+        std::fs::write(&victim, "UNTOUCHED").unwrap();
+        let planted: Vec<std::path::PathBuf> = (0..16).map(|n| dir.join(format!("bish-herestring-{}-{n}", std::process::id()))).collect();
+        for path in &planted {
+            std::fs::remove_file(path).ok();
+            std::os::unix::fs::symlink(&victim, path).ok();
+        }
+
+        for body in ["first body", "second body"] {
+            let mut f = here_string_file(body).expect("a here-document needs a descriptor");
+            let mut back = String::new();
+            f.read_to_string(&mut back).unwrap();
+            assert_eq!(back, body, "the command has to read what the here-document said");
+        }
+
+        let after = std::fs::read_to_string(&victim).unwrap();
+        for path in &planted {
+            std::fs::remove_file(path).ok();
+        }
+        std::fs::remove_file(&victim).ok();
+        assert_eq!(after, "UNTOUCHED", "a here-document reached a file through a planted symlink");
     }
 
     // `set -n` is the flag whose point is that nothing happens, which

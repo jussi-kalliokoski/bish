@@ -86,6 +86,30 @@ pub(crate) fn unlinked_temp_file(tag: &str) -> Option<std::fs::File> {
     None
 }
 
+/// A temporary file that keeps its name, created so that no name planted
+/// in advance can be opened instead.
+///
+/// `unlinked_temp_file` above with the unlink left out, for the callers
+/// that need something to pass by path. `create_new` is what matters:
+/// `O_CREAT|O_EXCL` fails on a name that already exists -- a symlink
+/// included, which is the whole point -- so a pre-planted
+/// `/tmp/bish-<tag>-<pid>-<n>` makes this move to the next number rather
+/// than writing through it. An attacker who plants all eight only
+/// denies the file; they never redirect it.
+///
+/// The caller owns the name and is responsible for removing it.
+pub(crate) fn exclusive_temp_file(tag: &str) -> Option<(std::fs::File, std::path::PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..8 {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bish-{tag}-{}-{n}", std::process::id()));
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) else { continue };
+        return Some((file, path));
+    }
+    None
+}
+
 /// What a directory looked like at one moment: every name in it, with
 /// enough of each entry's identity to tell "changed" from "same file,
 /// looked at twice".
