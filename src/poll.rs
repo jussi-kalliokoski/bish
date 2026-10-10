@@ -1,12 +1,8 @@
-// Waiting on several descriptors at once, so repl.rs's main loop can
-// watch stdin, a job's pty master, a session socket and the resize
-// self-pipe together instead of blocking on one `read` with everything
-// else checked once per iteration in between.
-//
-// The syscall and its struct are in `platform`; what is here is the
-// part that is bish's -- which descriptors count as "ready" (a closed
-// peer does, see `PollSet`), the self-pipe trick, and the resize
-// handler.
+// Waiting on several descriptors at once, so repl.rs's loop watches
+// stdin, a job's pty master, a session socket and the resize self-pipe
+// together instead of blocking on one. The syscall is in `platform`;
+// here is what's bish's: what counts as ready (a closed peer does, see
+// `PollSet`), the self-pipe, and the resize handler.
 #![allow(dead_code)]
 
 use std::io;
@@ -14,35 +10,31 @@ use std::os::fd::RawFd;
 
 use crate::platform::{self, PollFd};
 
-// Under this module's own names, which is where the rest of bish asks.
+// Under this module's names, where the rest of bish asks.
 pub const POLLIN: i16 = platform::POLL_READABLE;
 pub const POLLERR: i16 = platform::POLL_ERROR;
 pub const POLLHUP: i16 = platform::POLL_HUNG_UP;
 
-// True if `fd` has input available within timeout_ms. The single-fd
-// case term::stdin_ready wraps.
+// Whether `fd` has input within `timeout_ms`; `term::stdin_ready` wraps
+// it.
 pub fn poll_one(fd: RawFd, timeout_ms: i32) -> bool {
     let mut watched = [PollFd::watching(fd, POLLIN)];
     platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0) && watched[0].reported() & POLLIN != 0
 }
 
-/// `poll_one`, counting a closed peer as ready.
-///
-/// A pipe whose writer has gone reports `POLLHUP`, not `POLLIN` -- so
-/// anything waiting for "readable" alone waits for ever on a descriptor
-/// whose next read would return 0. That is the same reason `PollSet`
-/// below watches for it, and it is what a pipeline stage waiting for
-/// end-of-input needs.
+/// `poll_one`, counting a closed peer as ready: a pipe whose writer went
+/// reports `POLLHUP`, not `POLLIN`, so waiting for readable alone would
+/// wait forever for a read that returns 0. A pipeline stage waiting for
+/// end of input needs this.
 pub fn poll_readable_or_eof(fd: RawFd, timeout_ms: i32) -> bool {
     let mut watched = [PollFd::watching(fd, POLLIN)];
     platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0) && watched[0].reported() & (POLLIN | POLLHUP | POLLERR) != 0
 }
 
-// A set of fds, each watched for POLLIN (readable) plus POLLHUP/POLLERR
-// (so a closed peer -- a dead job's pty, a disconnected client socket --
-// is reported as "ready" too: the next read on it returns 0/an error,
-// which is how callers already detect EOF/disconnect, rather than this
-// set silently never waking for it again).
+// A set of fds, each watched for `POLLIN` plus `POLLHUP`/`POLLERR`, so a
+// closed peer (a dead job's pty, a disconnected client) counts as ready:
+// the next read returns 0 or an error, which is how callers detect it,
+// rather than never waking.
 pub struct PollSet {
     fds: Vec<PollFd>,
 }
@@ -62,14 +54,10 @@ impl PollSet {
         self.fds.retain(|p| p.fd() != fd);
     }
 
-    // `timeout_ms`: None blocks indefinitely; Some(0) polls without
-    // blocking at all. Returns the registered fds that are ready, in
-    // registration order (poll(2) itself has no concept of readiness
-    // order). An empty set returns immediately with nothing ready
-    // rather than ever calling poll(2) with nfds=0 -- that call is
-    // well-defined (it just sleeps for `timeout`), but "wait
-    // indefinitely on nothing" would otherwise hang this forever, which
-    // is never what an empty set's caller actually wants.
+    // `timeout_ms`: `None` blocks indefinitely, `Some(0)` doesn't block.
+    // Returns the ready fds in registration order. An empty set returns at
+    // once rather than calling poll(2) with nfds=0, which with no timeout
+    // would sleep forever.
     pub fn wait(&mut self, timeout_ms: Option<i32>) -> io::Result<Vec<RawFd>> {
         if self.fds.is_empty() {
             return Ok(Vec::new());
@@ -77,10 +65,9 @@ impl PollSet {
         for p in &mut self.fds {
             p.clear();
         }
-        // A signal interrupting the wait is not an error and not a
-        // readiness either: anything worth acting on arrives through one
-        // of these descriptors (the self-pipe below), so the layer
-        // reports it as nothing ready.
+        // A signal interrupting the wait is neither error nor readiness:
+        // anything worth acting on comes through a descriptor (the
+        // self-pipe).
         platform::wait_for_ready(&mut self.fds, timeout_ms.unwrap_or(-1))?;
         Ok(self.fds.iter().filter(|p| p.reported() & (POLLIN | POLLHUP | POLLERR) != 0).map(|p| p.fd()).collect())
     }
@@ -92,13 +79,11 @@ impl Default for PollSet {
     }
 }
 
-// The standard "self-pipe trick": a pipe whose write end a signal
-// handler can safely write to (write(2) is async-signal-safe; almost
-// nothing else usable inside a handler is) to wake a blocked poll()
-// call immediately. Register its read end with a PollSet the same way
-// any other fd; the byte's value carries no meaning -- `drain` just
-// empties whatever accumulated, so the next `wait` doesn't spuriously
-// return immediately on a byte already consumed.
+// The self-pipe trick: a pipe a signal handler can safely write to
+// (write(2) is async-signal-safe; little else is) to wake a blocked
+// poll(). Register its read end like any fd; the byte means nothing, and
+// `drain` empties what accumulated so the next `wait` doesn't return at
+// once.
 pub struct SelfPipe {
     read_fd: RawFd,
     write_fd: RawFd,
@@ -114,22 +99,17 @@ impl SelfPipe {
         self.read_fd
     }
 
-    // The value a signal handler should stash (typically in a static
-    // AtomicI32, set once at startup) and pass to
-    // wake_from_signal_handler. Exposing the raw fd rather than a
-    // method that writes through `&self` keeps "this gets called from
-    // inside a signal handler, not through the owning struct" an
-    // explicit, visible contract at the call site -- and this struct is
-    // meant to live for the whole process once installed, never dropped
-    // out from under a handler that might still reference its fd.
+    // The fd a signal handler stores (in a static set at startup) and passes
+    // to `wake_from_signal_handler`: a raw fd, not a `&self` method, makes
+    // "called from a handler" explicit at the call site. The struct lives for
+    // the whole process once installed.
     pub fn write_fd(&self) -> RawFd {
         self.write_fd
     }
 
     pub fn drain(&self) {
         let mut buf = [0u8; 64];
-        // Non-blocking, so "nothing left" arrives as an error rather
-        // than as a wait.
+        // Non-blocking, so "nothing left" is an error, not a wait.
         while platform::read_bytes(self.read_fd, &mut buf).is_ok_and(|n| n > 0) {}
     }
 }
@@ -141,13 +121,9 @@ impl Drop for SelfPipe {
     }
 }
 
-// Writes one wake-up byte to `fd` (a SelfPipe's write_fd) -- async-
-// signal-safe, the only part of this module meant to be called from
-// inside a real signal handler. A full pipe buffer (extremely unlikely
-// for one byte written at a time, but possible under a storm of signals
-// with nothing draining) is treated as "already woken, nothing more to
-// do" rather than an error -- losing a redundant wake-up byte when
-// one's already queued doesn't lose the wake-up itself.
+// Writes one wake-up byte to `fd` (a `SelfPipe`'s write end):
+// async-signal-safe, the only part meant for a real signal handler. A
+// full pipe means a wake-up is already queued, so nothing is lost.
 pub fn wake_from_signal_handler(fd: RawFd) {
     platform::wake(fd);
 }
@@ -161,17 +137,12 @@ extern "C" fn sigwinch_wake_handler(_sig: i32) {
     }
 }
 
-// Installs a SIGWINCH handler that wakes `write_fd` (a SelfPipe's own
-// write_fd) directly, instead of setting a flag polled once per
-// iteration -- for a process with no other on_idle-style periodic check
-// to notice a resize between `PollSet::wait` calls (session.rs's own
-// client loop: it has nothing else to interleave, so it blocks
-// genuinely indefinitely, unlike repl::run's own exec::
-// install_winch_handler/take_winch, a different flag-based mechanism
-// for a different caller -- deliberately not reused here to avoid this
-// module depending on exec.rs for one signal number). Only one
-// installation is meaningful at a time per process, which is all any
-// current caller needs.
+// Installs a SIGWINCH handler that writes to `write_fd` directly, for a
+// process with no periodic check to notice a resize between waits
+// (session.rs's client loop blocks indefinitely). repl::run uses
+// `exec::install_winch_handler`/`take_winch`, a flag, instead; not
+// reused, so this module needn't depend on exec.rs. One installation per
+// process.
 pub fn install_sigwinch_wake(write_fd: RawFd) {
     SIGWINCH_WAKE_FD.store(write_fd, std::sync::atomic::Ordering::SeqCst);
     platform::on_signal(platform::SIGWINCH, sigwinch_wake_handler);
