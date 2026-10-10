@@ -1,13 +1,10 @@
-// The man(7) macro package: the ~30 macros every Linux man page is
-// written in, turned into the document model. Runs on interp's event
-// stream, so by the time anything here sees a `.TP`, the page's own
-// `.de`/`.ie`/`.ds` scaffolding has already been executed away.
+// The man(7) macro package: the ~30 macros man pages are written in,
+// turned into the document model. It runs on interp's event stream, so
+// a page's `.de`/`.ie`/`.ds` scaffolding is already executed away.
 //
-// The structure this recovers is the point. A `.TP` is a *tagged
-// paragraph* -- the flag and the prose that documents it, explicitly
-// paired by the page's own markup. Mining that out of `man`'s rendered
-// output means measuring indentation and hoping; here it is simply what
-// the page said.
+// The structure is the point: a `.TP` is a tagged paragraph, a flag
+// paired with its prose by the page's own markup, which rendered `man`
+// output would only show as indentation.
 
 use std::ops::Range;
 
@@ -39,11 +36,10 @@ struct Builder {
     para: Vec<Inline>,
     para_span: Option<Range<usize>>,
     style: Style,
-    // `\fP` means "the font before this one", so one step of history is
-    // exactly what roff itself keeps.
+    // `\fP` means the previous font, so roff keeps one step of history.
     prev_style: Style,
     literal: Option<(Vec<String>, Range<usize>)>,
-    // `.TP` sets this: the *next* line of content is the tag, not body.
+    // `.TP` sets this: the next line of content is the tag, not body.
     awaiting_tag: bool,
     // `.SH` with no argument takes its title from the following line.
     awaiting_heading: Option<u8>,
@@ -110,8 +106,8 @@ impl Builder {
         }
     }
 
-    // Closes a `.TP` body, but not an `.RS` -- a new tagged paragraph
-    // ends the previous one, while an explicit indent block outlives it.
+    // Closes a `.TP` body but not an `.RS`: a new tagged paragraph ends the
+    // previous one, an indent block outlives it.
     fn close_tagged(&mut self) {
         if matches!(self.stack.last(), Some((Container::Tagged { .. }, _))) {
             self.close_container();
@@ -152,8 +148,8 @@ impl Builder {
         if let Some((lines, _)) = &mut self.literal {
             let mut style = self.style;
             let mut prev = self.prev_style;
-            // Font escapes still resolve inside a literal block; the
-            // *layout* is what is preserved, not the markup.
+            // Font escapes still resolve in a literal block; the layout is
+            // kept, not the markup.
             let inlines = to_inlines(text, span, &mut style, &mut prev);
             self.style = style;
             self.prev_style = prev;
@@ -171,8 +167,8 @@ impl Builder {
             self.open(Container::Tagged { tag, span });
             return;
         }
-        // roff fills, so trailing whitespace on an input line is never
-        // content -- and a stripped `\"` comment always leaves some.
+        // roff fills, so trailing whitespace is never content, and a stripped
+        // `\"` comment always leaves some.
         let inlines = self.inlines(text.trim_end(), span.clone());
         if inlines.is_empty() {
             return;
@@ -186,9 +182,8 @@ impl Builder {
             content.extend(inlines);
             return;
         }
-        // Filling: consecutive input lines are one paragraph, joined by
-        // a space, which is roff's own default and why a man page's
-        // source line breaks don't survive into its output.
+        // Filling: consecutive input lines are one paragraph joined by a
+        // space, as roff does by default.
         if !self.para.is_empty() && !matches!(self.para.last(), Some(Inline::Break { .. })) {
             self.para.push(Inline::Text { text: " ".to_string(), style: self.style, span: span.start..span.start });
         }
@@ -228,12 +223,11 @@ impl Builder {
                 let content = self.inlines(&args.join(" "), span.clone());
                 self.push_block(Block::Heading { level, content, span });
             }
-            // Every paragraph break: they differ in indentation, which a
-            // terminal at this width has no way to show anyway.
+            // All paragraph breaks; they differ in indentation, which a
+            // terminal at this width can't show.
             "PP" | "LP" | "P" | "HP" | "Pp" | "sp" | "br" | "PD" | "ne" | "ti" => {
                 if self.literal.is_some() {
-                    // A break inside a no-fill block is a blank line,
-                    // which is the one thing it can be there.
+                    // In a no-fill block a break is a blank line.
                     if let Some((lines, _)) = &mut self.literal
                         && (name == "br" || name == "sp")
                     {
@@ -242,8 +236,8 @@ impl Builder {
                     return;
                 }
                 if name == "br" && !self.para.is_empty() {
-                    // A break inside a paragraph is a real line break,
-                    // not the end of the paragraph.
+                    // In a paragraph a break is a line break, not the
+                    // paragraph's end.
                     self.para.push(Inline::Break { span });
                     return;
                 }
@@ -262,8 +256,8 @@ impl Builder {
                 self.flush_para();
                 self.flush_literal();
                 self.close_tagged();
-                // `.IP` carries its own tag as an argument -- or has
-                // none, in which case it is just an indented paragraph.
+                // `.IP` takes its tag as an argument, or has none and is an
+                // indented paragraph.
                 match args.first() {
                     Some(tag) if !tag.is_empty() => {
                         let tag = self.inlines(tag, span.clone());
@@ -280,15 +274,14 @@ impl Builder {
             "RE" => {
                 self.flush_para();
                 self.flush_literal();
-                // `.RE` closes the indent and any tagged paragraph
-                // inside it.
+                // `.RE` closes the indent and any tagged paragraph inside it.
                 self.close_tagged();
                 if matches!(self.stack.last(), Some((Container::Indented { .. }, _))) {
                     self.close_container();
                 }
             }
-            // The one-font macros. With no arguments they set the font
-            // for the lines that follow instead.
+            // The one-font macros. With no arguments they set the font for
+            // the lines that follow.
             "B" | "I" | "SM" | "SB" | "R" | "CW" => {
                 let style = match name {
                     "B" | "SB" => Style { bold: true, ..Style::default() },
@@ -305,8 +298,7 @@ impl Builder {
                 self.add_styled(&text, style, span);
             }
             // The alternating-font macros: `.BR ls (1)` is "ls" bold and
-            // "(1)" roman, with no space between them -- which is the
-            // whole reason they exist.
+            // "(1)" roman, with no space between.
             "BI" | "IB" | "BR" | "RB" | "IR" | "RI" => {
                 let (a, b) = font_pair(name);
                 self.add_alternating(&args, a, b, span);
@@ -369,14 +361,13 @@ impl Builder {
                     _ => Style::default(),
                 };
             }
-            // Layout requests a terminal at one width has nothing to do
-            // with.
+            // Layout requests that mean nothing on a terminal of one width.
             "ll" | "in" | "ad" | "na" | "ps" | "vs" | "nh" | "hy" | "ce" | "rj" | "fl" | "ns" | "rs" | "bp" | "pl" | "po" | "tl" | "pc" | "nx"
             | "ex" | "am" | "PU" | "UC" | "DT" | "IX" | "ci" => {}
             other => {
-                // An unknown macro's arguments are still text the reader
-                // should see -- dropping them would silently lose
-                // content from a page using a package this doesn't know.
+                // An unknown macro's arguments are still text to show;
+                // dropping them would lose content from a page using
+                // another package.
                 if !args.is_empty() {
                     let text = args.join(" ");
                     self.text(&text, span);
@@ -403,8 +394,8 @@ impl Builder {
         }
     }
 
-    // `.BR a b c` alternates fonts *without* spaces between the
-    // arguments, which is how `ls`(1) is written as one unit.
+    // `.BR a b c` alternates fonts without spaces between arguments, which
+    // is how `ls`(1) is one unit.
     fn add_alternating(&mut self, args: &[String], first: Style, second: Style, span: Range<usize>) {
         if args.is_empty() {
             return;
@@ -454,8 +445,8 @@ fn font_pair(name: &str) -> (Style, Style) {
 }
 
 // Text with its escapes resolved into styled runs. `style` and `prev`
-// are threaded in and out because a font change made on one line stays
-// in effect on the next -- roff's font is a mode, not a span.
+// are threaded through because a font change lasts into the next line:
+// roff's font is a mode, not a span.
 pub fn to_inlines(text: &str, span: Range<usize>, style: &mut Style, prev: &mut Style) -> Vec<Inline> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Inline> = Vec::new();
@@ -501,8 +492,7 @@ pub fn to_inlines(text: &str, span: Range<usize>, style: &mut Style, prev: &mut 
             Some('`') => buf.push('`'),
             Some('~') | Some(' ') | Some('0') | Some('|') | Some('^') => buf.push(' '),
             Some('t') => buf.push('\t'),
-            // Zero-width and hyphenation control: they exist to affect
-            // typesetting, and contribute no characters.
+            // Zero-width and hyphenation controls: no characters.
             Some('&') | Some('%') | Some(':') | Some('c') | Some('!') | Some('/') | Some(',') => {}
             // A named special character.
             Some('(') | Some('[') => {
@@ -512,11 +502,9 @@ pub fn to_inlines(text: &str, span: Range<usize>, style: &mut Style, prev: &mut 
                 };
                 buf.push_str(special_char(&name));
             }
-            // Size, motion and drawing: presentation with no text.
-            // Size, motion, drawing -- and `\X`/`\Y`, which write a
-            // control string straight to the output device. Real pages
-            // use `\X'tty: link ...'` around every option name; those
-            // are hyperlinks for a device that can show them, not text.
+            // Size, motion and drawing: no text. Nor `\X`/`\Y`, control
+            // strings for the output device; pages wrap option names in
+            // `\X'tty: link ...'`.
             Some('s') | Some('h') | Some('v') | Some('l') | Some('L') | Some('D') | Some('o') | Some('w') | Some('z') | Some('k') | Some('x')
             | Some('X') | Some('Y') | Some('n') | Some('*') => {}
             Some(&c) => buf.push(c),
@@ -528,9 +516,8 @@ pub fn to_inlines(text: &str, span: Range<usize>, style: &mut Style, prev: &mut 
     out
 }
 
-// groff's special-character names, limited to the ones man pages
-// actually use. An unknown name renders as itself rather than
-// disappearing, so a page using something exotic still reads.
+// groff's special-character names that man pages use. An unknown name
+// renders as itself, so the page still reads.
 fn special_char(name: &str) -> &str {
     match name {
         "bu" => "\u{2022}",
@@ -610,10 +597,9 @@ fn special_char(name: &str) -> &str {
     }
 }
 
-// `\[uXXXX]` for the handful of code points man pages name that way.
-// Resolving the general case would need a `char::from_u32` and a
-// `&'static str`, which this signature can't return -- so the common
-// ones are a table and the rest fall through as their own name.
+// `\[uXXXX]` for the code points man pages name that way. A table, as
+// the general case would need a `&'static str` for any code point;
+// others fall through as their own name.
 const UNICODE_NAMES: &[(&str, &str)] = &[
     ("u2018", "\u{2018}"),
     ("u2019", "\u{2019}"),
