@@ -1,30 +1,17 @@
-// Shared engine behind the `compgen`/`complete`/`compopt` builtins
-// (exec.rs) and bish's own interactive Tab completion (bishedit/
-// completion.rs) -- same "hand-rolled, standalone, no Shell dependency"
-// shape as glob.rs/regex.rs/csscolor.rs, so both the exec layer (which has
-// live, mutable Shell state) and the editor layer (which only ever gets an
-// owned per-prompt snapshot, see ShellCompletionProvider's own doc comment
-// on why) can drive the exact same logic from whatever data they actually
-// have on hand.
+// The engine behind `compgen`, `complete` and `compopt` and behind Tab
+// completion. It doesn't depend on `Shell`, so both the builtins (with a
+// live shell) and the editor (with a per-prompt snapshot; see
+// `ShellCompletionProvider`) run the same logic on what they have.
 //
-// Every behavioral rule encoded here (which sources get filtered by the
-// current word and which don't, the exact -F/-C calling convention, `-o`'s
-// names being validated but otherwise inert, complete -p's own print
-// order) was reverse-engineered by running real bash side by side, not
-// guessed from the man page.
+// The behaviour (which sources the current word filters, the `-F`/`-C`
+// calling convention, inert `-o` names, `complete -p`'s print order) was
+// worked out by running bash side by side.
 //
-// -F/-C run via subprocess (re-invoking this binary with `-c`, given a
-// serialized preamble of the caller's current functions/vars -- see
-// exec.rs's own functions_preamble), never via an in-process function
-// call. That's a deliberate, real (if narrow) divergence from bash's own
-// -F semantics for the *standalone* `compgen`/`complete` builtins (real
-// bash calls -F in-process, so side effects the function has on shell
-// state persist; this doesn't) -- made specifically so the exact same
-// resolver also works from bishedit::completion.rs's interactive Tab path,
-// which only ever has an owned snapshot (cwd + a serialized preamble), not
-// a live, mutably-borrowable Shell, to work with. A hand-written
-// completion function mutating its caller's shell state on purpose would
-// be very unusual; COMPREPLY is the only thing that matters in practice.
+// `-F` and `-C` run in a subprocess (this binary with `-c` and a preamble
+// of the caller's functions and variables; see `functions_preamble`), not
+// in-process as in bash, so a completion function's side effects on the
+// shell don't persist. The editor's path only has a snapshot, so this
+// lets both share one resolver; COMPREPLY is what matters in practice.
 use std::path::Path;
 use std::process::Command;
 
@@ -87,8 +74,7 @@ pub fn action_by_name(name: &str) -> Option<CompgenAction> {
     })
 }
 
-// name -> action's own long name, for -p reconstruction when an action has
-// no one-letter shorthand.
+// An action's long name, for `-p` when it has no one-letter flag.
 pub fn action_name(action: CompgenAction) -> &'static str {
     use CompgenAction::*;
     match action {
@@ -119,10 +105,9 @@ pub fn action_name(action: CompgenAction) -> &'static str {
     }
 }
 
-// The single-letter shorthand flags from compgen/complete's own usage
-// synopsis (`[-abcdefgjksuv]`) -- a strict subset of the -A action names
-// above (no one-letter shorthand exists for arrayvar/binding/disabled/
-// enabled/helptopic/hostname/running/setopt/shopt/signal/stopped).
+// The one-letter flags in the usage (`[-abcdefgjksuv]`), a subset of the
+// actions: arrayvar, binding, disabled, enabled, helptopic, hostname,
+// running, setopt, shopt, signal and stopped have none.
 pub fn action_from_flag(c: char) -> Option<CompgenAction> {
     use CompgenAction::*;
     Some(match c {
@@ -161,72 +146,52 @@ pub fn action_flag_char(action: CompgenAction) -> Option<char> {
     })
 }
 
-// compgen/complete's own `-o` option names -- validated (an unrecognized
-// name is a usage error, confirmed against real bash) but otherwise inert
-// here, since every one of them only changes interactive readline
-// behavior, never the generated candidate text itself (confirmed
-// empirically: `compgen -o filenames -W` with a real directory name
-// produced no trailing slash, no different from without -o at all).
+// The `-o` names: an unknown one is a usage error, as in bash, but
+// otherwise they're inert here, since each only changes readline's
+// behaviour, never the generated text (`compgen -o filenames` adds no
+// slash).
 pub const O_OPTIONS: &[&str] = &["bashdefault", "default", "dirnames", "filenames", "noquote", "nosort", "nospace", "plusdirs"];
 
-// Every word this shell's grammar reserves: the ones its lexer turns
-// into a reserved-word token, the brace/double-bracket pairs that are
-// reserved punctuation rather than word-lookup keywords here, and `!`
-// and `time`, which the pipeline rule reserves without either becoming
-// a keyword token. Shared by `compgen -A keyword` and by `type`, which
-// has to answer "keyword" for all of them -- they were left out on the
-// grounds that bish's grammar did not reserve them, but `! false` and
-// `time f` both parse, so it does.
+// Every reserved word: the lexer's keyword tokens, the brace and
+// double-bracket pairs, and `!` and `time`, which the pipeline rule
+// reserves. Used by `compgen -A keyword` and by `type`.
 pub const KEYWORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "function", "coproc", "in", "{", "}", "[[",
     "]]", "!", "time",
 ];
 
-// Every bit of live Shell state a *contextual* action (one that isn't just
-// a static table or a plain filesystem read) needs -- built once per use
-// from a live Shell (exec.rs's own Shell::action_context) or a per-prompt
-// snapshot (repl.rs, for bishedit::completion.rs's interactive path), so
-// this module itself never has to reach into exec::Shell's private
-// fields. Plain owned data throughout -- cheap enough to snapshot once per
-// compgen/complete invocation or once per prompt redraw, not a hot path.
+// The live shell state the contextual actions need, built from a `Shell`
+// (`Shell::action_context`) or a per-prompt snapshot (repl.rs), so this
+// module never reaches into `Shell`. Owned data, built once per use.
 #[derive(Clone, Default)]
 pub struct ActionContext {
     pub aliases: Vec<String>,
     pub functions: Vec<String>,
-    // Indexed + associative array names combined -- ArrayVar/Variable
-    // don't distinguish the two.
+    // Indexed and associative array names together; ArrayVar and Variable
+    // don't distinguish them.
     pub arrays: Vec<String>,
     pub exported: Vec<String>,
-    // Every name currently visible to a variable lookup: process env
-    // (where every non-local bish assignment actually lives) plus any
-    // `local`-declared overlay names, NOT including array names (those are
-    // folded in separately by whoever builds this, alongside `arrays`).
+    // The names a variable lookup can see, without arrays (the builder adds
+    // those with `arrays`).
     pub variables: Vec<String>,
     pub builtins: Vec<String>,
     pub shopt_names: Vec<String>,
     pub set_o_names: Vec<String>,
-    // Bare (non-"SIG"-prefixed) signal names, e.g. "HUP" -- resolve_action
-    // adds the "SIG" prefix and the EXIT pseudo-signal itself.
+    // Signal names without `SIG` (`HUP`); `resolve_action` adds the prefix
+    // and EXIT.
     pub signal_names: Vec<String>,
     pub jobs: Vec<String>,
     pub running_jobs: Vec<String>,
     pub stopped_jobs: Vec<String>,
-    // Every PATH executable name, unfiltered by any prefix -- the caller
-    // (resolve_spec) applies its own word-prefix filter downstream anyway,
-    // so prefiltering here would only save (already cheap, once-per-
-    // invocation) work, never change the result.
+    // Every PATH executable, unfiltered: `resolve_spec` applies the word
+    // filter anyway.
     pub path_commands: Vec<String>,
 }
 
-// `-f`/`-d`'s shared directory-splitting logic: only the final path
-// segment of `word` is completed, matching the same convention
-// ShellCompletionProvider::file_candidates uses for interactive Tab
-// completion (a leading directory part stays a literal prefix of every
-// returned name). Unlike that interactive path, real bash's own -f/-d
-// neither hides dotfiles nor appends a trailing '/' to directories
-// (confirmed against real bash) -- so this deliberately doesn't either, a
-// real (if narrow) divergence from bish's own Tab-completion convention in
-// favor of matching bash's compgen exactly.
+// `-f`/`-d`: only the last path segment of `word` is completed, the
+// directory part staying a literal prefix, as in Tab completion. Unlike
+// Tab completion, and as bash's `-f`/`-d` do, dotfiles aren't hidden and
+// directories get no `/`.
 pub fn path_entries(cwd: &Path, word: &str, dirs_only: bool) -> Vec<String> {
     let dir_part = match word.rfind('/') {
         Some(idx) => &word[..idx + 1],
@@ -255,44 +220,31 @@ pub fn path_entries(cwd: &Path, word: &str, dirs_only: bool) -> Vec<String> {
         .collect()
 }
 
-// `-A group`/`-A user`: first colon-separated field of every non-comment,
-// non-blank line. Plain /etc/group and /etc/passwd parsing -- no NSS
-// (LDAP/sssd/etc.) consultation the way a real getgrent(3)/getpwent(3)
-// call would do, a documented gap matching this codebase's existing
-// tolerance for "no crash, just a plausible-not-guaranteed answer" on
-// anything system-database-shaped. Empty (not an error) if the file can't
-// be read at all.
+// `-A group`/`-A user`: the first field of each line of /etc/group or
+// /etc/passwd, without NSS (LDAP, sssd). Empty if unreadable.
 fn read_colon_first_field(path: &str) -> Vec<String> {
     std::fs::read_to_string(path)
         .map(|s| s.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|l| l.split(':').next().map(str::to_string)).collect())
         .unwrap_or_default()
 }
 
-// `-A hostname`: every whitespace-separated field after the first (the IP
-// address) on each non-comment /etc/hosts line -- real bash reads
-// $HOSTFILE (defaulting to /etc/hosts); this always reads /etc/hosts
-// itself, a narrower but honest subset.
+// `-A hostname`: the names after the address on each /etc/hosts line.
+// bash reads `$HOSTFILE`; this always reads /etc/hosts.
 fn read_hosts_hostnames() -> Vec<String> {
     std::fs::read_to_string("/etc/hosts")
         .map(|s| s.lines().map(|l| l.split('#').next().unwrap_or("")).flat_map(|l| l.split_whitespace().skip(1).map(str::to_string)).collect())
         .unwrap_or_default()
 }
 
-// `-A service`: real bash's own answer here is itself just "list
-// /etc/init.d" on a traditional SysV-init Linux system, empty everywhere
-// else -- same behavior here, no systemd unit-file enumeration attempted.
+// `-A service`: /etc/init.d's entries, which is bash's answer too; no
+// systemd units.
 fn read_dir_names(path: &str) -> Vec<String> {
     std::fs::read_dir(path).map(|entries| entries.flatten().filter_map(|e| e.file_name().into_string().ok()).collect()).unwrap_or_default()
 }
 
-// Raw candidates for one -A action/shorthand flag, unfiltered by `word`
-// (the caller, resolve_spec, applies the prefix filter uniformly across
-// every source). A few real bash actions have nothing backing them in
-// bish at all -- `binding` (no named-keybinding registry; bish's editor
-// never exposed one) and `helptopic` (no `help` builtin) always yield
-// empty rather than being rejected as unknown action names, the same
-// "recognized, honestly empty" tolerance as an unready man page elsewhere
-// in this codebase.
+// Raw candidates for one action, unfiltered by `word` (`resolve_spec`
+// filters every source alike). `binding` and `helptopic` are always empty
+// rather than unknown.
 pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, word: &str) -> Vec<String> {
     use CompgenAction::*;
     match action {
@@ -300,10 +252,8 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
         ArrayVar => ctx.arrays.clone(),
         Binding => Vec::new(),
         Builtin => ctx.builtins.clone(),
-        // Deliberately excludes aliases, unlike real bash -- same "this
-        // won't actually run" reasoning as ShellCompletionProvider's own
-        // command_name_candidates (bish's `alias` is never expanded at
-        // command-run time).
+        // Aliases aren't included, unlike bash; see
+        // `ShellCompletionProvider::command_name_candidates`.
         Command => {
             let mut names = ctx.builtins.clone();
             names.extend(ctx.functions.iter().cloned());
@@ -311,10 +261,6 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
             names
         }
         Directory => path_entries(cwd, word, true),
-        // bish has no `enable`/`disable` builtin -- nothing is ever
-        // disabled, so this pair's answer is always "all of them" / "none
-        // of them", same as a real bash session that has never called
-        // `enable -n` on anything.
         Disabled => Vec::new(),
         Enabled => ctx.builtins.clone(),
         Export => ctx.exported.clone(),
@@ -329,11 +275,7 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
         Service => read_dir_names("/etc/init.d"),
         Setopt => ctx.set_o_names.clone(),
         Shopt => ctx.shopt_names.clone(),
-        // "SIG"-prefixed, matching real bash's own -A signal output
-        // (confirmed: "SIGHUP" "SIGINT" ...) plus the EXIT pseudo-signal --
-        // the only pseudo-signal bish's own `trap` actually recognizes
-        // (unlike real bash, no DEBUG/ERR/RETURN support to advertise
-        // here).
+        // `SIG`-prefixed, as bash's `-A signal` prints them, plus EXIT.
         Signal => std::iter::once("EXIT".to_string()).chain(ctx.signal_names.iter().map(|n| format!("SIG{n}"))).collect(),
         Stopped => ctx.stopped_jobs.clone(),
         User => read_colon_first_field("/etc/passwd"),
@@ -345,11 +287,9 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
     }
 }
 
-// A registered/parsed completion source -- the same shape whether it came
-// from `compgen`'s own one-shot arguments or a `complete NAME`
-// registration stored in Shell::completions. Every field mirrors one of
-// compgen/complete's own options 1:1; see resolve_spec for how they
-// combine.
+// A completion source, from `compgen`'s arguments or a `complete NAME`
+// registration in `Shell::completions`. Each field is one option; see
+// `resolve_spec` for how they combine.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct CompgenSpec {
     pub actions: Vec<CompgenAction>,
@@ -360,12 +300,10 @@ pub struct CompgenSpec {
     pub filterpat: Option<String>,
     pub prefix: String,
     pub suffix: String,
-    // -o names, in the order first given -- for -p reconstruction
-    // (sorted there, matching real bash's own -p output order) and
-    // compopt's -o/+o toggling. Never consulted by `resolve_spec`, which
-    // only generates text; `nosort` is read by the completion UI, which
-    // is the thing that has an order to leave alone (see
-    // ShellCompletionProvider::registered_spec_candidates).
+    // `-o` names in the order first given, for `-p` (sorted there, as bash
+    // prints them) and `compopt`. `resolve_spec` never reads them; `nosort`
+    // is read by the completion UI (see
+    // `ShellCompletionProvider::registered_spec_candidates`).
     pub opts: Vec<String>,
 }
 
@@ -383,15 +321,10 @@ pub enum ParseError {
     MissingArg(&'static str),
 }
 
-// Parses the option grammar `compgen`/`complete` share (everything except
-// compgen's own `-V varname` and complete's own `-p`/`-r`/`-D`, which their
-// respective callers handle before/around this). Returns the built spec
-// plus every non-option token encountered (both bare words and anything
-// after a `--`) in order -- compgen only ever wants the *last* one (its
-// own `[word]` is singular; a caller passing more than one just has the
-// last one win, matching this module's own precedent elsewhere), complete
-// wants *all* of them (one registration can name several commands at
-// once).
+// Parses the option grammar `compgen` and `complete` share (not `-V`,
+// `-p`, `-r` or `-D`, which their callers handle). Returns the spec and
+// every non-option token in order: `compgen` uses the last as its word,
+// `complete` all of them as command names.
 pub fn parse_spec_args(args: &[String]) -> Result<(CompgenSpec, Vec<String>), ParseError> {
     let mut spec = CompgenSpec::default();
     let mut positionals = Vec::new();
@@ -467,25 +400,14 @@ enum ExternalKind {
     Command,
 }
 
-// `-F`/`-C`: runs in a subprocess -- the same re-invoke-this-binary-with-
-// `-c` pattern exec.rs's own run_command_substitution uses for `$(...)`,
-// given `preamble` (exec.rs's Shell::functions_preamble output: every
-// currently-visible var/array/function serialized as real bish source
-// text) so the invoked function/command sees the same functions and
-// variables the caller does. Both kinds get the same three positional
-// words appended, shell-quoted, onto the invoked text -- $1/$2/$3 =
-// "compgen"/current word/previous word, always "compgen"/`word`/""
-// since there's no real command-line context to draw $1 or $3 from
-// (confirmed against real bash: a function that echoes "$1 $2 $3" prints
-// "compgen <word> " every time; `-C "echo hi"` runs as if you'd typed
-// `echo hi 'compgen' '<word>' ''`). For -F, the invoked text is a call to
-// the named function followed by dumping $COMPREPLY -- for -C, `text`
-// itself is the whole command line. Splits captured stdout into lines,
-// one candidate per line; any subprocess-spawn failure (missing exe,
-// nonexistent function -- caught here as simply "no COMPREPLY output")
-// just yields no candidates rather than erroring, since this same
-// function backs the interactive Tab-completion path, where a hard error
-// would be far more disruptive than silently offering nothing.
+// `-F`/`-C` in a subprocess: this binary with `-c` (as `$(...)` runs),
+// after `preamble` (`Shell::functions_preamble`), so the function sees
+// the caller's functions and variables. Both get three quoted words
+// appended: `compgen`, `word` and "" for $1, $2 and $3, since there's no
+// command line to take them from (bash's do the same). For `-F` the text
+// calls the function and prints COMPREPLY; for `-C` it's the command
+// itself. Output is one candidate per line. Any failure yields nothing,
+// since this backs Tab completion too, where an error would be worse.
 fn run_external(kind: ExternalKind, text: &str, word: &str, cwd: &Path, preamble: &str) -> Vec<String> {
     let Ok(exe) = std::env::current_exe() else { return Vec::new() };
     let quote = crate::serialize::quote_literal;
@@ -501,16 +423,10 @@ fn run_external(kind: ExternalKind, text: &str, word: &str, cwd: &Path, preamble
     }
 }
 
-// Resolves a whole spec into its final candidate list, in front of the
-// `word` prefix filter (-A actions/-G/-W) or deliberately behind it (-F/
-// -C, trusted to have already applied their own prefix logic -- confirmed
-// against real bash: a COMPREPLY entry not matching `word` at all still
-// comes through unfiltered), then -X (whole-pool filter, `!pattern` keeps
-// only matches instead of excluding them) and -P/-S (whole-pool wrap).
-// Does not decide exit-status/empty-vs-had-a-source semantics -- that's
-// each caller's own business (compgen: exit 1 iff a source was given and
-// this came back empty; the interactive path: just show whatever comes
-// back, empty or not).
+// Resolves a spec into its candidates: actions, `-G` and `-W` filtered by
+// `word`, `-F`/`-C` unfiltered (bash trusts them too), then `-X` over the
+// whole pool (`!pattern` keeps matches instead of removing them), then
+// `-P`/`-S`. The exit status for an empty result is the caller's call.
 pub fn resolve_spec(spec: &CompgenSpec, word: &str, ctx: &ActionContext, cwd: &Path, preamble: &str) -> Vec<String> {
     let mut sourced: Vec<String> = Vec::new();
     for action in &spec.actions {
@@ -544,10 +460,9 @@ pub fn resolve_spec(spec: &CompgenSpec, word: &str, ctx: &ActionContext, cwd: &P
     candidates
 }
 
-// `complete -p`: reconstructs a spec's own `complete [options] NAME` text
-// -- print order (-o sorted, then each action as its shorthand flag if one
-// exists else `-A name`, then -G/-W/-F/-C, then -P/-S, then -X, then the
-// trailing name) matches real bash's own observed -p output exactly.
+// `complete -p`: a spec back as `complete [options] NAME`, in bash's
+// order: `-o` sorted, actions as flags or `-A name`, `-G`/`-W`/`-F`/`-C`,
+// `-P`/`-S`, `-X`, then the name.
 pub fn format_spec(spec: &CompgenSpec, trailing: &str) -> String {
     let mut parts = vec!["complete".to_string()];
     let mut sorted_opts = spec.opts.clone();
