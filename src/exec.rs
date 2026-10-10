@@ -15417,7 +15417,7 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["-a", "p", "echo bash"])), 0);
         assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "println!(\"%s\")"])), 0);
         assert_eq!(shell.abbrs.len(), 2, "same name, different language -- two entries, not a redefinition");
-        // Redefining still replaces in place, keyed on both.
+        // Redefining replaces in place, keyed on name and language.
         assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-a", "p", "dbg!(%s)"])), 0);
         assert_eq!(shell.abbrs.len(), 2);
         assert_eq!(shell.abbrs[1].expansion, "dbg!(%s)");
@@ -15442,7 +15442,7 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=rust", "-e", "p"])), 0);
         assert_eq!(shell.abbrs.len(), 1);
         assert_eq!(shell.abbrs[0].lang, "bash");
-        // ...and erasing a language it isn't defined for is a miss.
+        // Erasing for a language it isn't defined for is a miss.
         assert_eq!(crate::builtins::bish::run_abbr(&mut shell, &strs(&["--lang=go", "-e", "p"])), 1);
     }
 
@@ -15464,8 +15464,8 @@ mod tests {
         crate::builtins::bish::run_abbr(&mut shell, &strs(&["-s"]));
         assert_eq!(
             out.borrow().as_str(),
-            // The default language is left off, so an abbreviation that
-            // never mentioned one still shows the way it always did.
+            // The default language is left off, so an abbreviation without
+            // one prints as before.
             "abbr -a --lang='!(bash)' 'p' 'note %s'\nabbr -a 'plain' 'echo hi'\n"
         );
     }
@@ -15525,23 +15525,18 @@ mod tests {
     #[test]
     fn bare_shopt_and_s_and_u_alone_enumerate_every_known_option() {
         let mut shell = Shell::new();
-        // Bare `shopt` (no -s/-u, no names): every known option is a
-        // valid target, so this must not error and must not mutate
-        // anything -- this is the bug this whole patch exists to fix
-        // ("shopt without arguments does nothing").
+        // Bare `shopt` lists every option without error or change.
         assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &[]), 0);
         assert!(shell.shopt_options.is_empty());
 
-        // `shopt -s`/`shopt -u` alone list, not toggle -- no names means
-        // nothing to turn on/off, unlike `shopt -s NAME`.
+        // `shopt -s` and `shopt -u` with no names list; they don't toggle.
         assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-s"])), 0);
         assert_eq!(crate::builtins::shell::run_shopt(&mut shell, &strs(&["-u"])), 0);
         assert!(shell.shopt_options.is_empty(), "-s/-u alone must only list, never mutate");
     }
 
-    // A small local registry, so these exercise run_bishopt's own logic
-    // for every value kind without depending on which production
-    // options happen to exist.
+    // A local registry covering every value kind, independent of the real
+    // options.
     fn test_bishopts() -> Vec<(&'static str, BishOptDefault)> {
         vec![
             ("verbose", BishOptDefault::Bool(false)),
@@ -15568,8 +15563,7 @@ mod tests {
     #[test]
     fn bishopt_quiet_flag_behaves_like_the_bare_get_but_without_printing() {
         let mut shell = Shell::new();
-        // -q/--quiet only changes whether get *prints* -- the exit status
-        // (what shopt -q itself is for) is identical to the bare get's.
+        // `-q` only suppresses the output; the status is the same.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["-q", "verbose"]), &test_bishopts()), 1);
         assert_eq!(
             crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--quiet", "greeting"]), &test_bishopts()),
@@ -15702,14 +15696,9 @@ mod tests {
         assert!(!parent.bishopts.contains_key("greeting"), "parent must not see the child's later bishopt changes");
     }
 
-    // The exploit this closed, as a test: plant a symlink where the old
-    // implementation would have written, and see whether a here-document
-    // overwrites what it points at.
-    //
-    // The names are guessed the way an attacker would have to -- this
-    // process's own pid and a counter from zero -- and a spread of them
-    // is planted because the counter was process-global and some other
-    // test may have moved it. Any one of them landing is the bug.
+    // Plants symlinks at the names an attacker would guess (this pid and a
+    // counter from zero, spread since other tests may have advanced it)
+    // and checks a here-document doesn't overwrite their targets.
     #[test]
     fn a_here_document_cannot_be_aimed_at_a_file_by_planting_a_symlink() {
         use std::io::Read;
@@ -15737,40 +15726,33 @@ mod tests {
         assert_eq!(after, "UNTOUCHED", "a here-document reached a file through a planted symlink");
     }
 
-    // `set -n` is the flag whose point is that nothing happens, which
-    // makes it the one flag a shell can appear to support by doing
-    // nothing at all. It did: `n` has been in SET_FLAGS since that list
-    // was written, so `set -n` was accepted and then dropped on the
-    // floor, and a script that asked not to run ran.
+    // `set -n` must actually stop execution; accepting and ignoring it
+    // would run a script that asked not to run.
     #[test]
     fn noexec_parses_a_script_and_runs_none_of_it() {
         let mut shell = Shell::new();
         let out = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(out.clone());
 
-        // Everything before it runs; nothing after it does, including a
-        // construct and an EXIT trap registered before the flag.
+        // Everything before it runs; nothing after, not even an EXIT trap set
+        // before it.
         shell.run_source_here("echo before; trap 'echo trapped' EXIT; set -n; echo after; for i in 1 2; do echo $i; done", "<test>");
         assert_eq!(out.borrow().as_str(), "before\n");
 
-        // Recorded where a script can see it, which is what `$-` and
-        // `set -o` are for.
+        // Recorded, for `$-` and `set -o`.
         assert_eq!(shell.shell_option_enabled("noexec"), Some(true));
         assert!(shell.lookup_var("-").contains('n'), "$- must carry the flag: {:?}", shell.lookup_var("-"));
 
-        // And it cannot be undone, because undoing it is itself a
-        // command: the `set +n` above never ran.
+        // And it can't be undone: the `set +n` above never ran.
         out.borrow_mut().clear();
         shell.run_source_here("set +n; echo back", "<test>");
         assert_eq!(out.borrow().as_str(), "", "nothing can run, including the thing that would turn it off");
         assert_eq!(shell.shell_option_enabled("noexec"), Some(true));
     }
 
-    // bash ignores `set -n` from a shell somebody is typing at, and not
-    // as a courtesy: a prompt that parsed your line and declined to run
-    // it has no way left to accept `set +n`. It does not merely decline
-    // to honour it -- it does not record it, so `set +o` still says off
-    // and `$-` never grows an `n`.
+    // An interactive shell ignores `set -n`, as bash does: a prompt that
+    // ran nothing could never accept `set +n`. Not even recorded: `set +o`
+    // says off and `$-` has no `n`.
     #[test]
     fn an_interactive_shell_discards_noexec_rather_than_storing_it() {
         let mut shell = Shell::new();
@@ -15782,29 +15764,20 @@ mod tests {
         assert_eq!(out.borrow().as_str(), "still running\n");
         assert_eq!(shell.shell_option_enabled("noexec"), Some(false), "not stored, so `set +o` agrees");
         assert!(!shell.lookup_var("-").contains('n'), "{:?}", shell.lookup_var("-"));
-        // The long name is the same answer; it is one flag.
+        // The long name is the same flag.
         shell.run_source_here("set -o noexec; echo also running", "<test>");
         assert_eq!(shell.shell_option_enabled("noexec"), Some(false));
 
-        // A flag given at invocation is kept, though -- it is applied
-        // before any prompt exists, which is also bash's answer: `bash
-        // -ni -c` runs nothing.
+        // A flag given at invocation is kept, applied before any prompt;
+        // bash's `bash -ni -c` runs nothing either.
         let mut invoked = Shell::new();
         invoked.apply_shell_flag('n', true);
         invoked.mark_interactive();
         assert_eq!(invoked.shell_option_enabled("noexec"), Some(true), "the flag survives; honouring it is the loop's decision");
     }
 
-    // `::bish theme begin`/`end`'s own tests -- every `bishopt --set`
-    // inside a declaration goes through &test_bishopts(), exactly like every
-    // other run_bishopt test above; "theme" itself is a real KNOWN_BISHOPTS
-    // entry (bishopt_value/store_bishopt's own fallback logic doesn't
-    // depend on which registry a *different* option came from), so these
-    // set/read it directly rather than needing their own parallel entry
-    // in TEST_BISHOPTS.
-    // `::bish theme list` is the only way to find out what the names
-    // are, so it has to name the shipped ones with nothing configured at
-    // all -- which is exactly the state somebody asking is in.
+    // `::bish theme list` must name the shipped themes with nothing
+    // configured, since that's how one finds the names.
     #[test]
     fn theme_list_names_the_shipped_themes_and_marks_the_active_one() {
         let mut shell = Shell::new();
@@ -15825,8 +15798,8 @@ mod tests {
         assert!(text.lines().any(|l| l.starts_with("* kaamos")), "{text:?}");
         assert!(text.lines().any(|l| l.starts_with("  revontulet")), "{text:?}");
 
-        // A declared theme of its own name joins the list; one that
-        // shadows a shipped name stays a single row and says so.
+        // A declared theme joins the list; one shadowing a shipped name stays
+        // one row and says so.
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "paper"]), KNOWN_BISHOPTS), 0);
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
@@ -15835,25 +15808,22 @@ mod tests {
         assert!(text.lines().any(|l| l.starts_with("  paper\tdeclared")), "{text:?}");
     }
 
-    // The themes bish ships are a tier below a declared one and above a
-    // registered default, and the tier is per *name* -- which is the
-    // whole point: liking a shipped theme except for one colour should
-    // not mean copying the other forty.
+    // Shipped themes sit between a declared theme and a registered
+    // default, per name, so liking a shipped theme but one colour doesn't
+    // mean copying the other forty.
     #[test]
     fn a_shipped_theme_colours_what_a_declared_one_leaves_alone() {
         let mut shell = Shell::new();
-        // Nothing active: a shipped theme is inert until named, exactly
-        // as a declared one is.
+        // Nothing active: a shipped theme is inert until named.
         assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor), None);
         assert_eq!(shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory"), shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory"));
         let registered = shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory");
 
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "kaamos"]), KNOWN_BISHOPTS), 0);
         assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Truecolor), Some(vt100::Color::Rgb(0x6E, 0x0D, 0x91)));
-        // The scheme's own sixteen-slot reduction of itself, on a
-        // terminal that cannot do better.
+        // The scheme's own 16-color reduction, on a terminal limited to that.
         assert_eq!(shell.hl_color_for("keyword", crate::csscolor::ColorSupport::Ansi16), Some(vt100::Color::Indexed(5)));
-        // A chrome option too, and it is no longer the registered one.
+        // A UI option too, no longer the registered default.
         let active = shell.bishopt_value(KNOWN_BISHOPTS, "ui_col_directory");
         assert_ne!(active, registered, "a shipped theme has to beat a registered default");
         assert_eq!(
@@ -15864,8 +15834,7 @@ mod tests {
             ))
         );
 
-        // A declared theme of the same name wins for what it mentions
-        // and leaves the rest shipped.
+        // A declared theme of the same name wins for what it sets.
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "begin"])).status(), 0);
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "kaamos"]), KNOWN_BISHOPTS), 0);
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "keyword", "#010203"])), 0);
@@ -15876,12 +15845,12 @@ mod tests {
             Some(vt100::Color::Rgb(0x14, 0x7B, 0x7C)),
             "a name the declaration never mentioned still comes from the shipped theme"
         );
-        // And the listing says the same thing, bottom tier first.
+        // The listing agrees, bottom tier first.
         let colours: std::collections::HashMap<String, String> = shell.hl_colors().into_iter().collect();
         assert_eq!(colours.get("keyword").map(String::as_str), Some("#010203"));
         assert_eq!(colours.get("comment").map(String::as_str), Some("#147B7C, -bish-cyan"));
 
-        // Switching skies moves every colour that was not spoken for.
+        // Switching moves every colour not set elsewhere.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "revontulet"]), KNOWN_BISHOPTS), 0);
         assert_eq!(shell.hl_color_for("comment", crate::csscolor::ColorSupport::Truecolor), Some(vt100::Color::Rgb(0x11, 0x71, 0x72)));
         assert_eq!(
@@ -15889,8 +15858,8 @@ mod tests {
             Some(vt100::Color::Rgb(0xCB, 0x5E, 0xFB)),
             "the kaamos declaration does not follow"
         );
-        // A name nothing has ever said anything about is still unset:
-        // the shipped themes are not a registry of defaults.
+        // A name nothing mentions is still unset: shipped themes aren't a
+        // registry of defaults.
         assert_eq!(shell.hl_color_for("something_no_one_has_named", crate::csscolor::ColorSupport::Truecolor), None);
     }
 
@@ -15902,14 +15871,13 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts()), 0);
         assert_eq!(crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status(), 0);
 
-        // Neither "theme" nor "accent" was actually applied live -- both
-        // still read as whatever they were before the declaration.
+        // Neither `theme` nor `accent` was applied live.
         assert_eq!(shell.bishopt_value(KNOWN_BISHOPTS, "theme"), Some(BishOptValue::Str(String::new())));
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
         );
-        // But the theme itself was registered, "theme" entry excluded.
+        // The theme was registered, without a `theme` entry.
         let dark = shell.themes.get("dark").expect("theme must be registered");
         assert_eq!(
             dark.opts.get("accent"),
@@ -15940,21 +15908,21 @@ mod tests {
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "blue"]), &test_bishopts());
         crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
 
-        // Registering "dark" doesn't activate it by itself.
+        // Registering doesn't activate.
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color("red".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(255, 0, 0, 255))]))
         );
 
-        // Activating it (an ordinary set, outside any declaration) makes
-        // its opts the new fallback wherever nothing else was set.
+        // Activating it outside a declaration makes its options the fallback
+        // wherever nothing else was set.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "dark"]), KNOWN_BISHOPTS), 0);
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
             Some(BishOptValue::Color("blue".to_string(), vec![crate::csscolor::TermColor::Rgba(crate::csscolor::Rgba::new(0, 0, 255, 255))]))
         );
 
-        // An explicit override still wins over the active theme.
+        // An explicit setting still wins over the active theme.
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "accent", "green"]), &test_bishopts());
         assert_eq!(
             shell.bishopt_value(&test_bishopts(), "accent"),
@@ -15971,8 +15939,8 @@ mod tests {
             1,
             "a second begin while one is already in progress must be refused"
         );
-        // The original declaration must still be intact -- a set right
-        // after the refused nested begin still lands in it.
+        // The original declaration is intact: a set after the refused nested
+        // `begin` still lands in it.
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "t"]), KNOWN_BISHOPTS);
         crate::builtins::bish::run_bish(&mut shell, &strs(&["theme", "end"])).status();
         assert!(shell.themes.contains_key("t"));
@@ -16014,11 +15982,9 @@ mod tests {
         assert!(shell.themes.contains_key("fromshell"), "::bish must parse and dispatch as an ordinary command word");
     }
 
-    // Every name bish's own highlighting produces has to be spellable
-    // at `::bish hl`. Not an exhaustive list of what that command
-    // accepts -- the namespace is open -- but these are the ones that
-    // do something today, so a typo'd or duplicated entry here is a
-    // colour nobody can set.
+    // Every name bish's highlighting produces must be settable at
+    // `::bish hl`. Not all it accepts, since the namespace is open, but a
+    // typo or duplicate here is a colour nobody can set.
     #[test]
     fn every_highlight_kind_has_a_distinct_settable_name() {
         let mut names: Vec<&str> = crate::bishedit::highlight::HL_NAMES.iter().map(|(_, n)| *n).collect();
@@ -16037,29 +16003,24 @@ mod tests {
     #[test]
     fn an_unset_highlight_colour_is_none_so_the_renderer_keeps_its_own_default() {
         let mut shell = Shell::new();
-        // No registry and no defaults: `::bish hl`'s namespace is open,
-        // so the only thing that can be said about a name nobody has
-        // mentioned is that it is unset -- and the caller then uses
-        // `highlight::default_style`, which is what a fresh install
-        // rendered with before any of this existed.
+        // No registry and no defaults, since the namespace is open: an
+        // unmentioned name is unset, and the caller falls back to
+        // `highlight::default_style`.
         assert_eq!(shell.hl_color("string"), None);
         assert_eq!(shell.hl_color("something_no_one_has_named"), None);
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#123456"])), 0);
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
-        // An open namespace takes a name nothing produces yet, which is
-        // what lets a server's semantic token types be coloured before
-        // bish knows about them.
+        // A name nothing produces yet is accepted, so a server's semantic
+        // token types can be coloured before bish knows them.
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "lsp_type_parameter", "#abcdef"])), 0);
         assert_eq!(shell.hl_color("lsp_type_parameter"), Some(vt100::Color::Rgb(0xab, 0xcd, 0xef)));
-        // Unsetting takes it back to "nothing said".
+        // Unsetting returns it to unset.
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--unset", "string"])), 0);
         assert_eq!(shell.hl_color("string"), None);
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--unset", "string"])), 1, "unsetting what is not set says so");
     }
 
-    // The point of `::bish hl` being its own command but not its own
-    // *concept*: a theme is one thing you switch to, and it carries the
-    // palette along with the options.
+    // A theme carries the palette along with the options.
     #[test]
     fn a_theme_captures_highlight_colours_alongside_bishopts() {
         let mut shell = Shell::new();
@@ -16069,20 +16030,18 @@ mod tests {
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#222222"])), 0);
         assert_eq!(crate::builtins::bish::run_bish_theme(&mut shell, &strs(&["end"])), 0);
 
-        // Declaring is not switching, so nothing has changed yet.
+        // Declaring isn't switching.
         assert_eq!(shell.hl_color("string"), None);
-        // Switching brings both halves.
+        // Switching brings both.
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "theme", "midnight"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x11, 0x11, 0x11)));
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x22, 0x22, 0x22)));
 
-        // Something set directly still wins over the theme, the same
-        // precedence a bishopt has.
+        // A direct setting wins over the theme, as for a bishopt.
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#333333"])), 0);
         assert_eq!(shell.hl_color("string"), Some(vt100::Color::Rgb(0x33, 0x33, 0x33)));
-        // ...and the listing shows the theme's entries too, so `::bish
-        // hl` with no arguments answers "what is in force", not "what
-        // did I type".
+        // The listing includes the theme's entries: what's in force, not what
+        // was typed.
         let listed = shell.hl_colors();
         assert!(listed.iter().any(|(n, v)| n == "string" && v == "#333333"), "{listed:?}");
     }
@@ -16097,9 +16056,8 @@ mod tests {
     #[test]
     fn bishopt_color_resolves_the_default_then_an_override_then_none_for_unknown() {
         let mut shell = Shell::new();
-        // The chrome colours stayed bishopts, and still have defaults:
-        // `-bish-blue` is ANSI slot 4, terminal-resolved, not a fixed
-        // RGB -- so a fresh install renders as it always did.
+        // UI colours are bishopts with defaults: `-bish-blue` is ANSI slot 4,
+        // resolved by the terminal.
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Indexed(4)));
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "ui_col_directory", "#123456"]), KNOWN_BISHOPTS);
         assert_eq!(shell.bishopt_color("ui_col_directory"), Some(vt100::Color::Rgb(0x12, 0x34, 0x56)));
@@ -16149,8 +16107,7 @@ mod tests {
             ))
         );
 
-        // Echoed back verbatim on get, same as any other Color -- the
-        // whole list as typed, not whichever candidate happened to win.
+        // `get` echoes the whole list as typed, not the winning candidate.
         let buf = Rc::new(RefCell::new(String::new()));
         shell.set_sink_capture(buf.clone());
         crate::builtins::bish::run_bishopt(&mut shell, &strs(&["accent"]), &test_bishopts());
@@ -16171,11 +16128,10 @@ mod tests {
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi256), Some(vt100::Color::Indexed(200)));
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
-        // Nothing in this particular list suits ColorSupport::None -- the
-        // least-demanding candidate (last in the list) is still used.
+        // Nothing here suits `ColorSupport::None`, so the last, least
+        // demanding candidate is used.
         assert_eq!(shell.bishopt_color_for("ui_col_directory", ColorSupport::None), Some(vt100::Color::Indexed(1)));
-        // And the same tiering through `::bish hl`, which shares the
-        // candidate-picking with bishopt rather than re-deriving it.
+        // `::bish hl` shares the candidate picking.
         assert_eq!(crate::builtins::bish::run_hl(&mut shell, &strs(&["--set", "string", "#ff0000, -bish-ansi(200), -bish-red"])), 0);
         assert_eq!(shell.hl_color_for("string", ColorSupport::Truecolor), Some(vt100::Color::Rgb(255, 0, 0)));
         assert_eq!(shell.hl_color_for("string", ColorSupport::Ansi16), Some(vt100::Color::Indexed(1)));
@@ -16187,9 +16143,7 @@ mod tests {
         buf
     }
 
-    // Every exit-status/output expectation in this block was checked
-    // against real bash (`bash -c 'compgen ...'`) before being asserted
-    // here -- see run_compgen's own doc comment.
+    // The `compgen` expectations below were checked against bash.
 
     #[test]
     fn compgen_wordlist_preserves_input_order_and_filters_by_prefix() {
@@ -16207,14 +16161,12 @@ mod tests {
     fn compgen_exit_status_is_1_only_when_a_source_was_given_and_yielded_nothing() {
         let mut shell = Shell::new();
         let _buf = capture_output(&mut shell);
-        // No source at all -- always exits 0, even with a trailing word and
-        // even though nothing gets printed.
+        // No source: status 0, even with a word and no output.
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &[]), 0);
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["zzz"])), 0);
-        // A real source that produced zero matches -- exits 1.
+        // A source with no matches: 1.
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "", "--", "x"])), 1);
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "abc def", "--", "zzz"])), 1);
-        // A real source with a match -- exits 0.
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-W", "abc def", "--", "a"])), 0);
     }
 
@@ -16247,10 +16199,8 @@ mod tests {
         assert!(owned.iter().any(|n| n == "if"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "done"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "[["), "{owned:?}");
-        // `!` and `time` were left out on the grounds that bish's
-        // grammar did not reserve them. It does -- `! false` and
-        // `time f` both parse -- and `type -t` has to answer "keyword"
-        // for them, which it does off this same list.
+        // `!` and `time` are reserved words in bish's grammar too, and
+        // `type -t` answers "keyword" off this list.
         assert!(owned.iter().any(|n| n == "!"), "{owned:?}");
         assert!(owned.iter().any(|n| n == "time"), "{owned:?}");
     }
@@ -16264,8 +16214,7 @@ mod tests {
         assert_eq!(names.first().map(String::as_str), Some("EXIT"));
         assert!(names.iter().any(|n| n == "SIGTERM"), "{names:?}");
         assert!(names.iter().any(|n| n == "SIGINT"), "{names:?}");
-        // The bare (non-"SIG"-prefixed) form SIGNAL_NAMES itself stores
-        // must not leak through here.
+        // Not the bare form `SIGNAL_NAMES` stores.
         assert!(!names.iter().any(|n| n == "TERM"), "{names:?}");
     }
 
@@ -16327,8 +16276,7 @@ mod tests {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-F", "not_a_real_function", "--", "a"])), 1);
-        // Capture is a combined stdout+stderr sink (see OutputSink::Capture's
-        // own doc comment), so the error message lands right here too.
+        // Capture combines stdout and stderr, so the error lands here.
         assert_eq!(buf.borrow().as_str(), "bish: compgen: not_a_real_function: function not found\n");
     }
 
@@ -16351,9 +16299,8 @@ mod tests {
     #[test]
     fn compgen_disabled_is_always_empty_and_enabled_matches_known_builtins() {
         let mut shell = Shell::new();
-        // Same "a source was given and yielded nothing" rule as any other
-        // empty action -- `disabled` is a real, meaningfully-empty source,
-        // not "no source at all", so this still exits 1.
+        // `disabled` is a source that can be empty, so this is 1, not the
+        // no-source 0.
         assert_eq!(crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "disabled"])), 1);
         let buf = capture_output(&mut shell);
         crate::builtins::completion::run_compgen(&mut shell, &strs(&["-A", "enabled"]));
@@ -16376,11 +16323,8 @@ mod tests {
     #[test]
     fn compgen_variable_action_sees_both_a_global_and_a_local_scope_var() {
         let mut shell = Shell::new();
-        // Set through the shell rather than with `std::env::set_var`:
-        // since variables moved off the process environment (see the
-        // `globals` field), a name something else puts in the real
-        // environment behind the shell's back is deliberately not one
-        // of its variables -- that cross-talk is what the move removed.
+        // Set through the shell: a name put in the process environment from
+        // outside isn't a shell variable (see the `globals` field).
         shell.run_source_here("export BISH_COMPGEN_TEST_VAR=1", "<test>");
         shell.var_scopes.push(HashMap::from([("local_only_var".to_string(), Some("x".to_string()))]));
         let buf = capture_output(&mut shell);
@@ -16412,12 +16356,7 @@ mod tests {
         std::fs::write(dir.join("a.rs"), b"").unwrap();
         std::fs::write(dir.join("b.txt"), b"").unwrap();
 
-        // An absolute pattern (rather than relying on shell.cwd) --
-        // glob::expand resolves a bare pattern against the real process
-        // cwd, not shell.cwd (same as ordinary command-word globbing
-        // elsewhere in this file), so an absolute pattern is what actually
-        // exercises this without a racy process-wide chdir under parallel
-        // test execution.
+        // An absolute pattern, so the test doesn't depend on any cwd.
         let pattern = format!("{}/*.rs", dir.display());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
@@ -16452,33 +16391,12 @@ mod tests {
         assert!(bare_result.lines().any(|l| l == ".hidden"), "real bash's own -f does not hide dotfiles: {bare_result:?}");
     }
 
-    // Neither -F's nor -C's own subprocess round-trip is unit-tested here
-    // (only -F's up-front "does this function even exist" pre-check,
-    // above, which never spawns anything): compgen::run_external
-    // re-invokes std::env::current_exe(), and under `cargo test` that
-    // resolves to the *test harness* binary, not a real bish -- its own
-    // arg parsing has nothing to do with `-c script` and just errors.
-    // run_command_substitution/run_proc_sub_in/run_proc_sub_out (the
-    // pre-existing features this reuses the exact same self-reexec
-    // pattern from) have the same gap for the same reason, hence no unit
-    // tests for `$(...)` either -- verified instead via a live pty smoke
-    // test against the actually-compiled `bish` binary:
-    // `compgen -C "echo hi" -- curword` printed "hi compgen curword " (the
-    // trailing space from the appended empty previous-word arg), and
-    // `compgen -F myfunc -- xyz` (myfunc: `COMPREPLY=(foo bar "$2")`)
-    // printed "foo\nbar\nxyz", both matching real bash exactly.
+    // `-F` and `-C`'s round trip isn't tested here: `compgen::run_external`
+    // re-runs `current_exe()`, which under `cargo test` is the test harness.
 
-    // Regression tests for a real, pre-existing bug this session's own
-    // compgen/complete work surfaced: lexer.rs's `keyword()` has no notion
-    // of command position, so a bare word exactly matching a reserved word
-    // (if/then/.../function/[[/]]) always became its keyword token
-    // regardless of where it appeared -- `echo function` failed to parse
-    // at all ("expected function name, got None"), since the leftover
-    // Tok::KwFunction got reinterpreted as starting a *new* function
-    // definition once parse_simple_command's own word-collecting loop
-    // stopped at it. Fixed via keyword_text (lexer.rs) reversing that
-    // mapping wherever the parser is already past the point where a bare
-    // word could legitimately start a new command.
+    // A reserved word where a command can't start is a plain word:
+    // `echo function` must parse. The lexer doesn't know command position,
+    // so the parser maps such keywords back to words (`keyword_text`).
     #[test]
     fn a_keyword_shaped_word_in_argument_position_is_an_ordinary_argument() {
         let mut shell = Shell::new();
@@ -16494,10 +16412,8 @@ mod tests {
 
     #[test]
     fn a_for_loops_own_wordlist_accepts_keyword_shaped_items_including_do_and_done() {
-        // The plan's own worked example against real bash: even "do"/
-        // "done" are literal wordlist items here, since the wordlist only
-        // ends at the `;` right before the *real* `do` that opens the
-        // loop body.
+        // Checked against bash: even `do`/`done` are wordlist items, since
+        // the list ends at the `;` before the real `do`.
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"for x in if while do done; do echo "[$x]"; done"#, "<test>");
@@ -16522,11 +16438,8 @@ mod tests {
 
     #[test]
     fn an_assignment_prefix_suppresses_reserved_word_status_for_the_next_word() {
-        // Confirmed against real bash: `FOO=bar if` really does run a
-        // command literally named "if" (fails with "command not found"),
-        // it does not open an if-block. Exit 127 either way (command not
-        // found) is enough to confirm this parsed as Command::Simple, not
-        // as an (invalid, dangling) Command::If.
+        // Checked against bash: `FOO=bar if` runs a command named `if` (127),
+        // not an if-block.
         let mut shell = Shell::new();
         shell.run_source_here("FOO=bar if", "<test>");
         assert_eq!(shell.last_status, 127);
@@ -16534,11 +16447,8 @@ mod tests {
 
     #[test]
     fn a_genuinely_bare_unmatched_marker_keyword_is_still_a_syntax_error() {
-        // The one case the fix must NOT paper over: a `then`/`do`/`in`/...
-        // with no assignment prefix and no preceding word at all (i.e.
-        // truly the first token of a new simple command) is a syntax
-        // error in real bash (`true; then echo hi` -> "unexpected token
-        // `then'"), not a command literally named "then" to look up.
+        // A `then` where a command starts, with no prefix, stays a syntax
+        // error, as in bash (`true; then echo hi`).
         let mut shell = Shell::new();
         let result = shell.run_source_here("true; then echo hi", "<test>");
         assert!(matches!(result, ExecResult::Status(2)), "{result:?}");
@@ -16578,18 +16488,14 @@ mod tests {
 
     #[test]
     fn an_unrecognized_at_transform_letter_is_a_expansion_failed() {
-        // `${v@Z}` isn't one of the implemented transform letters, and
-        // parse_brace_content falls back to reading the whole `${...}`
-        // as a literal variable name -- which is a name nothing can
-        // ever set, so check_param_name catches it. bash calls it a bad
-        // substitution too; expanding it to the empty string, which is
-        // what this used to do, is how the typo went unnoticed.
+        // `@Z` isn't a transform, so the whole `${...}` reads as a variable
+        // name nothing can set, and `check_param_name` reports a bad
+        // substitution, as bash does.
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         let result = shell.run_source_here(r#"v=hi; echo "[${v@Z}]""#, "<test>");
         assert!(matches!(result, ExecResult::Exit(1)), "{result:?}");
-        // The capture takes stderr too -- the diagnostic is all there
-        // is; the `echo` never ran.
+        // The capture takes stderr too; the `echo` never ran.
         assert_eq!(buf.borrow().as_str(), "bish: ${v@Z}: bad substitution\n");
     }
 
@@ -16627,8 +16533,7 @@ mod tests {
 
     #[test]
     fn var_transform_capital_a_on_a_specific_array_index_keeps_the_array_flag() {
-        // Confirmed against real bash: ${arr[0]@A} -> declare -a arr='1'
-        // (still shows the array's own -a flag, but only that element).
+        // As in bash: `${arr[0]@A}` is `declare -a arr='1'`.
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"arr=(1 2 3); echo "${arr[0]@A}""#, "<test>");
@@ -16703,8 +16608,7 @@ mod tests {
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"p='\D{%Y}'; echo "${p@P}""#, "<test>");
-        // Just check it's a plausible 4-digit year, since we can't
-        // control the wall clock from a unit test.
+        // A plausible four-digit year; the clock can't be controlled here.
         let out = buf.borrow().clone();
         assert_eq!(out.trim_end().len(), 4);
         assert!(out.trim_end().chars().all(|c| c.is_ascii_digit()));
@@ -16766,10 +16670,7 @@ mod tests {
 
     #[test]
     fn plain_declare_without_g_auto_localizes_inside_a_function() {
-        // The bug the -g fix above was found alongside: before this, a
-        // plain (non-`-g`) declare inside a function leaked its
-        // assignment to the global scope exactly like an ordinary
-        // assignment does, instead of auto-localizing like `local`.
+        // A plain `declare` in a function is local, like `local`.
         let mut shell = Shell::new();
         shell.run_source_here(r#"f() { declare dtest_local_var=5; }; f"#, "<test>");
         assert!(!shell.var_is_set("dtest_local_var"));
@@ -16807,8 +16708,7 @@ mod tests {
         let printed = buf.borrow().clone();
         assert!(printed.contains("foo"), "{printed:?}");
 
-        // Round-trip: what got printed should itself be valid bish that
-        // (re)defines the same function.
+        // What was printed must redefine the same function.
         let mut shell2 = Shell::new();
         let result = shell2.run_source_here(&printed, "<test>");
         assert!(matches!(result, ExecResult::Status(0)), "{result:?}");
@@ -16820,15 +16720,10 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("foo() { echo hi; }", "<test>");
         let buf = capture_output(&mut shell);
-        // Named: the bare name, which is what this test has always been
-        // called and what bash prints. The assertion said `declare -f
-        // foo` -- the long form -- so the name described bash and the
-        // assertion pinned what bish did instead.
+        // With a name: the bare name, as bash prints it.
         crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-F", "foo"]), &[]);
         assert_eq!(buf.borrow().as_str(), "foo\n");
-        // Unnamed: a re-readable declaration line per function, which
-        // is the other half of bash's rule and the reason the two
-        // forms differ at all.
+        // Without: a declaration line per function, which can be read back.
         buf.borrow_mut().clear();
         crate::builtins::vars::run_declare(&mut shell, "declare", &strs(&["-F"]), &[]);
         assert_eq!(buf.borrow().as_str(), "declare -f foo\n");
@@ -16867,14 +16762,11 @@ mod tests {
 
     #[test]
     fn a_function_shadows_a_same_named_builtin() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Confirmed against real bash: a user function of the same name
-        // as an ordinary builtin (even a POSIX "special" one like
-        // export/return/break) wins, with `builtin`/`command` as the
-        // explicit bypasses.
+        // Checked against bash: a function named like a builtin, even a
+        // special one (`export`, `return`), wins; `builtin` and `command`
+        // bypass it.
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
         shell.run_source_here(r#"cd() { echo "fake cd $1"; }; cd /somewhere"#, "<test>");
@@ -16883,9 +16775,7 @@ mod tests {
 
     #[test]
     fn builtin_bypasses_a_shadowing_function() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
@@ -16912,18 +16802,14 @@ mod tests {
 
     #[test]
     fn restrict_to_builtins_still_blocks_a_shadowing_function() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // restrict_to_builtins (command mode's colon-line) means "only
-        // real builtins run here" -- unlike ordinary dispatch, it must
-        // NOT let a same-named function preempt the actual builtin.
+        // `restrict_to_builtins` (the colon line) runs only builtins: a
+        // function of the same name must not preempt one.
         let mut shell = Shell::new();
         shell.restrict_to_builtins = true;
         let buf = capture_output(&mut shell);
-        // Defining the function itself still works (declare/functions
-        // aren't gated); only invoking it as a command is.
+        // Defining the function still works; only running it is gated.
         shell.restrict_to_builtins = false;
         shell.run_source_here("cd() { echo fake; }", "<test>");
         shell.restrict_to_builtins = true;
@@ -16951,7 +16837,7 @@ mod tests {
 
     #[test]
     fn array_literal_mixed_positional_and_keyed_resumes_the_running_index() {
-        // Matches real bash: (1 [5]=x 2) -> indices 0, 5, 6.
+        // As in bash: `(1 [5]=x 2)` has indices 0, 5, 6.
         let mut shell = Shell::new();
         shell.run_source_here("arr=(1 [5]=x 2)", "<test>");
         let arr = shell.arrays.get("arr").cloned().unwrap_or_default();
@@ -16978,11 +16864,8 @@ mod tests {
 
     #[test]
     fn declare_capital_a_with_an_inline_array_literal_as_a_later_word() {
-        // The actual gap this whole batch of work was about: `declare -A
-        // m=([a]=1 [b]=2)` used to mis-parse entirely (the parenthesized
-        // body got read as an unrelated subshell command) since array-
-        // literal recognition only applied in leading-prefix-assignment
-        // position, not to a later word of one of these five builtins.
+        // `declare -A m=([a]=1 [b]=2)`: an array literal as a later word of
+        // one of these builtins, not only as a leading assignment.
         let mut shell = Shell::new();
         shell.run_source_here("declare -A m=([a]=1 [b]=2)", "<test>");
         assert_eq!(shell.assoc_arrays.get("m").and_then(|m| m.get("a")).map(String::as_str), Some("1"));
@@ -17024,9 +16907,7 @@ mod tests {
 
     #[test]
     fn restricted_mode_blocks_cd() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
@@ -17034,25 +16915,20 @@ mod tests {
         assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
     }
 
-    // `let` must not expand its own argument. The word stage already
-    // did, so a second pass runs whatever the first pass produced:
-    // `x='$(cmd)'; let "y=$x+1"` executed cmd, which makes `let
-    // "n=$untrusted"` -- an ordinary thing to write -- command
-    // execution. bash expands `let`'s text not at all, so this is its
-    // behaviour as well as the safe one.
+    // `let` doesn't expand its argument again: the word stage already did,
+    // and a second pass would make `let "n=$untrusted"` run commands. bash
+    // doesn't expand `let`'s text either.
     #[test]
     fn let_does_not_expand_what_was_already_expanded() {
         let mut shell = Shell::new();
-        // Arithmetic still works, including through a variable: the word
-        // stage substitutes the value and `let` evaluates it.
+        // Arithmetic through a variable still works.
         shell.run_source_here("x=5; let 'y=x+1'", "<test>");
         assert_eq!(shell.lookup_var("y"), "6");
         shell.run_source_here("let \"z=$x*2\"", "<test>");
         assert_eq!(shell.lookup_var("z"), "10");
 
-        // A command substitution that survived the word stage -- because
-        // it was quoted, or because it came out of a variable -- is a
-        // syntax error and not a command.
+        // A command substitution left after the word stage (quoted, or from a
+        // variable) is a syntax error, not a command.
         for form in ["let \"q=$sub+1\"", "let \"$sub\"", "let 'q=$(echo 9)'"] {
             let mut shell = Shell::new();
             shell.run_source_here("sub='$(echo 9)'", "<test>");
@@ -17062,13 +16938,10 @@ mod tests {
         }
     }
 
-    // A re-exec'd child is handed the shell's state as a script, and
-    // restriction has to be part of it -- it has no `-o` name, so the
-    // option replay never carried it and every backgrounded subshell
-    // arrived unrestricted. The corpus checks the behaviour against
-    // bash; this checks the one thing it cannot see, which is the
-    // *order*: `set -r` has to come after the assignments, because PATH
-    // is readonly once it is in force.
+    // A re-exec'd child gets restriction in its state script, since it has
+    // no `-o` name for the option replay. The corpus checks behaviour; this
+    // checks order: `set -r` after the assignments, since it makes PATH
+    // readonly.
     #[test]
     fn the_preamble_restricts_a_child_only_after_telling_it_everything() {
         let mut shell = Shell::new();
@@ -17077,10 +16950,8 @@ mod tests {
         shell.run_source_here("set -r", "<test>");
         let preamble = shell.functions_preamble();
         assert!(preamble.ends_with("set -r\n"), "restriction has to be the last thing said: {preamble:?}");
-        // And the assignments it would have made illegal are above it.
-        // `BASH_ENV` is one of the names restriction makes readonly, so
-        // a `set -r` written any earlier would have the child refuse the
-        // line that carries it.
+        // `BASH_ENV` is readonly under restriction, so its assignment must
+        // come before `set -r`.
         let mut shell = Shell::new();
         shell.run_source_here("BASH_ENV=/dev/null; set -r", "<test>");
         let preamble = shell.functions_preamble();
@@ -17088,10 +16959,8 @@ mod tests {
         assert!(preamble[..at].contains("BASH_ENV="), "a readonly-under-r name has to be assigned before: {preamble:?}");
     }
 
-    // The two places a program name reaches `Command::new` without this
-    // shell's dispatch: a language server and a debug adapter. Both are
-    // started later, from code with no `Shell`, so the name is checked
-    // where it is given -- by the same rule a command name follows.
+    // A language server and a debug adapter are named outside dispatch, so
+    // the name is checked where it's given, by the command-name rule.
     #[test]
     fn a_restricted_shell_refuses_to_register_a_program_by_path() {
         let mut shell = Shell::new();
@@ -17111,9 +16980,7 @@ mod tests {
 
     #[test]
     fn restricted_mode_is_a_one_way_latch() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         shell.run_source_here("set -r; set +r", "<test>");
@@ -17142,14 +17009,12 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
         for name in ["SHELL", "PATH", "ENV", "BASH_ENV"] {
-            // Fatal, not merely refused: a write to a readonly name
-            // stops a non-interactive shell, which is what real bash
-            // does here too (`bash -r -c 'SHELL=/x; echo after'`
-            // prints the error and nothing else, exiting 1).
+            // Fatal, as in bash: a write to a readonly name stops a
+            // non-interactive shell (`bash -r -c 'SHELL=/x; echo after'`).
             let result = shell.run_source_here(&format!("{name}=/tmp"), "<test>");
             assert!(matches!(result, ExecResult::Exit(1)), "{name}: {result:?}");
         }
-        // Still readable/unchanged, just refused as a write target.
+        // Readable, just not writable.
         assert_ne!(shell.lookup_var("PATH"), "/tmp");
     }
 
@@ -17172,11 +17037,8 @@ mod tests {
 
     #[test]
     fn restricted_mode_allows_input_redirection() {
-        // Plain `<` must not be treated as a write and refused --
-        // confirmed by exit status alone (an external command's own
-        // stdout goes straight to this process's real inherited stdio,
-        // not through capture_output's sink, so its content isn't
-        // observable from a unit test here).
+        // Plain `<` isn't a write. Checked by status, since an external's
+        // stdout bypasses the capture.
         let mut shell = Shell::new();
         shell.run_source_here("set -r", "<test>");
         let result = shell.run_source_here("cat < /etc/hostname", "<test>");
@@ -17234,11 +17096,9 @@ mod tests {
         assert!(!shell.opt_posix);
     }
 
-    // Regression: a `${var op word}` expansion's raw-word scan used to stop
-    // at the first literal '}', even one reached only through a quoted
-    // nested expansion (`${x:-"${x}"}`, the `${VAR+"${VAR}"}` idiom mise's
-    // own activation script uses) -- it would mistake that inner '}' for
-    // the outer terminator and then fail with "unterminated double quote".
+    // A `${var op word}` operand may contain a `}` inside a quoted nested
+    // expansion (`${x:-"${x}"}`, the `${VAR+"${VAR}"}` idiom mise's
+    // activation uses).
     #[test]
     fn var_op_word_with_a_nested_quoted_expansion_finds_the_real_closing_brace() {
         let mut shell = Shell::new();
@@ -17274,32 +17134,22 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "a{b\n");
     }
 
-    // Regression: `declare -f`/`-F` on a name that isn't a function used to
-    // print "declare: NAME: not found" to stderr -- real bash fails
-    // silently there (unlike `declare -p` on a nonexistent variable, which
-    // does print a message). This surfaced as a spurious message on every
-    // bish startup once the nested-expansion fix above let mise's own
-    // `declare -F _mise_hook >/dev/null && unset -f _mise_hook`-style guards
-    // actually run.
+    // `declare -f`/`-F` on a non-function fails silently, as in bash
+    // (unlike `declare -p`); mise's activation guards on it.
     #[test]
     fn declare_f_on_a_nonexistent_function_is_silent() {
         let mut shell = Shell::new();
-        // capture_output's sink backs both stdout and stderr, so an empty
-        // buffer here means the builtin wrote nothing at all.
+        // The capture backs both stdout and stderr, so empty means nothing
+        // was written.
         let buf = capture_output(&mut shell);
         let result = shell.run_source_here("declare -F not_a_real_function_xyz", "<test>");
         assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
         assert_eq!(buf.borrow().as_str(), "");
     }
 
-    // Regression: builtins used to ignore their own per-command redirects
-    // entirely (their output always went straight to the shell's own
-    // sink) -- confirmed as a real problem via mise's own bash activation
-    // script, which relies on `declare -p foo >/dev/null 2>&1`/`declare -F
-    // foo >/dev/null`-style guards actually being silenced. These check
-    // push_builtin_output_sink/pop_builtin_output_sink (installed around
-    // every dispatch_builtin_or_external call) against real bash's own
-    // observed behavior for each redirect form.
+    // Builtins honour their own redirects, checked against bash for each
+    // form; mise's activation silences guards with
+    // `declare -p foo >/dev/null 2>&1`.
     #[test]
     fn builtin_stderr_redirected_to_dev_null_leaves_the_shells_own_sink_untouched() {
         let mut shell = Shell::new();
@@ -17355,8 +17205,6 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "hi\n");
     }
 
-    // The one thing a parallel table can get wrong: an option nobody
-    // wrote a line for, or a line for an option that no longer exists.
     #[test]
     fn every_bishopt_is_described() {
         let mut options: Vec<&str> = KNOWN_BISHOPTS.iter().map(|(n, _)| *n).collect();
@@ -17376,7 +17224,7 @@ mod tests {
         assert!(lines.contains("accepts: 1-64"), "{lines}");
         assert!(lines.contains("default: 4"), "{lines}");
         assert!(lines.contains("now: 4"), "{lines}");
-        // ...and it follows the live value.
+        // It follows the live value.
         assert_eq!(crate::builtins::bish::run_bishopt(&mut shell, &strs(&["--set", "shiftwidth", "2"]), KNOWN_BISHOPTS), 0);
         assert!(shell.describe_bishopts(KNOWN_BISHOPTS, Some("shiftwidth")).join("\n").contains("now: 2"));
     }
