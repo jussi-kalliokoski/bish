@@ -14658,10 +14658,11 @@ fn run_command_mode(
                                     // The `git` capability, from the file's own
                                     // directory: an untrusted repo gets no blame
                                     // gutter, because blame runs its filters.
+                                    let owned_default = app.sessions.get(&session_id).map(|s| s.shell.bishopt_str("trust_owned")).unwrap_or_default();
                                     let trusted = tb
                                         .path()
                                         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                                        .is_some_and(|d| crate::trust::is_trusted(&d, "git"));
+                                        .is_some_and(|d| crate::trust::is_trusted(&d, "git", &owned_default));
                                     match fileeditor::toggle_git_blame(tb, subarg, trusted) {
                                         Ok(on) => {
                                             let output = if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };

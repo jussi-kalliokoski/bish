@@ -17358,6 +17358,16 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     // `tab` by default, which is what the opener did before it could be
     // asked, and `*` so the key cycles all four until somebody says
     // otherwise.
+    // Capabilities a directory you own is trusted for without a
+    // `::bish trust` entry -- a glob over the same capability names, as
+    // `opener_targets` is over destinations. Empty by default, which
+    // trusts nothing: owning a directory is a weaker signal than
+    // vouching for it (you own a tarball the moment you extract it), so
+    // the safe default is that ownership grants nothing and every
+    // directory is untrusted until `::bish trust` says otherwise. Set it
+    // to `git`, or `*`, to opt into "trust what I own" for those
+    // capabilities -- a deliberate loosening, not the default.
+    ("trust_owned", BishOptDefault::Str("")),
     ("opener_target", BishOptDefault::Str("tab")),
     ("opener_targets", BishOptDefault::Str("*")),
     // The other place columns have to line up, and the one where the
@@ -17584,6 +17594,7 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("extends", "Shown in the last column when a line continues off the right edge."),
     ("precedes", "Shown in the first column when a line continues off the left edge."),
     ("tabular", "Which languages draw their columns lined up. A language glob, as `abbr --lang` uses."),
+    ("trust_owned", "Capabilities a directory you own is trusted for with no `::bish trust` entry (a glob; empty trusts nothing)."),
     ("opener_target", "Where Ctrl+T's opener starts: `tab`, `here`, `vsplit` (stacked) or `hsplit` (side by side)."),
     ("opener_targets", "Which of those Ctrl+T cycles through, as a glob over their names."),
     ("table_wrap", "Fit a rendered markdown table to the pane by wrapping its cells. Off, it keeps its full width and the pager scrolls sideways."),

@@ -256,7 +256,9 @@ pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
             let dir = resolve(sh, rest.first().map(String::as_str).unwrap_or("."));
             // A predicate: silent, and the exit status is the answer --
             // `::bish trust --check git && ...`, the way `test` is used.
-            i32::from(!crate::trust::is_trusted(&dir, capability))
+            // Honours `trust_owned` too, so a hook's check gives the
+            // same answer bish's own git integration would.
+            i32::from(!crate::trust::is_trusted(&dir, capability, &sh.bishopt_str("trust_owned")))
         }
         Some("--remove") | Some("-r") => {
             let default = [".".to_string()];

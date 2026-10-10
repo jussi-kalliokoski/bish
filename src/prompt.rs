@@ -219,7 +219,7 @@ fn username() -> String {
 // `git status`'s branch/dirty segment, or empty outside a repo (or with
 // no `git` on $PATH -- `git::head_status`'s own doc comment covers why
 // those two cases aren't told apart here).
-fn git_segment(cwd: &std::path::Path, budget: Option<usize>) -> String {
+fn git_segment(cwd: &std::path::Path, budget: Option<usize>, owned_default: &str) -> String {
     let fitted = |branch: &str, taken: usize| match budget {
         // The parentheses and the dirty marker are part of the segment
         // the budget is about, so the name itself gets what is left of
@@ -231,7 +231,7 @@ fn git_segment(cwd: &std::path::Path, budget: Option<usize>) -> String {
     // reads the branch from .git/HEAD and runs no git in the worktree
     // (see git::head_status), so a repository's own config cannot turn a
     // prompt draw into code execution.
-    let trusted = crate::trust::is_trusted(cwd, "git");
+    let trusted = crate::trust::is_trusted(cwd, "git", owned_default);
     match crate::git::head_status(cwd, trusted) {
         Some(status) if status.dirty => format!(" {GIT_DIRTY_COLOR}({}*){RESET}", fitted(&status.branch, 3)),
         Some(status) => format!(" {GIT_CLEAN_COLOR}({}){RESET}", fitted(&status.branch, 2)),
@@ -255,7 +255,7 @@ fn prefix(shell: &Shell, is_root: bool, cols: usize) -> String {
         Some(columns) => fit_path(&path, columns),
         None => path,
     };
-    let git = git_segment(&shell.cwd, budget(shell.bishopt_int("prompt_git_budget"), cols));
+    let git = git_segment(&shell.cwd, budget(shell.bishopt_int("prompt_git_budget"), cols), &shell.bishopt_str("trust_owned"));
     let uh_color = if is_root { ROOT_USER_HOST_COLOR } else { USER_HOST_COLOR };
     let path_color = if is_root { ROOT_PATH_COLOR } else { PATH_COLOR };
     format!("{uh_color}{host}{RESET}:{path_color}{path}{RESET}{git}")

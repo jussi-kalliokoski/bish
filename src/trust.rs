@@ -80,16 +80,32 @@ pub fn load() -> Vec<Entry> {
 /// Whether `dir` is trusted for `capability` -- the one question
 /// everything that acts on a directory's own say-so asks.
 ///
-/// True when some recorded entry covers `dir` -- is it, or an ancestor
-/// of it -- and that entry's capability glob matches the one asked for.
-/// Both sides are resolved to real paths first, so neither a relative
-/// query nor a symlinked tree escapes the comparison.
-pub fn is_trusted(dir: &Path, capability: &str) -> bool {
+/// Trusted when some recorded entry covers `dir` -- is it, or an
+/// ancestor of it -- and that entry's capability glob matches; both
+/// sides are resolved to real paths first.
+///
+/// `owned_default` is the `trust_owned` bishopt: a glob of capabilities a
+/// directory you own is trusted for with no recorded entry. Empty by
+/// default, trusting nothing -- owning a place is a weaker signal than
+/// vouching for it (a downloaded archive is yours the moment you unpack
+/// it), so this grants nothing unless the option is deliberately set.
+pub fn is_trusted(dir: &Path, capability: &str, owned_default: &str) -> bool {
     let dir = canonical(dir);
-    load().iter().any(|entry| {
+    let by_entry = load().iter().any(|entry| {
         let root = canonical(&entry.dir);
         (dir == root || dir.starts_with(&root)) && glob::matches(&entry.capabilities, capability)
-    })
+    });
+    by_entry || (!owned_default.is_empty() && glob::matches(owned_default, capability) && owned_by_this_user(&dir))
+}
+
+/// Whether `dir` is owned by the user bish is running as.
+///
+/// The effective uid, since that is who would act on the trust. A
+/// directory bish cannot stat is not owned -- the check fails closed, so
+/// an unreadable or vanished path grants nothing.
+fn owned_by_this_user(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).map(|m| m.uid() == crate::platform::effective_user()).unwrap_or(false)
 }
 
 /// Records `dir` as trusted for `capabilities`, replacing any entry for
@@ -191,20 +207,20 @@ mod tests {
             trust(&repo, "*").unwrap();
 
             // The directory itself and everything under it.
-            assert!(is_trusted(&repo, "git"));
-            assert!(is_trusted(&repo.join("src"), "git"));
-            assert!(is_trusted(&repo.join("src/inner"), "anything-at-all"));
+            assert!(is_trusted(&repo, "git", ""));
+            assert!(is_trusted(&repo.join("src"), "git", ""));
+            assert!(is_trusted(&repo.join("src/inner"), "anything-at-all", ""));
             // Not its parent, and not a sibling.
-            assert!(!is_trusted(root, "git"));
+            assert!(!is_trusted(root, "git", ""));
             std::fs::create_dir_all(root.join("other")).unwrap();
-            assert!(!is_trusted(&root.join("other"), "git"));
+            assert!(!is_trusted(&root.join("other"), "git", ""));
 
             // A narrower glob trusts only what it matches.
             let tool = root.join("tool");
             std::fs::create_dir_all(&tool).unwrap();
             trust(&tool, "mise:*").unwrap();
-            assert!(is_trusted(&tool, "mise:env"));
-            assert!(!is_trusted(&tool, "git"));
+            assert!(is_trusted(&tool, "mise:env", ""));
+            assert!(!is_trusted(&tool, "git", ""));
         });
     }
 
@@ -219,9 +235,9 @@ mod tests {
             // directory: trust is about the place, not the name.
             let link = root.join("link");
             std::os::unix::fs::symlink(&real, &link).unwrap();
-            assert!(is_trusted(&link, "git"), "a symlink to a trusted dir is trusted");
+            assert!(is_trusted(&link, "git", ""), "a symlink to a trusted dir is trusted");
             std::fs::create_dir_all(link.join("sub")).unwrap();
-            assert!(is_trusted(&link.join("sub"), "git"), "...and so is a path reached through it");
+            assert!(is_trusted(&link.join("sub"), "git", ""), "...and so is a path reached through it");
         });
     }
 
@@ -233,11 +249,11 @@ mod tests {
             trust(&dir, "*").unwrap();
             trust(&dir, "git").unwrap();
             assert_eq!(load().iter().filter(|e| canonical(&e.dir) == canonical(&dir)).count(), 1, "one entry per directory");
-            assert!(is_trusted(&dir, "git"));
-            assert!(!is_trusted(&dir, "mise:env"), "the second trust replaced the first's `*`");
+            assert!(is_trusted(&dir, "git", ""));
+            assert!(!is_trusted(&dir, "mise:env", ""), "the second trust replaced the first's `*`");
 
             assert!(untrust(&dir).unwrap());
-            assert!(!is_trusted(&dir, "git"));
+            assert!(!is_trusted(&dir, "git", ""));
             assert!(!untrust(&dir).unwrap(), "nothing left to remove");
         });
     }
@@ -250,6 +266,48 @@ mod tests {
             let path = store_path().unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
             assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        });
+    }
+
+    // `trust_owned`: a directory you own is trusted for the capabilities
+    // its glob matches, with no recorded entry -- the opt-in "trust what
+    // I own", off by default.
+    #[test]
+    fn owning_a_directory_trusts_it_only_when_the_option_is_set() {
+        with_store(|root| {
+            let mine = root.join("mine");
+            std::fs::create_dir_all(&mine).unwrap();
+            // The temp dir is created by this test, so it is owned by
+            // this user -- the case the option is about.
+
+            // Default (empty) trusts nothing, even what you own: this is
+            // the no-trust-by-default the audit settled on.
+            assert!(!is_trusted(&mine, "git", ""));
+            // Set to `git`: owned directory is now trusted for git, and
+            // only git.
+            assert!(is_trusted(&mine, "git", "git"));
+            assert!(!is_trusted(&mine, "mise:env", "git"));
+            // `*` trusts it for everything.
+            assert!(is_trusted(&mine, "anything", "*"));
+            // It descends like any trust -- a subdir you own is covered.
+            std::fs::create_dir_all(mine.join("sub")).unwrap();
+            assert!(is_trusted(&mine.join("sub"), "git", "git"));
+            // A directory owned by someone else is not trusted no matter
+            // the option: /proc is root-owned and a reliable stand-in on
+            // the machines bish runs on. Skipped where it is not there.
+            let other = std::path::Path::new("/proc");
+            if other.is_dir() {
+                use std::os::unix::fs::MetadataExt;
+                if std::fs::metadata(other).map(|m| m.uid() != crate::platform::effective_user()).unwrap_or(false) {
+                    assert!(!is_trusted(other, "git", "*"), "ownership, not just the glob, has to hold");
+                }
+            }
+            // An explicit entry still works with the option off, which
+            // is the ordinary path.
+            assert!(!is_trusted(&root.join("elsewhere"), "git", ""));
+            std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+            trust(&root.join("elsewhere"), "*").unwrap();
+            assert!(is_trusted(&root.join("elsewhere"), "git", ""));
         });
     }
 
