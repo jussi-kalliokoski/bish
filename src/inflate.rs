@@ -1,53 +1,34 @@
-// DEFLATE decompression (RFC 1951), hand-rolled -- no external crate,
-// same spirit as glob.rs/regex.rs/json.rs/csscolor.rs. Decompression
-// only: nothing in this codebase produces compressed output, and a
-// compressor is a genuinely separate (and much larger) problem --
-// Huffman *construction*, match finding, block splitting -- with no
-// caller here to justify it.
+// DEFLATE decompression (RFC 1951). Decompression only: nothing here
+// produces compressed output.
 //
-// The decoder follows Mark Adler's own `puff` reference structure
-// (canonical Huffman decoded one bit at a time, walking the code-length
-// counts) rather than the table-driven approach zlib itself ships. That
-// costs speed and buys a decoder small enough to read in one sitting and
-// check against the RFC line by line -- the right trade for what this is
-// for (opening an archive in the editor), where the files are a script
-// or a config, not a filesystem image. If a real performance need ever
-// shows up it looks like noticeable lag opening one specific large
-// member, at which point a multi-bit lookup table is a self-contained
-// change to `Huffman::decode` alone.
-//
-// Callers: archive.rs (gzip and zip both frame a raw DEFLATE stream).
+// Structured like Mark Adler's `puff` (canonical Huffman decoded a bit at
+// a time from the code-length counts) rather than zlib's tables: slower,
+// but small enough to check against the RFC, and the files are scripts
+// and configs. A multi-bit lookup table would be a change to
+// `Huffman::decode` alone. Used by archive.rs (gzip and zip both wrap raw
+// DEFLATE).
 
-// How many bytes one call may decompress to. DEFLATE's own maximum
-// ratio is about 1032:1 and gzip members concatenate (archive::gunzip
-// loops over them), so without a ceiling a megabyte of input can ask
-// for hundreds of gigabytes of memory -- and the paths that get here
-// are not all interactive: manpages.rs gunzips whatever `man -w` points
-// at, on a background thread, while you type at the prompt. Same
-// precedent as framing.rs's MAX_CONTENT_LENGTH: refuse rather than trust
-// the size a stranger's file asks for.
-//
-// 64 MiB, the same number lsp.rs already picked for the same kind of
-// question, is far past anything this decoder exists for (a script, a
-// config, a man page) and far below anything that hurts. A caller with
-// a tighter idea of what it is reading passes its own budget instead --
-// see manpages.rs, whose reads are not user-initiated at all.
+// How many bytes one call may decompress to. DEFLATE's ratio reaches
+// about 1032:1 and gzip members concatenate, so a megabyte of input
+// could ask for hundreds of gigabytes, and not only interactively:
+// manpages.rs gunzips what `man -w` names on a background thread. 64
+// MiB, as lsp.rs's limit, is far above any script, config or man page.
+// Callers expecting less pass their own budget (manpages.rs).
 pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
-// A code is at most 15 bits, and the two alphabets are at most 288/30
-// symbols -- all three fixed by the RFC, not tuning knobs.
+// Fixed by the RFC: codes of at most 15 bits, alphabets of at most 288
+// and 30 symbols.
 const MAX_BITS: usize = 15;
 const MAX_LIT_CODES: usize = 288;
-// 30 distance codes carry meaning (DIST_BASE below), but the alphabet is
-// 32 symbols wide: the fixed code assigns all 32 a 5-bit code, and HDIST
-// may legally announce up to 32. Codes 30 and 31 simply never appear in
-// a valid stream, which compressed_block checks for when one does.
+// 30 distance codes mean something (`DIST_BASE`), but the alphabet is
+// 32 wide: the fixed code gives all 32 a 5-bit code, and HDIST may name
+// 32. Codes 30 and 31 never appear in a valid stream;
+// `compressed_block` rejects them.
 const MAX_DIST_CODES: usize = 32;
 
-// Length codes 257..=285: the base length each stands for, and how many
-// extra bits follow it. Code 284's own 5 extra bits can encode 227..=257,
-// but 285 is defined as exactly 258 with no extra bits, so the two
-// overlap at the top -- that's the RFC's own table, not a mistake here.
+// Length codes 257..=285: each one's base length and extra bits. 284
+// with 5 extra bits reaches 227..=257, and 285 is exactly 258 with none,
+// so they overlap at the top, as the RFC's table has it.
 const LENGTH_BASE: [u16; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LENGTH_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
 
@@ -55,16 +36,14 @@ const DIST_BASE: [u16; 30] =
     [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 
-// The order the dynamic-block header sends its code-length code lengths
-// in -- front-loaded so the ones most likely to be zero end up last and
-// can be omitted entirely (that's what HCLEN counts).
+// The order a dynamic header sends its code-length code lengths, the
+// likely zeros last so HCLEN can omit them.
 const CODE_LENGTH_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-// DEFLATE reads its bits least-significant-first *within* each byte,
-// while a Huffman code's own bits arrive most-significant-first -- the
-// one genuinely confusing thing about the format, and the reason
-// `Huffman::decode` pulls one bit at a time and shifts it in from the
-// bottom rather than grabbing a whole code at once.
+// DEFLATE packs bits least significant first within each byte, while a
+// Huffman code's bits arrive most significant first, so
+// `Huffman::decode` takes one bit at a time and shifts it in from the
+// bottom.
 struct Bits<'a> {
     data: &'a [u8],
     pos: usize,
@@ -91,24 +70,21 @@ impl<'a> Bits<'a> {
         Ok(value)
     }
 
-    // Drops the partial byte, for a stored block (whose LEN/NLEN and
-    // payload are byte-aligned).
+    // Drops the partial byte, for a stored block, whose header and payload
+    // are byte-aligned.
     fn align(&mut self) {
         let whole = self.count / 8;
         self.buf = 0;
         self.count = 0;
-        // Bytes already read into `buf` that were never consumed have to
-        // go back, or the stored block would start mid-way through the
-        // data.
+        // Whole bytes read into `buf` but unconsumed go back, or the stored
+        // block would start mid-data.
         self.pos -= whole as usize;
     }
 }
 
-// A canonical Huffman code, stored the way decoding actually wants it:
-// how many codes there are of each bit length, and the symbols in
-// canonical order. That's all the shape a canonical code has -- the code
-// *values* themselves are implied by the lengths, so they're never
-// materialized.
+// A canonical Huffman code as decoding wants it: how many codes of each
+// length, and the symbols in canonical order. The code values follow
+// from the lengths, so they're never stored.
 struct Huffman {
     counts: [u16; MAX_BITS + 1],
     symbols: Vec<u16>,
@@ -124,18 +100,15 @@ impl Huffman {
             }
             counts[len as usize] += 1;
         }
-        // A code with every length zero decodes nothing; that's legal
-        // (an unused distance alphabet, for one) and only an error if
-        // something later actually tries to read a symbol from it.
+        // Every length zero decodes nothing, which is legal (an unused
+        // distance alphabet) until something reads a symbol from it.
         if counts[0] as usize == lengths.len() {
             return Ok(Huffman { counts, symbols: Vec::new() });
         }
-        // Kraft's inequality, checked the way puff does: `left` is how
-        // many codes of the current length are still unassigned, and it
-        // going negative means the code is over-subscribed (two symbols
-        // sharing a prefix). Left over at the end means incomplete --
-        // rejected too, since a decoder that ran off the end of an
-        // incomplete code would read whatever came next as a symbol.
+        // Kraft's inequality, as puff checks it: `left` counts unassigned
+        // codes of the current length; negative means over-subscribed (two
+        // symbols sharing a prefix), leftover at the end means incomplete,
+        // also rejected, since decoding would run off the end of the code.
         let mut left = 1i32;
         #[allow(clippy::needless_range_loop, reason = "`len` is a code length; the range is the alphabet, not `counts`")]
         for len in 1..=MAX_BITS {
@@ -148,14 +121,12 @@ impl Huffman {
         if left > 0 {
             return Err("incomplete Huffman code".to_string());
         }
-        // Where each length's symbols start inside `symbols`, then the
-        // symbols filled in in symbol order -- which *is* canonical
-        // order, since canonical codes are assigned in increasing
-        // (length, symbol) order.
+        // Where each length's symbols start in `symbols`, then the symbols in
+        // symbol order, which is canonical order, since canonical codes go by
+        // (length, symbol).
         let mut offsets = [0u16; MAX_BITS + 2];
-        // `len` is a code length, not just an index -- it addresses two
-        // different arrays at two different offsets -- so iterating the
-        // slice instead would obscure exactly the thing that matters.
+        // `len` addresses two arrays at two offsets, so it's a range, not an
+        // iterator over one.
         for len in 1..=MAX_BITS {
             offsets[len + 1] = offsets[len] + counts[len];
         }
@@ -169,10 +140,9 @@ impl Huffman {
         Ok(Huffman { counts, symbols })
     }
 
-    // Walks lengths shortest-first, keeping `first` (the first code
-    // value of this length) and `index` (where this length's symbols
-    // start) in step, until the code read so far falls inside the
-    // current length's range.
+    // Walks lengths shortest first, keeping `first` (this length's first
+    // code) and `index` (where its symbols start) in step, until the code
+    // read so far falls in the current length's range.
     fn decode(&self, bits: &mut Bits) -> Result<u16, String> {
         let mut code = 0i32;
         let mut first = 0i32;
@@ -191,9 +161,8 @@ impl Huffman {
     }
 }
 
-// The block type 01 alphabets, which every stream can use without
-// sending a header for them -- their lengths are written into the RFC
-// itself rather than into the file.
+// Block type 01's alphabets, whose lengths are in the RFC, not the
+// stream.
 fn fixed_tables() -> (Huffman, Huffman) {
     let mut lit = [0u8; MAX_LIT_CODES];
     for (sym, len) in lit.iter_mut().enumerate() {
@@ -204,30 +173,23 @@ fn fixed_tables() -> (Huffman, Huffman) {
             _ => 8,
         };
     }
-    // All 32, not just the 30 meaningful ones -- 30 five-bit codes would
-    // leave two of the 32 five-bit slots unused, which is an incomplete
-    // code and rightly rejected.
+    // All 32: 30 five-bit codes would leave the code incomplete.
     let dist = [5u8; MAX_DIST_CODES];
-    // Both are complete by construction, so the unwraps can't fire.
+    // Both complete by construction.
     (Huffman::build(&lit).unwrap(), Huffman::build(&dist).unwrap())
 }
 
-// Every byte `data` decompresses to. `data` is a *raw* DEFLATE stream:
-// no zlib header, no gzip header -- peeling those is the container's job
-// (archive.rs).
+// Everything a raw DEFLATE stream decompresses to; zlib or gzip headers
+// are the container's (archive.rs).
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
     inflate_prefix(data, MAX_OUTPUT).map(|(out, _)| out)
 }
 
-// `inflate`, plus how many bytes of `data` the stream actually occupied
-// -- what a container needs to find whatever follows it (gzip's own
-// CRC/length trailer, and then possibly another member: see
-// archive::gunzip). A DEFLATE stream doesn't announce its own length,
-// so this is the only way to know.
-//
-// `max_out` is how many bytes this stream may produce -- MAX_OUTPUT for
-// a caller decompressing one thing, and whatever is left of that budget
-// for a caller walking a sequence of them.
+// `inflate`, plus how many bytes of `data` the stream took, so a
+// container can find what follows (gzip's trailer and maybe another
+// member, see `archive::gunzip`); DEFLATE doesn't record its length.
+// `max_out` is this stream's output budget: `MAX_OUTPUT`, or what's
+// left of it across a sequence.
 pub fn inflate_prefix(data: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), String> {
     let mut bits = Bits::new(data);
     let mut out = Vec::new();
@@ -246,8 +208,8 @@ pub fn inflate_prefix(data: &[u8], max_out: usize) -> Result<(Vec<u8>, usize), S
             _ => return Err("invalid DEFLATE block type".to_string()),
         }
         if last {
-            // Whole bytes pulled into the bit buffer but never consumed
-            // belong to whatever comes next, not to this stream.
+            // Whole bytes in the bit buffer but unconsumed belong to what
+            // follows.
             return Ok((out, bits.pos - (bits.count / 8) as usize));
         }
     }
@@ -258,8 +220,8 @@ fn stored_block(bits: &mut Bits, out: &mut Vec<u8>, max_out: usize) -> Result<()
     let header = bits.data.get(bits.pos..bits.pos + 4).ok_or("truncated stored block header")?;
     let len = u16::from_le_bytes([header[0], header[1]]) as usize;
     let nlen = u16::from_le_bytes([header[2], header[3]]);
-    // NLEN is LEN's one's complement -- the format's own check that the
-    // header wasn't garbled, cheap enough to honour.
+    // NLEN is LEN's one's complement, the format's check against a garbled
+    // header.
     if nlen != !(len as u16) {
         return Err("stored block length check failed".to_string());
     }
@@ -273,10 +235,8 @@ fn stored_block(bits: &mut Bits, out: &mut Vec<u8>, max_out: usize) -> Result<()
     Ok(())
 }
 
-// The literal/length and distance alphabets a type-10 block sends ahead
-// of itself: first a small alphabet describing code *lengths*, then both
-// real alphabets' lengths encoded with it (16/17/18 being run-length
-// escapes, which is what makes this compact enough to be worth sending).
+// A type-10 block's alphabets: a small alphabet of code lengths, then
+// both alphabets' lengths in it, with 16/17/18 as run-length escapes.
 fn dynamic_tables(bits: &mut Bits) -> Result<(Huffman, Huffman), String> {
     let nlen = bits.take(5)? as usize + 257;
     let ndist = bits.take(5)? as usize + 1;
@@ -299,8 +259,8 @@ fn dynamic_tables(bits: &mut Bits) -> Result<(Huffman, Huffman), String> {
                 lengths[i] = sym as u8;
                 i += 1;
             }
-            // 16 repeats the *previous* length; 17 and 18 are runs of
-            // zeros, differing only in how long a run they can express.
+            // 16 repeats the previous length; 17 and 18 are runs of zeros of
+            // different reach.
             16 => {
                 let prev = *lengths.get(i.wrapping_sub(1)).ok_or("DEFLATE length repeat with no previous length")?;
                 let run = 3 + bits.take(2)? as usize;
@@ -318,11 +278,10 @@ fn dynamic_tables(bits: &mut Bits) -> Result<(Huffman, Huffman), String> {
         }
     }
     let lit = Huffman::build(&lengths[..nlen])?;
-    // A distance alphabet with exactly one code is what an encoder emits
-    // for a block with no matches at all; Huffman::build calls that
-    // incomplete, so allow it through as the empty code it effectively
-    // is -- any actual attempt to decode a distance from it then fails
-    // on its own, which is the correct outcome for a corrupt stream.
+    // A distance alphabet of one code is what encoders emit for a block
+    // with no matches. `Huffman::build` calls it incomplete, so it passes as
+    // the empty code; decoding a distance from it then fails, as it should
+    // for a corrupt stream.
     let dist_lengths = &lengths[nlen..];
     let dist = match Huffman::build(dist_lengths) {
         Ok(h) => h,
@@ -346,10 +305,9 @@ fn fill(lengths: &mut [u8], i: &mut usize, value: u8, run: usize) -> Result<(), 
     Ok(())
 }
 
-// The actual LZ77 loop, identical for fixed and dynamic blocks once the
-// two alphabets are in hand: symbols under 256 are literal bytes, 256
-// ends the block, and anything above is a (length, distance) back
-// reference into what's already been decompressed.
+// The LZ77 loop for fixed and dynamic blocks: symbols below 256 are
+// literal bytes, 256 ends the block, above is a (length, distance) back
+// reference.
 fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman, max_out: usize) -> Result<(), String> {
     loop {
         let sym = lit.decode(bits)?;
@@ -372,17 +330,14 @@ fn compressed_block(bits: &mut Bits, out: &mut Vec<u8>, lit: &Huffman, dist: &Hu
                 if distance > out.len() {
                     return Err("back reference before the start of the output".to_string());
                 }
-                // Checked before the copy rather than inside it: this is
-                // the one place a few bytes of input turn into up to 258
-                // of output, so it is where a bomb actually grows.
+                // Checked before the copy: this is where a few input bytes
+                // become up to 258 output bytes, where a bomb grows.
                 if out.len() + len > max_out {
                     return Err(too_big(max_out));
                 }
-                // Copied one byte at a time on purpose: an overlapping
-                // copy (distance < len, which is how a run of the same
-                // byte is encoded) has to see the bytes this very loop
-                // is writing. extend_from_within/copy_within would both
-                // read the pre-copy state and get it wrong.
+                // One byte at a time: an overlapping copy (distance < len,
+                // a run of one byte) must see what this loop writes, which
+                // `extend_from_within` and `copy_within` wouldn't.
                 let start = out.len() - distance;
                 for i in 0..len {
                     let byte = out[start + i];
@@ -398,17 +353,15 @@ fn too_big(max_out: usize) -> String {
     format!("decompressed size exceeds the {max_out}-byte limit")
 }
 
-// The CRC-32 gzip and zip both carry, computed bit by bit rather than
-// from a 256-entry table -- the table is a speed optimization for
-// streaming a whole disk, and this only ever checks one member's worth
-// of bytes right after decompressing it.
+// The CRC-32 gzip and zip carry, bit by bit rather than from a table:
+// it checks one member after decompressing.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
-            // The reversed (LSB-first) form of the standard polynomial,
-            // which is the form both formats specify.
+            // The reversed, LSB-first standard polynomial, as both formats
+            // specify.
             crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
         }
     }
@@ -420,14 +373,10 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
-    // Every input below is compressed by a real compressor (python3's
-    // zlib) rather than hand-assembled: a bit stream written by hand
-    // would only ever prove this decoder agrees with my own reading of
-    // the RFC, which is precisely the thing under test. Skipped, not
-    // failed, where there's no python3 -- the same "quietly unavailable,
-    // not a hard dependency" contract the git tests already use, and
-    // archive.rs's own tests cover real compressed bytes with no
-    // external program at all.
+    // Inputs come from a real compressor (python3's zlib), not hand-built
+    // streams, which would only test the decoder against my reading of the
+    // RFC. Skipped without python3; archive.rs's tests use real compressed
+    // bytes without one.
     fn compressor_available() -> bool {
         std::process::Command::new("python3")
             .arg("-c")
@@ -472,17 +421,16 @@ mod tests {
         round_trip(b"hello, deflate\n");
     }
 
-    // A long run compresses into overlapping back references (distance
-    // smaller than length), the one case a bulk copy gets wrong.
+    // A long run becomes overlapping back references (distance shorter
+    // than length), which a bulk copy gets wrong.
     #[test]
     fn inflates_overlapping_back_references() {
         round_trip("ab".repeat(5000).as_bytes());
         round_trip(&vec![b'x'; 70000]);
     }
 
-    // Enough distinct bytes with a skewed distribution to make a real
-    // compressor emit a dynamic-Huffman block rather than a stored or
-    // fixed one.
+    // Distinct bytes with a skewed distribution, so the compressor emits a
+    // dynamic-Huffman block.
     #[test]
     fn inflates_a_dynamic_huffman_block() {
         let mut data = Vec::new();
@@ -495,10 +443,8 @@ mod tests {
         round_trip(&data);
     }
 
-    // The whole point of the ceiling: a compressor turns 4 MiB of one
-    // repeated byte into a few kilobytes, and a decompressor with no
-    // limit will happily be told to produce hundreds of gigabytes by a
-    // file that costs nothing to send.
+    // The ceiling: 4 MiB of one byte compresses to a few kilobytes, which
+    // would ask an unlimited decompressor for gigabytes if repeated.
     #[test]
     fn refuses_to_decompress_past_the_ceiling() {
         if !compressor_available() {
@@ -512,15 +458,13 @@ mod tests {
 
         let err = inflate_prefix(&compressed, 1 << 20).unwrap_err();
         assert!(err.contains("exceeds"), "and one it does not is refused, not attempted: {err}");
-        // The refusal has to come from the back-reference path -- that
-        // is where a bomb grows -- so a budget under even the first
-        // literal byte is not what is being tested here.
+        // The refusal must come from the back-reference path, so the budget
+        // isn't below the first literal.
         assert!(inflate_prefix(&compressed, 0).is_err());
     }
 
-    // Stored blocks carry their bytes literally, so they can never be a
-    // bomb -- but they are a second way into `out`, and the ceiling has
-    // to hold on that path too.
+    // Stored blocks can't be bombs, but they're a second way into `out`,
+    // and the ceiling holds there too.
     #[test]
     fn the_ceiling_holds_on_the_stored_block_path() {
         if !compressor_available() {
@@ -535,8 +479,7 @@ mod tests {
         assert!(inflate_prefix(&compressed, data.len() - 1).is_err());
     }
 
-    // Incompressible input is what makes a compressor fall back to
-    // stored blocks, which take the byte-aligned path.
+    // Incompressible input makes the compressor use stored blocks.
     #[test]
     fn inflates_stored_blocks() {
         let mut data = Vec::new();
@@ -571,7 +514,7 @@ mod tests {
         assert!(inflate(&[0b111]).is_err());
     }
 
-    // Against the RFC's own published check value for "123456789".
+    // The RFC's published check value for "123456789".
     #[test]
     fn crc32_matches_the_known_check_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
