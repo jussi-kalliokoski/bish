@@ -1,17 +1,10 @@
-// `e [file]`: a builtin modal text editor built entirely on bishedit's
-// existing vim vocabulary (motion.rs/vimkeys.rs/registers.rs) plus the
-// new mutable multi-line buffer (bishedit::textbuffer::TextBuffer). A
-// top-level module, the same tier as editor.rs/repl.rs, not part of
-// bishedit itself -- this is a concrete interactive consumer, not
-// reusable headless logic.
+// `e [file]`: the modal text editor, built on bishedit's vim vocabulary
+// (motion.rs, vimkeys.rs, registers.rs) and `TextBuffer`.
 //
-// Reached via `exec::ExecResult::Edit`, exactly the way `window`
-// (`ExecResult::Window`) and `fg` (`ExecResult::Fg`) already have to
-// bubble up to repl.rs: a builtin has no raw-mode/keystroke/rendering
-// access of its own, and `Registers` lives in `repl::run`'s own locals,
-// not in `Shell` at all. repl.rs owns detach/resume (`Frame::Edit`,
-// mirroring `Frame::Job`) -- this module only drives one already-open
-// session for as long as it's focused.
+// Reached through `exec::ExecResult::Edit`, as `window` and `fg` are: a
+// builtin has no keystroke or rendering access, and `Registers` lives in
+// `repl::run`. repl.rs owns detach and resume (`Frame::Edit`); this module
+// drives one open session while it's focused.
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -34,20 +27,17 @@ use crate::term;
 use crate::vt100;
 use crate::window::Rect;
 
-// What `repl.rs`'s `edit_frames` side table actually holds -- not just a
-// bare `TextBuffer`, so a mid-typed count/prefix or an in-progress
-// Visual selection survives a detach, matching how a real `Frame::Job`'s
-// own live state already does the same across Ctrl+G.
+// What repl.rs's `edit_frames` holds: more than a `TextBuffer`, so a
+// half-typed count or a Visual selection survives a detach.
 pub struct EditSession {
     pub buffer: TextBuffer,
     pub vk: VimKeys,
 }
 
 impl EditSession {
-    // `path`: `None` opens a fresh unnamed buffer; `Some` opens (or, for
-    // a nonexistent path, prepares to create -- see `TextBuffer::open`'s
-    // own doc comment) that file. Compressed content (a gzip'd file, a
-    // member inside a zip) opens read-only -- see `compressed_text`.
+    // `None` opens an unnamed buffer; `Some` opens that file, or prepares
+    // to create it (`TextBuffer::open`). Compressed content opens read-only
+    // (see `compressed_text`).
     pub fn open(path: Option<&str>, vheight: usize) -> io::Result<EditSession> {
         let buffer = match path {
             Some(p) => match compressed_text(p) {
@@ -65,28 +55,17 @@ impl EditSession {
     }
 }
 
-// The text behind a path that holds compressed content -- a member
-// inside a zip (`some.zip!/dir/file.txt`) or a gzip'd file
-// (`notes.txt.gz`) -- or `None` for an ordinary path, which is every
-// caller's cue to read it the normal way.
-//
-// Read-only follows from the format, not from caution: writing either
-// one back means compressing, which crate::inflate deliberately doesn't
-// do (see its own module comment). Every caller marks the buffer
-// readonly, so `:w` refuses with the same message any other read-only
-// buffer gives rather than silently producing a corrupt archive.
-//
-// Bytes become text lossily. A member that isn't text at all comes out
-// as replacement characters, which is a legible "this isn't text" and
-// leaves `e --hex` as the way to actually look at it -- the same thing
-// opening any binary file in this editor already does.
+// The text behind a path holding compressed content, a zip member
+// (`some.zip!/dir/file.txt`) or a gzip'd file (`notes.txt.gz`); `None`
+// for an ordinary path. Read-only, since writing back would mean
+// compressing, which crate::inflate doesn't do; callers mark the buffer
+// readonly so `:w` refuses. Converted lossily: a binary member shows
+// replacement characters, and `e --hex` shows its bytes.
 pub(crate) fn compressed_text(path: &str) -> Option<Result<String, String>> {
     compressed_bytes(path).map(|r| r.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-// compressed_text's own source, before the lossy text conversion -- what
-// `e --hex` on the same path wants instead (hexedit::HexBuffer::
-// from_bytes), since the whole point there is to see the real bytes.
+// `compressed_text`'s bytes, before the text conversion, for `e --hex`.
 pub(crate) fn compressed_bytes(path: &str) -> Option<Result<Vec<u8>, String>> {
     if let Some((archive, inner)) = crate::archive::split(path) {
         return Some(crate::archive::read_member(&archive, &inner));
@@ -94,52 +73,31 @@ pub(crate) fn compressed_bytes(path: &str) -> Option<Result<Vec<u8>, String>> {
     let as_path = std::path::Path::new(path);
     match crate::archive::kind_of(as_path) {
         Some(crate::archive::Kind::Gzip) => Some(crate::archive::gunzip(as_path).map(|(_, bytes)| bytes)),
-        // A zip or a tar names a directory of members, not content --
-        // `e` browses one (repl::expand_browse_targets) rather than
-        // reaching here. `e --hex some.zip` does reach here, and wants
-        // the archive's own raw bytes, which is what reading the file
-        // gives.
+        // A zip or tar is browsed, not opened
+        // (`repl::expand_browse_targets`); `e --hex some.zip` gets here and
+        // wants the archive's own bytes.
         Some(crate::archive::Kind::Zip) | Some(crate::archive::Kind::Tar) | None => None,
     }
 }
 
-// One file `e` was asked to open. `e` takes several at once (`e a.sh
-// b.sh`), opening one editor frame per target on the focused pane's own
-// frame stack -- the first one named ends up on top, and closing it
-// (`:q`) reveals the next, which is exactly what that stack already does
-// for every other frame kind (see repl.rs's `Frame`).
+// One file `e` was asked to open. `e a.sh b.sh` opens a frame per file
+// on the pane's frame stack, the first named on top, so `:q` reveals
+// the next.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EditTarget {
-    // `None` is a fresh unnamed buffer -- a bare `e` with no arguments
-    // at all, or flags with no file after them.
+    // `None` is an unnamed buffer: `e` with no file.
     pub path: Option<String>,
-    // `--hex`: open this file as raw bytes in the hex editor
-    // (hexedit::HexSession, a `Frame::Hex`) instead of as text.
+    // `--hex`: open as bytes in the hex editor (`hexedit::HexSession`).
     pub hex: bool,
-    // `--readonly`: refuse every edit. Meaningful for both kinds of
-    // buffer (`TextBuffer::set_readonly`, `HexBuffer::readonly`) --
-    // opening something to look at without any chance of changing it by
-    // accident is exactly as reasonable for a script as for a core dump.
+    // `--readonly`: refuse every edit, for text or hex.
     pub readonly: bool,
 }
 
-// `e`'s own argument parsing, shared by the builtin (via `ExecResult::
-// Edit`) and `bish tool edit` so the two can't drift apart.
-//
-// Flags are *per-file*: they attach to the file that follows them, so
-// `e script.sh --hex core.bin` opens one of each and `e --hex a.bin
-// b.bin` opens only `a.bin` as hex. Prefix binding (rather than
-// suffix, or a single mode for the whole command) is the only
-// unambiguous rule once several files can be named at once, and it's the
-// one every other command line already uses. Flags with no file after
-// them apply to a fresh unnamed buffer, so `e --hex` opens an empty one
-// to build a binary in.
-//
-// `--` ends option parsing, the usual way, so a file whose name really
-// does start with `-` is still openable (`e -- -weird.txt`). An
-// unrecognized leading-dash argument is an error rather than a filename:
-// silently opening a buffer named `--hxe` because of a typo is a far
-// worse outcome than being told the flag isn't one.
+// `e`'s argument parsing, shared by the builtin and `bish tool edit`.
+// Flags apply to the file after them: `e script.sh --hex core.bin`
+// opens one of each. Flags with no file after them apply to an unnamed
+// buffer (`e --hex`). `--` ends options; an unknown flag is an error,
+// not a filename (a typo'd `--hxe` shouldn't open a buffer).
 pub fn parse_edit_args(args: &[String]) -> Result<Vec<EditTarget>, String> {
     let mut targets: Vec<EditTarget> = Vec::new();
     let mut pending = EditTarget::default();
@@ -159,9 +117,7 @@ pub fn parse_edit_args(args: &[String]) -> Result<Vec<EditTarget>, String> {
                     pending.readonly = true;
                     continue;
                 }
-                // `-` alone is left alone: not a flag anywhere in this
-                // codebase, and conventionally a filename-shaped
-                // stand-in for a stream.
+                // A lone `-` is a filename.
                 other if other.starts_with('-') && other != "-" => {
                     return Err(format!("unrecognized option '{arg}'"));
                 }
@@ -170,19 +126,16 @@ pub fn parse_edit_args(args: &[String]) -> Result<Vec<EditTarget>, String> {
         }
         targets.push(EditTarget { path: Some(arg.clone()), ..std::mem::take(&mut pending) });
     }
-    // Trailing flags (or no arguments at all) -- one unnamed buffer,
-    // carrying whatever was set for it.
+    // Trailing flags, or no arguments: one unnamed buffer with them.
     if targets.is_empty() || pending != EditTarget::default() {
         targets.push(pending);
     }
     Ok(targets)
 }
 
-// What the status line (`mode_label`) and `build_editor_frame`'s own
-// Visual-highlight gating need to know about the current mode -- `R`'s
-// own addition to what used to be a plain `insert_mode: bool` (Replace
-// behaves like Insert for both of those: no Visual selections shown,
-// `-- REPLACE --` instead of `-- INSERT --`).
+// The mode as the status line (`mode_label`) and the Visual
+// highlighting in `build_editor_frame` need it. Replace behaves like
+// Insert for both, labelled `-- REPLACE --`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditorMode {
     Normal,
@@ -190,21 +143,11 @@ pub(crate) enum EditorMode {
     Replace,
 }
 
-// `content_cols`: the pane's own current content width (post-gutter),
-// same value `build_editor_frame` itself would compute for `rect` right
-// now -- see `editor_content_cols`, which every caller of this function
-// uses to get it. Passed in fresh rather than read back off `buf` (unlike
-// `viewport_height`, a stored field with no resize hook -- see Buffer::
-// viewport_left's own doc comment) so a pane resize is honored on the
-// very next keystroke instead of only once `vheight` happens to get
-// resynced some other way.
-//
-// `viewport_left` is a *display column*, not a char index (matching its
-// own doc comment's original stated intent -- see bishedit::
-// unicode_width's own doc comment for why those two aren't the same
-// number once a line has any wide/zero-width chars before the cursor).
-// The cursor's own char index is converted via `col_of` before the
-// exact same threshold comparison this function always did.
+// Scrolls so the cursor is visible. `content_cols` is the pane's
+// content width now (`editor_content_cols`), passed in so a resize
+// applies on the next keystroke. `viewport_left` is a display column,
+// not a char index (see bishedit::unicode_width), so the cursor goes
+// through `col_of`.
 pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     if buf.wrap.wrap {
         scroll_wrapped(buf, content_cols);
@@ -212,32 +155,25 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     }
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
-    // `scrolloff`: keep this many lines visible above and below the
-    // cursor. Capped at half the pane for the same reason
-    // `sidescrolloff` is -- a margin wider than that has no middle left
-    // to keep the cursor in -- and clamped against the buffer's own ends,
-    // since there is nothing to scroll past the first and last lines.
+    // `scrolloff`, capped at half the pane, since a wider margin leaves no
+    // middle for the cursor, and clamped at the buffer's ends.
     let margin = buf.wrap.scrolloff.min(height.saturating_sub(1) / 2);
     let top = buf.viewport_top();
     let highest = buf.line_count().saturating_sub(height);
     if buf.folds.any_closed() {
-        // Once a fold is closed, a difference of line numbers is no
-        // longer a number of rows, so the rows are counted instead.
+        // With a closed fold, line numbers no longer count rows, so rows are
+        // counted.
         scroll_rows_to(buf, line, 0, content_cols);
     } else if line < top + margin {
         buf.set_viewport_top(line.saturating_sub(margin));
     } else if line + margin >= top + height {
         buf.set_viewport_top((line + margin + 1 - height).min(highest));
     }
-    // In drawn columns, so a tabular file scrolls by what is on screen
-    // rather than by how many characters the line happens to hold.
+    // In drawn columns, so a tabular file scrolls by what's on screen.
     let display = display_row(buf, line, tabular_layout(buf).as_ref());
     let cursor_col = col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))]);
     let width = content_cols.max(1);
-    // `sidescrolloff`: keep this many columns visible either side of the
-    // cursor rather than letting it sit against the edge. Capped at half
-    // the pane, since a margin wider than that has no middle to keep the
-    // cursor in.
+    // `sidescrolloff`, capped at half the pane like `scrolloff`.
     let margin = buf.wrap.sidescrolloff.min(width.saturating_sub(1) / 2);
     if cursor_col < buf.viewport_left() + margin {
         buf.set_viewport_left(cursor_col.saturating_sub(margin));
@@ -246,33 +182,22 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut TextBuffer, content_cols: usize) {
     }
 }
 
-// How far one horizontal wheel notch moves the view. More than
-// MOUSE_WHEEL_LINES because a column is a much smaller step than a
-// line -- a column a notch would feel like nothing.
-//
-// Untested against a trackpad's sideways gesture, unlike the vertical
-// step beside it; if that turns out to lurch the same way, this is the
-// number to look at.
+// How far one horizontal wheel notch moves the view, more than
+// `MOUSE_WHEEL_LINES` since a column is a small step. Untested with a
+// trackpad's sideways gesture.
 pub(crate) const MOUSE_WHEEL_COLUMNS: usize = 6;
 
-// Moves the view sideways by `columns` (negative for left), the way the
-// mouse's horizontal wheel and vim's own `zh`/`zl` do -- and then brings
-// the *cursor* to the view rather than the view back to the cursor,
-// which is the whole difference between this and
-// `scroll_to_show_cursor` above.
-//
-// A no-op while `wrap` is on: a wrapped line has nothing off to the side
-// to scroll into, by construction.
+// Moves the view sideways by `columns` (negative for left), as the
+// horizontal wheel and vim's `zh`/`zl` do, then brings the cursor into
+// view rather than the view to the cursor. A no-op while `wrap` is on.
 pub(crate) fn scroll_horizontally(buf: &mut TextBuffer, columns: isize, content_cols: usize) {
     if buf.wrap.wrap || columns == 0 {
         return;
     }
     let width = content_cols.max(1);
     let layout = tabular_layout(buf);
-    // Only as far as there is something to see. The widest *visible*
-    // line, not the widest in the file: it is the only thing the reader
-    // could be scrolling towards, and it costs a pass over one screen
-    // rather than over the whole buffer.
+    // Only as far as the widest visible line, which is all the reader can
+    // be scrolling towards.
     let last = (buf.viewport_top() + buf.viewport_height()).min(buf.line_count());
     let widest = (buf.viewport_top()..last)
         .map(|line| {
@@ -285,9 +210,8 @@ pub(crate) fn scroll_horizontally(buf: &mut TextBuffer, columns: isize, content_
     let left = (buf.viewport_left() as isize + columns).clamp(0, furthest as isize) as usize;
     buf.set_viewport_left(left);
 
-    // ...and drag the cursor along, so the next keystroke doesn't snap
-    // the view straight back. Same `sidescrolloff` margin
-    // scroll_to_show_cursor keeps, for the same reason.
+    // And move the cursor along, keeping the `sidescrolloff` margin, so the
+    // next key doesn't snap the view back.
     let (line, col) = buf.cursor();
     let display = display_row(buf, line, layout.as_ref());
     let cursor_col = col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))]);
@@ -301,9 +225,8 @@ pub(crate) fn scroll_horizontally(buf: &mut TextBuffer, columns: isize, content_
     }
 }
 
-// The same job in visual rows: which row the cursor is on, and whether
-// the window has to move for it. Horizontal scroll is forced to zero --
-// a wrapped line has no off-screen right edge to scroll to.
+// The same in visual rows. Horizontal scroll is zero: a wrapped line has
+// nothing off to the side.
 fn scroll_wrapped(buf: &mut TextBuffer, content_cols: usize) {
     buf.set_viewport_left(0);
     let (line, col) = buf.cursor();
@@ -315,17 +238,14 @@ fn scroll_wrapped(buf: &mut TextBuffer, content_cols: usize) {
     scroll_rows_to(buf, line, seg, content_cols);
 }
 
-// Moves the window just enough to show visual row `seg` of `line`, with
-// `scrolloff` rows around it -- counted by walking the rows the screen
-// actually draws, so a wrapped line and a closed fold are both measured
-// by what they take up.
+// Moves the window just enough to show visual row `seg` of `line` with
+// `scrolloff` rows around it, counting the rows the screen draws, so
+// wrapped lines and closed folds count as what they take up.
 fn scroll_rows_to(buf: &mut TextBuffer, line: usize, seg: usize, content_cols: usize) {
     let height = buf.viewport_height().max(1);
 
-    // `scrolloff`, counted in *visual* rows here rather than lines: with
-    // wrapping on, "two lines below the cursor" and "two rows below the
-    // cursor" are different amounts of screen, and rows are what the
-    // margin is actually protecting.
+    // `scrolloff` in visual rows, which are what it protects when lines
+    // wrap.
     let margin = buf.wrap.scrolloff.min(height.saturating_sub(1) / 2);
     let back_from = |buf: &TextBuffer, from: (usize, usize), steps: usize| {
         let mut at = from;
@@ -339,8 +259,7 @@ fn scroll_rows_to(buf: &mut TextBuffer, line: usize, seg: usize, content_cols: u
         at
     };
 
-    // Above the window: the cursor's own row moves to `margin` rows
-    // below the top -- with no margin, to the top itself.
+    // Above the window: the cursor's row goes `margin` rows below the top.
     let above = line < buf.viewport_top() || (line == buf.viewport_top() && seg < buf.viewport_sub());
     if above || rows_between(buf, (buf.viewport_top(), buf.viewport_sub()), (line, seg), margin, content_cols) < margin {
         let top = back_from(buf, (line, seg), margin);
@@ -348,9 +267,9 @@ fn scroll_rows_to(buf: &mut TextBuffer, line: usize, seg: usize, content_cols: u
         buf.set_viewport_sub(top.1);
         return;
     }
-    // Below it: walk forward from the top, and if the cursor isn't
-    // reached within the pane's height minus the margin, put it that
-    // many rows above the bottom by walking back from it instead.
+    // Below it: walk from the top, and if the cursor isn't within the
+    // height minus the margin, walk back from it to put it `margin` rows
+    // above the bottom.
     let reach = height.saturating_sub(margin);
     let mut at = (buf.viewport_top(), buf.viewport_sub());
     for _ in 0..reach {
@@ -364,9 +283,8 @@ fn scroll_rows_to(buf: &mut TextBuffer, line: usize, seg: usize, content_cols: u
     buf.set_viewport_sub(top.1);
 }
 
-// How many visual rows `to` sits below `from`, giving up once it passes
-// `limit` -- the caller only ever asks "is it at least this far", and a
-// buffer can be long enough that walking the true distance is wasted.
+// How many visual rows `to` is below `from`, giving up past `limit`,
+// since callers only ask whether it's at least that far.
 fn rows_between(buf: &TextBuffer, from: (usize, usize), to: (usize, usize), limit: usize, content_cols: usize) -> usize {
     let mut at = from;
     for n in 0..limit {
@@ -382,8 +300,8 @@ fn rows_between(buf: &TextBuffer, from: (usize, usize), to: (usize, usize), limi
     limit
 }
 
-// Both walk the rows `visible_rows` draws, so a closed fold is one row
-// here too and scrolling cannot disagree with the screen about it.
+// Both walk the rows `visible_rows` draws, so scrolling agrees with the
+// screen about closed folds.
 fn next_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usize) -> (usize, usize) {
     if let Some((_, end)) = buf.folds.closed_at(line) {
         return (end + 1, 0);
@@ -405,25 +323,12 @@ fn previous_row(buf: &TextBuffer, (line, sub): (usize, usize), content_cols: usi
     (above, line_segments(buf, above, content_cols).len().saturating_sub(1))
 }
 
-// How many columns are actually left for `buf`'s own text after its
-// gutter (line numbers, diagnostic markers) -- the exact formula build_
-// editor_frame itself uses for `content_cols`, factored out so scroll_
-// to_show_cursor's callers (run_insert_mode, and repl.rs's own copy for
-// NavBuffer navigation) can compute the same width without duplicating
-// the gutter-clamping arithmetic.
-// The buffer position a click at real terminal row/column `row0`/`col0`
-// (both 0-indexed) lands on, for a buffer drawn into `rect` -- the exact
-// inverse of build_editor_frame's own placement, so the two can't
-// disagree about which character is under the pointer: same gutter
-// width, same `viewport_top`/`viewport_left`, same `char_at_col`
-// translation from a display column to a char index (they differ the
-// moment a line holds anything wide).
-//
-// `None` for a click outside `rect` or below the last row that holds
-// content. A click in the gutter, or past the end of a line, resolves to
-// the nearest real position on that line rather than nothing -- which is
-// what every editor does, and what makes clicking in the rough vicinity
-// of a line feel like it worked.
+// The buffer position a click at screen row/column `row0`/`col0`
+// (0-based) lands on, for a buffer drawn in `rect`: the inverse of
+// `build_editor_frame`'s placement (gutter, viewport, `char_at_col`), so
+// they agree about what's under the pointer. `None` outside `rect` or
+// below the last line; a click in the gutter or past a line's end lands
+// on the nearest position on that line.
 pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, usize)> {
     if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
         return None;
@@ -434,8 +339,8 @@ pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0
     }
     let gutter = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     let content_cols = rect.cols - gutter;
-    // The same rows the frame drew, so a click can't land on a line the
-    // screen doesn't show there.
+    // The rows the frame drew, so a click can't land on a line not shown
+    // there.
     let rows = visible_rows(buf, content_cols, editor_content_rows(rect));
     let visual = rows.get(row)?;
     let line = visual.line;
@@ -443,41 +348,32 @@ pub(crate) fn position_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0
     let chars = buf.line_chars(line);
     let display = display_row(buf, line, tabular_layout(buf).as_ref());
     let cell = if buf.wrap.wrap {
-        // Within a wrapped row, the click is an offset into that row's
-        // own segment, past the continuation prefix.
+        // In a wrapped row, an offset into its segment, past the continuation
+        // prefix.
         let into = x.saturating_sub(visual.seg.indent);
         let base = col_at_cell(&display.cells, display.cell_of[visual.seg.start.min(chars.len())]);
         cell_at_col(&display.cells, base + into)
     } else {
         cell_at_col(&display.cells, buf.viewport_left() + x)
     };
-    // A click landing on padding belongs to the character it was
-    // inserted after -- padding is not part of the file, so there is
-    // nothing else it could mean.
+    // A click on padding belongs to the character before it.
     let col = source_at_or_before(&display, cell);
     let col = if buf.wrap.wrap { col.min(visual.seg.end.saturating_sub(1).max(visual.seg.start)) } else { col };
-    // Normal mode's cursor can never sit past a line's last character
-    // (see run_insert_mode's own exit clamp for the same rule), so an
-    // overshooting click lands on it instead.
+    // Normal mode's cursor can't sit past a line's last character, so an
+    // overshooting click lands on it.
     Some((line, col.min(chars.len().saturating_sub(1))))
 }
 
+// The columns left for text after the gutter: `build_editor_frame`'s
+// `content_cols`, for callers of `scroll_to_show_cursor`.
 pub(crate) fn editor_content_cols(buf: &TextBuffer, rect: Rect) -> usize {
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     rect.cols - gutter_width
 }
 
-// `K`-hover's own popup rendering, shared by debugger.rs's own read-only
-// view and repl.rs's real file editor (see docs.rs's own hover_lines for
-// the content half of this same sharing) -- no existing generic
-// floating-popup primitive in this codebase to reuse otherwise (the
-// closest precedents, the completion row and the command-output
-// overlay, are both fixed-position, not cursor-relative). Anchored just
-// below `cursor_row`/`cursor_col` (already screen-relative -- see each
-// caller's own cursor_screen_pos-style helper), flipping above when
-// there isn't room below, clamped to stay within `rect` so it never
-// overlaps whatever sits below the source view (a status row, an output
-// pane, ...).
+// `K`'s hover popup, shared by debugger.rs and the file editor (docs.rs's
+// `hover_lines` is the content). Below the cursor (screen-relative),
+// above when there's no room, clamped inside `rect`.
 pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
     if lines.is_empty() {
         return String::new();
@@ -505,14 +401,9 @@ pub(crate) fn render_hover_popup(lines: &[String], cursor_row: usize, cursor_col
     out
 }
 
-// The completion popup: a list anchored under the cursor, the selected
-// row marked.
-//
-// Drawn in reverse video like `render_hover_popup` just above, for the
-// same reason -- it floats over real text, and reverse video is the one
-// way to be legible over it without assuming anything about colours.
-// The selection is marked with `>` *and* bold rather than by colour
-// alone, so it is unambiguous on a terminal that has none.
+// The completion popup: a list under the cursor. Reverse video like
+// `render_hover_popup`, to be legible over text without assuming
+// colours; the selection is marked with `>` and bold, not colour alone.
 pub(crate) fn render_completion_popup(
     items: &[crate::bishedit::completion::EditorCompletion],
     selected: usize,
@@ -524,15 +415,15 @@ pub(crate) fn render_completion_popup(
     render_popup_list(&rows, selected, cursor_row, cursor_col, rect)
 }
 
-/// The same widget over plain `(label, detail)` rows -- what a code
-/// action picker needs, and what completion is underneath.
+/// The same widget over plain `(label, detail)` rows, for a code action
+/// picker; completion is built on it.
 pub(crate) fn render_popup_list(items: &[(String, String)], selected: usize, cursor_row: usize, cursor_col: usize, rect: Rect) -> String {
     const MAX_ROWS: usize = 10;
     if items.is_empty() {
         return String::new();
     }
-    // Scrolled so the selection is always on screen: a server can
-    // answer with hundreds.
+    // Scrolled to keep the selection visible: a server can answer with
+    // hundreds.
     let first = selected.saturating_sub(MAX_ROWS - 1);
     let shown: Vec<&(String, String)> = items.iter().skip(first).take(MAX_ROWS).collect();
     let max_width = rect.cols.saturating_sub(4).clamp(10, 60);
@@ -568,10 +459,8 @@ pub(crate) fn render_popup_list(items: &[(String, String)], selected: usize, cur
     out
 }
 
-// Plain character-level wrap (not word-aware) for one hover line into
-// however many `width`-wide rows it takes -- simple, and entirely
-// adequate for the short doc comments/man snippets this actually
-// displays.
+// Character-level wrap of one hover line into `width`-wide rows, enough
+// for doc comments and man snippets.
 fn wrap_hover_line(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![line.to_string()];
@@ -583,13 +472,9 @@ fn wrap_hover_line(line: &str, width: usize) -> Vec<String> {
     chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
-// `d{motion}`/`c{motion}`: resolves `motion` against the buffer's own
-// current cursor, removes that range (`TextBuffer::delete_range` already
-// does both the extraction *and* the removal in one call -- simpler than
-// editor.rs's own LineBuffer-specific version, which had to do them
-// separately), writes it to a register. Returns whether anything was
-// actually deleted, same as `editor.rs`'s own `delete_motion` -- `Change`
-// uses this to decide whether to enter insert mode at all.
+// `d{motion}`/`c{motion}`: removes the motion's range from the cursor
+// (`TextBuffer::delete_range`) into a register. Returns whether anything
+// was deleted; `Change` enters Insert only then.
 pub(crate) fn delete_motion(
     buf: &mut TextBuffer,
     registers: &mut Registers,
@@ -610,13 +495,9 @@ pub(crate) fn delete_motion(
     true
 }
 
-// `dd`/`cc`'s own whole-line shorthand -- deliberately *not* editor.rs's
-// own `delete_lines` (that one flattens "linewise" to "the whole buffer",
-// only ever correct because `LineBuffer` never has more than one line).
-// Scopes to exactly the `count` lines starting at the cursor, same
-// clamping `motion::whole_lines` itself already applies, so the yanked
-// register text and the removed range always agree on which lines were
-// affected.
+// `dd`: exactly `count` lines from the cursor, clamped as
+// `motion::whole_lines` clamps, so the register and the removed range
+// agree.
 pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
@@ -626,28 +507,18 @@ pub(crate) fn delete_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     buf.delete_range(&range);
 }
 
-// `cc`/`S`: the lines' *text* goes, the first line itself stays.
-//
-// Not `delete_lines` followed by an insert, which is what this used to
-// be: removing the line outright leaves the cursor at the start of the
-// line that follows, so `ccZ` on `  abc\ndef` typed `Z` onto `def` and
-// produced `Zdef` -- one line where vim has two. vim's `cc` empties the
-// line and leaves it in place, and the register still gets the lines
-// linewise, exactly as `dd` would have recorded them.
-//
-// The cursor lands past the reconstructed indent rather than at column
-// zero, the same rule `o`/`O` follow here (`autoindent_for`), which is
-// where this differs from `vim -u NONE` -- see the editor corpus's own
-// `cc-keeps-the-indent` divergence.
+// `cc`/`S`: the lines' text goes, and the first line stays, as in vim;
+// the register gets the lines linewise, as from `dd`. The cursor lands
+// after the rebuilt indent (`autoindent_for`), as `o` and `O` do, unlike
+// `vim -u NONE`: see the corpus's `cc-keeps-the-indent` divergence.
 pub(crate) fn change_lines(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let count = count.unwrap_or(1).max(1);
     let text = motion::whole_lines(buf, count);
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
     let (row, last) = motion::line_span(&*buf, count);
     let indent = autoindent_for(buf, row);
-    // Everything from the start of the first line to the end of the
-    // last, as an inclusive character range: that empties the lines and
-    // joins what is left of them into one, rather than removing any.
+    // From the start of the first line to the end of the last, inclusive:
+    // empties the lines and joins what's left into one.
     let end_col = buf.line_len(last);
     if end_col > 0 || last > row {
         let to = if end_col > 0 { (last, end_col - 1) } else { (last, 0) };
@@ -660,16 +531,11 @@ pub(crate) fn change_lines(buf: &mut TextBuffer, registers: &mut Registers, coun
     }
 }
 
-// `>{motion}`/`>>`/Visual `>`'s own shared row-range primitive: prepends
-// The selection between two caret positions, as the `Inclusive` range
-// the rest of this editor already understands -- so an Insert-mode
-// selection renders, yanks and deletes through exactly the same code a
-// Visual one does.
-//
-// Carets sit *between* characters and a range covers characters, so the
-// later end steps back one: dragging from before `a` to before `c`
-// selects `ab`, not `abc`. `None` when the two carets are in the same
-// place, which is a cursor rather than a selection.
+// The selection between two carets as an `Inclusive` range, so an
+// Insert-mode selection renders, yanks and deletes like a Visual one.
+// Carets sit between characters, so the later end steps back one:
+// dragging from before `a` to before `c` selects `ab`. `None` when they
+// coincide.
 fn selection_between(buf: &TextBuffer, a: (usize, usize), b: (usize, usize)) -> Option<motion::MotionRange> {
     let (from, to) = if a <= b { (a, b) } else { (b, a) };
     if from == to {
@@ -678,8 +544,8 @@ fn selection_between(buf: &TextBuffer, a: (usize, usize), b: (usize, usize)) -> 
     let to = if to.1 > 0 {
         (to.0, to.1 - 1)
     } else {
-        // The caret is at the start of a line, so the selection ends at
-        // the end of the one before it.
+        // A caret at a line's start ends the selection at the end of the line
+        // before.
         let previous = to.0.checked_sub(1)?;
         (previous, buf.line_len(previous))
     };
@@ -695,10 +561,9 @@ fn one_indent(buf: &TextBuffer) -> String {
     if buf.expandtab { " ".repeat(buf.shiftwidth) } else { "\t".to_string() }
 }
 
-// How many leading characters of `row` come to one indent's worth of
-// columns -- what `<<` removes. A tab counts for a whole tabstop, and a
-// line indented by less than a full level just loses what it has, which
-// is vim's own rule.
+// How many leading characters of `row` make one indent's worth of
+// columns, which `<<` removes. A tab counts a whole tabstop; a line
+// indented less loses what it has, as in vim.
 fn outdent_chars(buf: &TextBuffer, row: usize) -> usize {
     let mut columns = 0;
     let mut chars = 0;
@@ -713,12 +578,9 @@ fn outdent_chars(buf: &TextBuffer, row: usize) -> usize {
     chars
 }
 
-// One indent's worth of characters to every *non-empty* line in `from_row..=to_row` --
-// vim's own rule that shifting right never adds trailing whitespace to a
-// genuinely empty line. Callers are always some already-resolved whole-
-// line range: `>`/`<` act linewise regardless of the motion/selection
-// that produced it (see `vimkeys::Op::Indent`'s own doc comment), so
-// there's no shape/column math left to do here, just the two row bounds.
+// One indent to every non-empty line in `from_row..=to_row` (vim never
+// indents an empty line). `>` and `<` are always linewise
+// (`vimkeys::Op::Indent`), so only the rows matter.
 pub(crate) fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
     for row in from_row..=to_row {
         if buf.line_len(row) == 0 {
@@ -728,15 +590,12 @@ pub(crate) fn indent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) 
     }
 }
 
-// `<{motion}`/`<<`/Visual `<`'s own counterpart: strips up to
-// INDENT_WIDTH columns of leading whitespace from every line in range --
-// vim's own "outdent removes at most one shiftwidth's worth" rule (a
-// line indented less than that just loses whatever it has).
+// `<`'s counterpart: strips up to one indent's worth of columns from
+// each line in range (see `outdent_chars`).
 pub(crate) fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize) {
     for row in from_row..=to_row {
-        // In *columns*, not characters: with `expandtab` off one tab is
-        // a whole indent, so stripping `shiftwidth` characters would
-        // strip a whole shiftwidth of tabs.
+        // In columns, not characters: with `expandtab` off one tab is a whole
+        // indent.
         let strip = outdent_chars(buf, row);
         if strip == 0 {
             continue;
@@ -746,17 +605,10 @@ pub(crate) fn outdent_rows(buf: &mut TextBuffer, from_row: usize, to_row: usize)
     }
 }
 
-// `>{motion}`/`<{motion}`: resolves `m` exactly like any other operator
-// target (`motion::motion_range`'s own ordinary rules -- a failed/empty
-// one is silently a no-op, same as `delete_motion`), but only ever reads
-// its resolved row bounds, never its shape/columns -- `>`/`<` always act
-// linewise (see `vimkeys::Op::Indent`'s own doc comment), unlike every
-// other operator in this file. Known simplification: real vim also
-// shortens an *exclusive* motion's own end row by one when it lands
-// exactly on column 0 of the next line (so e.g. `>j` from a line's own
-// start doesn't pull in a line the cursor only just barely touched) --
-// not implemented here, so a motion landing exactly at another line's
-// start currently includes that line too.
+// `>{motion}`/`<{motion}`: the motion resolves as for any operator (an
+// empty one is a no-op), but only its rows are used. Unlike vim, an
+// exclusive motion ending at column 0 of a line still includes that
+// line (`>j` from a line's start).
 pub(crate) fn indent_operator_motion(buf: &mut TextBuffer, m: motion::Motion, count: Option<usize>) {
     let Some(range) = motion::motion_range(buf, m, count) else { return };
     indent_rows(buf, range.from.0, range.to.0);
@@ -769,11 +621,8 @@ pub(crate) fn outdent_operator_motion(buf: &mut TextBuffer, m: motion::Motion, c
     buf.set_cursor(range.from.0, 0);
 }
 
-// `>>`/`<<`'s own whole-line shorthand -- same `count` lines starting at
-// the cursor that `delete_lines`'s own doc comment already establishes
-// for `dd`/`cc`. `count` only ever selects *how many lines* are shifted,
-// never *by how much* -- `3>>` shifts 3 lines by one shiftwidth each,
-// not one line by three, matching real vim.
+// `>>`/`<<`: `count` lines from the cursor, each shifted once (`3>>` is
+// three lines, not three levels), as in vim.
 pub(crate) fn indent_lines(buf: &mut TextBuffer, count: Option<usize>) {
     let count = count.unwrap_or(1).max(1);
     let (row, last) = motion::line_span(&*buf, count);
@@ -788,15 +637,10 @@ pub(crate) fn outdent_lines(buf: &mut TextBuffer, count: Option<usize>) {
     buf.set_cursor(row, 0);
 }
 
-// Visual mode's own `>`/`<` -- shifts every line any committed selection
-// (plus the active one, already folded into `buf.selections` by the
-// caller -- see `surround_selections`'s own doc comment for the same
-// "iterate the committed set" shape) touches, whole-line, same linewise-
-// regardless-of-shape rule as the Normal-mode operator forms above.
-// Iterated directly rather than sorted/reversed the way `delete_
-// selections` needs to: inserting/removing leading whitespace at column
-// 0 never shifts any other line's own row index, so order can't matter
-// here the way it does for a deletion that changes line count.
+// Visual `>`/`<`: shifts every line any selection touches (the active
+// one is already in `buf.selections`), linewise whatever the shape. No
+// need to go in reverse as `delete_selections` does: changing leading
+// whitespace never moves another line.
 pub(crate) fn indent_selections(buf: &mut TextBuffer) {
     if buf.selections.is_empty() {
         return;
@@ -819,19 +663,9 @@ pub(crate) fn outdent_selections(buf: &mut TextBuffer) {
     buf.set_cursor(leftmost_row, 0);
 }
 
-// `x`: deletes up to `count` *grapheme clusters* starting at the
-// cursor, clamped to the end of the line -- vim's own primitive (see
-// `vimkeys::apply_delete_forward`'s own doc comment on why this isn't
-// quite reducible to `d{count}l`; that's the plain shell prompt's own
-// separate, single-line, non-cluster-aware implementation of the same
-// primitive -- kept out of scope here the same way this codebase's
-// other multi-select/vim-feature work already draws that exact
-// boundary, see e.g. multi-selection `c`'s own doc comment). Cluster-,
-// not char-index-, counted: pressing `x` once on a ZWJ emoji sequence
-// deletes the *whole* glyph in one press rather than leaving broken
-// remnants behind, and `3x` deletes 3 whole clusters, not 3 raw
-// codepoints (which could otherwise split a cluster right down the
-// middle, deleting only part of it).
+// `x`: deletes up to `count` grapheme clusters from the cursor, to the
+// end of the line, so one `x` on a ZWJ emoji sequence removes the whole
+// glyph.
 pub(crate) fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let (row, col) = buf.cursor();
     let len = buf.line_len(row);
@@ -839,10 +673,7 @@ pub(crate) fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Register
         return;
     }
     let chars = buf.line_chars(row);
-    // Clamped to this cluster's own start first (not just the last
-    // valid char index) -- defense in depth matching char_at_col's own
-    // "never lands inside a wide char" convention, in case the cursor
-    // ever got here sitting mid-cluster through some other path.
+    // From the cluster's start, in case the cursor is somehow inside one.
     let start = crate::bishedit::grapheme::cluster_range(&chars, col.min(len - 1)).0;
     let mut end = start;
     for _ in 0..count.unwrap_or(1).max(1) {
@@ -855,14 +686,9 @@ pub(crate) fn delete_char_forward(buf: &mut TextBuffer, registers: &mut Register
     }
 }
 
-// `ys{motion}`/`yss`'s own target resolution: a motion resolves exactly
-// like any other operator target (`None` on a failed/empty one, same
-// silent no-op `delete_motion` already gives); `yss`'s own current-line
-// shorthand spans `count` lines starting at the cursor -- the same "this
-// operator, this line, `count` of them" shape `delete_lines`'s own doc
-// comment already establishes for `dd`/`cc`, unlike `editor.rs`'s own
-// single-line `LineBuffer` version of this same target, where `count`
-// has nothing further to extend into.
+// `ys{motion}`/`yss`'s target. A motion resolves as for any operator
+// (`None` when empty); `yss` spans `count` lines from the cursor, as
+// `dd` does.
 fn resolve_surround_target(buf: &mut TextBuffer, target: &SurroundTarget) -> Option<motion::MotionRange> {
     match target {
         SurroundTarget::Motion(m, count) => motion::motion_range(buf, m.clone(), *count),
@@ -875,13 +701,10 @@ fn resolve_surround_target(buf: &mut TextBuffer, target: &SurroundTarget) -> Opt
     }
 }
 
-// `ys{motion}{ch}`/`yss{ch}`: wraps `target`'s resolved range in `ch`'s
-// own delimiter pair. Inserts the close delimiter first, then the open
-// one -- inserting at/after `close_at` can never shift `open_at`'s own
-// position, so no further adjustment is needed regardless of shape (see
-// `motion::surround_insert_points`'s own doc comment). Cursor lands on
-// the inserted open delimiter's own first character, matching
-// vim-surround.
+// `ys{motion}{ch}`/`yss{ch}`: wraps the range in `ch`'s pair, close
+// first, so the open position doesn't move (see
+// `motion::surround_insert_points`). The cursor lands on the opening
+// delimiter, as in vim-surround.
 pub(crate) fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: char) {
     let Some(range) = resolve_surround_target(buf, &target) else {
         return;
@@ -895,11 +718,9 @@ pub(crate) fn add_surround(buf: &mut TextBuffer, target: SurroundTarget, ch: cha
     buf.set_cursor(open_at.0, open_at.1);
 }
 
-// `ds{ch}`: removes the nearest enclosing pair named by `ch`, plus any
-// padding `motion::surround_delete_spans` decides to strip -- close side
-// first, so removing it can never shift the open side's own position. A
-// no-op if `ch` doesn't name a valid target or no such pair encloses the
-// cursor.
+// `ds{ch}`: removes the nearest enclosing pair `ch` names, and the
+// padding `motion::surround_delete_spans` strips, close side first. A
+// no-op when there's no such pair.
 pub(crate) fn delete_surround(buf: &mut TextBuffer, ch: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
@@ -913,11 +734,8 @@ pub(crate) fn delete_surround(buf: &mut TextBuffer, ch: char) {
     buf.set_cursor(open_range.from.0, open_range.from.1);
 }
 
-// `cs{ch}{replacement}`: like `delete_surround`, but replaces the found
-// pair's own two delimiter characters with `replacement`'s pair instead
-// of removing them -- never touches any padding around them (unlike
-// `ds`). Close side first, same reasoning as `add_surround`/
-// `delete_surround`.
+// `cs{ch}{replacement}`: replaces the pair's two delimiters with
+// `replacement`'s, padding untouched, close side first.
 pub(crate) fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
@@ -937,10 +755,8 @@ pub(crate) fn change_surround(buf: &mut TextBuffer, ch: char, replacement: char)
     buf.set_cursor(open_pos.0, open_pos.1);
 }
 
-// Visual mode's own `S{ch}` -- wraps every committed selection plus the
-// active one in `ch`'s own delimiter pair, mirroring editor.rs's own
-// `surround_selections` (see its doc comment) generalized to a
-// `TextBuffer`'s multi-line selections/`insert_text`.
+// Visual `S{ch}`: wraps every selection in `ch`'s pair, as editor.rs's
+// `surround_selections` does on one line.
 pub(crate) fn surround_selections(buf: &mut TextBuffer, ch: char) {
     if buf.selections.is_empty() {
         return;
@@ -960,12 +776,9 @@ pub(crate) fn surround_selections(buf: &mut TextBuffer, ch: char) {
     buf.set_cursor(leftmost_open_at.0, leftmost_open_at.1);
 }
 
-// `r{ch}`: replaces `count` characters starting at the cursor with `ch`
-// each -- see editor.rs's own identical-in-spirit `replace_char` for the
-// "never crosses a line break, refuses if not enough characters remain"
-// rule. Built on `delete_range`/`insert_text` (no in-place char mutation
-// exists on `TextBuffer`) rather than that one's direct `Vec<char>`
-// splice, same reasoning `change_surround`'s own doc comment gives.
+// `r{ch}`: replaces `count` characters from the cursor with `ch`; never
+// crosses a line break, and refuses if too few remain (as editor.rs's
+// `replace_char`).
 pub(crate) fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     let (row, col) = buf.cursor();
     if count == 0 || col + count > buf.line_len(row) {
@@ -978,8 +791,7 @@ pub(crate) fn replace_char(buf: &mut TextBuffer, ch: char, count: usize) {
     buf.set_cursor(row, col + count - 1);
 }
 
-// `Ctrl-A`/`Ctrl-X`: see editor.rs's own identical-in-spirit
-// `adjust_number`.
+// `Ctrl-A`/`Ctrl-X`, as editor.rs's `adjust_number`.
 pub(crate) fn adjust_number(buf: &mut TextBuffer, delta: i64) {
     let Some(m) = motion::find_number(buf, buf.cursor()) else {
         return;
@@ -1002,24 +814,10 @@ pub(crate) fn case_kind_for_op(op: Op) -> motion::CaseKind {
     }
 }
 
-// `gu{motion}`/`gU{motion}`/`g~{motion}`'s shared range transform, and
-// `guu`/`gUU`/`g~~`'s own whole-line shorthand (via a `Linewise` range
-// built the same way `delete_lines`'s own doc comment describes).
-// `Linewise` is handled one row at a time -- each row's own content is
-// replaced in place (delete then reinsert *without* any embedded `\n`,
-// so line count is never at risk) -- rather than reusing the
-// `Inclusive`/`Exclusive` branch's single `extract_text`/`delete_range`/
-// `insert_text` round trip: that branch's text can safely carry the
-// embedded `\n`s it already had (never changes line count, since
-// `motion::extract_text`'s own boundary-crossing `\n`s exactly mirror
-// what's being put back), but `Linewise`'s own trailing `\n` after the
-// *last* line would, reinserted as-is, split off a spurious extra blank
-// line where the following content should have reattached instead
-// (`put`'s own Linewise branch sidesteps this differently, by wrapping a
-// stripped body in a fresh leading/trailing `\n` itself rather than
-// reusing one already baked into extracted text -- not reusable here
-// since this needs an exact in-place replace, not a shift-everything-
-// down paste).
+// `gu`/`gU`/`g~` over a range, and `guu`/`gUU`/`g~~` over lines.
+// Linewise ranges are replaced a row at a time, without newlines:
+// reinserting the extracted text, with its trailing newline, would
+// split off a blank line.
 fn case_operator_range(buf: &mut TextBuffer, range: &motion::MotionRange, kind: motion::CaseKind) {
     if range.shape == motion::MotionShape::Linewise {
         for row in range.from.0..=range.to.0 {
@@ -1027,19 +825,10 @@ fn case_operator_range(buf: &mut TextBuffer, range: &motion::MotionRange, kind: 
             if len == 0 {
                 continue;
             }
-            // `Inclusive`/`len - 1` (the line's own last real character),
-            // not `Exclusive`/`len` (one past it): `motion::extract_text`
-            // walks forward via `step_forward`, which never lands on
-            // that virtual past-the-end column at all (see its own doc
-            // comment) -- an `Exclusive` range built to stop *there*
-            // never actually satisfies the walk's own "reached `to`"
-            // check, so it silently keeps walking into the *next* line's
-            // content instead. `delete_range`'s own splice is unaffected
-            // (it's bounded by row indices, not this walk), but the text
-            // it returns would be, and this function reinserts exactly
-            // that text -- unlike most other callers, which only care
-            // about the splice succeeding, not the returned text being
-            // pixel-perfect.
+            // `Inclusive` to the last character, not `Exclusive` past it:
+            // `motion::extract_text` never lands on the past-the-end
+            // column, so an `Exclusive` range ending there would walk into
+            // the next line, and this reinserts that text.
             let line_range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, 0), to: (row, len - 1) };
             let text = buf.delete_range(&line_range);
             let transformed: String = text.chars().map(|c| motion::case_transform(c, kind)).collect();
@@ -1068,12 +857,8 @@ pub(crate) fn case_operator_lines(buf: &mut TextBuffer, count: Option<usize>, ki
     case_operator_range(buf, &range, kind);
 }
 
-// `~`: toggles the case of `count` characters starting at the cursor,
-// then advances the cursor to just past the last one toggled -- see
-// editor.rs's own identical-in-spirit `toggle_case`. Builds the whole
-// toggled run as one string and swaps it in via a single `delete_range`/
-// `insert_text` pair rather than `TextBuffer` having any in-place
-// per-character mutation to loop over.
+// `~`: toggles the case of `count` characters from the cursor and moves
+// past them, as editor.rs's `toggle_case`.
 pub(crate) fn toggle_case(buf: &mut TextBuffer, count: usize) {
     let (row, col) = buf.cursor();
     let len = buf.line_len(row);
@@ -1088,14 +873,9 @@ pub(crate) fn toggle_case(buf: &mut TextBuffer, count: usize) {
     buf.set_cursor(row, end_col.min(buf.line_len(row).saturating_sub(1)));
 }
 
-// `p`/`P`: a linewise register (`yy`, `dd`, ...) pastes as whole new
-// line(s) below (`p`)/above (`P`) the cursor's own line; a charwise one
-// pastes inline. Built entirely on `insert_text` (which already
-// understands embedded newlines) rather than a dedicated line-splice
-// primitive -- see this function's own two branches for exactly how
-// bracketing the pasted text with a leading/trailing "\n" and choosing
-// the insertion column makes `insert_text`'s ordinary line-splitting
-// logic land the result in the right place either way.
+// `p`/`P`: a linewise register pastes as whole lines below or above the
+// cursor's line, a charwise one inline. Both through `insert_text`, by
+// bracketing the text with newlines and choosing the column.
 pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool, count: Option<usize>, register: Option<char>) {
     let value = registers.read(register);
     if value.text.is_empty() {
@@ -1105,8 +885,8 @@ pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool,
     let (row, col) = buf.cursor();
     let repeated: String = value.text.repeat(count);
     match value.shape {
-        // Whole lines go above or below a closed fold, never into it --
-        // the same rule `o` and `O` follow (see `open_line`).
+        // Whole lines go above or below a closed fold, never into it, as with
+        // `o` and `O`.
         RegisterShape::Line => {
             let body = repeated.strip_suffix('\n').unwrap_or(&repeated);
             let (first, last) = buf.fold_span(row);
@@ -1122,19 +902,13 @@ pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool,
         RegisterShape::Char => {
             let insert_col = if before { col } else { (col + 1).min(buf.line_len(row)) };
             let new_cursor = buf.insert_text((row, insert_col), &repeated);
-            // Cursor ends on the last inserted character -- same rule
-            // vimkeys::apply_put's own doc comment establishes for the
-            // single-line case.
+            // The cursor ends on the last inserted character, as in
+            // `vimkeys::apply_put`.
             buf.set_cursor(new_cursor.0, new_cursor.1.saturating_sub(1));
         }
-        // A block goes back as a rectangle: each of its lines at the
-        // *same column* on consecutive lines, rather than spliced end to
-        // end. Which is the whole difference between a block and the
-        // same characters yanked charwise, and the reason `Block` is a
-        // register shape rather than a detail of how it was selected.
-        //
-        // A line too short to reach that column is padded out to it, so
-        // the rectangle stays a rectangle -- vim does the same.
+        // A block goes back as a rectangle, each line at the same column on
+        // consecutive lines; that's what makes `Block` a register shape. A
+        // line too short is padded to the column, as vim does.
         RegisterShape::Block => {
             let insert_col = if before { col } else { (col + 1).min(buf.line_len(row)) };
             let piece: Vec<&str> = value.text.split('\n').collect();
@@ -1156,9 +930,7 @@ pub(crate) fn put(buf: &mut TextBuffer, registers: &mut Registers, before: bool,
     }
 }
 
-// vim's own "`cw`/`cW` act like `ce`/`cE`" rule -- see editor.rs's own
-// `redirect_cw_to_ce` for the full reasoning (identical here, just
-// against a `TextBuffer` cursor instead of a `LineEditor` one).
+// vim's `cw` acts like `ce`; see editor.rs's `redirect_cw_to_ce`.
 pub(crate) fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion::Motion {
     let (row, col) = buf.cursor();
     let on_word_char = matches!(buf.char_at(row, col), Some(c) if !c.is_whitespace());
@@ -1169,31 +941,12 @@ pub(crate) fn redirect_cw_to_ce(buf: &TextBuffer, m: &motion::Motion) -> motion:
     }
 }
 
-// Positions the cursor (and, for `s`/`S`/`C`, removes text first -- same
-// "delete always yanks" rule any other delete gets, matching real vim)
-// for one `InsertCmd`, *before* `run_insert_mode`'s own typing loop
-// starts. Deliberately not `vimkeys::apply_insert_cmd` (that one's
-// `Vec<char>`-based, single-line only) -- this is TextBuffer's own
-// multi-line equivalent. `SubstituteLine` clears just the *current*
-// line's own content (an in-place `delete_range` from column 0 to end,
-// same-line so nothing joins) -- never the whole buffer the way
-// editor.rs's own single-line `SubstituteLine` handling does, since
-// unlike `LineBuffer`, "the current line" and "the whole buffer" are not
-// the same thing here.
-// `o`/`O`: splices a bare newline in at the end of the current line
-// (`above: false`) or the start of it (`above: true`) via `insert_text`,
-// which does the actual line-splitting. For `o`, `insert_text`'s own
-// returned cursor already lands exactly right (row + 1, col 0 -- the
-// fresh empty line below). For `O` it doesn't: inserting at column 0
-// pushes the *original* content down to row + 1 and leaves the new empty
-// line at the original `row`, but `insert_text`'s "cursor right after
-// what was just inserted" convention still reports (row + 1, 0) -- the
-// pushed-down line, not the new blank one -- so this repositions
-// explicitly for that case.
+// `o`/`O`: a newline at the end (`o`) or start (`O`) of the line, through
+// `insert_text`. For `O` the returned cursor is the pushed-down line, so
+// it's moved to the new blank one.
 pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
-    // On a closed fold, above the whole of it or below the whole of it:
-    // opening a line *inside* a fold nobody can see would put the typing
-    // somewhere hidden.
+    // On a closed fold, above or below the whole fold: a line opened inside
+    // it would be hidden.
     let (first, last) = buf.fold_span(buf.cursor().0);
     let row = if above { first } else { last };
     let indent = autoindent_for(buf, row);
@@ -1211,17 +964,11 @@ pub(crate) fn open_line(buf: &mut TextBuffer, above: bool) {
     }
 }
 
-/// The whitespace a new line opened from `row` should start with:
-/// exactly `row`'s own leading whitespace, copied.
-///
-/// **Plain** autoindent, vim's `autoindent` and not its `smartindent` --
-/// no opening a level after `{` or `then`, no closing one on `}`. The
-/// virtue of copying is that it is never wrong in a way that surprises:
-/// it puts the caret where the eye already is, and it cannot mis-guess a
-/// language's block structure because it never guesses.
-///
-/// Empty when the line is only whitespace, so pressing Enter on a blank
-/// line does not leave a trail of trailing spaces behind.
+/// The whitespace a line opened from `row` starts with: `row`'s leading
+/// whitespace, copied. Plain `autoindent`, not `smartindent`: no guessing
+/// at blocks after `{` or `then`, so never wrong in a surprising way.
+/// Empty for a whitespace-only line, so Enter on a blank line leaves no
+/// trailing spaces.
 pub(crate) fn autoindent_for(buf: &TextBuffer, row: usize) -> String {
     let chars = buf.line_chars(row);
     if chars.iter().all(|c| c.is_whitespace()) {
@@ -1230,15 +977,16 @@ pub(crate) fn autoindent_for(buf: &TextBuffer, row: usize) -> String {
     chars.iter().take_while(|c| **c == ' ' || **c == '\t').collect()
 }
 
+// Places the cursor for an `InsertCmd` before `run_insert_mode` starts,
+// removing text first for `s`, `S` and `C` (into a register, as any
+// delete). `S` clears the current line, not the buffer.
 pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     let (row, col) = buf.cursor();
     match cmd {
         InsertCmd::Before => {}
         InsertCmd::After => buf.set_cursor(row, (col + 1).min(buf.line_len(row))),
-        // `I` inserts at the first non-blank, which is where `^` goes
-        // -- not at column zero. On an indented line the two are
-        // different places, and column zero is the one nobody means:
-        // it puts the text in front of the indentation.
+        // `I` inserts at the first non-blank, where `^` goes, not in front of
+        // the indentation.
         InsertCmd::LineStart => {
             let col = motion::first_non_blank(buf, row);
             buf.set_cursor(row, col);
@@ -1265,11 +1013,11 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
                 buf.delete_range(&range);
             }
         }
-        // `gi`: the `^` mark `run_insert_mode` sets every time Insert mode
-        // ends, clamped in case the buffer's shrunk since. Falls back to
-        // the cursor's own current position if Insert mode has never run
-        // yet this session (no mark set) -- matches vim's own "gi with no
-        // prior insert behaves like i".
+        // Lines scrolled per wheel event, here, in repl.rs's Normal mode
+        // and in the pager. One, because terminals report distance, not
+        // notches (kitty sends an event per cell height travelled), so no
+        // constant could mean one notch. The wheel moves the cursor and the
+        // view follows it.
         InsertCmd::LastInsertPos => {
             let (target_row, target_col) = buf.get_mark('^').unwrap_or((row, col));
             let target_row = target_row.min(buf.line_count() - 1);
@@ -1279,94 +1027,19 @@ pub(crate) fn resolve_insert_start(buf: &mut TextBuffer, cmd: InsertCmd) {
     }
 }
 
-// The typing loop once Insert mode has actually started (cursor already
-// positioned by `resolve_insert_start`, or -- for `c{motion}`/`cc`/
-// Visual `c` -- already sitting exactly where a delete just left it, no
-// repositioning needed at all). Always returns to Normal mode in the
-// caller (the one real Normal-mode loop, `repl.rs`'s
-// `run_normal_mode_navigation`) once this returns -- Escape/Ctrl-C/
-// Ctrl+G all mean exactly the same thing here (leave Insert mode),
-// and EOF does too (nothing sensible to keep typing into). Unlike a live
-// shell prompt's own Insert-mode-to-Normal-mode transition, there's no
-// second "which mode am I actually in" question to answer afterward:
-// this pane's own Normal mode is already the one true one, so Ctrl+G
-// has nothing further to detach *to* -- it used to jump straight past
-// Normal mode to inspecting/switching other windows in one keystroke;
-// now it just means "stop typing," and reaching another window from here
-// is `<C-w>...` after this returns, same total keystroke count as before.
-//
-// `replace` (`R` -- see `KeyOutcome::EnterReplace`'s own doc comment)
-// swaps two of this loop's own arms (`Key::Char`/`Key::Backspace`) from
-// their ordinary Insert-mode behavior to overtype instead -- everything
-// else (motion keys, Enter, exit) behaves identically either way, which
-// is why this is a flag on the one shared loop rather than a second copy
-// of it.
-// term_rows/term_cols are plain by-value snapshots, not &mut usize, even
-// though on_idle (built by every call site) closes over the *same*
-// underlying term_rows/term_cols one level up as &mut usize to drive
-// service_background_jobs's own resize handling -- a second, direct
-// &mut borrow of that same storage here would conflict with the
-// closure's borrow of it, since both live for this whole call. The
-// practical effect: a resize mid-insert-session is still fully applied
-// (session screen, job ptys, the caller's own term_rows/term_cols) by
-// the time this function returns, but this function's own rendering
-// keeps using the size it started with until then -- the same "next
-// natural redraw" caveat this codebase already accepts elsewhere for a
-// loop that's actively blocked on a keystroke.
-// Lines scrolled per mouse wheel notch -- here, in repl.rs's own
-// Normal-mode navigation, and in the pager.
-//
-// One, because the terminal has already decided how fast the wheel
-// turns. This was three on the theory that a line a notch "reads as
-// sluggish for a fast scroll"; that was a guess, and it was wrong. A
-// How far one wheel *event* moves the cursor. One, because a terminal
-// does not report notches -- it reports distance.
-//
-// Measured from kitty's own output: one turn of the wheel arrives as
-// two, three or four identical SGR events, varying run to run. Its
-// mouse.c divides its own `wheel_scroll_multiplier` out the moment an
-// application turns mouse reporting on (`scale /= fabs(scale)`, keeping
-// only the sign) and then writes one event per cell-height the wheel or
-// finger actually travelled. So no kitty setting changes this, and no
-// constant here can mean "one notch": the terminal has already decided
-// how far, and it says so in the number of events.
-//
-// What it must not do is *lead* the view. Before bish handled the wheel
-// itself, kitty translated it into that many arrow keys (mouse.c's
-// fake_scroll), which moved the cursor and left the viewport to follow
-// only when it had to. Measured side by side in the editor with the
-// cursor mid-screen: twelve arrow keys moved the view not at all, while
-// twelve wheel events moved it twelve lines. That is the whole of what
-// "it scrolls three lines at a time" was -- not the count, which never
-// changed, but a viewport that had started leading instead of
-// following. So the wheel is a cursor motion again, the same one the
-// terminal used to send.
+// Lines scrolled per wheel event, here, in repl.rs's Normal mode and in
+// the pager. One, because terminals report distance, not notches: kitty
+// sends one event per cell height travelled (two to four per turn), so
+// no constant here can mean one notch. The wheel moves the cursor, as
+// the arrow keys kitty used to translate it into did, so the view
+// follows rather than leads.
 pub(crate) const MOUSE_WHEEL_LINES: usize = 1;
 
-// `extra_cursors`: every position besides `buf.cursor()` itself that
-// this same Insert-mode session must also type into -- multi-selection
-// `c`'s own "replace every one of these with what I'm about to type"
-// (repl.rs's own Key::Char('c') arm passes each deleted selection's own
-// gap, other than the one `buf.cursor()` already sits on; every other
-// caller passes `&[]`, the ordinary single-cursor case this always was
-// before). `cursors[0]` is kept mirroring `buf.cursor()` throughout --
-// navigation (Left/Right/Up/Down/PageUp/PageDown/wheel) only ever moves
-// that one, matching real editors' own multi-cursor convention that
-// navigating mid-edit doesn't drag every other cursor along with it;
-// only an actual mutation (Enter/Tab/Backspace/a typed char) replicates
-// across the whole set, via apply_insert_to_all/apply_backspace_to_all.
-// What one idle tick reported. `None` is "nothing happened"; `Some` is
-// "repaint, into *this* geometry".
-//
-// The two travel together on purpose. A caller holding a live
-// `TextBuffer`/`VimKeys` has to know when to repaint, because
-// `compositor_redraw` (already run inside `on_idle` itself) paints a
-// driven `Frame::Edit` pane blank -- see service_background_jobs's own
-// doc comment. But the commonest reason to be told that is a terminal
-// resize, which is exactly the moment the geometry captured before
-// Insert mode began stopped describing anything real. Reporting only
-// *whether* to repaint -- as this did -- meant Insert mode faithfully
-// repainted a 38-row frame into a 20-row terminal.
+// What one idle tick reported: `None` for nothing, `Some` for repaint
+// into this geometry. Together because a repaint is mostly due to a
+// resize, when the geometry measured before Insert mode is stale.
+// `compositor_redraw` paints a driven `Frame::Edit` blank (see
+// `service_background_jobs`), so the caller must repaint.
 #[derive(Clone, Copy)]
 pub(crate) struct IdleRedraw {
     pub(crate) rect: Rect,
@@ -1374,55 +1047,35 @@ pub(crate) struct IdleRedraw {
     pub(crate) term_cols: usize,
 }
 
-/// What Insert mode needs from whoever is driving it.
-///
-/// One object rather than two closures because both of them need the
-/// same mutable state (the session table, the window list), and two
-/// closures capturing it are two simultaneous unique borrows -- which
-/// the compiler is right to refuse. Methods on one object take that
-/// borrow once.
-///
-/// `idle` is called while nothing is arriving on stdin; `complete` when
-/// Ctrl-N asks what could go at the cursor. A caller with no language
-/// server implements the second as "nothing", which is what makes
-/// Ctrl-N a no-op rather than an error in a plain editor.
+/// What Insert mode needs from whoever drives it. One object rather
+/// than two closures, since both need the same mutable state and two
+/// closures would borrow it twice. `idle` runs while stdin is quiet;
+/// `complete` answers Ctrl-N, as nothing without a language server.
 pub(crate) trait InsertServices {
     fn idle(&mut self, buf: &mut TextBuffer) -> Option<IdleRedraw>;
     fn complete(&mut self, _buf: &TextBuffer, _row: usize, _col: usize) -> Vec<crate::bishedit::completion::EditorCompletion> {
         Vec::new()
     }
-    /// The signature of the call being typed at this position, as
-    /// popup lines, or `None` for "nothing to show here".
-    ///
-    /// `typed` is the character just inserted, or `None` when something
-    /// else moved the cursor. The implementor decides whether that
-    /// character is a trigger, because the answer is the server's own
-    /// (`signatureHelpProvider.triggerCharacters`) and this module has
-    /// no server. A `None` return closes whatever is showing, so an
-    /// argument list that has been closed stops advertising itself.
+    /// The signature of the call being typed here, as popup lines, or `None`
+    /// to show nothing (closing what's open). `typed` is the character just
+    /// inserted, `None` when something else moved the cursor; the
+    /// implementor decides whether it's a trigger, since that's the server's
+    /// `signatureHelpProvider.triggerCharacters`.
     fn signature(&mut self, _buf: &TextBuffer, _row: usize, _col: usize, _typed: Option<char>) -> Option<Vec<String>> {
         None
     }
 
-    /// Whether Insert mode should wait on the terminal once every
-    /// queued key is spent. Real editing does, and must: a macro that
-    /// ends mid-insert leaves you in Insert mode, exactly as vim does.
-    ///
-    /// Tests drive a whole excursion from a macro replay with no
-    /// terminal behind fd 0, where "wait for a keystroke" means wait
-    /// forever -- and used to get away with it only because fd 0
-    /// happened to be at EOF, so the poll said ready and the read said
-    /// None. Run with fd 0 held open by anything that never speaks
-    /// (a socket, an idle pipe) the same tests hang. They answer false
-    /// instead, and Insert mode ends when the replay does.
+    /// Whether Insert mode waits on the terminal once queued keys are spent.
+    /// Real editing does: a macro ending mid-insert leaves you in Insert, as
+    /// in vim. Tests replaying a macro with no terminal answer false, or
+    /// they'd hang waiting on fd 0.
     fn awaits_live_input(&self) -> bool {
         true
     }
 }
 
-/// For a caller with nothing to offer: no idle work, no completions.
-/// Only this module's own tests today, which is why it is test-only --
-/// every real caller has a shell behind it.
+/// For a caller with nothing to offer: no idle work, no completions. Only
+/// this module's tests; real callers have a shell.
 #[cfg(test)]
 pub(crate) struct NoInsertServices;
 
@@ -1437,13 +1090,9 @@ impl InsertServices for NoInsertServices {
     }
 }
 
-// The completion popup while it is open.
-//
-// Fetched once, then filtered as you keep typing rather than re-asked
-// -- which is what makes it feel instant, and is honest about what it
-// is: a snapshot of what the server said at the moment you asked. A
-// server that wanted to be re-asked says so with `isIncomplete`, which
-// this client reads and ignores (see `lsp::completions`).
+// The completion popup while it's open. Fetched once and filtered as
+// you type, so it's instant: a snapshot of the server's answer.
+// `isIncomplete` is read and ignored (see `lsp::completions`).
 struct LiveCompletion {
     /// Everything the server offered, in its own order.
     all: Vec<crate::bishedit::completion::EditorCompletion>,
@@ -1451,16 +1100,15 @@ struct LiveCompletion {
     shown: Vec<usize>,
     /// Index into `shown`.
     selected: usize,
-    /// Where the word being completed starts, on `row`. Captured when
-    /// the popup opens so the filter can see what has been typed since.
+    /// Where the completed word starts, on `row`, captured at opening so the
+    /// filter sees what's been typed since.
     row: usize,
     word_start: usize,
 }
 
 impl LiveCompletion {
-    // Narrows to the candidates still matching the word under the
-    // cursor. `false` when nothing matches any more, which is the
-    // caller's cue to close: a popup with no rows is just a box.
+    // Narrows to candidates still matching the word under the cursor. False
+    // when none do, and the caller closes the popup.
     fn refilter(&mut self, buf: &TextBuffer) -> bool {
         let (row, col) = buf.cursor();
         if row != self.row || col < self.word_start {
@@ -1489,132 +1137,94 @@ impl LiveCompletion {
     }
 }
 
+// Insert mode's loop, once `resolve_insert_start` (or a `c` delete) has
+// placed the cursor. Escape, Ctrl-C, Ctrl+G and EOF all end it, back to
+// `run_normal_mode_navigation`. `replace` (`R`) makes typing and
+// Backspace overtype. `term_rows`/`term_cols` are copies: `on_idle`
+// holds the originals, so a resize applies when this returns.
+// `extra_cursors` are the other positions a multi-selection `c` types
+// into; navigation moves only the main cursor, edits apply to all.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_insert_mode(
     buf: &mut TextBuffer,
     vk: &mut VimKeys,
     rect: Rect,
     registers: &mut Registers,
-    // Takes the buffer, rather than closing over it: the caller needs
-    // it mutably for the whole of this call, and an idle tick that has
-    // to see the live text (document synchronization -- see repl.rs's
-    // `sync_language_server_document`) can't borrow it a second time.
-    // Handing it in at the one moment nothing else holds it is what
-    // makes both possible.
+    // The buffer is handed in, not closed over: the caller holds it
+    // mutably for the whole call, and an idle tick syncing the document to
+    // a language server (`sync_language_server_document`) needs to see it.
     services: &mut dyn InsertServices,
     replace: bool,
     term_rows: usize,
     term_cols: usize,
     color_overrides: Option<&highlight::ColorOverrides>,
     extra_cursors: &[(usize, usize)],
-    // The shell's whole abbreviation table, narrowed here to the ones
-    // targeting this file's own language -- see `language_of` and
-    // `abbr --lang=`. Empty for callers with no shell behind them.
+    // The shell's abbreviations, narrowed here to this file's language (see
+    // `language_of`, `abbr --lang=`). Empty without a shell.
     abbrs: &[Abbr],
 ) -> io::Result<()> {
     let mode = if replace { EditorMode::Replace } else { EditorMode::Insert };
-    // Rebound as mutable: an idle tick may hand back new geometry (see
-    // IdleRedraw), and every later render in this function has to use
-    // it rather than what the caller measured before Insert mode began.
+    // Mutable: an idle tick may report new geometry (`IdleRedraw`), which
+    // later renders must use.
     let (mut rect, mut term_rows, mut term_cols) = (rect, term_rows, term_cols);
     let mut cursors: Vec<(usize, usize)> = std::iter::once(buf.cursor()).chain(extra_cursors.iter().copied()).collect();
-    // Where a mouse drag started, while one is in progress. Insert mode
-    // gets a selection of its own -- the one a GUI editor gives you --
-    // rather than borrowing Visual mode's: Visual is a *mode*, and the
-    // point here is to select without leaving the one you are typing in.
+    // Where a mouse drag started, while one is in progress. Insert mode has
+    // its own selection, as GUI editors do, rather than switching to
+    // Visual.
     let mut drag_anchor: Option<(usize, usize)> = None;
-    // Resolved once per Insert-mode session: the file's language can't
-    // change while it's being typed into, and neither can the table (the
-    // caller snapshots it fresh on the way in -- see repl.rs).
+    // Once per session: neither the language nor the snapshot table can
+    // change while typing.
     let abbrs = snippet::for_language(abbrs, &language_of(buf));
     let mut live: Option<LiveSnippet> = None;
     let mut completing: Option<LiveCompletion> = None;
-    // The signature of the call being typed, while there is one. Opened
-    // by a trigger character the server named, refreshed by every key
-    // after that, and closed the moment the server has nothing more to
-    // say -- see `InsertServices::signature`.
+    // The signature of the call being typed, while there is one; see
+    // `InsertServices::signature`.
     let mut signature: Option<Vec<String>> = None;
-    // Before the first frame, not just after every keystroke.
-    //
-    // Where insert starts is chosen by the *caller* -- `a` steps the
-    // cursor past the last character, `o` opens a line below, `A` goes
-    // to the end -- and any of those can land outside the viewport the
-    // pane was last scrolled to. Without this the first thing typed
-    // goes in at a position nobody can see: `a` at the end of a line
-    // too long for the pane types off the right edge, and `o` under a
-    // horizontally scrolled line types at column 0 while the viewport
-    // is still scrolled right. Both were reported; both are this one
-    // missing call, because the loop below has always scrolled *after*
-    // a key and never before the first.
-    //
-    // Typing happens on a line you can see: vim never keeps the folds
-    // around the cursor's line closed in Insert mode, and a closed fold
-    // here would be a row that cannot show what is being typed into it.
+    // Before the first frame too: `a`, `o` or `A` can put the cursor outside
+    // the viewport, and the first character would go in out of sight.
+    // Folds around the cursor's line open, as vim keeps them in Insert mode,
+    // since a closed fold can't show what's typed into it.
     let line = buf.cursor().0;
     buf.folds.open_all(line);
     buf.set_viewport_height(editor_content_rows(rect));
     scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
     render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
-    // `"."`'s own accumulator for this session -- see `Registers::
-    // set_last_insert`'s own doc comment. Best-effort: a Backspace just
-    // pops the most recently accumulated character regardless of whether
-    // it's actually erasing something typed *this* session or older
-    // pre-existing text it backed into -- real vim tracks that
-    // distinction precisely; this doesn't.
+    // `"."`'s text for this session (`Registers::set_last_insert`).
+    // Backspace pops the last character even when erasing older text,
+    // which vim tracks and this doesn't.
     let mut inserted = String::new();
-    // Whether the bytes arriving right now were pasted rather than
-    // typed, bracketed by the terminal (see `Key::PasteStart`). Nothing
-    // that helpfully reacts to typing runs while this is set:
-    // autoindent would staircase every line, and `abbr` would expand a
-    // word that happens to look like an abbreviation in someone else's
-    // code.
+    // Whether input is a bracketed paste (`Key::PasteStart`). Autoindent and
+    // `abbr` are off meanwhile: pasted lines would staircase, and pasted
+    // code could trip an abbreviation.
     let mut pasting = false;
-    // Asking the real terminal to bracket pastes for the duration.
-    // `sync_bracketed_paste` (repl.rs) does the same thing for a
-    // *foreground job* that asked for it; the two never overlap, since
-    // no job is being driven while this loop owns the keyboard.
+    // Bracketed paste on for the duration. `sync_bracketed_paste` (repl.rs)
+    // does it for a foreground job; the two never overlap.
     let _paste_guard = term::BracketedPasteGuard::enable();
     let live_input = services.awaits_live_input();
     loop {
-        // Waits for a byte to actually be ready *before* calling
-        // vk.next_key below, rather than passing `on_idle` as that
-        // call's own on_idle closure -- vk.next_key(&mut self, ...)
-        // holds `vk` (and this function needs `buf` too) exclusively
-        // borrowed for its whole call, which would make it impossible
-        // for `on_idle` to also redraw them from inside that call. See
-        // run_normal_mode_navigation's own identical restructuring
-        // (repl.rs) for the full reasoning -- same fix, same root cause.
-        // A queued key -- a macro replay, or a mapping's expansion -- is
-        // not a byte on stdin, so polling for one would block with keys
-        // already in hand and hand them out one per real keystroke.
+        // Waits for input before `vk.next_key`, rather than passing
+        // `on_idle` to it: that call borrows `vk` exclusively, so `on_idle`
+        // couldn't redraw (as in `run_normal_mode_navigation`). Queued keys
+        // (a macro, a mapping's expansion) aren't on stdin, so they skip
+        // the wait.
         while !vk.has_pending_keys() && live_input && !term::stdin_ready(editor::IDLE_POLL_MS) {
             if let Some(geometry) = services.idle(buf) {
                 rect = geometry.rect;
                 term_rows = geometry.term_rows;
                 term_cols = geometry.term_cols;
-                // A shrink can leave the cursor below the viewport, and
-                // working that out needs the new height -- which is a
-                // stored field with no resize hook of its own.
+                // A shrink can leave the cursor below the viewport, which
+                // needs the new height.
                 buf.set_viewport_height(editor_content_rows(rect));
                 scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
                 render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
             }
         }
-        // Goes through `vk.next_key` (not a bare `read_key_idle`) so a
-        // macro recorded/replayed from Normal mode -- see its own doc
-        // comment -- still works across a full Insert-mode excursion:
-        // `run_normal_mode_navigation` calls this function inline, with
-        // the same `vk`, so nothing here needs its own bookkeeping. A
-        // byte is already known ready (just confirmed above), so this
-        // on_idle closure is never actually called.
-        //
-        // `next_mapped_key` rather than `next_key`, so `::bish map -m
-        // insert` applies here -- the mode is passed explicitly because
-        // this loop, not `VimKeys`, is what makes it Insert mode. The
-        // several places below that read one further raw key for their
-        // own purposes (`<C-r>{register}`, `<C-o>`'s one-shot command)
-        // keep using `next_key` and stay unmapped, the same line Normal
-        // mode draws with `wants_raw_key`.
+        // Through `vk`, so a macro replay crosses into Insert mode with the
+        // same `vk`; a byte is known ready, so its `on_idle` never runs.
+        // `next_mapped_key` applies `::bish map -m insert`, with the mode
+        // given since this loop is what makes it Insert. The raw reads below
+        // (`<C-r>{register}`, `<C-o>`) stay unmapped, as Normal mode's
+        // `wants_raw_key` does.
         let key = match vk.next_mapped_key("insert", || if live_input { editor::read_key_idle(&mut || {}) } else { Ok(None) })? {
             Some(k) => k,
             None => {
@@ -1623,23 +1233,19 @@ pub(crate) fn run_insert_mode(
                 return Ok(());
             }
         };
-        // A mapping whose prefix was typed speculatively (see
-        // `Matcher::feed`) has completed, so those characters come back
-        // off before whatever it mapped to runs. Exactly Backspace's own
-        // effect, reused rather than reimplemented, so multi-cursor and
-        // the `inserted` record stay consistent. Invisible to undo: an
-        // Insert session is one undo step, so a character typed and
-        // removed inside it leaves nothing behind.
+        // A mapping whose prefix was typed speculatively (`Matcher::feed`)
+        // has completed, so those characters are taken back first, through
+        // Backspace's own path so multi-cursor and `inserted` stay
+        // consistent. Invisible to undo, since an Insert session is one
+        // undo step.
         for _ in 0..vk.take_pending_revert() {
             apply_backspace_to_all(buf, &mut cursors);
             buf.set_cursor(cursors[0].0, cursors[0].1);
             inserted.pop();
         }
-        // Any key outside a live snippet's own vocabulary accepts it as
-        // it stands and then means whatever it always meant -- the exact
-        // rule read_line already follows for the same thing at the shell
-        // prompt, and what keeps every arrow/motion/Escape arm below free
-        // of snippet-aware special cases.
+        // A key outside a live snippet's vocabulary accepts it as it stands,
+        // then means what it always does, as at the shell prompt, so the arms
+        // below needn't know about snippets.
         if live.is_some()
             && !matches!(
                 key,
@@ -1651,27 +1257,16 @@ pub(crate) fn run_insert_mode(
             buf.snippet_holes.clear();
         }
 
-        // Any key the popup does not use closes it and then means
-        // whatever it always meant -- the same rule a live snippet just
-        // above follows, and what keeps every other arm free of
-        // completion-aware special cases. `Char`/`Backspace` are not in
-        // this list because they *narrow* the popup rather than
-        // dismissing it: typing more of a word is how you pick from one.
+        // A key the popup doesn't use closes it, then means what it always
+        // does. `Char` and `Backspace` narrow it instead: typing more of a
+        // word is how you pick.
         if completing.is_some() && !matches!(key, Key::CtrlN | Key::CtrlP | Key::Enter | Key::Tab | Key::Escape | Key::Char(_) | Key::Backspace) {
             completing = None;
         }
 
-        // Typing with a selection standing replaces it -- select-and-type,
-        // the other half of the Backspace/Delete arms below and what a
-        // selection means everywhere one can exist. Done here rather than
-        // as another guarded arm because the arms that insert differ only
-        // in *what* they insert, and every one of them would need the
-        // same four lines.
-        //
-        // Only a plain character, and only with no popup or snippet live:
-        // those two own `Char` while they are up (it narrows a completion
-        // and fills a tabstop), and Replace mode's whole contract is that
-        // the line's length does not change.
+        // Typing a character over a selection replaces it, as Backspace and
+        // Delete delete it below. Not with a popup or snippet live, which own
+        // `Char`, nor in Replace mode, which keeps the line's length.
         if !buf.selections.is_empty() && !replace && live.is_none() && completing.is_none() && matches!(key, Key::Char(_)) {
             let range = buf.selections[0];
             buf.selections.clear();
@@ -1681,7 +1276,7 @@ pub(crate) fn run_insert_mode(
         }
 
         match key {
-            // --- the completion popup owns these while it is open ----
+            // The completion popup owns these while it's open.
             Key::CtrlN if completing.is_some() && live.is_none() => {
                 let state = completing.as_mut().unwrap();
                 if !state.shown.is_empty() {
@@ -1694,9 +1289,8 @@ pub(crate) fn run_insert_mode(
                     state.selected = (state.selected + state.shown.len() - 1) % state.shown.len();
                 }
             }
-            // Escape closes the popup and stays in Insert mode -- the
-            // one place Escape does not leave, matching every editor
-            // with a completion menu.
+            // Escape closes the popup and stays in Insert mode, as in every
+            // editor with a completion menu.
             Key::Escape if completing.is_some() => {
                 completing = None;
             }
@@ -1704,25 +1298,22 @@ pub(crate) fn run_insert_mode(
                 let state = completing.take().unwrap();
                 if let Some(item) = state.chosen().cloned() {
                     let (row, col) = buf.cursor();
-                    // The server's own range when it named one; the word
-                    // being typed otherwise.
+                    // The server's range when it gave one, else the word
+                    // being typed.
                     let (row, start, end) = item.replace.unwrap_or((row, state.word_start, col));
                     let line_len = buf.line_len(row);
                     let (start, end) = (start.min(line_len), end.min(line_len).max(start.min(line_len)));
-                    // A server's snippet completion becomes exactly the
-                    // same live snippet an `abbr` does -- same keys,
-                    // same marking, same accept -- so `fn ${1:name}()`
-                    // arrives with the caret already in `name` instead
-                    // of as literal punctuation to clean up.
+                    // A snippet completion becomes the same live snippet an
+                    // `abbr` does, so `fn ${1:name}()` arrives with the
+                    // caret in `name`.
                     match item.snippet.then(|| Snippet::parse(&item.insert)).flatten() {
                         Some(snip) => {
                             let replaced: String = buf.line_chars(row)[start..end].iter().collect();
                             live = Some(LiveSnippet::start(snip, row, start, replaced, buf));
                         }
                         None => {
-                            // `flatten` and not the raw text: a server
-                            // that flagged a snippet with no tabstops in
-                            // it still wrote `\$` for a literal dollar.
+                            // `flatten`, not the raw text: a snippet with
+                            // no tabstops still escapes `$` as `\$`.
                             let text = if item.snippet { snippet::flatten(&item.insert) } else { item.insert.clone() };
                             buf.replace_span((row, start), (row, end), &text);
                             buf.set_cursor(row, start + text.chars().count());
@@ -1732,8 +1323,8 @@ pub(crate) fn run_insert_mode(
                     cursors[0] = buf.cursor();
                 }
             }
-            // Opening it: only with no snippet live, since Ctrl-N is
-            // that feature's own "next placeholder" while one is.
+            // Opening it, only with no snippet live, where Ctrl-N means the
+            // next placeholder.
             Key::CtrlN if live.is_none() => {
                 let (row, col) = buf.cursor();
                 let line = buf.line_chars(row);
@@ -1746,19 +1337,12 @@ pub(crate) fn run_insert_mode(
                     }
                 }
             }
-            // --- a live `abbr` snippet owns these eight keys, exactly as
-            // it does at the shell prompt (editor.rs) ------------------
-            // Tab advances rather than indenting, Ctrl-E cancels back to
-            // the abbreviation name, Ctrl-Y accepts, and Enter advances
-            // except on the last placeholder in visit order, where it
-            // accepts instead of inserting a newline.
-            // Each of these resyncs `cursors[0]` from the buffer on the
-            // way out: the snippet moves the real cursor through its own
-            // model, and this function's other arms all insert at
-            // `cursors[0]` -- leaving it behind is how a keystroke right
-            // after an accept lands back where the abbreviation started
-            // (found via pty, and exactly what the invariant every other
-            // arm here already maintains exists to prevent).
+            // A live `abbr` snippet owns these keys, as at the shell
+            // prompt: Tab advances, Ctrl-E cancels back to the name, Ctrl-Y
+            // accepts, Enter advances except on the last placeholder, where
+            // it accepts. Each resyncs `cursors[0]`, since the snippet
+            // moves the real cursor and the other arms insert at
+            // `cursors[0]`.
             Key::Tab | Key::CtrlN if live.is_some() => {
                 let state = live.as_mut().unwrap();
                 state.snip.advance(false);
@@ -1785,10 +1369,8 @@ pub(crate) fn run_insert_mode(
                 live.take().unwrap().cancel(buf);
                 cursors[0] = buf.cursor();
             }
-            // Only ever eats what was typed into the active placeholder;
-            // with nothing left in it, it stops rather than chewing into
-            // the snippet's own literal text, which the model could not
-            // put back.
+            // Only eats what was typed into the active placeholder, never the
+            // snippet's literal text, which the model couldn't put back.
             Key::Backspace if live.is_some() => {
                 let state = live.as_mut().unwrap();
                 if state.snip.backspace() {
@@ -1804,74 +1386,44 @@ pub(crate) fn run_insert_mode(
                 inserted.push(c);
             }
 
-            // `^`: vim's own name for this mark (`:help '^`) -- wherever
-            // the cursor was the last time Insert mode ended, however it
-            // ended. `gi` reads it back (see resolve_insert_start's own
-            // `LastInsertPos` arm).
-            //
-            // Ctrl-C is a plain alias for Escape throughout this editor
-            // (see the identical treatment in the unified Normal mode's
-            // own Visual-mode handling); Ctrl+G is too, here (see
-            // this function's own doc comment).
+            // `^` (`:help '^`) marks where the cursor was when Insert mode
+            // last ended, for `gi`. Ctrl-C and Ctrl+G are Escape here.
             Key::CtrlG | Key::CtrlSpace | Key::Escape | Key::CtrlC => {
-                // The `'^'` mark records the exact position insert mode
-                // left off at (so `gi` resumes appending from the same
-                // spot, one-past-the-last-character included) -- captured
-                // *before* the Normal-mode-only clamp just below, which
-                // must not affect it.
+                // Before the clamp below: `gi` resumes at the exact spot,
+                // past the last character included.
                 buf.set_mark('^', buf.cursor());
                 registers.set_last_insert(inserted);
-                // Leaving Insert mode steps the cursor one column left,
-                // as vim's does, so the caret lands *on* the character
-                // just typed rather than after it. That is what makes
-                // `x` delete what you were looking at and `A`-then-Esc
-                // leave you on the last character.
-                //
-                // This used only to clamp a cursor sitting past the end
-                // of the line, which is the same thing in the common
-                // "typed to the end and pressed Escape" case and nothing
-                // at all anywhere else -- so `i`, type, Escape, `x` in
-                // the middle of a line deleted the character *after* the
-                // insertion instead of the last one typed.
-                //
-                // Column 0 stays at column 0: there is nowhere left, and
-                // an empty line has nothing to sit on either.
+                // Leaving Insert mode steps the cursor one column left, as
+                // vim does, onto the character just typed, so `i`, type,
+                // Escape, `x` deletes the last character typed. Column 0
+                // stays put.
                 let (row, col) = buf.cursor();
                 buf.set_cursor(row, col.saturating_sub(1));
                 return Ok(());
             }
-            // Enter is the first of the two abbreviation triggers, same
-            // as at the shell prompt: it expands rather than inserting a
-            // newline, and a second Enter (now finding nothing to expand)
-            // does the newline. Never in Replace mode, whose whole
-            // contract is that the line's length doesn't change --
-            // splicing an expansion in would break exactly that.
-            // An `abbr` never expands out of pasted text: a word in
-            // someone else's code that happens to match one of yours is
-            // not an abbreviation you typed.
+            // Enter is an abbreviation trigger, as at the shell prompt: it
+            // expands instead of inserting a newline, and a second Enter
+            // inserts one. Not in Replace mode, which keeps the line's
+            // length, and never on pasted text, where a match isn't
+            // something you typed.
             Key::Enter if !replace && !pasting && expand_abbr(buf, &abbrs, &mut live) => {
                 cursors[0] = buf.cursor();
             }
             Key::Enter => {
-                // Autoindent, unless these characters were pasted --
-                // a paste already carries its own indentation, and
-                // adding to it is the staircase bracketed paste exists
-                // to prevent.
+                // Autoindent, except for pasted text, which carries its own.
                 let indent = if pasting { String::new() } else { autoindent_for(buf, buf.cursor().0) };
                 let text = format!("\n{indent}");
                 apply_insert_to_all(buf, &mut cursors, &text);
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.push_str(&text);
             }
-            // With `expandtab` on, spaces up to the next `shiftwidth`
-            // boundary; with it off, one literal tab. Never overtypes
-            // even in Replace mode, same as Enter just above.
+            // `expandtab` on: spaces to the next `shiftwidth` boundary;
+            // off: a tab. Never overtypes, even in Replace mode.
             Key::Tab => {
                 let text = if buf.expandtab {
                     let (line, col) = buf.cursor();
-                    // To the next boundary in *drawn columns*, so a tab
-                    // pressed after a literal tab lands where it looks
-                    // like it should.
+                    // To the next boundary in drawn columns, so a tab after
+                    // a literal tab lands where it looks like it should.
                     let at = display_column(buf, line, col);
                     " ".repeat(buf.shiftwidth - (at % buf.shiftwidth))
                 } else {
@@ -1881,15 +1433,10 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.push_str(&text);
             }
-            // Replace mode's own Backspace: known simplification -- steps
-            // the cursor back without restoring the character it walks
-            // back over (real vim remembers and restores each one) and
-            // never crosses a line boundary backward, unlike ordinary
-            // Insert mode's own version just below. Never combined with
-            // extra_cursors in practice (only `c`, always plain Insert,
-            // ever passes any) -- moves `cursors[0]` directly rather than
-            // going through apply_backspace_to_all's own multi-cursor
-            // machinery, since there's never more than one cursor here.
+            // Replace mode's Backspace steps back without restoring the
+            // character (vim restores it) and doesn't cross lines. Only
+            // plain Insert ever has extra cursors, so this moves
+            // `cursors[0]` alone.
             Key::Backspace if replace => {
                 let (row, col) = buf.cursor();
                 if col > 0 {
@@ -1898,11 +1445,8 @@ pub(crate) fn run_insert_mode(
                 cursors[0] = buf.cursor();
                 inserted.pop();
             }
-            // With a selection standing, Backspace deletes *it* and
-            // leaves the caret where it was -- which is what Backspace
-            // means everywhere else a selection can exist, and the one
-            // gesture that makes selecting in Insert mode worth
-            // anything.
+            // With a selection, Backspace deletes it and leaves the caret
+            // where it was.
             Key::Backspace if !buf.selections.is_empty() => {
                 let range = buf.selections[0];
                 buf.selections.clear();
@@ -1915,17 +1459,9 @@ pub(crate) fn run_insert_mode(
                 buf.set_cursor(cursors[0].0, cursors[0].1);
                 inserted.pop();
             }
-            // Delete: Backspace's forward twin, and absent for the same
-            // reason Home/End were -- the shell prompt has had it
-            // (editor.rs's own `Key::Delete` arm) and this loop simply
-            // had no arm, so the key did nothing at all. Selection first,
-            // exactly as Backspace does, because a standing selection is
-            // what either key means when there is one.
-            //
-            // `inserted` (the `.`-repeat accumulator) is deliberately
-            // left alone: what Delete removes is *ahead* of the cursor
-            // and so was never part of what this session typed. Same
-            // best-effort acknowledgement `Key::CtrlW` already makes.
+            // Delete: Backspace's forward twin, the selection first.
+            // `inserted` isn't touched: what Delete removes lies ahead and
+            // was never typed in this session.
             Key::Delete if !buf.selections.is_empty() => {
                 let range = buf.selections[0];
                 buf.selections.clear();
@@ -1937,37 +1473,19 @@ pub(crate) fn run_insert_mode(
                 apply_delete_to_all(buf, &mut cursors);
                 buf.set_cursor(cursors[0].0, cursors[0].1);
             }
-            // Ctrl-W: delete the word before the cursor -- real vim's own
-            // Insert-mode convention (`:help i_CTRL-W`), same idea
-            // editor::LineEditor::kill_word_backward already gives the
-            // plain shell prompt. Reuses `Motion::WordBackward` +
-            // `motion_range` -- the exact same primitive Normal mode's
-            // own `db` operator is built on -- rather than a second,
-            // bespoke word-boundary implementation, so this crosses a
-            // line boundary backward exactly when `db`/plain `b` already
-            // do. Scoped to the primary cursor only, matching this
-            // function's existing "never combined with extra_cursors in
-            // practice" convention for Replace mode's own Backspace/Char
-            // arms above -- multi-selection `c` never needs a whole-word
-            // delete mid-insert. `inserted` (the `.`-repeat accumulator)
-            // is deliberately left untouched, same "best-effort, not
-            // exact" acknowledgment this function's own doc comment
-            // already makes for plain Backspace -- Ctrl-W can delete text
-            // that predates this Insert-mode session, which there's no
-            // clean way to un-accumulate.
+            // Ctrl-W deletes the word before the cursor (`:help i_CTRL-W`),
+            // through `Motion::WordBackward` and `motion_range` as `db` is,
+            // so it crosses lines when `db` does. Primary cursor only.
+            // `inserted` isn't touched: it can delete text from before this
+            // session.
             Key::CtrlW => {
                 if let Some(range) = motion::motion_range(buf, motion::Motion::WordBackward, None) {
                     buf.delete_range(&range);
                     cursors[0] = buf.cursor();
                 }
             }
-            // Ctrl-U: back to the start of the line's text. Insert mode
-            // had no arm for it at all, so it did nothing -- while the
-            // *line* editor has always had it. Stopping at the first
-            // non-blank rather than at column zero keeps the
-            // indentation, which is what makes it usable on an indented
-            // line; from inside the indentation there is nothing left
-            // to keep, so it goes to the start.
+            // Ctrl-U: back to the first non-blank, keeping the indentation;
+            // from inside the indentation, to the line's start.
             Key::CtrlU => {
                 let (row, col) = buf.cursor();
                 let indent = motion::first_non_blank(buf, row);
@@ -1983,51 +1501,33 @@ pub(crate) fn run_insert_mode(
                 cursors[0] = buf.cursor();
             }
             Key::Right => {
-                // `Motion::Right` clamps at the last real character (its
-                // ordinary Normal-mode meaning); Insert mode's cursor is
-                // allowed one column past that (where the next typed
-                // char would land), so this moves it directly rather
-                // than going through the clamped motion.
+                // `Motion::Right` stops at the last character, Normal
+                // mode's limit; Insert mode's cursor may sit one past it,
+                // so it's moved directly.
                 let (row, col) = buf.cursor();
                 buf.set_cursor(row, (col + 1).min(buf.line_len(row)));
                 cursors[0] = buf.cursor();
             }
-            // Home/End/Delete: keys the terminal sends that Insert mode
-            // simply had no arm for, so they did nothing at all -- while
-            // Normal mode has had all three (vimkeys.rs binds Home/End to
-            // LineStart/LineEnd) and so has the shell prompt
-            // (editor.rs's own Home/End/Delete arms). The asymmetry was
-            // the bug: the one mode where a person reaches for Home is
-            // the one that ignored it.
-            //
-            // `Home` is column 0, not first-non-blank -- vim's own
-            // `<Home>`, with `^` still the other thing.
-            // The paste brackets themselves insert nothing -- they only
-            // say what the characters between them are.
+            // The paste brackets insert nothing; they mark what's between
+            // them.
             Key::PasteStart => pasting = true,
             Key::PasteEnd => pasting = false,
+            // `Home` is column 0, vim's `<Home>`; `^` is the first non-blank.
             Key::Home => {
                 motion::apply_motion(buf, motion::Motion::LineStart, None);
                 cursors[0] = buf.cursor();
             }
-            // `Motion::LineEnd` clamps to the last real character, which
-            // is Normal mode's meaning; Insert mode's cursor is allowed
-            // one column past it (where the next typed char lands), so
-            // this goes there directly -- the same reasoning `Key::Right`
-            // just above already makes.
+            // Insert mode's cursor may sit past the last character, where
+            // `Motion::LineEnd` stops, so it goes there directly, as
+            // `Key::Right`.
             Key::End => {
                 let (row, _) = buf.cursor();
                 buf.set_cursor(row, buf.line_len(row));
                 cursors[0] = buf.cursor();
             }
-            // Alt-Left/Alt-Right: real vim's own `b`/`w` word motions,
-            // available in Insert mode too (not just Normal) -- the
-            // conventional word-navigation binding most editors give
-            // these two keys. `editor::read_line`'s own Alt-Left/Right
-            // (the plain shell prompt) keeps its separate, pre-existing
-            // meaning -- directory history browsing, only at an empty
-            // buffer -- unrelated to this buffer-editing context and
-            // deliberately left alone.
+            // Alt-Left/Alt-Right: the `b`/`w` word motions, as most editors
+            // bind them. The shell prompt's Alt-Left/Right browse directory
+            // history instead.
             Key::AltLeft => {
                 motion::apply_motion(buf, motion::Motion::WordBackward, None);
                 cursors[0] = buf.cursor();
@@ -2044,9 +1544,8 @@ pub(crate) fn run_insert_mode(
                 motion::apply_motion(buf, motion::Motion::Down, None);
                 cursors[0] = buf.cursor();
             }
-            // Same physical-key-as-Ctrl-F/Ctrl-B convention as Normal
-            // mode's own vimkeys.rs handling -- real vim honors
-            // PageUp/PageDown in Insert mode too, not just Normal.
+            // PageUp/PageDown as Ctrl-B/Ctrl-F, which vim honours in Insert
+            // mode too.
             Key::PageDown => {
                 motion::apply_motion(buf, motion::Motion::PageDown, None);
                 cursors[0] = buf.cursor();
@@ -2055,30 +1554,21 @@ pub(crate) fn run_insert_mode(
                 motion::apply_motion(buf, motion::Motion::PageUp, None);
                 cursors[0] = buf.cursor();
             }
-            // Mouse wheel: scrolls the view without otherwise touching
-            // the cursor (Motion::ScrollLineDown/Up's own behavior --
-            // only nudges the cursor back into view if scrolling would
-            // otherwise carry it off-screen), same as Ctrl-E/Ctrl-Y
-            // already do in Normal mode. MOUSE_WHEEL_LINES lines per
-            // notch, not 1 -- matches most terminals'/editors' own
-            // default wheel granularity.
-            // A click puts the caret where you clicked and drops any
-            // selection, the same as clicking in anything else does.
+            // A click puts the caret there and drops any selection.
             Key::Mouse(ev) if buf.mouse && ev.is_left_click() => {
                 let (row0, col0) = ((ev.row as usize).saturating_sub(1), (ev.col as usize).saturating_sub(1));
                 if let Some((line, col)) = position_at_screen(buf, rect, row0, col0) {
                     buf.selections.clear();
                     buf.set_cursor(line, col);
-                    // Collapses any extra cursors: clicking says where
-                    // you want to be, which is one place.
+                    // Clicking collapses extra cursors: it says where you
+                    // want to be.
                     cursors = vec![(line, col)];
                     drag_anchor = Some((line, col));
                 }
             }
-            // ...and dragging from it selects, without leaving Insert
-            // mode. `Inclusive`, so it renders and deletes exactly the
-            // way a Visual selection already does -- there is one
-            // selection concept in this buffer, not two.
+            // Dragging from it selects, staying in Insert mode.
+            // `Inclusive`, so it renders and deletes as a Visual selection
+            // does.
             Key::Mouse(ev) if buf.mouse && ev.is_left_drag() => {
                 let (row0, col0) = ((ev.row as usize).saturating_sub(1), (ev.col as usize).saturating_sub(1));
                 if let Some(anchor) = drag_anchor
@@ -2090,9 +1580,8 @@ pub(crate) fn run_insert_mode(
                 }
             }
             Key::Mouse(ev) if buf.mouse && ev.is_release() => drag_anchor = None,
-            // The wheel moves the cursor, and the view follows it --
-            // which is what the terminal used to do for bish before it
-            // handled the wheel itself. See MOUSE_WHEEL_LINES.
+            // The wheel moves the cursor and the view follows; see
+            // `MOUSE_WHEEL_LINES`.
             Key::Mouse(ev) if ev.is_scroll_down() => {
                 motion::apply_motion(buf, motion::Motion::Down, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
@@ -2101,20 +1590,16 @@ pub(crate) fn run_insert_mode(
                 motion::apply_motion(buf, motion::Motion::Up, Some(MOUSE_WHEEL_LINES));
                 cursors[0] = buf.cursor();
             }
-            // The horizontal wheel, where the terminal sends one (see
-            // MouseEvent::is_scroll_left). It moves the cursor too -- a
-            // caret parked off-screen is not somewhere you can type.
+            // The horizontal wheel (`MouseEvent::is_scroll_left`). It moves
+            // the cursor too: a caret off-screen is nowhere to type.
             Key::Mouse(ev) if ev.is_scroll_left() || ev.is_scroll_right() => {
                 let columns = if ev.is_scroll_right() { MOUSE_WHEEL_COLUMNS as isize } else { -(MOUSE_WHEEL_COLUMNS as isize) };
                 scroll_horizontally(buf, columns, editor_content_cols(buf, rect));
                 cursors[0] = buf.cursor();
             }
-            // Space is the other abbreviation trigger. Unlike a plain
-            // expansion (where the space that ended the word is still
-            // inserted right after it, matching fish), a *snippet*
-            // swallows it: the caret is already parked inside the first
-            // placeholder, where a space would be the first thing typed
-            // into it rather than anything that ended the abbreviation.
+            // Space is the other abbreviation trigger. A plain expansion
+            // keeps the space after it; a snippet swallows it, since the
+            // caret is already in the first placeholder.
             Key::Char(' ') if !replace && !pasting && !abbrs.is_empty() && expand_abbr(buf, &abbrs, &mut live) => {
                 cursors[0] = buf.cursor();
                 if live.is_none() {
@@ -2125,21 +1610,14 @@ pub(crate) fn run_insert_mode(
                 }
             }
             Key::Char(c) => {
-                // Typing drops the selection rather than replacing it.
-                // Deliberately not the GUI behaviour: this is still a
-                // vim buffer, `u` is the only way back, and silently
-                // eating a swept region on the next keystroke is the
-                // kind of thing you only notice afterwards. Backspace
-                // is the key that deletes it, and says so.
+                // A selection still standing here (Replace mode, or a popup
+                // or snippet live) is dropped, not replaced.
                 buf.selections.clear();
                 let (row, col) = buf.cursor();
-                // Replace mode overwrites the character already at the
-                // cursor, if there is one -- deleting it first, then
-                // inserting, naturally extends the line once the cursor
-                // reaches its end (nothing left there to overwrite),
-                // matching real vim's own `R` behavior at end of line.
-                // Same "never combined with extra_cursors" reasoning as
-                // Replace's own Backspace arm above.
+                // Replace mode overwrites the character at the cursor, if
+                // any, so at the end of the line it extends the line, as
+                // vim's `R` does. Only one cursor, as for Replace's
+                // Backspace.
                 if replace && col < buf.line_len(row) {
                     let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (row, col), to: (row, col) };
                     buf.delete_range(&range);
@@ -2155,25 +1633,19 @@ pub(crate) fn run_insert_mode(
             }
             _ => {}
         }
-        // Kept in step with the model on every iteration rather than at
-        // each of the arms above: the buffer carries these purely so
-        // whoever draws it can mark the placeholders (see
-        // TextBuffer::snippet_holes), and one place to write them is one
-        // place for them to go stale.
+        // Synced from the model every iteration rather than in each arm: the
+        // buffer carries them only so the renderer can mark placeholders
+        // (`TextBuffer::snippet_holes`).
         buf.snippet_holes = live.as_ref().map(|live| snippet_holes(live, buf)).unwrap_or_default();
-        // Narrowed after the key has been applied, not before: what
-        // matters is the word as it stands now, and every arm above
-        // that changes it has already run.
+        // Narrowed after the key is applied, to the word as it stands now.
         if let Some(state) = completing.as_mut()
             && !state.refilter(buf)
         {
             completing = None;
         }
-        // Asked after the key has been applied, for the same reason the
-        // completion filter is: the question is about where the cursor
-        // is *now*. Only while something is being typed -- an arrow key
-        // or a Backspace that walks back out of the call closes it by
-        // getting `None` back, which is the whole of the close logic.
+        // Asked after the key is applied, about where the cursor is now. Only
+        // while typing; an arrow or a Backspace out of the call gets `None`,
+        // which closes it.
         {
             let typed = match key {
                 Key::Char(c) => Some(c),
@@ -2186,9 +1658,8 @@ pub(crate) fn run_insert_mode(
         }
         scroll_to_show_cursor(buf, editor_content_cols(buf, rect));
         render_editor_frame(buf, vk, mode, rect, term_rows, term_cols, color_overrides);
-        // The completion popup wins the space when both want it: you
-        // opened that one deliberately, and it is the one keys are
-        // going to.
+        // The completion popup wins the space when both want it: you opened
+        // it, and keys go to it.
         if let Some(state) = completing.as_ref() {
             let (row, col) = buf.cursor();
             let (screen_row, screen_col) = popup_anchor(buf, rect, row, col);
@@ -2203,13 +1674,8 @@ pub(crate) fn run_insert_mode(
     }
 }
 
-// Where on the real screen a popup anchored at this buffer position
-// belongs: the cursor's own cell, in terminal coordinates.
-//
-// Factored out when the signature popup became the second caller --
-// the completion popup had computed this inline, and two copies of a
-// gutter-plus-scroll-offset calculation is exactly the kind of thing
-// that drifts apart.
+// Where on screen a popup anchored at this buffer position goes: the
+// cursor's cell, in terminal coordinates.
 fn popup_anchor(buf: &TextBuffer, rect: Rect, row: usize, col: usize) -> (usize, usize) {
     let chars = buf.line_chars(row);
     let gutter = rect.cols.saturating_sub(editor_content_cols(buf, rect));
@@ -2218,15 +1684,14 @@ fn popup_anchor(buf: &TextBuffer, rect: Rect, row: usize, col: usize) -> (usize,
     (screen_row, screen_col)
 }
 
-// A live snippet's placeholders in the buffer's own (line, column)
-// space, for the renderer.
+// A live snippet's placeholders in the buffer's (line, column) space,
+// for the renderer.
 fn snippet_holes(live: &LiveSnippet, buf: &TextBuffer) -> Vec<textbuffer::SnippetHole> {
     live.holes()
         .into_iter()
-        // A hole that spans a line break is drawn on the line it starts
-        // on, out to the end of what is there: the renderer marks spans
-        // within one line, and a tabstop whose *default* contains a
-        // newline is rare enough not to be worth a second shape.
+        // A hole spanning a line break is drawn on its first line, to the end
+        // of that line: the renderer marks spans within a line, and a default
+        // with a newline is rare.
         .map(|(start, end, active)| textbuffer::SnippetHole {
             line: start.0,
             start: start.1,
@@ -2236,19 +1701,11 @@ fn snippet_holes(live: &LiveSnippet, buf: &TextBuffer) -> Vec<textbuffer::Snippe
         .collect()
 }
 
-// The file editor's own half of `abbr` expansion -- editor.rs's
-// `expand_abbr_at_cursor` for a `TextBuffer` instead of a prompt line.
-//
-// One deliberate difference from the shell prompt's version: no
-// command-position gate. That gate exists because an abbreviation typed
-// as an *argument* to a real command shouldn't fire; a file has no
-// command positions at all, and running bash's own word-role classifier
-// over, say, a Rust file would be meaningless. So here an abbreviation
-// expands wherever its name is the word ending at the cursor -- which is
-// also how snippets work in every editor that has them.
-//
-// `true` if something expanded, which for Enter is also the caller's cue
-// not to insert a newline as well.
+// The file editor's `abbr` expansion, editor.rs's
+// `expand_abbr_at_cursor` for a `TextBuffer`. No command-position check:
+// a file has no command positions, so an abbreviation expands wherever
+// its name is the word ending at the cursor. `true` when something
+// expanded, which tells Enter not to add a newline.
 fn expand_abbr(buf: &mut TextBuffer, abbrs: &[Abbr], live: &mut Option<LiveSnippet>) -> bool {
     if abbrs.is_empty() || buf.is_readonly() {
         return false;
@@ -2266,10 +1723,9 @@ fn expand_abbr(buf: &mut TextBuffer, abbrs: &[Abbr], live: &mut Option<LiveSnipp
     match Snippet::parse(&abbr.expansion) {
         Some(snip) => *live = Some(LiveSnippet::start(snip, row, word_start, word, buf)),
         None => {
-            // `flatten` rather than the raw text: an expansion with no
-            // *tabstops* can still carry `\$` or `${1}`-shaped noise,
-            // and what goes in is what a finished snippet would have
-            // left behind.
+            // `flatten`: even with no tabstops an expansion can carry `\$`
+            // or `${1}`, and what goes in is what a finished snippet would
+            // leave.
             let text = snippet::flatten(&abbr.expansion);
             buf.replace_span((row, word_start), (row, col), &text);
             buf.set_cursor(row, word_start + text.chars().count());
@@ -2278,20 +1734,10 @@ fn expand_abbr(buf: &mut TextBuffer, abbrs: &[Abbr], live: &mut Option<LiveSnipp
     true
 }
 
-// Inserts `text` (never containing more than one '\n', and only ever
-// exactly "\n" alone when it does -- Enter is the only run_insert_mode
-// caller that ever inserts a newline, and always just that one
-// character) at every position in `cursors`, replicating multi-
-// selection `c`'s own "type once, it lands everywhere" behavior (see
-// run_insert_mode's own doc comment on `extra_cursors`). Processes them
-// in ascending (row, col) order -- ascending, not descending, because
-// this is an *insertion*: text appearing at an earlier position only
-// ever pushes a later, not-yet-touched one further away, never
-// invalidates its own coordinates, so the earliest can always go first
-// and every later one's position is patched to account for it before
-// its own turn comes (the exact opposite ordering delete_selections'
-// own doc comment establishes for a *removal*, and apply_backspace_to_
-// all below, for the same underlying reason run the other way).
+// Inserts `text` (at most one `\n`, alone, from Enter) at every cursor
+// in `cursors`, for multi-selection `c`. In ascending order: an
+// insertion only pushes later cursors further, so each later one is
+// adjusted before its turn.
 fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], text: &str) {
     let is_newline = text == "\n";
     let width = text.chars().count();
@@ -2304,11 +1750,9 @@ fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], tex
         for &j in &order[step + 1..] {
             let (r, c) = cursors[j];
             if is_newline {
-                // A not-yet-processed cursor on the *same* row, at or
-                // after the split column, moves onto the newly created
-                // row instead, its own column now relative to that new
-                // line's own start; anything on a strictly later row
-                // just shifts down by the one new line.
+                // A cursor on the same row at or after the split moves to
+                // the new row, relative to its start; later rows shift down
+                // one.
                 if r == row && c >= col {
                     cursors[j] = (r + 1, c - col);
                 } else if r > row {
@@ -2321,13 +1765,9 @@ fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], tex
     }
 }
 
-// Delete, replicated across every tracked cursor -- apply_backspace_to_
-// all's forward twin, and processed furthest-first for the same reason.
-//
-// The cursor does not move: what goes is the character *after* it, and
-// at the end of a line that character is the newline, so the next line
-// joins onto this one. A cursor at the very end of the buffer is left
-// alone, matching the prompt's own `delete_forward` doing nothing there.
+// Delete at every cursor, furthest first, like
+// `apply_backspace_to_all`. The cursor stays; at a line's end the next
+// line joins. At the end of the buffer, nothing happens.
 fn apply_delete_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
     let mut order: Vec<usize> = (0..cursors.len()).collect();
     crate::sort::sort_by_key(&mut order, |&i| std::cmp::Reverse(cursors[i]));
@@ -2358,16 +1798,9 @@ fn apply_delete_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
     }
 }
 
-// Backspace, replicated across every tracked cursor -- see
-// apply_insert_to_all's own doc comment for the shared shape/reasoning;
-// this is its deletion counterpart, so it processes furthest-first
-// instead (removing something at a later position can never invalidate
-// an earlier, not-yet-processed cursor's own coordinates, but the
-// reverse isn't true -- the same rule delete_selections already
-// established for a whole visual selection, applied here one character
-// at a time instead). A cursor already at the very start of the buffer
-// (row 0, col 0) is simply left alone, matching ordinary single-cursor
-// Backspace's own ordinary Insert-mode arm doing nothing there either.
+// Backspace at every cursor, furthest first: removing text later never
+// moves an earlier cursor. A cursor at the buffer's start is left
+// alone.
 fn apply_backspace_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
     let mut order: Vec<usize> = (0..cursors.len()).collect();
     crate::sort::sort_by_key(&mut order, |&i| std::cmp::Reverse(cursors[i]));
@@ -2394,10 +1827,8 @@ fn apply_backspace_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) 
                 if r > row {
                     cursors[j] = (r - 1, c);
                 } else if r == row {
-                    // A degenerate overlap (two distinct cursors both at
-                    // column 0 of the same row) -- this row is gone,
-                    // joined into row - 1, so fold this one in there
-                    // too, same as the one actually being backspaced.
+                    // Two cursors at column 0 of the same row: this row
+                    // joins the one above, so this one moves there too.
                     cursors[j] = (r - 1, prev_len + c);
                 }
             }
@@ -2405,43 +1836,30 @@ fn apply_backspace_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) 
     }
 }
 
-// `"%"`: vim's own current-filename register -- refreshed here (a no-op
-// if there's no path, e.g. an unnamed buffer that still hasn't been
-// written anywhere) whenever the buffer's own path could plausibly have
-// just changed (repl.rs's `run_edit_frame`, once when it starts driving a
-// session, and `run_command_mode`'s own `w`/`wq`/`x` handling, since `:w
-// newname` can name a previously-unnamed buffer).
+// `"%"`, the current filename register, refreshed when the buffer's path
+// may have changed: when `run_edit_frame` starts, and after `:w`, `:wq`
+// or `:x`, since `:w newname` can name a buffer. A no-op without a path.
 pub(crate) fn set_last_filename(buf: &TextBuffer, registers: &mut Registers) {
     if let Some(path) = buf.path() {
         registers.set_last_filename(path.to_string_lossy().into_owned());
     }
 }
 
-/// `%` in a `:!` command line: the file this buffer is editing, spelled
-/// the way it was opened, with vim's own `:h`/`:t`/`:r`/`:e`/`:p`
-/// modifiers after it. `\%` is a literal `%`.
-///
-/// Only `:!` gets this. vim expands `%` across its whole ex line, which
-/// is why `:!printf '%s' x` is a famous vim annoyance -- but bish's
-/// colon line is a *shell* line, where `%` is real syntax (`${v%.c}`,
-/// `printf '%s'`, `jobs %1`). Expanding it everywhere would break every
-/// one of those to fix one command, so the `!` is what marks a line as
-/// wanting vim's rules instead of the shell's.
-///
-/// `#` is left alone for the same reason turned the other way: bish has
-/// no alternate file for it to mean, and `#` starts a comment in the
-/// shell this line is about to be handed to.
+/// `%` in a `:!` command line: the file being edited, as it was opened,
+/// with vim's `:h`/`:t`/`:r`/`:e`/`:p` modifiers. `\%` is a literal `%`.
+/// Only `:!`, since the colon line is a shell line where `%` is syntax
+/// (`${v%.c}`, `printf '%s'`, `jobs %1`). `#` is left alone: there's no
+/// alternate file, and it starts a shell comment.
 pub(crate) fn expand_filename_macros(line: &str, buf: &TextBuffer) -> Result<String, String> {
-    // vim's own text, and its own rule: an expansion that came out empty
-    // stops the command rather than running it with a hole in it.
+    // vim's message and rule: an empty expansion stops the command.
     const EMPTY: &str = "E499: Empty file name for '%'";
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
-            // The backslash goes and the `%` stays -- and only for `%`,
-            // since every other `\x` here belongs to the shell.
+            // The backslash goes and the `%` stays; other `\x` belong to
+            // the shell.
             '\\' if chars.get(i + 1) == Some(&'%') => {
                 out.push('%');
                 i += 2;
@@ -2464,26 +1882,23 @@ pub(crate) fn expand_filename_macros(line: &str, buf: &TextBuffer) -> Result<Str
     Ok(out)
 }
 
-/// The `:h`/`:t`/`:r`/`:e`/`:p` that may follow a `%`, applied left to
-/// right so `%:p:h` is the directory of the full path and `%:t:r` is the
-/// basename without its extension. An unknown `:x` is not a modifier at
-/// all: it stays in the command line, which is what makes `:!make %:2`
-/// keep its own colon.
+/// The modifiers after a `%`, applied left to right: `%:p:h` is the full
+/// path's directory, `%:t:r` the basename without extension. An unknown
+/// `:x` isn't a modifier and stays (`:!make %:2`).
 fn apply_filename_modifiers(name: &str, chars: &[char], i: &mut usize) -> String {
     let mut value = name.to_string();
     while chars.get(*i) == Some(&':') {
         let Some(&modifier) = chars.get(*i + 1) else { break };
         value = match modifier {
-            // `.` when there is nowhere above to go, matching vim --
-            // not the empty string, which would abort the command.
+            // `.` when there's nothing above, as in vim, not the empty
+            // string, which would abort the command.
             'h' => match value.rsplit_once('/') {
                 Some((head, _)) if !head.is_empty() => head.to_string(),
                 Some(_) => "/".to_string(),
                 None => ".".to_string(),
             },
             't' => value.rsplit('/').next().unwrap_or(&value).to_string(),
-            // One extension, and a leading dot is not one: `.hidden`
-            // is its own root, exactly as vim reads it.
+            // One extension; a leading dot isn't one (`.hidden`), as in vim.
             'r' => match split_extension(&value) {
                 Some((root, _)) => root.to_string(),
                 None => value,
@@ -2501,17 +1916,15 @@ fn apply_filename_modifiers(name: &str, chars: &[char], i: &mut usize) -> String
 }
 
 /// Splits `a/b/c.txt` into `a/b/c` and `txt`. `None` when the last
-/// component has no extension to speak of -- no dot, or the only dot is
-/// the one that makes it a dotfile.
+/// component has no extension: no dot, or only a dotfile's.
 fn split_extension(path: &str) -> Option<(&str, &str)> {
     let start = path.rfind('/').map_or(0, |at| at + 1);
     let dot = path[start..].rfind('.')? + start;
     (dot > start).then(|| (&path[..dot], &path[dot + 1..]))
 }
 
-/// `:p` for a file that does not exist yet, where `canonicalize` has
-/// nothing to resolve: the cwd in front of it, without following any
-/// links, which is as much as can honestly be said about it.
+/// `:p` for a file that doesn't exist yet: the cwd in front, without
+/// resolving links.
 fn absolute_path(path: &str) -> String {
     if path.starts_with('/') {
         return path.to_string();
@@ -2522,19 +1935,15 @@ fn absolute_path(path: &str) -> String {
     }
 }
 
-// All of this pane's own rect -- the mode-line lives in the terminal's
-// own global status row now (repl::render_global_status_row), not
-// carved out of this pane's own rect. `.max(1)`: a degenerate
-// zero-height rect still gets *some* content rather than a panicking
-// view.
+// The whole pane: the mode line is in the global status row
+// (`repl::render_global_status_row`). At least 1, so a zero-height rect
+// still has a row.
 fn editor_content_rows(rect: Rect) -> usize {
     rect.rows.max(1)
 }
 
-// "-- NORMAL --"/"-- VISUAL --"/"-- VISUAL LINE --"/"-- INSERT --"/
-// "-- REPLACE --", `[+]` while the buffer has unsaved changes -- vim's
-// own mode-line convention, mirroring repl.rs's own `mode_label` plus
-// the dirty flag that context has no equivalent of.
+// vim's mode line (`-- INSERT --` and so on), with `[+]` while there
+// are unsaved changes.
 fn mode_label(vk: &VimKeys, mode: EditorMode) -> &'static str {
     match mode {
         EditorMode::Insert => return "-- INSERT --",
@@ -2552,9 +1961,8 @@ fn mode_label(vk: &VimKeys, mode: EditorMode) -> &'static str {
 fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) -> String {
     let label = mode_label(vk, mode);
     let pending = vk.pending_display();
-    // "recording @a" while `q{reg}` is active -- mirrors repl.rs's own
-    // `normal_mode_status_left`, the `ScreenBuffer`-backed twin of this
-    // status line.
+    // "recording @a" during `q{reg}`, as repl.rs's
+    // `normal_mode_status_left` shows.
     let recording = vk.is_recording().map(|r| format!("recording @{r}  ")).unwrap_or_default();
     let mut left = if !pending.is_empty() {
         format!("{recording}{label} {pending}")
@@ -2569,15 +1977,10 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
     let total = buf.line_count();
     let mut right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
 
-    // What the language server is busy with, between the mode indicator
-    // and the cursor position. On the right because that is where it is
-    // out of the way of a `:` line being typed, and dropped outright
-    // rather than truncated when the pane is too narrow for both it and
-    // the position -- knowing where the cursor is matters more, every
-    // time, than knowing a server is indexing.
-    // A message the server asked to have shown wins the slot: it is
-    // news, where progress is a state, and it is gone by the next
-    // keypress either way.
+    // A message the server asked to show, else its progress, between the
+    // mode and the cursor position, out of the way of a `:` line. A message
+    // wins: it's news, and gone by the next key. Dropped, not truncated,
+    // when the pane is too narrow for it and the position.
     if let Some(progress) = buf.echoed_message.as_ref().or(buf.lsp_progress.as_ref()) {
         let candidate = format!("{progress}   {right}");
         if left.chars().count() + candidate.chars().count() < cols {
@@ -2600,26 +2003,12 @@ fn status_text(buf: &TextBuffer, vk: &VimKeys, mode: EditorMode, cols: usize) ->
     left
 }
 
-// The (start, end) char-index range `range` covers on this one `line`,
-// if any, already rebased to be relative to `start_char` (the char
-// index of render_row's own viewport-window-local `chars[0]` -- see
-// that function's own doc comment for why this is a char index, not a
-// display column, despite `chars` itself being a *column*-bounded
-// window: `chars` is still built by walking consecutive char indices
-// starting at `start_char`, just stopping early once the column budget
-// runs out, so every position in it corresponds 1:1 to a real char
-// index offset by `start_char` -- never a column) and clamped to
-// `cols` -- i.e. directly usable as an index into that array, unlike
-// spans_for_line/diagnostic_spans_for_line just below, which stay
-// line-absolute and get shifted separately inside render_row itself
-// (see its own doc comment for why the two don't share one convention:
-// a Linewise selection's own `(0, cols)` is *already* viewport-local by
-// definition -- it means "the whole visible row," not "the whole
-// line's own text," so shifting it by `start_char` again would be
-// wrong). Once mirrored exactly by repl.rs's own `selection_columns_
-// in_line` (see its doc comment); that one stays offset-less on purpose
-// -- ScreenBuffer never scrolls horizontally (Buffer::viewport_left's
-// own doc comment).
+// The (start, end) char range `range` covers on `line`, if any,
+// relative to `start_char` (the char index of `render_row`'s first
+// visible character) and clamped to `cols`, so it indexes that row's
+// array directly. `spans_for_line` and `diagnostic_spans_for_line` stay
+// line-absolute instead: a Linewise selection's `(0, cols)` already
+// means the visible row.
 fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_char: usize, cols: usize) -> Option<(usize, usize)> {
     if line < range.from.0 || line > range.to.0 {
         return None;
@@ -2627,9 +2016,7 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_cha
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
     }
-    // A block covers the same columns on every row it spans, which is
-    // what makes it a rectangle rather than a run -- so neither end
-    // depends on which row this is.
+    // A block covers the same columns on every row it spans.
     if let Some((left, right)) = motion::block_columns(range) {
         let start = left.saturating_sub(start_char);
         let end = (right + 1).saturating_sub(start_char).min(cols);
@@ -2640,29 +2027,9 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, start_cha
     Some((start, end))
 }
 
-// One column of the gutter drawn to the left of a line's own content.
-// The diagnostic marker and line numbers are the only columns today, but
-// the shape anticipates the same slot holding blame/coverage columns
-// later -- each is just another (width, render) pair appended to
-// GUTTER_COLUMNS, with no change needed anywhere else: build_editor_frame
-// only ever asks "how wide is the whole gutter" and "render line N's
-// gutter cells", never which columns exist. `render` returns the *fully
-// styled* cell text (its own SGR codes, if it wants color/dim) so each
-// column stays free to look however it needs to -- a future diff column
-// wants red/green, not the line-number column's dim gray -- rather than
-// this shared machinery imposing one style on all of them. `None` means
-// "blank, unstyled" -- used for filler rows past the buffer's own last
-// line, matching how render_row's own caller already leaves those rows'
-// content blank too. `render` also takes `starts` (line_starts's own
-// prefix-sum, computed once per frame by build_editor_frame) since the
-// diagnostic column needs it to translate buf.diagnostics's whole-buffer
-// char offsets into "does this line's own span intersect one" -- the
-// line-number column ignores it, same as any future column that doesn't
-// need it.
-/// Which column of the gutter this is, so a click or a hover landing in
-/// it can mean something particular. The renderers do not need it --
-/// they are told their own width and asked for their own cell -- but
-/// anything working *inwards* from a screen position does.
+// Which gutter column this is, so a click or hover on it can mean
+// something. The renderers don't need it; code working inwards from a
+// screen position does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GutterKind {
     Breakpoint,
@@ -2672,6 +2039,10 @@ pub(crate) enum GutterKind {
     LineNumber,
 }
 
+// One gutter column. `build_editor_frame` only asks for the total width
+// and each line's cells, so a column is added by appending to
+// `GUTTER_COLUMNS`. `render` returns styled text, `None` for blank;
+// `starts` (`line_starts`, once per frame) maps diagnostics' offsets.
 struct GutterColumn {
     kind: GutterKind,
     width: fn(&TextBuffer) -> usize,
@@ -2686,17 +2057,10 @@ static GUTTER_COLUMNS: &[GutterColumn] = &[
     GutterColumn { kind: GutterKind::LineNumber, width: line_number_width, render: render_line_number_cell },
 ];
 
-/// Which line and which gutter column a screen cell is in, or `None`
-/// when it is in the text (or off the buffer entirely).
-///
-/// The inverse of `render_gutter`, and it walks the same list in the
-/// same order for the same reason `position_at_screen` reproduces
-/// `build_editor_frame`'s own arithmetic: two places that disagree
-/// about where a column starts would put the pointer on the wrong one.
-///
-/// Only the first screen row of a wrapped line has a gutter -- the
-/// continuation rows are blank there, and a click on that blank is not
-/// a click on a marker that was never drawn.
+/// Which line and gutter column a screen cell is in, or `None` in the
+/// text or off the buffer. The inverse of `render_gutter`, walking the
+/// same list in the same order so the two agree. Only a wrapped line's
+/// first row has a gutter.
 pub(crate) fn gutter_at_screen(buf: &TextBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, GutterKind)> {
     if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
         return None;
@@ -2731,10 +2095,8 @@ fn total_gutter_width(buf: &TextBuffer) -> usize {
     GUTTER_COLUMNS.iter().map(|col| (col.width)(buf)).sum()
 }
 
-// `first` is whether this screen row is the *first* one of its buffer
-// line. Only that row gets the line number, the diff marker and the
-// rest: repeating them down a wrapped line would claim there are
-// several lines where there is one.
+// `first` is whether this is the line's first screen row: only that row
+// gets the number and markers.
 fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usize, first: bool) {
     for col in GUTTER_COLUMNS {
         let width = (col.width)(buf);
@@ -2746,18 +2108,10 @@ fn render_gutter(out: &mut String, buf: &TextBuffer, starts: &[usize], line: usi
     }
 }
 
-// This buffer's column layout, or `None` when it has no tabular form --
-// which covers almost every buffer, and every buffer while wrapping is
-// on (the two are different answers to "this line is wider than the
-// pane", and running both at once would align columns that have been
-// broken across rows).
-//
-// Measured across the whole file, because a column that changed width
-// as you scrolled would be worse than no alignment at all. That is a
-// pass over every line per redraw -- and for markdown a whole parse of
-// the document on top, though that is the same parse
-// `buffer_highlight_spans` already runs for the same buffer on the same
-// redraw. Like that one, worth caching only once someone can feel it.
+// This buffer's column layout, or `None` with no tabular form, which is
+// most buffers and every buffer while wrapping. Measured over the whole
+// file, so columns don't change width as you scroll: a pass per redraw,
+// plus a markdown parse, the same `buffer_highlight_spans` does.
 pub(crate) fn tabular_layout(buf: &TextBuffer) -> Option<crate::bishedit::tabular::Layout> {
     let style = buf.tabular.filter(|_| !buf.wrap.wrap)?;
     let lines: Vec<Vec<char>> = (0..buf.line_count()).map(|l| buf.line_chars(l)).collect();
@@ -2768,15 +2122,10 @@ pub(crate) fn tabular_layout(buf: &TextBuffer) -> Option<crate::bishedit::tabula
     }
 }
 
-// Which lines of a markdown buffer are table rows, as line ranges.
-// `None` for every other language, meaning "the whole file is one
-// table" -- true of a `.csv`, where there is nothing else in the file.
-//
-// A markdown document is the other shape: most of it is prose that must
-// not be touched, and two tables in it are unrelated and must not be
-// aligned to each other. Asking the real parser rather than
-// pattern-matching lines for pipes is what keeps a pipe inside a fenced
-// code block, or in a line of prose, from being mistaken for a column.
+// Which lines of a markdown buffer are table rows. `None` for other
+// languages, meaning the whole file is one table, as in a `.csv`. The
+// parser, not a search for pipes, so a pipe in a code block or prose
+// isn't a column, and separate tables aren't aligned together.
 fn table_regions(buf: &TextBuffer) -> Option<Vec<std::ops::Range<usize>>> {
     if language_of(buf) != "markdown" {
         return None;
@@ -2786,15 +2135,14 @@ fn table_regions(buf: &TextBuffer) -> Option<Vec<std::ops::Range<usize>>> {
     let mut spans = Vec::new();
     collect_table_spans(&doc.blocks, &mut spans);
 
-    // Byte offsets to line numbers, in one pass over the starts.
     let mut starts = vec![0usize];
     starts.extend(text.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1));
     let line_of = |offset: usize| starts.partition_point(|s| *s <= offset).saturating_sub(1);
     Some(spans.into_iter().map(|s| line_of(s.start)..line_of(s.end.saturating_sub(1)) + 1).collect())
 }
 
-// Tables can sit inside a block quote or a list item, so this walks the
-// whole tree rather than only the top level.
+// Tables can sit in a block quote or a list item, so the whole tree is
+// walked.
 fn collect_table_spans(blocks: &[crate::markdown::Block], out: &mut Vec<std::ops::Range<usize>>) {
     use crate::markdown::Block;
     for block in blocks {
@@ -2811,9 +2159,8 @@ fn collect_table_spans(blocks: &[crate::markdown::Block], out: &mut Vec<std::ops
     }
 }
 
-// One line as it will be drawn: its own characters plus whatever padding
-// lines its columns up. Without a layout this is the line itself, which
-// is what lets everything below run one code path.
+// One line as drawn: its characters plus any alignment padding. Without
+// a layout, the line itself.
 pub(crate) fn display_row(buf: &TextBuffer, line: usize, layout: Option<&crate::bishedit::tabular::Layout>) -> crate::bishedit::tabular::Row {
     let chars = buf.line_chars(line);
     let row = match layout {
@@ -2823,21 +2170,12 @@ pub(crate) fn display_row(buf: &TextBuffer, line: usize, layout: Option<&crate::
     splice_inlay_hints(expand_tabs(row, buf.tabstop), buf, line)
 }
 
-// The third producer of a `Row` whose cells and characters are not the
-// same thing -- after the tabular layout and tab expansion, and for the
-// same reason as both: everything downstream (the cursor, clicks,
-// horizontal scroll, selections, highlighting, diagnostics) addresses a
-// line through `Row`'s own two maps, so splicing here makes all of them
-// hint-aware at once and none of them have to know hints exist.
-//
-// After `expand_tabs`, not before: a hint is drawn text, and its width
-// has nothing to do with where the tab stops fall in the source.
-//
-// A hint's cells point at no source character (`source_at` is `None`),
-// which is what makes the cursor step over one in a single press and
-// what marks it for dimming in `render_row` -- the same treatment
-// tabular padding already gets, and true for the same reason: there is
-// nothing there.
+// Splices inlay hints into the row's cells, after `expand_tabs`, since a
+// hint's width has nothing to do with tab stops. Everything downstream
+// addresses a line through `Row`'s maps, so all of it becomes
+// hint-aware here. A hint's cells map to no source character, so the
+// cursor steps over one in a single press and `render_row` dims it, as
+// with tabular padding.
 fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line: usize) -> crate::bishedit::tabular::Row {
     if !buf.inlayhints {
         return row;
@@ -2848,9 +2186,8 @@ fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line
     }
     let mut cells: Vec<char> = Vec::with_capacity(row.cells.len());
     let mut source_at: Vec<Option<usize>> = Vec::with_capacity(row.cells.len());
-    // Walked in lockstep with the cells: a hint at character `c` is
-    // spliced immediately before the cell `c` starts at, which for a
-    // hint past the end of the line means at the end.
+    // In step with the cells: a hint at character `c` goes before the cell
+    // `c` starts at; one past the end goes at the end.
     let mut pending: Vec<(usize, &str)> = hints.map(|(_, col, text)| (*col, text.as_str())).collect();
     crate::sort::sort_by_key(&mut pending, |(col, _)| *col);
     let mut next = 0usize;
@@ -2864,9 +2201,8 @@ fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line
         }
     };
     for (i, ch) in row.cells.iter().enumerate() {
-        // Only at a cell that *starts* a character: splicing into the
-        // middle of a tab's spaces or a wide character's cells would
-        // put the hint inside something.
+        // Only where a character starts, never inside a tab's spaces or a
+        // wide character.
         if let Some(source) = row.source_at.get(i).copied().flatten()
             && row.cell_of.get(source) == Some(&i)
         {
@@ -2875,14 +2211,12 @@ fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line
         cells.push(*ch);
         source_at.push(row.source_at.get(i).copied().flatten());
     }
-    // Anything at or past the end of the line goes on the end, which is
-    // where a type hint after the last character belongs.
+    // Anything at or past the end goes on the end.
     emit(&mut cells, &mut source_at, usize::MAX, &mut next);
 
-    // Rebuilt exactly as `expand_tabs` rebuilds it, and for the same
-    // reason: the first cell naming a source character is the one it
-    // maps to, and everything with no cell of its own points one past
-    // the end so the maps stay monotonic.
+    // Rebuilt as `expand_tabs` does: a source character maps to its first
+    // cell, and characters with no cell point one past the end, keeping the
+    // maps monotonic.
     let mut cell_of = vec![cells.len(); row.cell_of.len()];
     for (cell, source) in source_at.iter().enumerate().rev() {
         if let Some(source) = source
@@ -2901,20 +2235,11 @@ fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line
     crate::bishedit::tabular::Row { cells, source_at, cell_of }
 }
 
-// A literal tab draws as spaces to the next `tabstop` boundary, and
-// this is where that happens -- on the *drawn cells*, after the tabular
-// layout and before anything reads them.
-//
-// That placement is the whole design: the cursor, click-to-position,
-// horizontal scrolling, selections, syntax highlighting and diagnostics
-// all already address the line through `Row`'s own two maps rather than
-// through character indices (see `render_row`), so expanding a tab here
-// makes every one of them tab-aware at once. Doing it in the renderer
-// instead would leave each of those to work it out separately, which is
-// exactly the drift the drawn-cell model exists to prevent.
-//
-// Each of a tab's spaces points back at the tab itself, so a click
-// anywhere in it lands on the one character that is really there.
+// A literal tab as spaces to the next `tabstop`, on the drawn cells,
+// after the tabular layout and before anything reads them. Since the
+// cursor, clicks, scrolling, selections, highlighting and diagnostics
+// all go through `Row`'s maps, this makes all of them tab-aware. Each
+// space maps back to the tab.
 fn expand_tabs(row: crate::bishedit::tabular::Row, tabstop: usize) -> crate::bishedit::tabular::Row {
     if !row.cells.contains(&'\t') {
         return row;
@@ -2937,8 +2262,8 @@ fn expand_tabs(row: crate::bishedit::tabular::Row, tabstop: usize) -> crate::bis
         source_at.push(source);
         column += char_width(*ch);
     }
-    // Rebuilt rather than shifted: a tab's spaces all name the same
-    // source character, and the first of them is the one it maps to.
+    // Rebuilt: a tab's spaces all name one character, which maps to the
+    // first.
     let mut cell_of = vec![cells.len(); row.cell_of.len()];
     for (cell, source) in source_at.iter().enumerate().rev() {
         if let Some(source) = source
@@ -2947,8 +2272,8 @@ fn expand_tabs(row: crate::bishedit::tabular::Row, tabstop: usize) -> crate::bis
             cell_of[*source] = cell;
         }
     }
-    // Anything with no cell of its own (past the end) points one past
-    // it, and the maps stay monotonic.
+    // Anything past the end points one past it, keeping the maps
+    // monotonic.
     let mut last = cells.len();
     for slot in cell_of.iter_mut().rev() {
         if *slot > last {
@@ -2959,16 +2284,15 @@ fn expand_tabs(row: crate::bishedit::tabular::Row, tabstop: usize) -> crate::bis
     crate::bishedit::tabular::Row { cells, source_at, cell_of }
 }
 
-// The drawn column a character index sits at -- what Tab advances from
-// and what `scroll_to_show_cursor` measures the margin against.
+// The drawn column of a character index: what Tab advances from and
+// `scroll_to_show_cursor` measures against.
 fn display_column(buf: &TextBuffer, line: usize, col: usize) -> usize {
     let display = display_row(buf, line, tabular_layout(buf).as_ref());
     col_at_cell(&display.cells, display.cell_of[col.min(buf.line_len(line))])
 }
 
-// Which character of the line a drawn cell belongs to. Padding belongs
-// to the character it was inserted after, so a cursor placed on it
-// lands somewhere real.
+// Which character a drawn cell belongs to. Padding belongs to the
+// character before it, so a cursor placed on it lands somewhere real.
 fn source_at_or_before(display: &crate::bishedit::tabular::Row, cell: usize) -> usize {
     let last = display.cells.len();
     for i in (0..=cell.min(last)).rev() {
@@ -2979,9 +2303,8 @@ fn source_at_or_before(display: &crate::bishedit::tabular::Row, cell: usize) -> 
     0
 }
 
-// `char_at_col`/`col_of`, over drawn cells rather than the line's own
-// characters. The two stop being the same thing the moment any padding
-// is inserted, exactly as they already differ for a wide glyph.
+// `char_at_col`/`col_of` over drawn cells, which differ from characters
+// once padding is inserted, as for a wide glyph.
 fn cell_at_col(cells: &[char], col: usize) -> usize {
     let mut used = 0;
     for (i, c) in cells.iter().enumerate() {
@@ -2998,9 +2321,8 @@ fn col_at_cell(cells: &[char], cell: usize) -> usize {
 }
 
 // A span of the line, in characters, mapped into the window of cells
-// being drawn. Everything composed onto a row goes through this, so
-// padding shifts a highlight exactly as far as it shifts the text under
-// it. `None` when the span falls entirely outside the window.
+// being drawn, so padding shifts a highlight as far as the text under
+// it. `None` when it falls outside the window.
 fn to_window(display: &crate::bishedit::tabular::Row, start_cell: usize, avail: usize, start: usize, end: usize) -> Option<(usize, usize)> {
     let last = display.cell_of.len().saturating_sub(1);
     let from = display.cell_of[start.min(last)];
@@ -3024,25 +2346,21 @@ pub(crate) struct VisualRow {
     pub(crate) fold: Option<usize>,
 }
 
-// How a buffer line is broken across screen rows. With wrapping off
-// this is always a single segment covering the whole line, and every
-// caller below then applies `viewport_left` to it exactly as before --
-// which is how one code path serves both modes.
+// How a line breaks into screen rows. With wrapping off, one segment
+// for the whole line, to which callers apply `viewport_left`.
 pub(crate) fn line_segments(buf: &TextBuffer, line: usize, content_cols: usize) -> Vec<crate::bishedit::wrap::Segment> {
     crate::bishedit::wrap::segments(&buf.line_chars(line), content_cols, &buf.wrap)
 }
 
-// The rows a pane shows, from the buffer's own scroll position. Shared
-// by rendering, by the click-to-position inverse, and by scrolling, so
-// none of the three can disagree about what is on screen.
+// The rows a pane shows from the buffer's scroll position, shared by
+// rendering, clicks and scrolling so they agree.
 pub(crate) fn visible_rows(buf: &TextBuffer, content_cols: usize, content_rows: usize) -> Vec<VisualRow> {
     let mut rows = Vec::with_capacity(content_rows);
-    // A top line some closed fold hides is drawn from that fold's own row.
+    // A top line hidden by a closed fold is drawn from the fold's row.
     let mut line = buf.fold_span(buf.viewport_top()).0;
     let mut skip = if line == buf.viewport_top() { buf.viewport_sub() } else { 0 };
     while rows.len() < content_rows && line < buf.line_count() {
-        // One row, however long the fold, and however long its first
-        // line: the row shows what the fold is, not what it holds.
+        // One row however long the fold: it shows what the fold is.
         if let Some((_, end)) = buf.folds.closed_at(line) {
             let seg = crate::bishedit::wrap::Segment { start: 0, end: buf.line_len(line), indent: 0 };
             rows.push(VisualRow { line, first: true, seg, fold: Some(end) });
@@ -3065,9 +2383,8 @@ pub(crate) fn visible_rows(buf: &TextBuffer, content_cols: usize, content_rows: 
     rows
 }
 
-// What a continued row opens with: `showbreak`, then padding out to the
-// indent the layout reserved for it. Dim, because it is the editor
-// talking rather than the file.
+// What a continued row starts with: `showbreak`, then padding to the
+// reserved indent. Dim: it's the editor, not the file.
 fn continuation_prefix(buf: &TextBuffer, indent: usize) -> String {
     if indent == 0 {
         return String::new();
@@ -3079,50 +2396,46 @@ fn continuation_prefix(buf: &TextBuffer, indent: usize) -> String {
     format!("\x1b[2m{mark}\x1b[0m{}", " ".repeat(indent - used))
 }
 
-// `:git blame`'s own gutter column: `short_commit` (8) + ' ' + `date`
-// (10, "YYYY-MM-DD") + ' ' + author (grows to fit the widest one actually
-// present, capped at BLAME_AUTHOR_MAX_WIDTH) + a trailing separator
-// space. Collapses to 0 -- no reserved space at all -- when blame isn't
-// currently toggled on for this buffer, unlike diagnostic_column_width's
-// always-reserved 2 columns (a stable sign column vim users expect to
-// never shift): blame is wide enough that reserving it unconditionally
-// would waste most of the window's width for the common case of it being
-// off, and unlike the sign column, "on" is a deliberate, infrequent user
-// toggle rather than something that comes and goes as they type.
+// `:git blame`'s column: the commit, the date and the author (as wide as
+// the widest, capped), each followed by a space. Zero width while blame
+// is off: unlike the sign column, it's wide, and toggled deliberately.
+const BLAME_COMMIT_WIDTH: usize = 8;
+const BLAME_DATE_WIDTH: usize = 10;
 const BLAME_AUTHOR_MAX_WIDTH: usize = 16;
 
 fn blame_column_width(buf: &TextBuffer) -> usize {
     let Some(blame) = &buf.blame else { return 0 };
     let author_width = blame.iter().flatten().map(|b| b.author.chars().count()).max().unwrap_or(0).clamp(1, BLAME_AUTHOR_MAX_WIDTH);
-    8 + 1 + 10 + 1 + author_width + 1
+    BLAME_COMMIT_WIDTH + 1 + BLAME_DATE_WIDTH + 1 + author_width + 1
 }
 
-// What a line git had nothing to say about shows instead of a commit --
-// see TextBuffer::blame's own doc comment for when that happens. Marked
-// rather than left blank, and in its own colour rather than the dim grey
-// every real blame row uses, so "this line isn't in what you asked about"
-// reads at a glance instead of looking like a rendering gap.
+// What a line git said nothing about shows instead of a commit (see
+// `TextBuffer::blame`), in its own colour, so it doesn't look like a
+// rendering gap.
 const BLAME_UNKNOWN: &str = "· N/A";
 
 fn render_blame_cell(buf: &TextBuffer, _starts: &[usize], line: usize, width: usize) -> Option<String> {
     let blame = buf.blame.as_ref()?;
-    let author_width = width.saturating_sub(8 + 1 + 10 + 1 + 1);
+    let author_width = width.saturating_sub(BLAME_COMMIT_WIDTH + 1 + BLAME_DATE_WIDTH + 1 + 1);
     match blame.get(line)? {
         Some(entry) => {
             let author: String = entry.author.chars().take(author_width).collect();
             Some(format!("\x1b[2m{} {} {:<aw$} \x1b[0m", entry.short_commit, entry.date, author, aw = author_width))
         }
-        None => Some(format!("\x1b[33m{:<8}\x1b[0m {:<10} {:<aw$} ", BLAME_UNKNOWN, "", "", aw = author_width)),
+        None => Some(format!(
+            "\x1b[33m{:<cw$}\x1b[0m {:<dw$} {:<aw$} ",
+            BLAME_UNKNOWN,
+            "",
+            "",
+            cw = BLAME_COMMIT_WIDTH,
+            dw = BLAME_DATE_WIDTH,
+            aw = author_width
+        )),
     }
 }
 
-// `:git diff`'s own gutter column: a single marker glyph + one padding
-// space, same fixed-2 shape as diagnostic_column_width just below --
-// unlike blame's column, a diff mark never needs more than one glyph to
-// say what it means. Collapses to 0 when diff isn't currently toggled on
-// for this buffer, same reasoning as blame_column_width above (a
-// deliberate, infrequent toggle, not something that comes and goes on
-// its own the way the diagnostic sign column's own contents do).
+// `:git diff`'s column: a marker and a space. Zero width while diff is
+// off, as for blame.
 fn diff_column_width(buf: &TextBuffer) -> usize {
     if buf.diff.is_some() { 2 } else { 0 }
 }
@@ -3137,22 +2450,16 @@ fn render_diff_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: us
     Some(format!("\x1b[{color}m{glyph}\x1b[0m "))
 }
 
-// A fixed 2 columns (marker glyph + one padding space) -- vim's own
-// `:set signcolumn` convention, not something that needs to grow with
-// the buffer the way the line-number column does.
-// `bish tool debug`'s own breakpoint column -- collapses to zero width
-// when `buf.breakpoints` is empty (the common case for an ordinary `e`-
-// opened buffer, which never touches it at all), same convention blame/
-// diff already use, unlike the diagnostic column's always-reserved 2.
+// The breakpoint column for `bish tool debug`, zero width with no
+// breakpoints and no debug session, as blame and diff are.
 fn breakpoint_column_width(buf: &TextBuffer) -> usize {
-    // Present for a whole debug session, not just while a breakpoint
-    // happens to exist -- see `TextBuffer::debug_attached`.
+    // For the whole debug session, not just while a breakpoint exists (see
+    // `TextBuffer::debug_attached`).
     if buf.breakpoints.is_empty() && !buf.debug_attached { 0 } else { 2 }
 }
 
-// 1-based, matching how the debugger itself (and ListItem::line) numbers
-// lines -- `line` here is the 0-indexed row every other GutterColumn
-// uses.
+// 1-based, as the debugger numbers lines; `line` is 0-based like every
+// gutter column's.
 fn render_breakpoint_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _width: usize) -> Option<String> {
     if line >= buf.line_count() || !buf.breakpoints.contains(&(line + 1)) {
         return None;
@@ -3160,31 +2467,24 @@ fn render_breakpoint_cell(buf: &TextBuffer, _starts: &[usize], line: usize, _wid
     Some("\x1b[1;31m\u{25cf}\x1b[0m ".to_string())
 }
 
+// A fixed 2 columns, marker and space, as vim's `signcolumn`.
 fn diagnostic_column_width(_buf: &TextBuffer) -> usize {
     2
 }
 
-// The worst severity among the diagnostics whose own char-offset range
-// (whole-buffer text offsets, same convention buffer_highlight_spans's
-// own spans use) intersects this one line's span -- same predicate
-// diagnostic_spans_for_line uses per-column below, just reduced to one
-// answer for the coarser gutter marker, which has room for a single
-// mark however many findings the line actually holds. `max` is the
-// reduction because `lint::Severity` is declared least-severe-first
-// specifically so it can be (see its own doc comment).
+// The worst severity among diagnostics whose range touches this line,
+// the predicate `diagnostic_spans_for_line` uses per column, reduced to
+// one mark. `max`, since `lint::Severity` is ordered least severe
+// first.
 fn line_severity(buf: &TextBuffer, starts: &[usize], line: usize) -> Option<lint::Severity> {
     let line_start = starts[line];
     let line_end = line_start + buf.line_len(line);
     buf.diagnostics.iter().filter(|d| d.start < line_end && d.end > line_start).map(|d| d.severity).max()
 }
 
-/// Every diagnostic whose own span touches `line`, worst first -- what
-/// the marker in the gutter is standing for.
-///
-/// Public because the gutter's marker says only "something is wrong
-/// here"; the thing that says *what* lives in repl.rs, and matching a
-/// diagnostic to a line is this file's own arithmetic (`line_severity`
-/// uses the same predicate to pick the colour).
+/// Every diagnostic touching `line`, worst first: what the gutter marker
+/// stands for. Public because repl.rs says what they are; matching them
+/// to a line is this file's arithmetic.
 pub(crate) fn diagnostics_on_line(buf: &TextBuffer, line: usize) -> Vec<&lint::Diagnostic> {
     if line >= buf.line_count() {
         return Vec::new();
@@ -3202,24 +2502,19 @@ fn render_diagnostic_cell(buf: &TextBuffer, starts: &[usize], line: usize, _widt
         return None;
     }
     let severity = line_severity(buf, starts, line)?;
-    // The gutter bullet takes the severity's own colour but not its
-    // underline -- underlining a bullet would just look like a typo.
+    // The bullet takes the severity's colour, not its underline.
     let (fg, _) = crate::theme::resolve(severity_element(severity), buf.colors.as_ref());
     let sgr = vt100::sgr_codes(fg, vt100::Color::Default, vt100::CellAttrs::default());
     Some(format!("{sgr}\u{25cf}\x1b[0m "))
 }
 
-// Vim's own gutter-width convention: as many digits as the buffer's last
-// line number needs, plus one trailing space of padding before the
-// buffer's own content starts. Grows dynamically as the buffer gains
-// lines (matching vim), rather than reserving a fixed width up front.
+// As many digits as the last line number needs, plus a space, as in
+// vim.
 fn line_number_width(buf: &TextBuffer) -> usize {
-    // Sized for the widest number this column can ever draw, not for
-    // whatever it happens to be drawing now: with `relativenumber` the
-    // distances are small but the cursor's own line still shows its
-    // absolute number, so the column can't shrink to fit the offsets.
-    // A gutter that changed width as the cursor moved would shift every
-    // line of the pane sideways on every `j`.
+    // Sized for the widest number the column can draw: with
+    // `relativenumber` the cursor's line still shows its absolute number,
+    // and a gutter that resized as the cursor moved would shift the pane on
+    // every `j`.
     buf.line_count().to_string().len() + 1
 }
 
@@ -3231,20 +2526,17 @@ fn render_line_number_cell(buf: &TextBuffer, _starts: &[usize], line: usize, wid
     Some(format!("{sgr}{:>pad$} \x1b[0m", line_number_text(buf, line), pad = width.saturating_sub(1)))
 }
 
-// What the gutter puts on this line: its own number, or -- with
-// `relativenumber` on -- how far it is from the cursor's, which is what
-// makes `12j` or `d8k` something you read off the screen instead of
-// counting. The cursor's own line keeps its absolute number either way:
-// a `0` there would be the one number on screen that is not a motion
-// count, and vim only shows one because it lets you turn `number` off,
-// which bish does not.
+// The line's number, or with `relativenumber` its distance from the
+// cursor, so `12j` can be read off the screen. The cursor's line keeps
+// its absolute number: vim shows 0 only because `number` can be off,
+// which bish's can't.
 fn line_number_text(buf: &TextBuffer, line: usize) -> String {
     let (cursor, _) = buf.cursor();
     if !buf.relativenumber || line == cursor {
         return (line + 1).to_string();
     }
-    // A closed fold is one row, so it counts as one: the number has to be
-    // what `3j` will do, not how many lines lie in between.
+    // A closed fold is one row, so it counts as one: the number is what
+    // `3j` does.
     if buf.folds.any_closed() {
         let (low, high) = (line.min(cursor), line.max(cursor));
         let target = buf.fold_span(high).0;
@@ -3259,20 +2551,12 @@ fn line_number_text(buf: &TextBuffer, line: usize) -> String {
     line.abs_diff(cursor).to_string()
 }
 
-// Language detection, v1: a bare extension check, not a content sniff --
-// no shebang or content fallback yet, which is a natural follow-up.
-//
-// A language *name*, not a file-type enum, because `abbr --lang=` is a
-// glob written by hand against it (`--lang=rust`, `--lang='*script'`,
-// `--lang='!(bash)'`) -- an enum could only ever offer the handful of
-// languages this crate happens to know about, while a name lets
-// `--lang=toml` work with nothing here having heard of TOML.
-//
-// The table below is therefore only for extensions whose name genuinely
-// *differs* from the language's; everything else is its own lowercased
-// extension. A buffer with no file at all -- a fresh `e` with no
-// argument -- is "text", which is also a language you can write
-// abbreviations for.
+// Language from the extension; no shebang or content sniffing. A name,
+// not an enum, because `abbr --lang=` globs over it by hand
+// (`--lang='*script'`), so `--lang=toml` works without this file knowing
+// TOML. This table lists only extensions that differ from the language;
+// others are their own lowercased extension. A buffer with no file is
+// "text".
 const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("sh", "bash"),
     ("bash", "bash"),
@@ -3295,9 +2579,8 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("hs", "haskell"),
     ("ex", "elixir"),
     ("exs", "elixir"),
-    // Man page sections. `ls.1`, `printf.3`, `crontab.5` are all roff
-    // source, and `language_of` looks through a `.gz` first, so a page
-    // straight out of /usr/share/man lands here too.
+    // Man page sections: `ls.1`, `printf.3` are roff, and `language_of`
+    // looks through `.gz`, so pages from /usr/share/man land here.
     ("1", "roff"),
     ("2", "roff"),
     ("3", "roff"),
@@ -3309,20 +2592,15 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("9", "roff"),
     ("man", "roff"),
     ("tmac", "roff"),
-    // The INI family. `.conf` is the loosest of these -- plenty of
-    // `.conf` files (nginx's, apache's) are nothing of the sort -- but
-    // it is by far the most common extension people actually put INI
-    // in, and the cost of being wrong is that a brace-and-semicolon
-    // config gets its words coloured as keys.
+    // The INI family. `.conf` is the loosest (nginx's isn't INI), but it's
+    // where people most often put INI, and a wrong guess only colours words
+    // as keys.
     ("ini", "ini"),
     ("cfg", "ini"),
     ("conf", "ini"),
     ("desktop", "ini"),
-    // systemd units, which are INI with a stricter dialect. Several of
-    // these are generic-looking words (`.path`, `.link`, `.target`) and
-    // a file with one of those names that *isn't* a unit will be read
-    // as INI; nothing but highlighting depends on this, and in practice
-    // nothing else claims them.
+    // systemd units, INI in a stricter dialect. Some (`.path`, `.link`,
+    // `.target`) are generic words, but only highlighting depends on this.
     ("service", "ini"),
     ("socket", "ini"),
     ("timer", "ini"),
@@ -3335,20 +2613,16 @@ const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
     ("netdev", "ini"),
     ("link", "ini"),
     ("nmconnection", "ini"),
-    // JSON with comments. `.json` itself stays strict -- most `.json`
-    // files really are, and colouring a stray `//` as a comment in one
-    // that isn't would be saying it is valid there.
+    // JSON with comments. `.json` stays strict, so a stray `//` isn't
+    // coloured as a valid comment.
     ("jsonc", "jsonc"),
-    // `local.env`, `production.env` -- the other way people name these.
+    // `local.env`, `production.env`.
     ("env", "dotenv"),
 ];
 
-// The other half of recognizing a file: what it is *called*. Every entry
-// above is an extension, and the most-used config files in the INI
-// family don't have one -- `.gitconfig`, `.editorconfig` and `.npmrc`
-// are all extension-less as far as `Path` is concerned (a leading dot
-// makes the whole name the stem). Matched case-insensitively against
-// the file name, ahead of the extension table.
+// Languages by file name, checked first, case-insensitively, for files
+// with no extension: `.gitconfig`, `.editorconfig` and `.npmrc` are all
+// stem to `Path`.
 const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
     (".gitconfig", "ini"),
     (".gitmodules", "ini"),
@@ -3360,24 +2634,19 @@ const LANGUAGE_BY_FILE_NAME: &[(&str, &str)] = &[
     ("pylintrc", "ini"),
     (".flake8", "ini"),
     (".coveragerc", "ini"),
-    // TOML that doesn't say so. `Pipfile` and `poetry.lock` are both
-    // TOML documents with names that give no hint of it.
+    // TOML without saying so.
     ("pipfile", "toml"),
     ("poetry.lock", "toml"),
-    // The files everyone knows are JSON-with-comments even though their
-    // extension says otherwise. TypeScript's own parser accepts
-    // comments here, and every real `tsconfig.json` has them.
+    // JSON with comments despite the extension: TypeScript accepts
+    // comments here, and real `tsconfig.json` files have them.
     ("tsconfig.json", "jsonc"),
     ("jsconfig.json", "jsonc"),
     ("devcontainer.json", "jsonc"),
     (".eslintrc.json", "jsonc"),
-    // `.envrc` is direnv's, and direnv scripts are bash -- it sits in
-    // this table specifically so the `.env` prefix rule below can't
+    // direnv's, which is bash; here so the `.env` prefix rule below can't
     // claim it.
     (".envrc", "bash"),
-    // python-dotenv reads this one by name. Here rather than in the
-    // extension table because `Path` sees `.flaskenv` as all stem and no
-    // suffix, the same as `.gitconfig`.
+    // Read by name by python-dotenv; all stem to `Path`, as `.gitconfig`.
     (".flaskenv", "dotenv"),
 ];
 
@@ -3388,13 +2657,11 @@ pub(crate) fn language_of(buf: &TextBuffer) -> String {
     }
 }
 
-// What a file at `path` is written in, from its name alone -- for text
-// that is not in a buffer, such as either side of a diff.
+// What a file at `path` is written in, from its name, for text not in a
+// buffer, such as either side of a diff.
 pub(crate) fn language_of_path(path: &std::path::Path) -> String {
-    // `.gz` says how the bytes are stored, not what they are -- what a
-    // `notes.json.gz` buffer holds is JSON, and it should highlight like
-    // it. The extension underneath is the answer for every purpose here,
-    // so the compression suffix is simply stepped over.
+    // `.gz` is how it's stored, not what it is: `notes.json.gz` is JSON, so
+    // the suffix is stepped over.
     let path = match path.extension() {
         Some(ext) if ext.eq_ignore_ascii_case("gz") => std::path::Path::new(path.file_stem().unwrap_or(path.as_os_str())),
         _ => path,
@@ -3403,34 +2670,24 @@ pub(crate) fn language_of_path(path: &std::path::Path) -> String {
     if let Some((_, lang)) = LANGUAGE_BY_FILE_NAME.iter().find(|(n, _)| *n == name) {
         return (*lang).to_string();
     }
-    // Some names only mean something in the directory they are in.
     let parent = path.parent().and_then(|p| p.file_name()).map(|d| d.to_string_lossy().to_lowercase());
     match parent.as_deref() {
-        // `config` alone is far too common a name to claim, but inside a
-        // `.git` directory (or the `git` one under `~/.config`) it is
-        // the git config -- the file you are actually editing when you
-        // type `e .git/config`.
+        // `config` alone is too common to claim, but in `.git` (or
+        // `~/.config/git`) it's the git config.
         Some(".git") | Some("git") if name == "config" => return "ini".to_string(),
-        // ...and inside `.cargo` it is cargo's, which is TOML. (Cargo
-        // itself now prefers `config.toml`, which needs no help.)
+        // In `.cargo` it's cargo's, which is TOML.
         Some(".cargo") if name == "config" => return "toml".to_string(),
-        // Every `.json` VS Code keeps in a project's `.vscode` accepts
-        // comments, and the ones people hand-edit are full of them.
+        // VS Code's `.vscode/*.json` files all accept comments, and have
+        // them.
         Some(".vscode") if name.ends_with(".json") => return "jsonc".to_string(),
         _ => {}
     }
-    // `tsconfig.json` is never alone for long: a real project grows
-    // `tsconfig.app.json`, `tsconfig.node.json`, `tsconfig.build.json`.
-    // All of them are the same format, so match the family rather than
-    // listing the members.
+    // The `tsconfig.*.json` family (`tsconfig.app.json`, ...) is one format.
     if (name.starts_with("tsconfig.") || name.starts_with("jsconfig.")) && name.ends_with(".json") {
         return "jsonc".to_string();
     }
-    // The same argument, and a bigger family: `.env`, `.env.local`,
-    // `.env.production`, `.env.test.local`, `.env.example`. Listing
-    // them would be listing a convention rather than matching it.
-    // `.envrc` is already spoken for above, since direnv's is a shell
-    // script rather than one of these.
+    // Likewise `.env`, `.env.local`, `.env.production` and the rest.
+    // `.envrc` is claimed above as bash.
     if name == ".env" || name.starts_with(".env.") {
         return "dotenv".to_string();
     }
@@ -3441,28 +2698,19 @@ pub(crate) fn language_of_path(path: &std::path::Path) -> String {
     LANGUAGE_BY_EXTENSION.iter().find(|(e, _)| *e == ext).map(|(_, lang)| (*lang).to_string()).unwrap_or(ext)
 }
 
-// The buffer's own text, lines joined by '\n' -- what a highlighter
-// needs to see a construct that spans several physical lines (a bash
-// heredoc body or multi-line double-quoted string, a JSON object) as
-// the single thing it actually is, instead of each line's own run
-// finding a dangling, unterminated piece of it with no idea what line
-// came before. Recomputed on every redraw, same as buffer_highlight_spans
-// below -- see that function's own doc comment on why that's an
-// accepted, not-yet-a-problem cost rather than something cached here.
 pub(crate) fn buffer_source(buf: &TextBuffer) -> String {
     buffer_text(buf)
 }
 
+// The buffer's text, lines joined by newlines, so a highlighter sees a
+// multi-line construct (a heredoc, a JSON object) whole.
 pub(crate) fn buffer_text(buf: &TextBuffer) -> String {
     (0..buf.line_count()).map(|l| (0..buf.line_len(l)).map(|c| buf.char_at(l, c).unwrap_or(' ')).collect::<String>()).collect::<Vec<_>>().join("\n")
 }
 
-// The char offset `buffer_text`'s own joined string lands each line's
-// first character at -- a running total of line_len(l) real chars plus
-// one for the '\n' joining it to the next line. Computed once as a
-// prefix-sum vector, indexed by line number, rather than summed fresh
-// per row -- build_editor_frame's own loop calls this once and reuses
-// it, not once per visible row.
+// The offset in `buffer_text`'s string where each line starts: a prefix
+// sum of line lengths plus one per newline, computed once per frame
+// rather than per row.
 pub(crate) fn line_starts_of(buf: &TextBuffer) -> Vec<usize> {
     line_starts(buf)
 }
@@ -3477,73 +2725,38 @@ fn line_starts(buf: &TextBuffer) -> Vec<usize> {
     starts
 }
 
-// Which highlighter (if any) this buffer's language has. The table
-// itself lives in bishedit::highlight, because a fenced code block
-// inside a markdown document asks the same question about its info
-// string and the two must not answer differently. `None` for a language
-// with no highlighter, which renders exactly as it did before any of
-// this existed: plain, uncoloured text.
+// This language's highlighter, if any. The table is in
+// bishedit::highlight, since a markdown code fence asks the same
+// question and must get the same answer. `None` renders plain text.
 fn highlighter_for(language: &str) -> Option<Box<dyn Highlighter>> {
     highlight::highlighter_for_language(language)
 }
 
-// Runs this buffer's own highlighter once against the *whole* buffer
-// text (see buffer_text's own doc comment for why that, not one line at
-// a time, is what actually fixes a multi-line construct).
-// Recomputed on every redraw (build_editor_frame's own single call
-// site, once per keystroke) rather than cached on EditSession: this
-// editor's target files are scripts/configs, not large codebases, and
-// re-lexing one of those is well under a millisecond -- a real caching
-// need would show up as noticeable input lag first, at which point it's
-// a small, self-contained change (memoize on buf.is_dirty() going true)
-// rather than one worth guessing at up front. HighlightContext::
-// default() (no cwd, no known_functions) still stands in for the
-// highlighter's own *classification* step: same "no context to offer"
-// choice command mode's own colon-line already makes, since nothing
-// here has a live Shell to pull those from -- bash's own Flag/
-// Subcommand/Link/InvalidCommand refinements that need them simply
-// don't fire, same as there; JsonHighlighter ignores the context
-// outright, having no use for any of it. `color_overrides` (`::bish hl`'s own palette -- see bishedit::
-// highlight::ColorOverrides/SYN_COL_OPTIONS) is a separate, later step
-// (picking a *color* for an already-classified span, not classifying
-// it), threaded in from wherever a live Shell to read it from actually
-// exists: repl.rs's own run_edit_frame, one level up from every caller
-// of this whole chain.
-//
-// Not a full fix for every multi-line case in *bash*: `next_span`'s own doc
-// comment (this same module) documents a pre-existing lexer position-
-// tracking gap for a heredoc body that itself contains a $VAR/$(...)
-// expansion -- content *after* such a heredoc in the same buffer can
-// still come out mis-highlighted. Narrower and pre-existing either way,
-// not something this change introduces or could fix without touching
-// lexer.rs's own heredoc-body capture.
-// The style layer on its own. Only the tests want it that way: the
-// render path needs both layers and takes them together, because they
-// come out of the same pass (see buffer_spans).
+// The style layer alone, for tests; rendering takes both layers from
+// one pass (`buffer_spans`).
 #[cfg(test)]
 fn buffer_highlight_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> Vec<StyledSpan> {
     buffer_spans(buf, color_overrides).0
 }
 
-// Both layers this buffer needs, from one run of the highlighter --
-// they come out of the same spans, and running the highlighter twice per
-// redraw to separate them would double the one real cost here.
+// Both span layers from one run of the highlighter over the whole text,
+// so multi-line constructs are seen whole. Recomputed every redraw: the
+// files are scripts and configs, which lex in well under a
+// millisecond. `HighlightContext::default()` stands in for a shell, so
+// bash's context-dependent refinements don't fire. `color_overrides`
+// (`::bish hl`) picks colours afterwards, from repl.rs's
+// `run_edit_frame`.
 //
-// The link layer is where `HighlightSpan.link` finally goes somewhere:
-// it has always been populated (bash's resolved file paths, markdown's
-// link destinations) and has never been read. On top of those, every
-// buffer gets a pass for bare URLs in its text -- a URL in a comment, in
-// a `.env` value, in a commit message -- which is language-independent
-// because being a URL is.
+// The link layer carries `HighlightSpan.link` (bash's resolved paths,
+// markdown's link targets), plus bare URLs found in any text.
 fn buffer_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverrides>) -> (Vec<StyledSpan>, Vec<highlight::LinkSpan>) {
     let text = buffer_text(buf);
     let mut spans = match highlighter_for(&language_of(buf)) {
         Some(highlighter) => highlighter.highlight(&text, HighlightContext::default()),
         None => Vec::new(),
     };
-    // Appended after the language's own spans so it paints over them:
-    // a URL inside a string is a URL, and the underline that says so is
-    // the only cue that it can be clicked.
+    // After the language's spans, so it paints over them: the underline is
+    // the cue a URL in a string can be clicked.
     for found in crate::url::find(&text) {
         let url: String = text.chars().skip(found.start).take(found.end - found.start).collect();
         spans.push(highlight::HighlightSpan { start: found.start, end: found.end, kind: highlight::HighlightKind::Link, link: Some(url) });
@@ -3557,53 +2770,24 @@ fn buffer_spans(buf: &TextBuffer, color_overrides: Option<&highlight::ColorOverr
             StyledSpan { start: s.start, end: s.end, fg, attrs }
         })
         .collect();
-    // Last, so it paints over the lexer's guesses: a language server
-    // knows which identifier is a parameter and which a constant, which
-    // is the whole reason to ask. Only the tokens that resolved to a
-    // colour are here at all (see repl::sync_semantic_tokens), so
-    // everything the server named and bish has no colour for keeps
-    // whatever the local highlighter made of it.
+    // Last, over the lexer's guesses: the server knows a parameter from a
+    // constant. Only tokens with a colour are here (`sync_semantic_tokens`);
+    // the rest keep the local highlighting.
     styled.extend(buf.semantic_spans.iter().cloned());
     (styled, links)
 }
 
-// This buffer's own directory is what a relative link target is
-// relative to; an unnamed buffer has none, and `url::absolute` gives no
-// link rather than a guessed one.
+// A relative link target is relative to the buffer's directory; an
+// unnamed buffer has none, so no link.
 fn absolute_link(buf: &TextBuffer, target: &str) -> Option<String> {
     crate::url::absolute(target, buf.path().and_then(|p| p.parent()))
 }
 
-// `:diag`'s own worker (see repl.rs's run_command_mode, the one caller):
-// runs every diagnose tool configured for this buffer's language against
-// the *whole* buffer text, for the same reason buffer_highlight_spans
-// does (a multi-line construct needs to be seen as one thing). Which
-// linters those are is a plain match on `language_of`: there is more
-// than one language with something to say now, and the `Linter` trait
-// was always shaped for that (concatenation is the default answer), it
-// just never had a second one to prove it. Unlike
-// buffer_highlight_spans this isn't
-// called on every redraw: `:diag` is an explicit, user-triggered check,
-// not a live-typing overlay, so there's no per-keystroke cost to worry
-// about and the result is cached on TextBuffer::diagnostics instead of
-// recomputed here (see that field's own doc comment for why it also
-// self-clears the moment the buffer it describes actually changes).
-//
-// A plain `Vec<&dyn Linter>` rather than BashLinter called directly --
-// lint.rs's own doc comment already frames Linter as "the one shared
-// core behind bish tool check, in-editor squiggles, and bish tool
-// lsp-server," and this feature's own ask was explicit that one language
-// may eventually run more than one diagnose tool over the same buffer
-// (a style linter alongside a correctness one, say); concatenating each
-// tool's own findings here is what makes adding a second one later just
-// "add it to this list," not a structural change.
+// `:diag`: runs this language's linters over the whole buffer, the
+// findings concatenated. Not per redraw: `:diag` is explicit, and the
+// result is cached on `TextBuffer::diagnostics`, which clears itself
+// when the buffer changes.
 pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
-    // Which of bish's own linters have anything to say about this
-    // buffer. A `Vec<&dyn Linter>` rather than a fixed-size array
-    // because the answer now depends on the language -- which is the
-    // shape this was always written for (see the `Linter` trait's own
-    // "concatenation is the default answer" note), it just never had a
-    // second language to prove it.
     let linters: Vec<&dyn Linter> = match language_of(buf).as_str() {
         lang if lang == snippet::DEFAULT_LANG => vec![&BashLinter],
         "json" => vec![&lint::JsonLinter],
@@ -3617,13 +2801,9 @@ pub(crate) fn diagnose_buffer(buf: &TextBuffer) -> Vec<lint::Diagnostic> {
     linters.iter().flat_map(|l| l.check(&text)).collect()
 }
 
-// A `Diagnostic`'s own flat char offset (into `buffer_text`'s joined
-// string -- the same addressing `lint::Diagnostic`/`Fix` use throughout)
-// translated into this buffer's real `(line, col)`, via the same
-// `line_starts` prefix-sum table `diagnostic_spans_for_line`'s own
-// underline rendering already builds fresh per redraw. Used by the
-// diagnostics pane (repl.rs) to jump the cursor to a selected problem,
-// and by `apply_fix` below to know where to splice its replacement.
+// A diagnostic's flat char offset (into `buffer_text`, as
+// `lint::Diagnostic` and `Fix` use) as `(line, col)`, through
+// `line_starts`. For jumping to a problem and for `apply_fix`.
 pub(crate) fn diagnostic_position(buf: &TextBuffer, offset: usize) -> (usize, usize) {
     let starts = line_starts(buf);
     let line = match starts.binary_search(&offset) {
@@ -3635,21 +2815,12 @@ pub(crate) fn diagnostic_position(buf: &TextBuffer, offset: usize) -> (usize, us
     (line, col)
 }
 
-// `diagnostic_position`'s inverse: a `(line, character)` as a language
-// server counts it, back to the flat char offset every diagnostic and
-// highlight span in this codebase is addressed by.
-//
-// Two conversions in one, and both matter. The column is in whatever
-// encoding the handshake settled on (`utf-32` is bish's own counting
-// and needs no work; `utf-16` differs on any line holding an emoji),
-// and the line has to be turned into an offset via the same
-// `line_starts` prefix sum everything else here uses.
-//
-// Clamps rather than fails at every step. A server can and does name a
-// position past the end of what bish currently holds -- it is answering
-// about a revision the buffer may have moved past, and the alternative
-// to clamping is discarding a finding that is very probably still
-// pointing at the right place.
+// `diagnostic_position`'s inverse for a language server's
+// `(line, character)`: the column in the negotiated encoding (`utf-32`
+// is bish's counting; `utf-16` differs on emoji), the line through the
+// `line_starts` prefix sum. Clamps at every step: a server may name a
+// position past what the buffer now holds, from an older revision, and
+// the finding probably still points at the right place.
 pub(crate) fn diagnostic_offset(buf: &TextBuffer, starts: &[usize], line: usize, character: usize, encoding: lsp::PositionEncoding) -> usize {
     let last = buf.line_count().saturating_sub(1);
     if line > last {
@@ -3659,30 +2830,20 @@ pub(crate) fn diagnostic_offset(buf: &TextBuffer, starts: &[usize], line: usize,
     starts[line] + lsp::from_server_column(&chars, character, encoding)
 }
 
-// Applies a batch of `lsp::TextEdit`s to a buffer, returning how many
-// actually changed anything.
-//
-// **Applied last-first.** LSP says a batch's ranges never overlap and
-// must be applied as though simultaneously, which for a buffer that
-// edits in place means starting from the end: an earlier edit that
-// shifted everything after it would invalidate every later range.
-// Exactly the rule `tool.rs`'s own `apply_fixes` already follows for a
-// batch of `lint::Fix`es, one coordinate system over.
-//
-// Multi-line edits are the norm here, not the exception -- a formatter
-// rewriting a block sends one edit spanning it -- so this splices with
-// `delete_range` + `insert_text` rather than the single-line
-// `replace_in_line` that completion's accept can get away with.
+// Applies a batch of `lsp::TextEdit`s, returning how many changed
+// anything. Last first: LSP ranges don't overlap and apply as though at
+// once, so starting from the end keeps earlier ranges valid, as
+// `tool.rs`'s `apply_fixes` does. Multi-line edits are normal (a
+// formatter rewriting a block), hence `delete_range` and `insert_text`.
 pub(crate) fn apply_text_edits(buf: &mut TextBuffer, edits: &[lsp::TextEdit], encoding: lsp::PositionEncoding) -> usize {
-    // One edit with its ends already in this buffer's coordinates.
+    // One edit with its ends in this buffer's coordinates.
     struct Resolved<'a> {
         from: (usize, usize),
         to: (usize, usize),
         text: &'a str,
     }
     let starts = line_starts(buf);
-    // Resolved against the *current* text before anything moves, which
-    // is the whole reason the order below matters.
+    // Resolved against the current text before anything moves.
     let mut resolved: Vec<Resolved<'_>> = edits
         .iter()
         .map(|edit| {
@@ -3709,22 +2870,16 @@ pub(crate) fn apply_text_edits(buf: &mut TextBuffer, edits: &[lsp::TextEdit], en
     applied
 }
 
-// A server position as this buffer's own `(row, col)`, clamped -- see
-// `diagnostic_offset`, which this is the two-dimensional face of.
+// A server position as `(row, col)`, clamped; see `diagnostic_offset`.
 fn position_of(buf: &TextBuffer, starts: &[usize], position: (usize, usize), encoding: lsp::PositionEncoding) -> (usize, usize) {
     let offset = diagnostic_offset(buf, starts, position.0, position.1, encoding);
     diagnostic_position(buf, offset)
 }
 
-// A server's findings as diagnostics this editor can draw. The one
-// place LSP's model and `lint::Diagnostic` meet -- which is here, and
-// not in lsp.rs, because only something holding the actual text can
-// convert a `(line, character)` into an offset.
-//
-// `fix` is always `None`: an LSP fix is a code action, which is a
-// separate request and a multi-range `WorkspaceEdit` that `lint::Fix`'s
-// deliberately-single-range shape cannot express. Nothing is silently
-// lost by that -- a server's diagnostic carries no edit of its own.
+// A server's findings as diagnostics this editor draws. Here, not in
+// lsp.rs, because only something holding the text can turn
+// `(line, character)` into an offset. `fix` is `None`: an LSP fix is a
+// code action, a separate request, and multi-range.
 pub(crate) fn diagnostics_from_server(buf: &TextBuffer, findings: &[lsp::Finding], encoding: lsp::PositionEncoding) -> Vec<lint::Diagnostic> {
     let starts = line_starts(buf);
     findings
@@ -3739,11 +2894,9 @@ pub(crate) fn diagnostics_from_server(buf: &TextBuffer, findings: &[lsp::Finding
                 _ => lint::Severity::Hint,
             },
             code: std::borrow::Cow::Owned(f.code.clone()),
-            // Always `Some`, even when the server named no source: this
-            // is what tells a relayed finding apart from one of bish's
-            // own, which is what lets a new publication replace exactly
-            // the right subset. The server's command stands in when it
-            // didn't say.
+            // Always `Some`, the server's command when it named no source:
+            // it tells a relayed finding from bish's own, so a new
+            // publication replaces the right subset.
             source: Some(f.source.clone().unwrap_or_else(|| "lsp".to_string())),
             message: f.message.clone(),
             fix: None,
@@ -3751,16 +2904,9 @@ pub(crate) fn diagnostics_from_server(buf: &TextBuffer, findings: &[lsp::Finding
         .collect()
 }
 
-// Splices `diagnostic`'s own `Fix` (if it has one) into `buf` --
-// `false`, no-op, if it doesn't. The same two primitives `tool.rs`'s own
-// CLI-only `apply_fixes` (a whole sorted batch, working on a raw
-// string) uses conceptually, just against a real `TextBuffer` and for
-// exactly one diagnostic: `delete_range` already clears `buf.
-// diagnostics` as part of any real edit (same rule any other change
-// obeys), so the caller re-running `diagnose_buffer` afterward is what
-// actually produces a fresh, correctly-offset list -- patching the old
-// one in place isn't worth the risk once a splice has shifted
-// everything after it.
+// Applies `diagnostic`'s fix, if it has one. `delete_range` clears
+// `buf.diagnostics`, so the caller re-runs `diagnose_buffer` for
+// correct offsets.
 pub(crate) fn apply_fix(buf: &mut TextBuffer, diagnostic: &lint::Diagnostic) -> bool {
     let Some(fix) = &diagnostic.fix else { return false };
     let from = diagnostic_position(buf, fix.start);
@@ -3771,18 +2917,10 @@ pub(crate) fn apply_fix(buf: &mut TextBuffer, diagnostic: &lint::Diagnostic) -> 
     true
 }
 
-// The batch counterpart to `apply_fix` above -- what a pre-save hook
-// (below) needs, since a hook's whole point is applying every fix it
-// found in one go, not one at a time. Same sort-by-descending-start-then
-// -splice shape as tool.rs's own `apply_fixes`, just calling `apply_fix`
-// against the real buffer for each one instead of splicing a raw string:
-// every diagnostic's `start`/`end` are offsets into the *original*
-// `buffer_text(buf)`, and processing right-to-left means every edit
-// still to come sits entirely before the point already spliced, so an
-// as-yet-unapplied offset never needs adjusting for one that already
-// landed. The overlap guard is defensive, matching tool.rs's own -- no
-// current hook produces overlapping fixes, but a corrupted splice would
-// be a much worse failure mode than silently skipping one.
+// Every fix, as a pre-save hook needs. Right to left by start, as
+// `tool.rs`'s `apply_fixes` does: offsets are into the original text,
+// so a later splice never moves one still to come. An overlapping fix
+// is skipped.
 fn apply_all_fixes(buf: &mut TextBuffer, diagnostics: &[lint::Diagnostic]) -> usize {
     let mut candidates: Vec<&lint::Diagnostic> = diagnostics.iter().filter(|d| d.fix.is_some()).collect();
     crate::sort::sort_by_key(&mut candidates, |d| std::cmp::Reverse(d.fix.as_ref().unwrap().start));
@@ -3800,45 +2938,22 @@ fn apply_all_fixes(buf: &mut TextBuffer, diagnostics: &[lint::Diagnostic]) -> us
     applied
 }
 
-// One filetype's pre-save hook: given the buffer's whole text, the
-// Diagnostics (with Fixes) it wants applied before the write hits disk --
-// the same shape `Linter::check` already uses, so a hook that would also
-// make sense as a live diagnostic doesn't need a second implementation.
-// `Result`, not a plain `Vec`, because unlike a Linter a hook may refuse
-// to touch content it can't make sense of at all (`BashFormatter::
-// check`'s own doc comment: it bails on a parse error rather than guess)
-// -- `Err` just means "leave the file alone," same as a failed `bish
-// tool format` leaving its target untouched.
+// A language's pre-save hook: the buffer's text in, diagnostics with
+// fixes out, the shape of `Linter::check`. `Err` leaves the file alone,
+// for a hook that can't make sense of the text (`BashFormatter::check`
+// on a parse error).
 type PreSaveHook = fn(&str) -> Result<Vec<lint::Diagnostic>, String>;
 
 fn bash_format_hook(text: &str) -> Result<Vec<lint::Diagnostic>, String> {
     Ok(strip_buffer_implicit_trailing_newline(text, BashFormatter.check(text)?))
 }
 
-// A hook's own Diagnostics assume the same "exactly one trailing
-// newline is real content" convention `bish tool format`'s CLI writer
-// does -- `BashFormatter::check`'s own EOF-gap rule always intends
-// literally "\n" there, since it's producing a plain string meant to be
-// written to a file as-is. `TextBuffer::save` already adds that
-// trailing newline itself on every write (see its own doc comment: one
-// line per row, joined by "\n", plus one more at the end) -- lines
-// never store a trailing newline as their own content. Applied
-// literally, a fix reaching all the way to the end of the buffer's text
-// that still ends in '\n' would double it up as a real extra blank last
-// line (`buf.insert_text` splits on every '\n' it's given, with no idea
-// one of them was only ever meant to represent `save`'s own implicit
-// one). Trimmed once here, right where the hook already knows it's
-// producing Diagnostics headed for a `TextBuffer`, rather than teaching
-// `BashFormatter` itself two different EOF conventions.
-//
-// The stripped fix can end up start == end with an empty replacement --
-// a script whose buffer content already matches canonical layout exactly
-// (`buffer_text` just never carries the trailing newline this diagnostic
-// otherwise exists to add). That diagnostic is dropped outright rather
-// than left in as a no-op `Fix`: `apply_fix`/`apply_all_fixes` count any
-// `Some(fix)` as "applied" regardless of whether it changes anything, so
-// leaving it in would make an already-formatted buffer misreport as
-// `FormatOutcome::Formatted` instead of `AlreadyFormatted`.
+// A hook writes its fixes for a file ending in one newline, but a
+// buffer's text has none: `TextBuffer::save` adds it. Applied as is, a
+// fix reaching the end would add a blank last line, so the newline is
+// trimmed here. A fix left empty (the text was already formatted) is
+// dropped, since `apply_fix` counts any fix as applied and the buffer
+// would report `Formatted` instead of `AlreadyFormatted`.
 fn strip_buffer_implicit_trailing_newline(text: &str, mut diagnostics: Vec<lint::Diagnostic>) -> Vec<lint::Diagnostic> {
     let end = text.chars().count();
     let is_eof_newline_fix = diagnostics.last().and_then(|d| d.fix.as_ref()).is_some_and(|f| f.end == end && f.replacement.ends_with('\n'));
@@ -3853,12 +2968,7 @@ fn strip_buffer_implicit_trailing_newline(text: &str, mut diagnostics: Vec<lint:
     diagnostics
 }
 
-// Which hooks run before a save, by language -- bash is the only one
-// with any tooling behind it today (see `language_of`), so it's the only
-// entry with anything in its list. A future language adds its own arm
-// here; a future bash-only hook (or one shared across every language,
-// e.g. line-ending normalization) just joins this one slice -- no change
-// needed to `run_pre_save_hooks` itself either way.
+// The pre-save hooks for a language; only bash has any.
 fn pre_save_hooks(language: &str) -> &'static [PreSaveHook] {
     match language {
         snippet::DEFAULT_LANG => &[bash_format_hook],
@@ -3866,34 +2976,22 @@ fn pre_save_hooks(language: &str) -> &'static [PreSaveHook] {
     }
 }
 
-// Runs one hook against `buf`'s current content and applies whatever
-// fixes it reports, returning how many actually landed -- the shared
-// core both `run_pre_save_hooks` (silent, every hook in the list) and
-// `format_buffer` (`:format`, one hook surfaced with real feedback)
-// splice fixes through.
+// Runs one hook on the buffer's text and applies its fixes, returning
+// how many landed. Shared by `run_pre_save_hooks` and `format_buffer`.
 fn run_one_hook(buf: &mut TextBuffer, hook: PreSaveHook) -> Result<usize, String> {
     let text = buffer_text(buf);
     let diagnostics = hook(&text)?;
     Ok(apply_all_fixes(buf, &diagnostics))
 }
 
-// `:w`/`:wq`/`:x`'s own worker (repl.rs's run_command_mode, called right
-// before `tb.save(...)`): runs every pre-save hook this buffer's
-// filetype has, in order, applying whatever fixes each one reports
-// straight to `buf` so they land in the same write. Each hook re-reads
-// `buffer_text(buf)` fresh rather than sharing one snapshot across the
-// whole loop, so a second hook already sees the first one's own edits --
-// the same "hooks compose like a pipeline" behavior a real formatter
-// followed by a real linter-fixer would need. A hook that errors (an
-// unparseable buffer, for bash's own hook) is skipped silently: this
-// runs on every save, including ones mid-edit with a script that
-// doesn't parse yet, and refusing to save over a syntax error would be
-// far more disruptive than just not reformatting it this time.
+// Before `:w`/`:wq`/`:x`: runs each pre-save hook for this language in
+// order, applying its fixes so they're in the same write. Each reads
+// the text afresh, seeing the previous hook's edits. A hook that errors
+// (a script that doesn't parse yet) is skipped: refusing to save would
+// be worse than not reformatting.
 pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
-    // A read-only buffer's `:w` is either about to be refused, or is a
-    // `:w SOMEWHERE-ELSE` writing this content out as it stands --
-    // neither is a reason to reformat text the user was told they can't
-    // change.
+    // A read-only buffer's `:w` is refused or writes the content elsewhere
+    // as it stands; neither is a reason to reformat it.
     if buf.is_readonly() {
         return;
     }
@@ -3902,36 +3000,22 @@ pub(crate) fn run_pre_save_hooks(buf: &mut TextBuffer) {
     }
 }
 
-// `:format`/`:fmt`'s own result -- unlike the silent pre-save path
-// above, an explicit, user-triggered format command has somewhere to
-// put real feedback (repl.rs's command-output overlay/sink_err), so it
-// gets to distinguish "nothing to do" from "couldn't even try" instead
-// of collapsing both into a no-op.
+// `:format`'s result. Unlike saving, it can report, so it tells "nothing
+// to do" from "couldn't try".
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FormatOutcome {
     Formatted,
     AlreadyFormatted,
-    // This filetype has no pre-save hook at all (`pre_save_hooks`
-    // returns an empty slice) -- distinct from a hook running and
-    // finding nothing to change.
+    // This language has no pre-save hook, as opposed to one that changed
+    // nothing.
     NotSupported,
-    // A hook ran and refused (`BashFormatter::check`'s own parse
-    // error, for bash's hook) -- the message is that Err's own text.
+    // A hook refused (bash's on a parse error), with its message.
     Error(String),
 }
 
-// `:format`/`:fmt`'s own worker (repl.rs's run_command_mode): the same
-// per-filetype hook list `run_pre_save_hooks` runs silently before every
-// save, just triggered by hand and reporting what happened instead of
-// swallowing it. Runs every hook for this filetype (today, at most one),
-// same "each sees the last one's own edits" pipeline -- but stops at the
-// first one that errors, rather than skipping just that one and moving
-// on: an explicit command asking to reformat this buffer that silently
-// formatted with only half its hooks would be a worse surprise than
-// reporting the failure and leaving the buffer exactly as it was before
-// this call (every hook here only ever mutates `buf` after fully
-// succeeding, so a later hook's error never leaves an earlier hook's own
-// edits half-applied).
+// `:format`: the pre-save hooks run by hand, reporting the outcome.
+// Stops at the first hook that errors, leaving that hook's changes
+// unmade (hooks only change `buf` on success).
 pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
     let hooks = pre_save_hooks(&language_of(buf));
     if hooks.is_empty() {
@@ -3947,24 +3031,21 @@ pub(crate) fn format_buffer(buf: &mut TextBuffer) -> FormatOutcome {
     if applied > 0 { FormatOutcome::Formatted } else { FormatOutcome::AlreadyFormatted }
 }
 
-// The two things every `:git` gutter needs before it can ask git
-// anything: a buffer that has a file at all, and a git to ask.
-/// The file this buffer came from, as it is on disk now -- decoded the
-/// way the buffer was, so a latin-1 file compares with its own text
-/// rather than failing on the first byte that is not UTF-8.
+/// The file as it is on disk now, decoded as the buffer was, so a
+/// latin-1 file compares with its own text.
 pub(crate) fn disk_text(buf: &TextBuffer) -> Result<String, String> {
     let path = buf.path().ok_or_else(|| "no file name".to_string())?;
     Ok(crate::encoding::decode(&std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?).text)
 }
 
-/// This file as git has it at `rev`, or in the index for `None`. A file
-/// that revision does not have is empty, so every line of the buffer
-/// reads as new.
+/// The file as git has it at `rev`, or in the index for `None`. Empty
+/// when the revision lacks it, so every line reads as new.
 pub(crate) fn git_text(buf: &TextBuffer, rev: Option<&str>) -> Result<String, String> {
     let path = git_path(buf)?;
     Ok(crate::git::file_at_rev(&path, rev)?.unwrap_or_default())
 }
 
+// What every `:git` gutter needs first: a file, and a git to ask.
 fn git_path(buf: &TextBuffer) -> Result<std::path::PathBuf, String> {
     let path = buf.path().ok_or_else(|| "no file name".to_string())?.to_path_buf();
     if !crate::git::available() {
@@ -3973,31 +3054,19 @@ fn git_path(buf: &TextBuffer) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
-// `:git blame [REV]`'s own worker (repl.rs's run_command_mode): toggles
-// the gutter's blame column off if it's currently on (`Ok(false)`), or
-// runs a fresh `git blame` and turns it on (`Ok(true)`) if it's currently
-// off -- same "one command, two states" shape as vim's own `:GBlame`-
-// style plugins, just built in.
-//
-// Blame describes some *committed* version of the file, which is not
-// necessarily what's on screen: the buffer may have been edited since,
-// and with a `REV` it is a different version outright. Rather than refuse
-// the first case and mis-align the second, the blame is lined up against
-// the buffer by diffing it with the content it was computed from (see
-// git::align_to). A line with no counterpart there -- typed just now, or
-// simply not present at that revision -- gets `None`, which the gutter
-// renders as its own marker rather than leaving blank (see
-// render_blame_cell).
+// `:git blame [REV]`: turns the blame column off (`Ok(false)`) or runs
+// `git blame` and turns it on (`Ok(true)`). The blame describes a
+// committed version, so it's aligned to the buffer by diffing with that
+// content (`git::align_to`); a line with no counterpart gets `None`,
+// drawn as its own marker (`render_blame_cell`).
 pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>, trusted: bool) -> Result<bool, String> {
     if buf.blame.is_some() {
         buf.blame = None;
         return Ok(false);
     }
     let path = git_path(buf)?;
-    // What the blame that comes back is indexed by. With a REV that's
-    // that revision's content; with none it's the working tree -- git
-    // blame's own default, and the file on disk rather than anything
-    // `git show` would return.
+    // What the blame is indexed by: that revision's content, or with no REV
+    // the file on disk, git blame's default.
     let old = match rev {
         Some(rev) => crate::git::file_at_rev(&path, Some(rev))?.unwrap_or_default(),
         None => {
@@ -4005,10 +3074,9 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>, trusted:
             crate::encoding::decode(&bytes).text
         }
     };
-    // `trusted` is the caller's decision about the `git` capability,
-    // passed down rather than looked up here so this stays testable
-    // without a trust store -- blame runs the repository's
-    // filter/textconv (see git::blame), which is why it is gated at all.
+    // `trusted` is the caller's `git` capability decision, passed in so
+    // this tests without a trust store. Blame runs the repository's
+    // filter/textconv (`git::blame`), hence the gate.
     let blamed = crate::git::blame(&path, rev, trusted)?;
     let old_lines: Vec<&str> = old.lines().collect();
     let current = buf.text();
@@ -4019,13 +3087,10 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>, trusted:
     Ok(true)
 }
 
-// What `:git show` with no revision means while blame is on: the commit
-// the gutter names beside the cursor's line. `None` while blame is off,
-// so a plain `:git show` goes on meaning HEAD.
-//
-// A line with no commit behind it -- typed since, or not in the revision
-// blame was run against -- is an error that says so. Showing HEAD instead
-// would be showing a commit the gutter never named.
+// What a bare `:git show` means while blame is on: the commit the
+// gutter names on the cursor's line. `None` while blame is off, so it
+// means HEAD. A line with no commit is an error rather than HEAD, which
+// the gutter never named.
 pub(crate) fn blamed_commit_at_cursor(buf: &TextBuffer) -> Option<Result<String, String>> {
     let blame = buf.blame.as_ref()?;
     let (row, _) = buf.cursor();
@@ -4036,15 +3101,9 @@ pub(crate) fn blamed_commit_at_cursor(buf: &TextBuffer) -> Option<Result<String,
     })
 }
 
-// `:git diff [REV]`'s own worker -- same "one command, two states" toggle
-// shape as toggle_git_blame just above, and the same reason it needs no
-// dirty-buffer refusal either: the comparison is between what git says
-// the file held at `rev` and this buffer's own *current* content, so an
-// unsaved buffer is simply part of what's being compared rather than
-// something that would make the answer wrong. A file that isn't in that
-// revision at all diffs against nothing, so every line reads as added --
-// which is what `git diff --no-index` against /dev/null said for an
-// untracked file before this, just arrived at without the special case.
+// `:git diff [REV]`: toggles, like blame. The buffer's current text is
+// compared, saved or not. A file the revision lacks diffs against
+// nothing, so every line reads as added.
 pub(crate) fn toggle_git_diff(buf: &mut TextBuffer, rev: Option<&str>) -> Result<bool, String> {
     if buf.diff.is_some() {
         buf.diff = None;
@@ -4058,18 +3117,10 @@ pub(crate) fn toggle_git_diff(buf: &mut TextBuffer, rev: Option<&str>) -> Result
     Ok(true)
 }
 
-// `:diff`'s own worker -- unlike `toggle_git_diff` just above, this
-// needs no git repository (or even git installed) at all: it answers a
-// genuinely different question, "what have I typed in this buffer
-// since I last saved" rather than "what's changed since the last
-// commit", via a hand-rolled Myers diff (crate::diff, through git::
-// marks_from_diff for the shared DiffMark-conversion logic) between
-// this buffer's own *current, in-memory* content and what's actually
-// on disk right now. Shares the same `buf.diff`/gutter rendering
-// `toggle_git_diff` already populates -- the two are mutually exclusive
-// toggle states (turning one on turns the other off, same as any
-// single field can only hold one thing at a time), not a second,
-// independent gutter column.
+// `:diff`: what changed since the last save, the buffer against the
+// file on disk, with no git needed (`crate::diff` through
+// `git::marks_from_diff`). It shares `buf.diff` with `:git diff`, so
+// turning one on turns the other off.
 pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
     if buf.diff.is_some() {
         buf.diff = None;
@@ -4083,13 +3134,9 @@ pub(crate) fn toggle_buffer_diff(buf: &mut TextBuffer) -> Result<bool, String> {
     Ok(true)
 }
 
-// Color/attrs for one diagnostic's own underline -- mirrors highlight::
-// default_style's shape exactly (severity in, presentation out), kept as
-// its own small function so severity has exactly one place it turns into
-// presentation. The match is exhaustive against the real enum rather
-// than a wildcard, which is what made growing Severity from its original
-// single `Warning` to LSP's four a one-line-per-variant change here
-// instead of a search for every place severity might matter.
+// The colour and attributes of a diagnostic's underline: the one place
+// a severity becomes presentation. An exhaustive match, so a new
+// severity must be handled here.
 fn diagnostic_style(buf: &TextBuffer, severity: lint::Severity) -> (vt100::Color, vt100::CellAttrs) {
     let element = severity_element(severity);
     crate::theme::resolve(element, buf.colors.as_ref())
@@ -4104,14 +3151,8 @@ fn severity_element(severity: lint::Severity) -> crate::theme::Ui {
     }
 }
 
-// diagnostic_spans_for_line's own sibling to spans_for_line (see that
-// function's own doc comment for the shared shape/reasoning -- same
-// whole-buffer-char-offset convention, same per-line clamp) -- reads
-// buf.diagnostics instead of a precomputed highlight pass, and resolves
-// each one's own color from diagnostic_style instead of a single shared
-// kind-to-style mapping (a highlight pass is one Highlighter's own
-// output, always styled uniformly by HighlightKind; diagnostics can vary
-// per finding once Severity grows past its current one variant).
+// `spans_for_line` for diagnostics: the same offsets and clamp, each
+// coloured by its own severity.
 fn diagnostic_spans_for_line(buf: &TextBuffer, diagnostics: &[lint::Diagnostic], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
     let line_end = line_start + line_len;
     diagnostics
@@ -4124,15 +3165,10 @@ fn diagnostic_spans_for_line(buf: &TextBuffer, diagnostics: &[lint::Diagnostic],
         .collect()
 }
 
-// Slices `spans` (whole-buffer char offsets, from buffer_highlight_spans)
-// down to the ones actually touching [line_start, line_start + line_len)
-// -- one line's own visible extent -- translated to offsets local to
-// that line (0 = its own first character), which is what render_row's
-// `chars` array (also one line long) can actually be indexed by. A span
-// that starts on an earlier line and/or continues onto a later one
-// (exactly the multi-line case this whole pass exists for) is clamped
-// at both ends rather than dropped, so e.g. a multi-line string still
-// shows its color on every line it passes through.
+// The spans touching one line (`line_start`, `line_len` long), as
+// offsets into that line. A span from an earlier line or continuing to
+// a later one is clamped, not dropped, so a multi-line string is
+// coloured on every line.
 fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> Vec<StyledSpan> {
     let line_end = line_start + line_len;
     spans
@@ -4142,9 +3178,8 @@ fn spans_for_line(spans: &[StyledSpan], line_start: usize, line_len: usize) -> V
         .collect()
 }
 
-// spans_for_line's own sibling for the link layer -- same whole-buffer
-// char offsets, same per-line clamp, so a URL that a wrapped line
-// carries across two rows stays one link on both of them.
+// `spans_for_line` for links, so a URL across two wrapped rows is one
+// link on both.
 fn links_for_line(links: &[highlight::LinkSpan], line_start: usize, line_len: usize) -> Vec<highlight::LinkSpan> {
     let line_end = line_start + line_len;
     links
@@ -4154,56 +3189,12 @@ fn links_for_line(links: &[highlight::LinkSpan], line_start: usize, line_len: us
         .collect()
 }
 
-// Reuses editor.rs's own compose_redraw pipeline (BashHighlighter ->
-// StyledSpan -> highlight::compose -> highlight::render_styled), with
-// this editor's own selection highlighting (`highlights`, already
-// resolved to column ranges by build_editor_frame's own caller) as a
-// second compose() layer instead of editor.rs's ghost-text/search-match
-// ones -- exactly the extensibility compose's own doc comment describes
-// ("adding a ... layer later is 'pass one more slice'"). Reverse-video,
-// not a distinct color, for the same reason editor.rs's own Visual-mode
-// selection layer uses it: applied *after* the syntax layer, so a
-// selection reads clearly regardless of what color it's covering,
-// matching vim's own selection-over-syntax convention. `line_styled` is
-// this line's own slice of a whole-buffer highlight pass (see
-// spans_for_line), computed once by build_editor_frame's own caller
-// rather than per row. `diag_styled` (diagnostic_spans_for_line's own
-// per-line slice) is composed *between* syntax and selection -- after
-// the syntax layer, so a diagnostic's underline is never hidden beneath
-// its own token color, but before the selection layer, so selecting
-// text over a diagnostic still reads as a selection first (matching
-// selection's own "wins regardless of what it's covering" rule, one
-// layer up).
-// `hoffset` (Buffer::viewport_left) is a *display column*, not a char
-// index (see bishedit::unicode_width's own doc comment) -- `chars` is a
-// window onto the line covering display columns `hoffset..hoffset+cols`
-// (via `char_at_col`/accumulated width, not a flat `hoffset+c` char
-// offset, which would grab exactly `cols` *characters* regardless of
-// how many real terminal columns those actually occupy -- letting a
-// wide char anywhere in the window push real content past `cols`
-// columns and spill into whatever's rendered immediately to the right,
-// e.g. a neighboring split pane). A char that would only *partially*
-// fit at the right edge is dropped whole, same "no half a CJK glyph"
-// rule editor.rs's own `truncate_visible` already uses; any budget left
-// over after that is padded with plain spaces, matching this function's
-// own previous behavior for a short line. Still built by walking
-// *consecutive* char indices starting from `start_char` (found via
-// `char_at_col`), never skipping one in the middle -- so `chars[i]`
-// always corresponds to real char index `start_char + i`, letting
-// `highlights` (selection_columns_in_line's own output, already
-// expressed in this same `start_char`-relative frame -- see its own doc
-// comment) and the rebased `line_styled`/`diag_styled` spans below
-// align with it exactly, with no separate cell-width bookkeeping
-// needed for *those* two layers at all.
-// Draws one screen row: the slice `start_cell..end_cell` of a line's
-// drawn cells, bounded by `cols` columns.
-//
-// Every span handed in is already expressed in this same window, in
-// cells (see `to_window`). That is deliberate: with a tabular display a
-// character index and a cell index are different numbers, and having
-// one place convert between them -- rather than each layer doing its
-// own arithmetic here -- is what keeps highlighting attached to the
-// text it highlights.
+// Draws one screen row: cells `start_cell..end_cell` of a line, within
+// `cols` columns. Every span is already in this window, in cells
+// (`to_window`), so with a tabular display one place converts between
+// characters and cells. Layers: syntax, then diagnostics (so an
+// underline isn't hidden), then selection in reverse video (so it reads
+// over any colour).
 #[allow(clippy::too_many_arguments)]
 fn render_row(
     out: &mut String,
@@ -4215,10 +3206,8 @@ fn render_row(
     line_styled: &[StyledSpan],
     diag_styled: &[StyledSpan],
     highlights: &[StyledSpan],
-    // Attribute-only marks composed *over* whatever colour the layers
-    // above resolved to, rather than replacing it -- today, the
-    // language server's own "these are the same symbol" answer. See
-    // `highlight::compose_attrs`.
+    // Attribute-only marks over the resolved colours, such as a language
+    // server's same-symbol highlight. See `highlight::compose_attrs`.
     attr_overlay: &[StyledSpan],
     links: &[highlight::LinkSpan],
 ) {
@@ -4235,8 +3224,8 @@ fn render_row(
         used += w;
         at += 1;
     }
-    // With wrapping off, a line that continues past either edge says so
-    // -- vim's `listchars` `extends`/`precedes`, empty by default.
+    // With wrapping off, a line continuing past an edge says so: vim's
+    // `listchars` `extends`/`precedes`, empty by default.
     let truncated_right = at < display.cells.len();
     let truncated_left = start_cell > 0;
     while used < cols {
@@ -4244,13 +3233,9 @@ fn render_row(
         used += 1;
     }
 
-    // Clamped against `chars.len()` (the real array length after the
-    // width-bounded walk and padding above), not `cols` (the column
-    // *budget* it was bounded to fit) -- the two only coincide when
-    // there's no wide char anywhere in this window; whenever there is,
-    // `chars.len() < cols` (a wide char spends 2 columns of budget for
-    // only 1 array slot), and clamping to the wider `cols` instead would
-    // hand `highlight::compose` a span end past the real end of `chars`.
+    // Clamped to `chars.len()`, not `cols`: a wide character takes two
+    // columns but one slot, so with one in the window `chars` is shorter
+    // than `cols`.
     let clamp = |spans: &[StyledSpan]| -> Vec<StyledSpan> {
         spans
             .iter()
@@ -4270,17 +3255,11 @@ fn render_row(
         .collect();
     let mut cells = highlight::compose(&chars, &[&line_styled, &diag_styled, &highlights]);
     highlight::compose_attrs(&mut cells, &attr_overlay);
-    // Text that is in the drawn line but not in the file -- an inlay
-    // hint -- is dimmed, so it reads as annotation rather than as code
-    // you could put the cursor in.
-    //
-    // "Belongs to no source character and is not blank" is what says so.
-    // Tabular padding and a tab's spaces have no source character
-    // either, but they are spaces: dim has no effect on a cell with no
-    // foreground to dim, so the looseness costs exactly nothing on
-    // screen. Doing it here rather than as another span layer is what
-    // keeps it right: spans address the *line's* characters, and a hint
-    // is precisely the thing that has none.
+    // Inlay hints, which aren't in the file, are dimmed so they read as
+    // annotation: cells with no source character that aren't blank. Padding
+    // and tab spaces have no source either, but dimming a space shows
+    // nothing. Not a span layer: spans address the line's characters, and a
+    // hint has none.
     for (i, cell) in cells.iter_mut().enumerate() {
         if cell.ch != ' ' && display.source_at.get(start_cell + i).copied().flatten().is_none() {
             cell.attrs.dim = true;
@@ -4298,9 +3277,8 @@ fn render_row(
     out.push_str(&rendered);
 }
 
-// Puts `marker` in the row's last (or first) column, replacing whatever
-// was drawn there -- which is the point: the column it covers is content
-// the reader can't see anyway.
+// Puts `marker` in the row's last (or first) column, over content the
+// reader can't see anyway.
 fn overlay_marker(rendered: &str, cols: usize, marker: &str, at_end: bool) -> String {
     let width: usize = marker.chars().map(char_width).sum();
     if width == 0 || width > cols {
@@ -4342,45 +3320,14 @@ fn split_rendered(rendered: &str, at: usize) -> (String, String) {
     (head, tail)
 }
 
-// The actual rendering, factored out as a pure string-builder (build the
-// whole escape-coded string first, print/feed it exactly once) --
-// mirrors repl.rs's own `compose_redraw`/`render_compositor_frame`
-// split. Content rows plus real-cursor positioning at the end -- no
-// status row: that's the terminal's own global one now
-// (repl::render_global_status_row), drawn separately by render_editor_
-// frame, below, since it belongs at an absolute terminal position this
-// function's own pane-relative-or-absolute `row_origin`/`col_origin`
-// duality (see just below) has no way to express for freeze_editor_
-// frame's own target. Reimplemented here rather than shared with
-// repl.rs's own `render_normal_mode_frame`: the two render different
-// concrete `Buffer` types (that one reads a `ScreenBuffer`'s
-// scrollback/live-grid split directly, not through the `Buffer` trait at
-// all).
-//
-// `row_origin`/`col_origin`: where this pane's own row 0/col 0 actually
-// lands for *this* target -- `rect.row`/`rect.col` (this pane's real
-// absolute position) for the real terminal (`render_editor_frame`,
-// below), but `0`/`0` for `freeze_editor_frame`'s own target instead:
-// each session's own `vt100::Screen` is sized and addressed *pane-
-// relative* (confirmed by render_compositor_frame's own per-pane loop,
-// which reads row `r`, not `pane.rect.row + r`, from that pane's own
-// screen) -- feeding this pane's *absolute* terminal position into it
-// would land the content at completely the wrong cells, or off-grid
-// entirely, in a split window. `rect` itself is still used for *size*
-// (`rect.rows`/`rect.cols`) either way -- only the position origin
-// changes.
-// The pattern whose matches this frame should mark, if any.
-//
-// Mirrors repl.rs's own `active_search_pattern` for `ScreenBuffer` --
-// duplicated rather than shared for the reason that one already gives
-// about its twin in editor.rs: the three contexts drive three different
-// `Buffer` impls, and this is a few lines either way.
+// The pattern this frame marks matches of, if any. Like repl.rs's
+// `active_search_pattern`, duplicated since each context drives a
+// different `Buffer`.
 fn active_search_pattern(vk: &VimKeys, buf: &TextBuffer) -> Option<String> {
     let pending = vk.pending_display();
     if let Some(rest) = pending.strip_prefix('/').or_else(|| pending.strip_prefix('?')) {
-        // A pattern still being typed is shown regardless of `:noh`:
-        // that is live feedback about what you are typing, not the
-        // leftover highlight `:noh` is about.
+        // A pattern being typed shows regardless of `:noh`: it's live
+        // feedback, not a leftover highlight.
         return if rest.is_empty() { None } else { Some(rest.to_string()) };
     }
     if !vk.search_highlight_on() {
@@ -4394,9 +3341,8 @@ fn active_search_pattern(vk: &VimKeys, buf: &TextBuffer) -> Option<String> {
     }
 }
 
-// What a closed fold's row shows: vim's fold text, filled out to the
-// pane with the dashes vim fills it with. In the line-number colour, so
-// it reads as the editor's own rather than as a line of the file.
+// A closed fold's row: vim's fold text, dashed out to the pane, in the
+// line-number colour so it reads as the editor's.
 fn fold_row(buf: &TextBuffer, line: usize, end: usize, width: usize) -> String {
     let level = buf.folds.level(line, end);
     let first: String = buf.line_chars(line).into_iter().map(|c| if c == '\t' { ' ' } else { c }).collect();
@@ -4416,15 +3362,10 @@ fn fold_row(buf: &TextBuffer, line: usize, end: usize, width: usize) -> String {
     format!("{sgr}{shown}\x1b[0m")
 }
 
-// The brackets to mark for the cursor where it is: the one it is on and
-// the one that closes or opens it, or neither.
-//
-// Insert and Replace leave the cursor one past what was just typed, so
-// the bracket behind it counts there too -- which is what lights a pair
-// up as the closing half is typed, as vim's does.
-//
-// Nothing at all with `matchbrackets` off, which is also the one thing
-// that stops the search below from running on every redraw.
+// The bracket under the cursor and its partner, or neither. Insert and
+// Replace leave the cursor past what was typed, so the bracket behind
+// it counts, lighting a pair as it's closed, as in vim. Nothing with
+// `matchbrackets` off, which also skips the search.
 fn matching_brackets(buf: &TextBuffer, mode: EditorMode) -> Vec<(usize, usize)> {
     if !buf.matchbrackets {
         return Vec::new();
@@ -4438,6 +3379,12 @@ fn matching_brackets(buf: &TextBuffer, mode: EditorMode) -> Vec<(usize, usize)> 
     }
 }
 
+// The frame as one escape-coded string, content rows and then the cursor;
+// the status row is drawn separately (`repl::render_global_status_row`).
+// Separate from repl.rs's `render_normal_mode_frame`, which reads a
+// `ScreenBuffer` directly. `row_origin`/`col_origin` place the pane's
+// row and column 0: the pane's position on the terminal, or 0/0 for a
+// session's own pane-relative grid (`freeze_editor_frame`).
 pub fn build_editor_frame(
     buf: &TextBuffer,
     vk: &VimKeys,
@@ -4449,39 +3396,24 @@ pub fn build_editor_frame(
 ) -> String {
     let content_rows = editor_content_rows(rect);
     let total = buf.line_count();
-    // What `hlsearch` should be drawing right now, worked out once for
-    // the whole frame rather than per row.
+    // What `hlsearch` draws, once per frame.
     let search_pattern = active_search_pattern(vk, buf);
-    // The bracket the cursor is on and the one it pairs with, found once
-    // for the frame rather than per row -- see `matching_brackets`.
+    // Once per frame; see `matching_brackets`.
     let matched_brackets = matching_brackets(buf, mode);
-    // Reserves at least one column for content even if the gutter would
-    // otherwise want more than the whole pane -- only reachable in a
-    // pathologically narrow split, but `content_cols` below would
-    // underflow without this.
+    // At least one column for content, however wide the gutter, or
+    // `content_cols` would underflow.
     let gutter_width = total_gutter_width(buf).min(rect.cols.saturating_sub(1));
     let content_cols = rect.cols - gutter_width;
-    // How far this line's own rendering is scrolled right -- see Buffer::
-    // viewport_left's own doc comment. scroll_to_show_cursor is what
-    // actually keeps this in bounds of the cursor's own column; nothing
-    // here clamps it, so a buffer that's never had a cursor move onto a
-    // long line (or whose gutter just grew, e.g. crossing a line-count
-    // digit boundary, shrinking content_cols out from under an old
-    // offset) could in principle scroll a short line's content fully off
-    // to the left -- reachable only via a resize/edit race no test below
-    // exercises, and self-correcting the moment the cursor moves again.
+    // How far rendering is scrolled right (see `Buffer::viewport_left`),
+    // kept near the cursor by `scroll_to_show_cursor`, not clamped here.
     let hoffset = buf.viewport_left();
     let active = if mode == EditorMode::Normal { crate::repl::active_visual_range(vk, buf) } else { None };
-    // Computed once for the whole buffer, not per visible row -- see
-    // buffer_highlight_spans's own doc comment for why a multi-line
-    // construct needs that.
+    // Once for the whole buffer, so multi-line constructs are seen whole.
     let (whole_styled, whole_links) = buffer_spans(buf, color_overrides);
-    // `hyperlinks` off means the text and only the text: the underline
-    // that marks a link stays (it is the language's own styling), but
-    // nothing is emitted for a terminal to make clickable.
+    // `hyperlinks` off keeps a link's underline but emits nothing
+    // clickable.
     let whole_links = if buf.hyperlinks { whole_links } else { Vec::new() };
-    // Measured once for the whole frame, not per row -- every row has to
-    // agree about where the columns are.
+    // Once per frame: every row must agree on the columns.
     let layout = tabular_layout(buf);
     let starts = line_starts(buf);
     let mut out = String::new();
@@ -4489,8 +3421,8 @@ pub fn build_editor_frame(
     for r in 0..content_rows {
         out.push_str(&format!("\x1b[{};{}H\x1b[K", row_origin + r + 1, col_origin + 1));
         let Some(row) = rows.get(r) else {
-            // Past the end of the buffer: the gutter still reserves its
-            // width so the content column doesn't jump.
+            // Past the end of the buffer the gutter keeps its width, so the
+            // content doesn't shift.
             render_gutter(&mut out, buf, &starts, total, false);
             continue;
         };
@@ -4501,21 +3433,15 @@ pub fn build_editor_frame(
             continue;
         }
         {
-            // The char index render_row's own window will start
-            // rendering from for *this* row -- see selection_columns_
-            // in_line's own doc comment for why this (not `hoffset`
-            // itself) is the right rebase point once a line can have
-            // wide chars in it. With wrapping on the segment already
-            // says where the row starts, and there is no horizontal
-            // scroll to apply.
+            // The char index this row's window starts at, the rebase point
+            // for `selection_columns_in_line`. With wrapping the segment
+            // says where the row starts, and there's no horizontal scroll.
             let wrapping = buf.wrap.wrap;
             let display = display_row(buf, line, layout.as_ref());
             let prefix = continuation_prefix(buf, row.seg.indent);
             let avail = content_cols.saturating_sub(row.seg.indent);
-            // Where in the drawn cells this row starts and stops. With
-            // wrapping that is whatever the layout segmented; without
-            // it, the horizontal scroll -- which is a display column, so
-            // it indexes cells rather than characters.
+            // Where this row starts and stops in drawn cells: the wrap
+            // segment, or the horizontal scroll, which is in cells.
             let (start_cell, end_cell) = if wrapping {
                 (display.cell_of[row.seg.start.min(buf.line_len(line))], display.cell_of[row.seg.end.min(buf.line_len(line))])
             } else {
@@ -4529,9 +3455,8 @@ pub fn build_editor_frame(
             let mut highlights: Vec<StyledSpan> = Vec::new();
             for range in buf.selections.iter().chain(active.iter()) {
                 let Some((start, end)) = selection_columns_in_line(range, line, 0, line_len + 1) else { continue };
-                // A linewise selection covers the row to the pane's own
-                // edge, padding included -- it is selecting the line,
-                // not a range of its characters.
+                // A linewise selection reaches the pane's edge, padding
+                // included: it selects the line.
                 let span =
                     if range.shape == motion::MotionShape::Linewise { Some((0, avail)) } else { to_window(&display, start_cell, avail, start, end) };
                 if let Some((start, end)) = span {
@@ -4543,15 +3468,8 @@ pub fn build_editor_frame(
                     });
                 }
             }
-            // Search matches, underlined -- distinct from a selection's
-            // reverse video just above, so a match inside a selection
-            // still reads as both.
-            //
-            // The file editor had no `hlsearch` at all, while both of
-            // bish's other Normal modes (the prompt's own, and normal
-            // mode over a pane's scrollback) have always drawn it. This
-            // is the one place people actually search, and it was the
-            // one place that never showed what it found.
+            // Search matches, underlined, so a match inside a reverse-video
+            // selection reads as both.
             for (start, end) in search_matches.iter().copied() {
                 let Some((start, end)) = to_window(&display, start_cell, avail, start, end) else { continue };
                 highlights.push(StyledSpan {
@@ -4561,12 +3479,10 @@ pub fn build_editor_frame(
                     attrs: vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() },
                 });
             }
-            // A live `abbr` snippet's own placeholders, marked exactly as
-            // the shell prompt marks them (editor.rs's `snippet_layer`):
-            // reverse video on the one being typed into, underline on the
-            // rest. Mapped into the drawn window like every other layer,
-            // and dropped entirely when scrolling has carried the hole
-            // off it.
+            // A live `abbr` snippet's placeholders, marked as at the shell
+            // prompt (editor.rs's `snippet_layer`): reverse video on the
+            // active one, underline on the rest; dropped when scrolled out
+            // of the window.
             for hole in buf.snippet_holes.iter().filter(|h| h.line == line) {
                 let Some((start, end)) = to_window(&display, start_cell, avail, hole.start, hole.end) else {
                     continue;
@@ -4587,12 +3503,11 @@ pub fn build_editor_frame(
                     .collect()
             };
             let line_styled = map(spans_for_line(&whole_styled, starts[line], line_len));
-            // The server's `documentHighlight` answer, kept on its own
-            // axis so an occurrence keeps its colour and gains an
-            // underline rather than losing one for the other.
+            // The server's `documentHighlight`, on a separate axis so an
+            // occurrence keeps its colour and gains an underline.
             let mut line_marks = map(spans_for_line(&buf.document_highlights, starts[line], line_len));
-            // On that same axis, and for the same reason: a bracket keeps
-            // whatever colour its language gave it and gains the mark.
+            // On that axis too: a bracket keeps its colour and gains the
+            // mark.
             line_marks.extend(matched_brackets.iter().filter(|(at, _)| *at == line).filter_map(|(_, col)| {
                 to_window(&display, start_cell, avail, *col, *col + 1).map(|(start, end)| StyledSpan {
                     start,
@@ -4614,21 +3529,17 @@ pub fn build_editor_frame(
     }
 
     let (cl, cc) = buf.cursor();
-    // Found in the rows actually drawn rather than computed from the
-    // line number, so a wrapped line puts the cursor on the row its own
-    // segment landed on.
+    // From the drawn rows, so on a wrapped line the cursor goes on its
+    // segment's row.
     let cursor_row = rows.iter().position(|row| row.line == cl && row.seg.contains(cc));
     let screen_row = match cursor_row {
         Some(r) => r,
         None => rows.iter().rposition(|row| row.line == cl).unwrap_or(0),
     }
     .min(content_rows.saturating_sub(1));
-    // The cursor's own real display column, not its char index -- see
-    // bishedit::unicode_width's own doc comment for why those two
-    // differ once any wide/zero-width char precedes it on this line.
-    // Through the drawn cells, not the line's own characters: with a
-    // tabular display the two differ by however much padding precedes
-    // the cursor.
+    // The cursor's display column, through the drawn cells: wide
+    // characters and tabular padding before it make that differ from its
+    // char index.
     let cursor_display = display_row(buf, cl, layout.as_ref());
     let cursor_cell = cursor_display.cell_of[cc.min(buf.line_len(cl))];
     let cursor_abs = col_at_cell(&cursor_display.cells, cursor_cell);
@@ -4644,47 +3555,34 @@ pub fn build_editor_frame(
         } else {
             cursor_abs.saturating_sub(hoffset).min(content_cols.saturating_sub(1))
         };
-    // On a closed fold's row there is no character to stand on, so the
-    // cursor stands at the start of the row, as it does in vim.
+    // On a closed fold's row the cursor sits at the row's start, as in vim.
     let screen_col = if rows.get(screen_row).is_some_and(|row| row.fold.is_some()) { gutter_width } else { screen_col };
     out.push_str(&format!("\x1b[{};{}H\x1b[?25h", row_origin + screen_row + 1, col_origin + screen_col + 1));
     out.push_str(cursor_shape(buf, mode, vk));
     out
 }
 
-// DECSCUSR (`CSI Ps SP q`): what the terminal's own cursor looks like, so
-// which mode you are in is legible without reading the status line --
-// the thing every modal editor's users learn to rely on and the one
-// piece of mode feedback that survives not looking at the bottom of the
-// screen.
-//
-// Emitted with every frame rather than once on entering a mode: a frame
-// is the only thing that reliably runs on every change, and a job's
-// output or another program's own escape sequences can have moved the
-// cursor's shape underneath us in between. It costs four bytes.
+// DECSCUSR (`CSI Ps SP q`): the cursor's shape shows the mode without
+// reading the status line. Sent with every frame, since a job's output
+// or another program may have changed it meanwhile; four bytes.
 pub(crate) fn cursor_shape(buf: &TextBuffer, mode: EditorMode, vk: &VimKeys) -> &'static str {
     if !buf.cursorshape {
         return "";
     }
     match mode {
-        // A bar sits *between* characters, which is where an insertion
-        // point actually is.
+        // A bar sits between characters, where an insertion goes.
         EditorMode::Insert => "\x1b[6 q",
-        // An underline says "this character is about to be replaced",
-        // which is exactly what Replace mode does to it.
+        // An underline: this character is about to be replaced.
         EditorMode::Replace => "\x1b[4 q",
-        // Normal mode's cursor is *on* a character, so a block. Except
-        // mid-operator (`d`, `c`, `y` waiting for a motion), where an
-        // underline says the keystroke you type next means something
-        // different from usual -- the state it is easiest to forget you
-        // are in.
+        // Normal mode's cursor is on a character: a block. Mid-operator (`d`,
+        // `c`, `y` awaiting a motion) an underline, since the next key means
+        // something different.
         EditorMode::Normal if !vk.is_idle_except_count() && !vk.is_visual() => "\x1b[4 q",
         EditorMode::Normal => "\x1b[2 q",
     }
 }
 
-/// Back to whatever the terminal draws by default -- for whoever is
-/// giving the terminal back.
+/// Back to the terminal's default, for whoever gives the terminal back.
 pub(crate) const CURSOR_SHAPE_RESET: &str = "\x1b[0 q";
 
 pub fn render_editor_frame(
@@ -4698,26 +3596,17 @@ pub fn render_editor_frame(
 ) {
     let mut out = crate::repl::render_global_status_row(&status_text(buf, vk, mode, term_cols), term_rows);
     out.push_str(&build_editor_frame(buf, vk, mode, rect, rect.row, rect.col, color_overrides));
-    // An editor paints the terminal directly and never the pane's own
-    // grid, so this is the only record of what it shows -- see
-    // `repl::record_paint`.
+    // An editor paints the terminal, never the pane's grid, so this is the
+    // only record of what it shows (`repl::record_paint`).
     crate::repl::record_paint(rect, &out);
     print!("{}", out);
     let _ = io::stdout().flush();
 }
 
-// Feeds this pane's own current editor state into `screen` (see
-// `build_editor_frame`'s own doc comment on why pane-relative addressing
-// -- `row_origin`/`col_origin` both `0` -- is what belongs in a
-// session's own grid, not this pane's absolute terminal position)
-// instead of the real terminal, so a compositor redraw of a pane whose
-// top frame is a *detached* `Frame::Edit` shows this editor's own last
-// real state instead of stale/blank content. Mirrors `freeze_idle_
-// prompt`/`freeze_input_with_text` exactly, just for `Frame::Edit`
-// instead of `Frame::Session` and via `build_editor_frame`'s own
-// already-absolute-within-the-grid positioning rather than those two
-// functions' simpler `\r\x1b[K`-prefixed single-row convention (this
-// content spans the pane's whole height, not just one row).
+// Draws this editor's state into `screen` instead of the terminal, at
+// pane-relative positions, so a compositor redraw of a pane whose top
+// frame is a detached `Frame::Edit` shows its last state. Like
+// `freeze_idle_prompt`, but the content spans the whole pane.
 pub fn freeze_editor_frame(
     screen: &Rc<RefCell<vt100::Screen>>,
     buf: &TextBuffer,
@@ -4744,10 +3633,8 @@ mod click_position_tests {
         b
     }
 
-    // The gutter build_editor_frame draws for this buffer, which every
-    // expectation below has to agree with -- read from the same place
-    // rather than hardcoded, so a new gutter column can't quietly make
-    // these tests describe a layout that no longer exists.
+    // The gutter `build_editor_frame` draws, read rather than hardcoded so
+    // a new gutter column doesn't silently break these tests.
     fn gutter(b: &TextBuffer) -> usize {
         total_gutter_width(b).min(rect().cols - 1)
     }
@@ -4758,29 +3645,24 @@ mod click_position_tests {
 bravo
 charlie");
         let g = gutter(&b);
-        // Third row of the pane, fourth character of that line.
+        // Third row of the pane, fourth character.
         assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g + 3), Some((2, 3)));
     }
 
-    // The gutter is not the text. Asking `position_at_screen` about it
-    // gets the line's first character, which is right for a click that
-    // means "put the cursor roughly there" and wrong for anything that
-    // wants to know *what* was pointed at.
+    // `position_at_screen` maps a gutter click to the line's first
+    // character; `gutter_at_screen` says what was pointed at.
     #[test]
     fn the_gutter_is_told_apart_from_the_text() {
         let b = buf("alpha\nbravo\ncharlie");
         let g = gutter(&b);
-        // The diagnostic column is always drawn (a fixed two cells,
-        // marked or blank), so it is the leftmost one here; the line
-        // numbers follow it and run to the edge of the gutter.
+        // The diagnostic column is always drawn (two cells), so it's leftmost
+        // here; the line numbers fill the rest of the gutter.
         assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10), Some((2, GutterKind::Diagnostic)));
         assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10 + g - 1), Some((2, GutterKind::LineNumber)));
-        // One past the gutter is the text, and no longer this
-        // function's business.
+        // One past the gutter is the text.
         assert_eq!(gutter_at_screen(&b, rect(), 2 + 2, 10 + g), None);
-        // ...which is exactly where `position_at_screen` starts
-        // answering, so between them every cell of a row is accounted
-        // for once.
+        // Where `position_at_screen` starts, so every cell of a row is
+        // accounted for once.
         assert_eq!(position_at_screen(&b, rect(), 2 + 2, 10 + g), Some((2, 0)));
     }
 
@@ -4789,8 +3671,8 @@ charlie");
         let mut b = buf("alpha\nbravo\ncharlie");
         b.breakpoints.insert(1);
         b.diff = Some(std::collections::HashMap::from([(0, crate::git::DiffMark::Added)]));
-        // Left to right, in the order `GUTTER_COLUMNS` draws them.
-        // The pane starts at row 2, so its first content row is 2.
+        // Left to right, in `GUTTER_COLUMNS` order. The pane's first row is
+        // 2.
         let mut at = 10;
         for expected in [GutterKind::Breakpoint, GutterKind::Diff, GutterKind::Diagnostic, GutterKind::LineNumber] {
             let width = GUTTER_COLUMNS.iter().find(|c| c.kind == expected).map(|c| (c.width)(&b)).expect("a column of that kind");
@@ -4801,9 +3683,8 @@ charlie");
         }
     }
 
-    // A column that is not being drawn cannot be pointed at -- without
-    // this, a zero-width column would swallow the first cell of
-    // whichever one actually starts there.
+    // A column not drawn can't be pointed at, or a zero-width column would
+    // swallow the next one's first cell.
     #[test]
     fn a_column_of_no_width_is_never_the_answer() {
         let b = buf("alpha\nbravo");
@@ -4812,9 +3693,8 @@ charlie");
         assert_ne!(hit.map(|(_, k)| k), Some(GutterKind::Breakpoint), "the first cell belongs to whatever is actually drawn there");
     }
 
-    // The breakpoint column stays for a whole debug session rather than
-    // appearing with the first breakpoint and vanishing with the last
-    // -- which would shift every line of the file sideways twice.
+    // The breakpoint column stays for the whole debug session, rather than
+    // shifting the file sideways with the first and last breakpoint.
     #[test]
     fn the_breakpoint_column_is_there_for_the_whole_session() {
         let mut b = buf("alpha\nbravo");
@@ -4849,7 +3729,7 @@ bravo");
 bravo");
         let g = gutter(&b);
         assert_eq!(position_at_screen(&b, rect(), 2 + 1, 10), Some((1, 0)), "in the gutter -> line start");
-        // Well past "bravo"'s own five characters -> its last one.
+        // Past "bravo"'s five characters: its last one.
         assert_eq!(position_at_screen(&b, rect(), 2 + 1, 10 + g + 30), Some((1, 4)));
     }
 
@@ -4873,9 +3753,8 @@ j");
 
     #[test]
     fn a_click_past_a_wide_character_counts_columns_not_chars() {
-        // Two double-width chars then ASCII: display column 4 is the
-        // *third* char, which is exactly the distinction char_at_col
-        // exists for -- a naive col-minus-gutter would say char 4.
+        // Two double-width characters, then ASCII: display column 4 is the
+        // third character, not the fourth.
         let b = buf("你好ab");
         let g = gutter(&b);
         assert_eq!(position_at_screen(&b, rect(), 2, 10 + g + 4), Some((0, 2)));
@@ -4908,9 +3787,7 @@ mod edit_args_tests {
 
     #[test]
     fn a_typo_ed_flag_is_an_error_rather_than_a_filename() {
-        // The whole point of rejecting these: `e --hxe data.bin` quietly
-        // creating a file called `--hxe` would be much worse than a
-        // message saying the flag isn't one.
+        // A typo'd flag is an error, not a file named `--hxe`.
         assert!(parse("--hxe data.bin").is_err());
     }
 
@@ -4942,8 +3819,7 @@ mod edit_args_tests {
 
     #[test]
     fn a_trailing_flag_opens_a_fresh_buffer_of_that_kind() {
-        // `e --hex` with no file: an empty byte buffer to build a small
-        // binary in, not a silently-ignored flag.
+        // `e --hex` alone: an empty byte buffer.
         let t = parse("--hex").unwrap();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].path, None);
@@ -4976,7 +3852,7 @@ mod delete_char_forward_cluster_tests {
 
     #[test]
     fn x_deletes_a_whole_cluster_in_one_press() {
-        // 'a' + MAN+ZWJ+WOMAN (a 3-char cluster) + 'b'
+        // `a`, MAN+ZWJ+WOMAN (one cluster of 3 chars), `b`.
         let mut b = buf("a\u{1F468}\u{200D}\u{1F469}b");
         b.set_cursor(0, 1); // on the cluster's own start
         let mut registers = Registers::new_for_test();
@@ -5044,9 +3920,8 @@ mod indent_tests {
 
     #[test]
     fn indent_operator_motion_shifts_every_line_the_motion_touches_regardless_of_its_own_shape() {
-        // WordForward from line 0 to line 1 is an ordinary exclusive
-        // charwise motion -- >{motion} still treats its target as whole
-        // lines (see Op::Indent's own doc comment).
+        // WordForward to line 1 is charwise exclusive; `>` still shifts whole
+        // lines (`Op::Indent`).
         let mut b = buf("foo\nbar");
         indent_operator_motion(&mut b, motion::Motion::WordForward, None);
         assert_eq!(text_of(&b), "    foo\n    bar");
@@ -5099,11 +3974,9 @@ mod macro_tests {
         (0..buf.line_count()).map(|l| buf.line_chars(l).into_iter().collect::<String>()).collect::<Vec<_>>().join("\n")
     }
 
-    // Drives one `KeyOutcome` the same way `run_normal_mode_navigation`'s
-    // own big `match vk.feed(key)` does, for exactly the two variants
-    // this test needs -- a motion, or an Insert-mode excursion (which
-    // stays inline via `run_insert_mode`, same `vk` throughout, the
-    // property this test exists to exercise).
+    // Drives one `KeyOutcome` as `run_normal_mode_navigation` does, for a
+    // motion or an Insert-mode excursion (`run_insert_mode` with the same
+    // `vk`).
     fn apply(buf: &mut TextBuffer, vk: &mut VimKeys, registers: &mut Registers, outcome: KeyOutcome) {
         match outcome {
             KeyOutcome::Motion(m, count) => motion::apply_motion(buf, m, count),
@@ -5115,22 +3988,6 @@ mod macro_tests {
         }
     }
 
-    // A macro whose recorded content spans a real Insert-mode excursion
-    // (`A;<Esc>`) plus a plain motion (`j`) -- built directly via
-    // `record_key` (there's no real terminal to drive `run_insert_mode`'s
-    // own reads live in a test), but *replayed* for real: `@a` below
-    // drives the actual `run_insert_mode` call through `apply`'s
-    // `EnterInsert` arm, and that function's own reads (routed through
-    // `vk.next_key`, same as every other host read site -- see that
-    // method's own doc comment) must be served entirely from the replay
-    // queue for this to produce the right buffer content at all -- if
-    // `run_insert_mode` instead fell through to a real terminal read,
-    // it would see immediate EOF and abandon each excursion after just
-    // the `A`, never inserting the `;`.
-    // `abbr` expansion inside the file editor's own Insert mode, driven
-    // through the same macro-replay queue the test just below uses --
-    // there's no real terminal here to type at, and `run_insert_mode`
-    // reads through `vk.next_key`, which serves a queued replay first.
     #[test]
     fn a_block_yank_puts_back_as_a_rectangle() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -5143,19 +4000,15 @@ mod macro_tests {
         registers.record_yank(None, crate::bishedit::registers::RegisterValue { text, shape: RegisterShape::Block });
         buf.selections.clear();
 
-        // Put after the cursor on the short last line: the rectangle is
-        // rebuilt downward, and a line too short to reach the column is
-        // padded out to it.
+        // Put after the cursor on the short last line: the rectangle goes
+        // downward, and a too-short line is padded to the column.
         buf.set_cursor(3, 0);
         put(&mut buf, &mut registers, false, None, None);
         assert_eq!(text_of(&buf), "aaa111\nbbb222\nccc333\nzaaaz\n bbb\n ccc");
     }
 
-    // Plain autoindent: copy, never guess. `smartindent` is what opens a
-    // level after `{`, and it is deliberately not this.
-    // `cc` empties the line; it does not remove it. Deleting the line
-    // outright put the insert at the start of the *next* line, so
-    // `ccZ` on `abc\ndef` produced `Zdef` -- one line where vim has two.
+    // `cc` empties the line rather than removing it, so `ccZ` on
+    // `abc\ndef` gives two lines, as in vim.
     #[test]
     fn change_lines_empties_the_lines_and_leaves_one_behind() {
         let mut registers = Registers::new_for_test();
@@ -5173,13 +4026,12 @@ mod macro_tests {
         change_lines(&mut buf, &mut registers, Some(2), None);
         assert_eq!(text_of(&buf), "\nc");
 
-        // The register gets the lines linewise, exactly as `dd` records
-        // them -- so `cc` then `p` puts a line back.
+        // The register gets the lines linewise, as from `dd`, so `p` puts a
+        // line back.
         let recorded = registers.read(None);
         assert_eq!((recorded.text.as_str(), recorded.shape), ("a\nb\n", RegisterShape::Line));
 
-        // The cursor lands past the indent that was reconstructed, the
-        // same rule `o`/`O` follow here.
+        // The cursor lands after the rebuilt indent, as with `o` and `O`.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "    abc\ndef");
         buf.set_cursor(0, 0);
@@ -5188,6 +4040,7 @@ mod macro_tests {
         assert_eq!(buf.cursor(), (0, 4));
     }
 
+    // Copied, never guessed: no `smartindent`.
     #[test]
     fn autoindent_copies_the_lines_own_leading_whitespace() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -5195,8 +4048,7 @@ mod macro_tests {
         assert_eq!(autoindent_for(&buf, 0), "");
         assert_eq!(autoindent_for(&buf, 1), "    ");
         assert_eq!(autoindent_for(&buf, 2), "\t");
-        // Whitespace-only: nothing, so Enter on a blank line does not
-        // leave a trail of trailing spaces behind it.
+        // Whitespace-only gives nothing.
         assert_eq!(autoindent_for(&buf, 3), "");
     }
 
@@ -5224,10 +4076,8 @@ mod macro_tests {
         assert_eq!(text_of(&buf), "fn main() {\n    y\n    let x = 1;\n}");
     }
 
-    // The reason bracketed paste ships with autoindent rather than after
-    // it: the same bytes have to land differently depending on whether
-    // they were typed or pasted, and without the brackets a terminal
-    // cannot say which.
+    // The same bytes land differently typed and pasted, and only the paste
+    // brackets tell them apart.
     #[test]
     fn a_bracketed_paste_keeps_its_own_indentation() {
         let pasted = |keys: Vec<Key>| {
@@ -5244,15 +4094,11 @@ mod macro_tests {
         bracketed.push(Key::PasteEnd);
         assert_eq!(pasted(bracketed), "    startif a {\n    b();\n}", "verbatim -- the paste brought its own indent");
 
-        // Typed, every Enter copies the line above it -- so the closing
-        // brace inherits `b();`'s own indent rather than the `if`'s.
-        // That is the staircase, and it is the correct behaviour for
-        // text someone is actually typing.
+        // Typed, every Enter copies the line above, so the closing brace
+        // takes `b();`'s indent: the staircase, which is right for typing.
         assert_eq!(pasted(body), "    startif a {\n        b();\n        }", "typed, the same characters get indented as you go");
     }
 
-    // The file editor never drew search matches at all, while both of
-    // bish's other Normal modes always have.
     #[test]
     fn the_editor_knows_what_a_search_highlight_should_cover() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -5270,27 +4116,22 @@ mod macro_tests {
         vk.suppress_search_highlight();
         assert_eq!(active_search_pattern(&vk, &buf), None, "`:noh`");
 
-        // ...but typing a *new* pattern still shows as you type it,
-        // suppressed or not: that is feedback about the keystrokes, not
-        // the leftover highlight `:noh` is about.
+        // A new pattern still shows as it's typed, suppressed or not: it's
+        // feedback, not a leftover highlight.
         for key in [Key::Char('/'), Key::Char('g')] {
             vk.feed(key);
         }
         assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("g"));
 
-        // Backspace is editing the pattern, so the highlight follows it
-        // back. This read `ga<BS>` before -- the transcript this comes
-        // from had gained the key's name instead of losing a character --
-        // so nothing matched and the highlight went out while the pattern
-        // underneath was still perfectly good.
+        // Backspace edits the pattern, and the highlight follows it.
         vk.feed(Key::Char('a'));
         assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("ga"));
         vk.feed(Key::Backspace);
         assert_eq!(active_search_pattern(&vk, &buf).as_deref(), Some("g"));
     }
 
-    // `insert_with`, but driving a buffer the caller prepared -- a
-    // selection standing, a cursor somewhere particular.
+    // `insert_with` on a buffer the caller prepared: a selection, a cursor
+    // placed.
     fn insert_into(buf: &mut TextBuffer, keys: &[Key]) {
         let mut vk = VimKeys::new();
         let mut registers = Registers::new_for_test();
@@ -5303,9 +4144,6 @@ mod macro_tests {
         run_insert_mode(buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
     }
 
-    // Home, End and Delete did nothing at all in Insert mode: Normal mode
-    // binds all three (vimkeys.rs) and so does the shell prompt
-    // (editor.rs), and this one loop had no arm for any of them.
     #[test]
     fn insert_mode_honours_home_and_end() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -5343,7 +4181,7 @@ def",
         assert_eq!(text_of(&buf), "abcdef", "at end of line the newline goes, joining the next");
         assert_eq!(buf.cursor(), (0, 3), "and the cursor does not move");
 
-        // The very end of the buffer has nothing after it.
+        // At the very end of the buffer there's nothing to delete.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "abc");
         buf.set_cursor(0, 3);
@@ -5351,9 +4189,6 @@ def",
         assert_eq!(text_of(&buf), "abc");
     }
 
-    // Backspace and Delete already replaced a standing selection; typing
-    // did not, which is the half that makes a mouse selection worth
-    // making.
     #[test]
     fn insert_mode_typing_replaces_a_standing_selection() {
         let select = |buf: &mut TextBuffer| {
@@ -5369,7 +4204,7 @@ def",
         assert_eq!(text_of(&buf), "alpha X gamma");
         assert!(buf.selections.is_empty(), "and the selection is gone, not left standing over new text");
 
-        // The two that already worked, pinned so they stay working.
+        // Backspace and Delete over a selection, pinned too.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "alpha beta gamma");
         select(&mut buf);
@@ -5383,9 +4218,8 @@ def",
         assert_eq!(text_of(&buf), "alpha  gamma");
     }
 
-    // An `InsertServices` that offers exactly what it was handed --
-    // enough to drive Ctrl-N and the accept that follows without a
-    // language server anywhere in sight.
+    // An `InsertServices` offering exactly what it was given, to drive
+    // Ctrl-N and the accept without a language server.
     struct FixedCompletions(Vec<crate::bishedit::completion::EditorCompletion>);
 
     impl InsertServices for FixedCompletions {
@@ -5427,8 +4261,6 @@ def",
         }
     }
 
-    // A server's snippet completion becomes exactly the same live
-    // snippet an `abbr` does: same keys, same marking, same accept.
     #[test]
     fn a_snippet_completion_splices_in_tentatively() {
         let items = vec![completion("gamma", "gamma(${1:x}, $2)$0", true)];
@@ -5441,7 +4273,7 @@ def",
         assert!(buf.snippet_holes[0].active, "the caret is in the first one");
         assert_eq!(buf.cursor(), (0, 6));
 
-        // Driven to the end it reads as if typed by hand, `$0` included.
+        // Driven to the end it reads as if typed, `$0` included.
         let mut keys = chars("ga");
         keys.push(Key::CtrlN);
         keys.push(Key::Enter);
@@ -5454,9 +4286,8 @@ def",
         assert_eq!(text_of(&buf), "gamma(1, 2);", "`$0` put the caret after the closing paren");
     }
 
-    // A server may flag a snippet that has no tabstops in it. That is
-    // plain text -- but still written in snippet notation, so `\$` is
-    // a literal dollar rather than two characters.
+    // A snippet flagged with no tabstops is plain text in snippet notation,
+    // so `\$` is a literal dollar.
     #[test]
     fn a_snippet_completion_with_no_tabstops_is_plain_text() {
         let mut keys = chars("co");
@@ -5465,16 +4296,16 @@ def",
         let buf = insert_completing(&keys, vec![completion("cost", "cost \\$5", true)]);
         assert_eq!(text_of(&buf), "cost $5");
         assert!(buf.snippet_holes.is_empty());
-        // Unflagged, the same text is exactly what it says.
+        // Unflagged, the same text is literal.
         let buf = insert_completing(&keys, vec![completion("cost", "cost \\$5", false)]);
         assert_eq!(text_of(&buf), "cost \\$5");
     }
 
+    // Insert mode with `abbrs`, fed `keys` through the macro-replay queue,
+    // which `vk.next_key` serves before any terminal.
     fn insert_with(path: Option<&str>, keys: &[Key], abbrs: &[Abbr]) -> TextBuffer {
-        // `TextBuffer::open` on a nonexistent path prepares to create it
-        // (see its own doc comment) -- nothing is ever written here, and
-        // the path is only present so `language_of` has an extension to
-        // read.
+        // A nonexistent path is never written; it's there so `language_of`
+        // has an extension.
         let mut buf = match path {
             Some(p) => TextBuffer::open(std::path::Path::new(p), 10).unwrap(),
             None => TextBuffer::new_unnamed(10),
@@ -5495,12 +4326,9 @@ def",
         text.chars().map(Key::Char).collect()
     }
 
-    // Ctrl+G is the detach gesture now, and in Insert mode -- where
-    // there is nothing left to detach *to* -- it means what Escape means,
-    // as Ctrl+C and the old Ctrl+Space already did. Ctrl+Space still
-    // works where a terminal sends it; macOS and the Linux input methods
-    // take it for switching input source before the terminal sees it,
-    // which is why the gesture moved.
+    // Ctrl+G leaves Insert mode like Escape, as Ctrl+C and Ctrl+Space do.
+    // Ctrl+Space still works where a terminal sends it; macOS and Linux
+    // input methods take it first.
     #[test]
     fn ctrl_g_leaves_insert_mode_as_escape_does_and_so_does_ctrl_space() {
         for leave in [Key::CtrlG, Key::CtrlSpace, Key::Escape, Key::CtrlC] {
@@ -5508,9 +4336,8 @@ def",
             keys.push(leave);
             keys.extend(chars("x"));
             let buf = insert_with(None, &keys, &[]);
-            // Insert mode has returned by the time the `x` arrives, so it
-            // is never inserted -- which is the whole test: a key that had
-            // not ended Insert mode would leave "hix" behind.
+            // Insert mode has ended by the time `x` arrives, or "hix" would
+            // be left.
             assert_eq!(text_of(&buf), "hi", "{leave:?} should have left insert mode");
         }
     }
@@ -5531,8 +4358,7 @@ def",
 
     #[test]
     fn insert_mode_expands_anywhere_in_a_line_not_only_in_command_position() {
-        // The shell prompt gates expansion to command position; a file
-        // has no command positions, so this deliberately does not.
+        // No command-position gate in a file, unlike the shell prompt.
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
         let buf = insert_with(Some("main.rs"), &chars("let x = pl "), &abbrs);
         assert_eq!(text_of(&buf), "let x = println!() ");
@@ -5575,10 +4401,8 @@ def",
 
     #[test]
     fn typing_after_an_accept_continues_from_the_end_of_the_snippet() {
-        // The regression this guards: the snippet moves the real cursor
-        // through its own model, so the multi-cursor list this function
-        // inserts at has to be resynced from the buffer -- left stale, a
-        // keystroke right after an accept lands back where the
+        // The snippet moves the real cursor through its model, so the
+        // multi-cursor list must be resynced, or the next key lands where the
         // abbreviation started.
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1()") }];
         let mut keys = chars("f ");
@@ -5591,7 +4415,7 @@ def",
 
     #[test]
     fn replace_mode_does_not_expand_abbreviations() {
-        // `R`'s whole contract is that the line's length doesn't change.
+        // Replace mode keeps the line's length.
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("pl", "println!()") }];
         let mut buf = TextBuffer::open(std::path::Path::new("main.rs"), 10).unwrap();
         let mut vk = VimKeys::new();
@@ -5609,17 +4433,15 @@ def",
     #[test]
     fn a_live_snippet_marks_its_tabstops_for_the_renderer() {
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn $1($2)") }];
-        // No accept/cancel: Insert mode ends at EOF with the snippet
-        // still live, so the marks are whatever was last written.
+        // No accept or cancel: Insert mode ends at EOF with the snippet live,
+        // so the marks are as last written.
         let buf = insert_with(Some("main.rs"), &chars("f "), &abbrs);
         assert_eq!(buf.snippet_holes.len(), 2);
         assert!(buf.snippet_holes[0].active && !buf.snippet_holes[1].active);
         assert_eq!((buf.snippet_holes[0].start, buf.snippet_holes[0].end), (3, 5));
     }
 
-    // A file buffer has as many lines as it likes, so a multi-line
-    // snippet stays multi-line here -- the one thing the prompt cannot
-    // do.
+    // A multi-line snippet stays multi-line in a file, unlike at the prompt.
     #[test]
     fn a_multi_line_snippet_spans_real_lines_in_a_file() {
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn ${1:name}() {\n    $0\n}") }];
@@ -5628,13 +4450,13 @@ def",
         keys.push(Key::CtrlY);
         keys.extend(chars("todo!()"));
         let buf = insert_with(Some("main.rs"), &keys, &abbrs);
-        // `$0` put the caret on the indented middle line, so what was
-        // typed next landed there rather than after the closing brace.
+        // `$0` put the caret on the indented middle line, where the typing
+        // landed.
         assert_eq!(text_of(&buf), "fn main() {\n    todo!()\n}");
     }
 
-    // Before it is accepted, the holes are marked on the lines they are
-    // actually on -- the renderer draws per line.
+    // Before accepting, the holes are marked on their own lines; the
+    // renderer draws per line.
     #[test]
     fn a_multi_line_snippets_holes_are_marked_line_by_line() {
         let abbrs = vec![Abbr { lang: "rust".into(), ..Abbr::new("f", "fn ${1:name}() {\n    $0\n}") }];
@@ -5648,6 +4470,10 @@ def",
         assert_eq!((buf.snippet_holes[1].line, buf.snippet_holes[1].start, buf.snippet_holes[1].end), (1, 4, 4));
     }
 
+    // A macro spanning an Insert-mode excursion (`A;<Esc>`) and a motion
+    // (`j`), recorded with `record_key` and replayed for real: the
+    // excursion's reads must come from the replay queue, or each would
+    // see EOF after the `A` and never insert the `;`.
     #[test]
     fn macro_replay_drives_a_real_insert_mode_excursion() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -5662,9 +4488,8 @@ def",
         }
         vk.stop_recording();
 
-        // `2@a`: replays the whole recorded sequence (Insert excursion
-        // included) twice in a row, landing on "one" then "two" (cursor
-        // starts on "one"), leaving "three" untouched.
+        // `2@a` replays the sequence twice, landing on "one" then "two", and
+        // leaves "three".
         assert!(vk.queue_macro_replay('a', 2));
         while let Some(key) = vk.next_key(|| Ok(None)).unwrap() {
             let outcome = vk.feed(key);
@@ -5701,17 +4526,10 @@ def",
     }
 }
 
-// Regression: `c` on multiple selections used to only type into the one
-// gap `delete_selections` picked as this buffer's own new `cursor` (the
-// leftmost) -- every other deleted selection's own gap sat there
-// untouched, receiving nothing typed. run_insert_mode's own
-// `extra_cursors` param is what replicates each keystroke across every
-// one of them instead; these drive it directly (bypassing repl.rs's own
-// `c` handler, which is what actually seeds `extra_cursors` from
-// delete_selections' own return value in production, but has no real
-// terminal to read a scripted key sequence from in a test -- same
-// "record into a macro, then replay it" trick macro_tests above already
-// uses for exactly that reason).
+// `c` on several selections types into every gap, through
+// `run_insert_mode`'s `extra_cursors`. Driven directly, bypassing
+// repl.rs's `c` handler, with keys replayed from a macro since there's
+// no terminal.
 #[cfg(test)]
 mod multi_cursor_insert_tests {
     use super::*;
@@ -5784,9 +4602,8 @@ mod multi_cursor_insert_tests {
 
     #[test]
     fn two_gaps_on_the_same_row_do_not_corrupt_each_others_position() {
-        // Gaps at columns 0 and 6 of one row -- typing "X" at both must
-        // land right where each original gap was, not have the first
-        // insertion's own rightward shift throw off the second's.
+        // Gaps at columns 0 and 6 of one row: each X lands at its own gap,
+        // not shifted by the first insertion.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), " place ");
         buf.set_cursor(0, 0);
@@ -5800,10 +4617,8 @@ mod multi_cursor_insert_tests {
     }
 }
 
-// Normal mode's cursor can never sit *after* the last character of a
-// line (only Insert mode allows that, to append) -- leaving Insert mode
-// while sitting there must pull the cursor back onto the last character
-// instead of leaving it in that Insert-only position.
+// Leaving Insert mode past a line's last character pulls the cursor
+// back onto it: Normal mode can't sit there.
 #[cfg(test)]
 mod insert_mode_exit_clamp_tests {
     use super::*;
@@ -5850,8 +4665,8 @@ mod insert_mode_exit_clamp_tests {
 
     #[test]
     fn the_caret_mark_still_records_the_true_one_past_end_insert_position() {
-        // `gi` resumes appending from exactly where insert mode left off,
-        // which the Normal-mode clamp above must not disturb.
+        // `gi` resumes exactly where Insert mode left off, unaffected by the
+        // clamp.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "ab");
         buf.set_cursor(0, 2);
@@ -5878,12 +4693,8 @@ mod insert_mode_exit_clamp_tests {
     }
 }
 
-// Ctrl-W in Insert mode: delete the word before the cursor (`:help
-// i_CTRL-W`) -- previously a silent no-op (fell through run_insert_
-// mode's own catch-all `_ => {}`, since Key::CtrlW was never matched
-// there at all; the Normal-mode `<C-w>` window-command prefix it maps
-// to elsewhere in this codebase is a different dispatch this function
-// never reaches).
+// Ctrl-W in Insert mode deletes the word before the cursor
+// (`:help i_CTRL-W`); Normal mode's `<C-w>` is a separate dispatch.
 #[cfg(test)]
 mod insert_mode_ctrl_w_tests {
     use super::*;
@@ -5969,10 +4780,7 @@ mod insert_mode_ctrl_w_tests {
     }
 }
 
-// Alt-Left/Alt-Right in Insert mode: real vim's own `b`/`w` word
-// motions, previously unhandled (silently fell through the same
-// catch-all `_ => {}` Ctrl-W did -- see this module's own commit
-// history) -- moves the cursor only, never deletes anything.
+// Alt-Left/Alt-Right in Insert mode: `b` and `w`, moving only.
 #[cfg(test)]
 mod insert_mode_alt_word_motion_tests {
     use super::*;
@@ -5992,13 +4800,6 @@ mod insert_mode_alt_word_motion_tests {
 
     #[test]
     fn leaving_insert_mode_steps_the_cursor_left_as_vim_does() {
-        // So the caret lands *on* what you just typed rather than after
-        // it, which is what makes `x` delete the right character and
-        // `A`-then-Escape leave you on the last one.
-        //
-        // This used only to clamp a cursor sitting past the end of the
-        // line -- the same thing when you typed to the end, and nothing
-        // at all in the middle of one.
         let leave_at = |text: &str, start: usize, typed: &str| {
             let mut buf = TextBuffer::new_unnamed(10);
             buf.insert_text((0, 0), text);
@@ -6011,15 +4812,14 @@ mod insert_mode_alt_word_motion_tests {
             run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
             buf.cursor().1
         };
-        // Typed in the middle: land on the last character typed, not the
-        // one after it. This is the case the old clamp missed entirely.
+        // Typed in the middle: lands on the last character typed.
         assert_eq!(leave_at("abcdef", 3, "zz"), 4);
-        // Typed at the end: the append position is past the last
-        // character, and stepping back is also what the clamp did.
+        // Typed at the end: the append position steps back onto the last
+        // character.
         assert_eq!(leave_at("abc", 3, "!"), 3);
-        // Column 0 has nowhere further left to go.
+        // Column 0 can't go further left.
         assert_eq!(leave_at("abcdef", 0, ""), 0);
-        // ...and an empty line has nothing to sit on at all.
+        // An empty line has nothing to sit on.
         assert_eq!(leave_at("", 0, ""), 0);
     }
 
@@ -6035,10 +4835,8 @@ mod insert_mode_alt_word_motion_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
-        // 6 is where the motion landed; Escape then steps one column
-        // left, as vim's does, and every exit from Insert mode goes
-        // through that. The assertion has to name the position *after*
-        // leaving, since `run_insert_mode` only returns once it has.
+        // The motion landed at 6, and leaving Insert mode steps back one,
+        // as in vim.
         assert_eq!(buf.cursor(), (0, 5), "cursor should land at the start of 'world' (`b`), less Escape's step back");
     }
 
@@ -6054,10 +4852,8 @@ mod insert_mode_alt_word_motion_tests {
         run_insert_mode(&mut buf, &mut vk, rect(), &mut registers, &mut NoInsertServices, false, 24, 80, None, &[], &[]).unwrap();
 
         assert_eq!(buf.line_chars(0).into_iter().collect::<String>(), "hello world", "nothing should be deleted");
-        // 6 is where the motion landed; Escape then steps one column
-        // left, as vim's does, and every exit from Insert mode goes
-        // through that. The assertion has to name the position *after*
-        // leaving, since `run_insert_mode` only returns once it has.
+        // The motion landed at 6, and leaving Insert mode steps back one,
+        // as in vim.
         assert_eq!(buf.cursor(), (0, 5), "cursor should land at the start of 'world' (`w`), less Escape's step back");
     }
 
@@ -6081,13 +4877,10 @@ mod diagnose_tests {
     use super::*;
     use std::borrow::Cow;
 
-    // `diagnose_buffer`'s language gate keys off the path's own
-    // extension (`language_of`) -- `new_unnamed`/`insert_text` cannot produce
-    // one, so a real `.bash` temp file is what actually exercises
-    // diagnose_buffer's language gate, the same way textbuffer.rs's own
-    // `open_and_save_round_trip_a_real_file` test does for `open`/`save`.
-    /// The directory comes back with the buffer because it owns it:
-    /// the file has to outlive this call, and nothing was removing it.
+    /// A buffer opened from a real `.bash` temp file, since
+    /// `diagnose_buffer`'s language comes from the path. The directory is
+    /// returned with it because it owns the file, which must outlive this
+    /// call.
     fn temp_bash_buffer(tag: &str, text: &str) -> (crate::tempdir::TempDir, TextBuffer) {
         let dir = crate::tempdir::TempDir::new(&format!("fileeditor-diag-test-{tag}"));
         let path = dir.join("script.bash");
@@ -6128,9 +4921,8 @@ mod diagnose_tests {
         assert!(diagnostic_spans_for_line(&b, &diags, 10, 20).is_empty());
     }
 
-    // The gutter has room for one mark per line; a line can hold
-    // several findings. The rule is "show the worst," which is the only
-    // reason `Severity` derives `Ord` at all.
+    // One gutter mark per line, however many findings: the worst, which is
+    // why `Severity` derives `Ord`.
     #[test]
     fn the_gutter_mark_takes_the_worst_severity_on_the_line() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -6147,10 +4939,9 @@ mod diagnose_tests {
         buf.diagnostics = vec![diag(0, 3, lint::Severity::Hint), diag(4, 7, lint::Severity::Error), diag(4, 7, lint::Severity::Warning)];
         let starts = line_starts(&buf);
         assert_eq!(line_severity(&buf, &starts, 0), Some(lint::Severity::Error));
-        // Nothing intersects the second line, so no mark at all.
+        // Nothing touches the second line.
         assert_eq!(line_severity(&buf, &starts, 1), None);
-        // ...and the mark is drawn in that severity's own colour, not
-        // the hardcoded yellow this used to always be.
+        // The mark is drawn in the severity's colour.
         let cell = render_diagnostic_cell(&buf, &starts, 0, 2).unwrap();
         let (fg, _) = crate::theme::resolve(crate::theme::Ui::Error, None);
         assert!(cell.starts_with(&vt100::sgr_codes(fg, vt100::Color::Default, vt100::CellAttrs::default())), "{cell:?}");
@@ -6166,14 +4957,13 @@ mod diagnose_tests {
         assert!(buf.diagnostics.is_empty());
     }
 
-    // The rule the whole batch turns on: applied last-first, because an
-    // earlier edit that shifted the text would invalidate every later
-    // range.
+    // Applied last first: an earlier edit shifting the text would
+    // invalidate later ranges.
     #[test]
     fn a_batch_of_edits_applies_without_invalidating_its_own_ranges() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "one two three");
-        // Given in *ascending* order, as a server sends them.
+        // In ascending order, as a server sends them.
         let edits = vec![
             lsp::TextEdit { start: (0, 0), end: (0, 3), text: "ONE".to_string() },
             lsp::TextEdit { start: (0, 4), end: (0, 7), text: "TWO!!".to_string() },
@@ -6187,8 +4977,8 @@ mod diagnose_tests {
     fn an_edit_may_span_lines_and_may_insert_them() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "a\nb\nc");
-        // Replace from mid-line 0 through mid-line 2 with two lines --
-        // the shape a formatter rewriting a block sends.
+        // Mid-line 0 to mid-line 2 replaced with two lines, as a formatter
+        // sends.
         let edits = vec![lsp::TextEdit { start: (0, 1), end: (2, 1), text: "X\nY".to_string() }];
         assert_eq!(apply_text_edits(&mut buf, &edits, lsp::PositionEncoding::Utf32), 1);
         assert_eq!(buffer_text(&buf), "aX\nY");
@@ -6198,17 +4988,17 @@ mod diagnose_tests {
     fn a_pure_insertion_and_a_pure_deletion_both_work() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "ac");
-        // Empty range, non-empty text: an insertion.
+        // Empty range, text: an insertion.
         assert_eq!(
             apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: "b".to_string() }], lsp::PositionEncoding::Utf32),
             1
         );
         assert_eq!(buffer_text(&buf), "abc");
-        // Non-empty range, empty text: a deletion.
+        // A range, no text: a deletion.
         assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 2), text: String::new() }], lsp::PositionEncoding::Utf32), 1);
         assert_eq!(buffer_text(&buf), "ac");
-        // Empty range, empty text: nothing, and counted as nothing, so
-        // a formatter that changed nothing can say so.
+        // Neither: nothing, counted as nothing, so a formatter that changed
+        // nothing can say so.
         assert_eq!(apply_text_edits(&mut buf, &[lsp::TextEdit { start: (0, 1), end: (0, 1), text: String::new() }], lsp::PositionEncoding::Utf32), 0);
         assert_eq!(buffer_text(&buf), "ac");
     }
@@ -6219,29 +5009,23 @@ mod diagnose_tests {
         buf.insert_text((0, 0), "abc\ndefgh\nij");
         let starts = line_starts(&buf);
         let utf32 = lsp::PositionEncoding::Utf32;
-        // The inverse of diagnostic_position, which is tested just
-        // below -- so the two are checked against each other.
+        // The inverse of `diagnostic_position`, checked against it.
         for offset in [0usize, 3, 4, 8, 9, 11] {
             let (line, col) = diagnostic_position(&buf, offset);
             assert_eq!(diagnostic_offset(&buf, &starts, line, col, utf32), offset, "offset {offset}");
         }
-        // Past the end clamps to the end of the buffer rather than
-        // discarding a finding that is probably still pointing at the
-        // right place.
+        // Past the end clamps to the end rather than dropping the finding.
         assert_eq!(diagnostic_offset(&buf, &starts, 99, 0, utf32), 12);
         assert_eq!(diagnostic_offset(&buf, &starts, 1, 99, utf32), starts[1] + 5);
     }
 
-    // The whole reason positionEncoding gets negotiated: a server still
-    // counting UTF-16 code units names a column bish would otherwise
-    // read as a different character.
     #[test]
     fn a_utf16_column_lands_on_the_right_character() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "a\u{1f30d}bc");
         let starts = line_starts(&buf);
-        // The emoji is one char to bish and two UTF-16 code units, so
-        // `b` is at char 2 but at UTF-16 column 3.
+        // The emoji is one char to bish and two UTF-16 units, so `b` is
+        // char 2 but UTF-16 column 3.
         assert_eq!(diagnostic_offset(&buf, &starts, 0, 3, lsp::PositionEncoding::Utf16), 2);
         assert_eq!(diagnostic_offset(&buf, &starts, 0, 2, lsp::PositionEncoding::Utf32), 2);
     }
@@ -6267,12 +5051,10 @@ mod diagnose_tests {
         assert_eq!(diagnostics[0].severity, lint::Severity::Error);
         assert_eq!(diagnostics[0].label(), "rustc:E0308");
         assert_eq!(diagnostics[1].severity, lint::Severity::Hint);
-        // Always sourced, even when the server named none: that is what
-        // distinguishes a relayed finding from one of bish's own, which
-        // is what lets a new publication replace exactly the right ones.
+        // Always sourced, so a relayed finding can be told from bish's own.
         assert_eq!(diagnostics[1].source.as_deref(), Some("lsp"));
-        // A server's diagnostic carries no edit of its own -- a fix is a
-        // separate code-action request.
+        // A server's diagnostic has no edit: a fix is a separate code-action
+        // request.
         assert!(diagnostics.iter().all(|d| d.fix.is_none()));
     }
 
@@ -6291,7 +5073,7 @@ mod diagnose_tests {
     fn apply_fix_splices_the_replacement_and_returns_true() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "echo $foo");
-        // "$foo" sits at flat offsets 5..9.
+        // `$foo` is at offsets 5..9.
         let diagnostic = lint::Diagnostic {
             start: 5,
             end: 9,
@@ -6341,8 +5123,8 @@ mod horizontal_scroll_tests {
         assert_eq!(b.viewport_left(), 6);
         scroll_horizontally(&mut b, 6, 10);
         assert_eq!(b.viewport_left(), 12);
-        // 40 columns of content in a 10-column pane: 30 is as far as
-        // there is anything left to see.
+        // 40 columns in a 10-column pane: 30 is as far as there's anything to
+        // see.
         for _ in 0..20 {
             scroll_horizontally(&mut b, 6, 10);
         }
@@ -6359,8 +5141,7 @@ mod horizontal_scroll_tests {
         assert_eq!(b.viewport_left(), 0);
     }
 
-    // The whole difference from scroll_to_show_cursor: the cursor comes
-    // to the view, not the view back to the cursor.
+    // The cursor comes to the view, not the view to the cursor.
     #[test]
     fn scroll_horizontally_brings_the_cursor_along() {
         let mut b = buf(&format!("{}\n", "x".repeat(40)));
@@ -6372,7 +5153,6 @@ mod horizontal_scroll_tests {
         assert_eq!(b.cursor(), (0, 12), "still in view, so left where it was");
     }
 
-    // Nothing to the side means nothing to do.
     #[test]
     fn scroll_horizontally_does_nothing_while_wrapping() {
         let mut b = buf(&format!("{}\n", "x".repeat(40)));
@@ -6420,9 +5200,8 @@ mod horizontal_scroll_tests {
         }
     }
 
-    // Carets sit between characters and a range covers characters, so
-    // the later end steps back one: from before `a` to before `c` is
-    // `ab`, not `abc`.
+    // Carets sit between characters, so from before `a` to before `c` is
+    // `ab`.
     #[test]
     fn an_insert_mode_selection_covers_what_is_between_the_carets() {
         let b = buf("abcdef\n");
@@ -6438,17 +5217,14 @@ mod horizontal_scroll_tests {
         assert_eq!(selection_between(&b, (0, 4), (0, 1)), selection_between(&b, (0, 1), (0, 4)));
     }
 
-    // A caret with nothing swept is a cursor, not an empty selection --
-    // otherwise a plain click would leave one standing for Backspace to
-    // find.
+    // A caret with nothing swept is a cursor, or a click would leave a
+    // selection for Backspace.
     #[test]
     fn a_caret_that_has_not_moved_is_not_a_selection() {
         let b = buf("abcdef\n");
         assert_eq!(selection_between(&b, (0, 3), (0, 3)), None);
     }
 
-    // Dragging up to the very start of a line ends the selection at the
-    // end of the line before it.
     #[test]
     fn a_selection_ending_at_a_line_start_ends_on_the_previous_line() {
         let b = buf("abc\ndef\n");
@@ -6466,8 +5242,7 @@ mod horizontal_scroll_tests {
         assert_eq!(drawn(&b, 0), "        one");
     }
 
-    // To the next *stop*, not a fixed width -- which is the whole
-    // difference between a tab and a run of spaces.
+    // To the next stop, not a fixed width.
     #[test]
     fn a_tab_fills_only_what_is_left_of_its_stop() {
         let mut b = buf("ab\tc\n");
@@ -6478,8 +5253,7 @@ mod horizontal_scroll_tests {
         assert_eq!(drawn(&b, 0), "abc x", "one");
     }
 
-    // Every space of a tab points back at the one character that is
-    // really there, so a click anywhere in it lands somewhere real.
+    // Each space of a tab maps back to the tab.
     #[test]
     fn every_column_of_a_tab_maps_back_to_the_tab() {
         let mut b = buf("\tx\n");
@@ -6518,8 +5292,7 @@ mod horizontal_scroll_tests {
         assert_eq!(buffer_text(&b), "  one\n");
     }
 
-    // vim's own rule: one tab is a whole indent, so outdenting a
-    // tab-indented line takes the tab and not a shiftwidth of them.
+    // One tab is a whole indent, as in vim.
     #[test]
     fn outdent_takes_one_indents_worth_of_columns_not_characters() {
         let mut b = buf("\t\tone\n");
@@ -6535,7 +5308,7 @@ mod horizontal_scroll_tests {
         b.wrap.scrolloff = 3;
         b.set_cursor(20, 0);
         scroll_to_show_cursor(&mut b, 40);
-        // The cursor sits three rows above the bottom, not on it.
+        // The cursor sits three rows above the bottom.
         assert_eq!(b.viewport_top(), 20 + 3 + 1 - 10);
     }
 
@@ -6549,8 +5322,8 @@ mod horizontal_scroll_tests {
         assert_eq!(b.viewport_top(), 38, "three lines kept above it");
     }
 
-    // Nothing to scroll past the ends, so the margin gives way there --
-    // otherwise the first line could never sit at the top.
+    // At the ends the margin gives way, or the first line could never be
+    // at the top.
     #[test]
     fn scrolloff_gives_way_at_the_ends_of_the_buffer() {
         let mut b = tall(100, 10);
@@ -6564,8 +5337,6 @@ mod horizontal_scroll_tests {
         assert_eq!(b.viewport_top(), last + 1 - 10, "the last line is on the last row");
     }
 
-    // A margin wider than half the pane has no middle left to keep the
-    // cursor in, so it is capped rather than fighting itself.
     #[test]
     fn a_scrolloff_wider_than_the_pane_is_capped() {
         let mut b = tall(100, 10);
@@ -6597,9 +5368,6 @@ mod horizontal_scroll_tests {
         assert_eq!(line_number_text(&b, 9), "5");
     }
 
-    // The column can't shrink to fit the offsets: a gutter that changed
-    // width as the cursor moved would shift the whole pane sideways on
-    // every `j`.
     #[test]
     fn the_gutter_keeps_its_width_under_relativenumber() {
         let mut b = tall(100, 10);
@@ -6621,9 +5389,8 @@ mod horizontal_scroll_tests {
         let mut b = buf(&"x".repeat(50));
         b.set_cursor(0, 20);
         scroll_to_show_cursor(&mut b, 10);
-        // The cursor (column 20) must be the *last* visible column of a
-        // 10-wide window -- vim's own "scroll exactly enough, not all the
-        // way" convention, same one viewport_top already follows.
+        // The cursor (column 20) is the last visible column: scroll just
+        // enough, as vim does.
         assert_eq!(b.viewport_left(), 11);
     }
 
@@ -6641,9 +5408,8 @@ mod horizontal_scroll_tests {
     #[test]
     fn selection_columns_in_line_rebases_a_charwise_range_by_hoffset_and_clamps_to_cols() {
         let range = motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 15), to: (0, 24) };
-        // Scrolled 10 columns right, a 10-wide window: the selection
-        // (line-absolute 15..25) becomes window-local 5..10, clamped at
-        // the window's own right edge.
+        // Scrolled 10 right in a 10-wide window: 15..25 becomes 5..10,
+        // clamped at the edge.
         assert_eq!(selection_columns_in_line(&range, 0, 10, 10), Some((5, 10)));
     }
 
@@ -6664,18 +5430,10 @@ mod horizontal_scroll_tests {
 mod pre_save_hook_tests {
     use super::*;
 
-    // A nonexistent path still leaves the buffer's own `path()` set (see
-    // `TextBuffer::open`'s own doc comment) -- exactly what `file_type`
-    // reads, with no real file needed for these tests. `text` is given
-    // with no trailing newline: that's the shape a buffer's own `lines`
-    // actually have for real content (`TextBuffer::open` strips exactly
-    // one trailing '\n' off whatever it reads, same as `buffer_text`
-    // never producing one either) -- a helper that instead spliced a
-    // trailing '\n' straight into `insert_text` would leave a phantom
-    // empty last line that isn't how a freshly opened file ever looks,
-    // and would silently hide the "TextBuffer::save adds its own
-    // trailing newline" issue `strip_buffer_implicit_trailing_newline`
-    // exists to handle.
+    // A buffer with a path ending in `ext`, which `language_of` reads; no
+    // file needed. `text` has no trailing newline, as an opened file's
+    // lines don't (`TextBuffer::save` adds one), so the test sees what
+    // `strip_buffer_implicit_trailing_newline` handles.
     fn buf_with_ext(text: &str, ext: &str) -> TextBuffer {
         let path = format!("/tmp/bish-fileeditor-pre-save-hook-test.{ext}");
         let mut buf = TextBuffer::open(std::path::Path::new(&path), 10).unwrap();
@@ -6684,12 +5442,9 @@ mod pre_save_hook_tests {
         buf
     }
 
-    // The end of the chain `highlight::CodeHighlighter` sits at the
-    // start of: its scanners count bytes, this pass counts characters,
-    // and one non-ASCII character anywhere in the buffer used to shift
-    // every span below it by the extra bytes that character costs --
-    // which is why this asserts on a `let` below the ellipsis rather
-    // than on the line holding it.
+    // The highlighter's scanners count bytes and this pass counts
+    // characters, so one non-ASCII character would shift every span after
+    // it; hence the assertion is on a `let` below the ellipsis.
     #[test]
     fn a_wide_character_does_not_shift_the_highlighting_under_it() {
         let text = "let a = '\u{2026}';\nlet b = 1;\n";
@@ -6705,10 +5460,8 @@ mod pre_save_hook_tests {
         TextBuffer::from_text(std::path::Path::new(path), "x\n", 10)
     }
 
-    // Checked against real vim (`vim -u NONE -i NONE -N`), which is
-    // where every one of these expectations comes from -- `%:r` keeping
-    // `sub/a.b` rather than `sub/a`, `%:h` on a bare name being `.`, and
-    // `.hidden` counting as its own root with no extension at all.
+    // Checked against `vim -u NONE -i NONE -N`: `%:r` keeps `sub/a.b`, `%:h`
+    // of a bare name is `.`, `.hidden` has no extension.
     #[test]
     fn percent_is_the_file_with_vims_own_modifiers() {
         let buf = named("sub/a.b.c");
@@ -6718,7 +5471,7 @@ mod pre_save_hook_tests {
         assert_eq!(expand("echo %:r"), "echo sub/a.b");
         assert_eq!(expand("echo %:e"), "echo c");
         assert_eq!(expand("echo %:h"), "echo sub");
-        // Left to right, so each modifier sees the last one's answer.
+        // Left to right, each modifier on the last one's result.
         assert_eq!(expand("echo %:t:r"), "echo a.b");
         // Twice in one line, and not only at a word boundary.
         assert_eq!(expand("cp % %.bak"), "cp sub/a.b.c sub/a.b.c.bak");
@@ -6731,33 +5484,28 @@ mod pre_save_hook_tests {
         assert_eq!(expand_filename_macros("echo %:r", &hidden).unwrap(), "echo .hidden");
     }
 
-    // `\%` is how vim writes a literal one, and the only escape this
-    // touches -- every other backslash belongs to the shell that is
-    // about to read the same line.
+    // `\%` is a literal `%`, the only escape touched; other backslashes are
+    // the shell's.
     #[test]
     fn a_backslash_makes_a_percent_literal() {
         let buf = named("f.txt");
         assert_eq!(expand_filename_macros("echo \\%", &buf).unwrap(), "echo %");
         assert_eq!(expand_filename_macros("printf '\\%s' %", &buf).unwrap(), "printf '%s' f.txt");
-        // Not an escape this cares about: it reaches the shell intact.
+        // Not ours: reaches the shell intact.
         assert_eq!(expand_filename_macros("echo \\n %", &buf).unwrap(), "echo \\n f.txt");
     }
 
-    // vim refuses rather than running the command with a hole where the
-    // name should be, and so does this.
+    // Refused rather than run with a hole where the name goes, as in vim.
     #[test]
     fn an_empty_expansion_is_an_error_not_an_empty_string() {
         assert!(expand_filename_macros("echo %", &TextBuffer::new_unnamed(10)).is_err());
-        // `:e` on a name with no extension is empty, which vim treats
-        // exactly like having no name at all.
+        // `:e` of a name without extension is empty, which vim treats as no
+        // name.
         assert!(expand_filename_macros("echo %:e", &named("noext")).is_err());
         assert!(expand_filename_macros("echo %:e", &named(".hidden")).is_err());
     }
 
-    // `#` has no alternate file to name in bish, and starts a comment in
-    // the shell this line is handed to -- so it stays exactly as typed.
-    // A colon that is not a modifier stays too, which is what keeps
-    // `%:2` and a `PATH`-ish argument readable.
+    // `#` stays as typed, as does a colon that isn't a modifier.
     #[test]
     fn what_is_not_a_macro_is_left_alone() {
         let buf = named("f.txt");
@@ -6768,11 +5516,9 @@ mod pre_save_hook_tests {
         assert_eq!(expand("grep -n x %:t:9"), "grep -n x f.txt:9");
     }
 
-    // The dispatch, not the highlighters themselves (each has its own
-    // tests in bishedit::highlight) -- what this pins is that the editor
-    // asks the right one and, for a language with none, quietly renders
-    // plain text instead of falling back to bash's highlighter and
-    // painting nonsense.
+    // The dispatch: the editor asks the right highlighter, and a language
+    // with none renders plain rather than as bash. The highlighters have
+    // their own tests.
     #[test]
     fn buffer_highlighting_follows_the_buffers_own_language() {
         let json = buf_with_ext(r#"{"a": 1}"#, "json");
@@ -6784,7 +5530,7 @@ mod pre_save_hook_tests {
         let markdown = buf_with_ext("# Title\n\n*emphasis*\n", "md");
         assert!(!buffer_highlight_spans(&markdown, None).is_empty(), "and a .md buffer");
 
-        // A man page section number is an extension like any other.
+        // A man section number is an extension like any other.
         let roff = buf_with_ext(".SH NAME\nls \\- list directory contents\n", "1");
         assert!(!buffer_highlight_spans(&roff, None).is_empty(), "and a .1 buffer");
         assert_eq!(language_of(&roff), "roff");
@@ -6792,18 +5538,14 @@ mod pre_save_hook_tests {
         let toml = buf_with_ext("[package]\nname = \"bish\"\n", "toml");
         assert!(!buffer_highlight_spans(&toml, None).is_empty(), "and a .toml buffer");
 
-        // Valid bash, and deliberately not highlighted as any: nothing
-        // claims to know what a .zig file is. (This used to be the .toml
-        // case, until TOML got a highlighter of its own -- the point of
-        // the assertion is the fallback, so it moved to a language
-        // nothing here has an opinion about rather than being dropped.)
+        // Valid bash, but a `.zig` file isn't claimed by anything, so it
+        // stays plain.
         let unclaimed = buf_with_ext("if true; then echo hi; fi", "zig");
         assert!(buffer_highlight_spans(&unclaimed, None).is_empty(), "a language with no highlighter renders plain");
     }
 
-    // Opening compressed content: a member inside a zip and a gzip'd
-    // file both arrive as ordinary-looking read-only buffers, named by
-    // the path that was asked for.
+    // A zip member and a gzip'd file both open read-only, named by the path
+    // asked for.
     #[test]
     fn compressed_paths_open_as_readonly_buffers_holding_the_decompressed_text() {
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-archive-{}", std::process::id()));
@@ -6825,8 +5567,7 @@ mod pre_save_hook_tests {
         assert_eq!(buffer_text(&session.buffer), "compressed text\nsecond line");
         assert!(session.buffer.is_readonly(), "a gzip file can't be written back");
 
-        // ...while an ordinary file in the same directory is untouched
-        // by any of this.
+        // An ordinary file beside them is untouched.
         let plain = dir.join("plain.txt");
         std::fs::write(&plain, "ordinary\n").unwrap();
         let session = EditSession::open(Some(&plain.display().to_string()), 10).unwrap();
@@ -6843,9 +5584,8 @@ mod pre_save_hook_tests {
         let zip = dir.join("sample.zip");
         std::fs::write(&zip, include_bytes!("testdata/sample.zip")).unwrap();
 
-        // An ordinary nonexistent path opens as a new file (vim's own
-        // `:e newfile`); a nonexistent *member* can't, since there's no
-        // way to create one.
+        // A nonexistent path opens as a new file (vim's `:e newfile`); a
+        // nonexistent member can't, since it can't be created.
         let opened = EditSession::open(Some(&crate::archive::join(&zip, "nope.txt")), 10);
         let err = match opened {
             Err(e) => e.to_string(),
@@ -6856,16 +5596,14 @@ mod pre_save_hook_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // `.gz` says how the bytes are stored, not what they are.
-    // The wrap options ride on the buffer (see TextBuffer::wrap), so a
-    // test can set them directly and check the layout the frame builder
-    // produces without a terminal.
+    // The wrap options are on the buffer (`TextBuffer::wrap`), so a test
+    // sets them and checks the layout without a terminal.
     fn wrapped_buf(text: &str, wrap: crate::bishedit::wrap::Options) -> TextBuffer {
         wrapped_buf_h(text, wrap, 10)
     }
 
-    // The viewport height is fixed at construction, so a test that cares
-    // about scrolling states it up front.
+    // The viewport height is fixed at construction, so scrolling tests give
+    // it.
     fn wrapped_buf_h(text: &str, wrap: crate::bishedit::wrap::Options, height: usize) -> TextBuffer {
         let mut buf = TextBuffer::new_unnamed(height);
         buf.insert_text((0, 0), text);
@@ -6898,29 +5636,26 @@ mod pre_save_hook_tests {
         assert!(rows.iter().all(|r| r.first), "each row opens its own line");
     }
 
-    // The frame and the click-to-position inverse have to agree, or a
-    // click lands on a different character than the one under the
-    // pointer.
+    // The frame and its click inverse must agree.
     #[test]
     fn a_click_on_a_wrapped_row_finds_the_character_under_it() {
         let buf = wrapped_buf("abcdefghij", wrap_on());
-        // A pane 4 columns wide *after* the gutter.
+        // 4 columns wide after the gutter.
         let gutter = total_gutter_width(&buf);
         let rect = Rect { row: 0, col: 0, rows: 12, cols: gutter + 4 };
-        // Row 0 column 0 is 'a'; row 1 column 0 is 'e' (the second
-        // segment starts at char 4); row 2 column 1 is 'j'.
+        // Row 0 col 0 is `a`, row 1 col 0 is `e` (the second segment starts
+        // at char 4), row 2 col 1 is `j`.
         assert_eq!(position_at_screen(&buf, rect, 0, gutter), Some((0, 0)));
         assert_eq!(position_at_screen(&buf, rect, 1, gutter), Some((0, 4)));
         assert_eq!(position_at_screen(&buf, rect, 2, gutter + 1), Some((0, 9)));
     }
 
-    // A line taller than the pane has to be scrollable *within* itself,
-    // or a minified file can scroll to the right line and then never
-    // reach the cursor inside it.
+    // A line taller than the pane scrolls within itself, or a minified file's
+    // cursor could be out of reach.
     #[test]
     fn scrolling_can_move_within_a_line_taller_than_the_pane() {
         let mut buf = wrapped_buf_h(&"x".repeat(40), wrap_on(), 3);
-        // 4 columns wide -> 10 rows for this one line, in a 3-row pane.
+        // 4 columns wide: 10 rows for this line, in a 3-row pane.
         buf.set_cursor(0, 39);
         scroll_to_show_cursor(&mut buf, 4);
         assert_eq!(buf.viewport_top(), 0, "still the only line there is");
@@ -6928,7 +5663,7 @@ mod pre_save_hook_tests {
         let rows = visible_rows(&buf, 4, 3);
         assert!(rows.iter().any(|r| r.seg.contains(39)), "the cursor's own row is on screen");
 
-        // Back to the top of the line.
+        // Back to the line's top.
         buf.set_cursor(0, 0);
         scroll_to_show_cursor(&mut buf, 4);
         assert_eq!(buf.viewport_sub(), 0);
@@ -6943,15 +5678,14 @@ mod pre_save_hook_tests {
         assert_eq!(buf.viewport_left(), 0, "a wrapped line has no off-screen right edge");
     }
 
-    // sidescrolloff only applies when *not* wrapping -- it is about the
-    // other way of handling a long line.
+    // `sidescrolloff` only applies without wrapping.
     #[test]
     fn sidescrolloff_keeps_columns_visible_either_side_of_the_cursor() {
         let mut buf = wrapped_buf(&"x".repeat(80), crate::bishedit::wrap::Options { sidescrolloff: 5, ..Default::default() });
         buf.set_cursor(0, 40);
         scroll_to_show_cursor(&mut buf, 20);
-        // The cursor sits 5 columns short of the right edge, not against
-        // it: viewport_left + 20 - 1 - 5 == 40.
+        // The cursor sits 5 columns short of the right edge:
+        // `viewport_left + 20 - 1 - 5 == 40`.
         assert_eq!(buf.viewport_left(), 26);
 
         buf.set_cursor(0, 26);
@@ -6966,14 +5700,12 @@ mod pre_save_hook_tests {
         let gutter = total_gutter_width(&buf);
         let rect = Rect { row: 0, col: 0, rows: 8, cols: gutter + 4 };
         let frame = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
-        // Char 9 is on the third segment (8..10), second column of it.
+        // Char 9 is on the third segment (8..10), its second column.
         assert!(frame.contains(&format!("\x1b[3;{}H", gutter + 2)), "expected the cursor on row 3 column {}, got:\n{frame:?}", gutter + 2);
     }
 
-    // The language server's "these are the same symbol" marks compose
-    // over the colour already there rather than replacing it -- the one
-    // thing that distinguishes this layer from the search and selection
-    // ones, and the thing a regression would silently undo.
+    // The language server's same-symbol marks compose over the colour
+    // rather than replacing it, unlike the search and selection layers.
     #[test]
     fn document_highlights_underline_without_taking_the_colour_off() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -6998,20 +5730,18 @@ mod pre_save_hook_tests {
             },
         ];
         let marked = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
-        // The read is underlined; the write is underlined *and* bold,
-        // which is what distinguishes "assigned here" from "used here".
+        // A read is underlined; a write underlined and bold.
         assert!(marked.contains("\x1b[0;4malpha"), "expected an underlined read:\n{marked:?}");
         assert!(marked.contains("\x1b[0;1;4malpha"), "expected a bold underlined write:\n{marked:?}");
-        // The word between them keeps no marking at all.
+        // The word between them is unmarked.
         assert!(marked.contains("\x1b[0m beta "), "{marked:?}");
-        // And the marks are gone the moment the buffer's are.
+        // And the marks go when the buffer's do.
         buf.document_highlights.clear();
         let cleared = build_editor_frame(&buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
         assert_eq!(cleared, plain, "clearing the marks restores exactly the unmarked frame");
     }
 
-    // What `%` would jump onto, said before it is pressed -- and the
-    // bracket it would jump from, so a pair reads as a pair.
+    // What `%` would jump to, and the bracket it would jump from.
     #[test]
     fn the_bracket_under_the_cursor_and_the_one_it_pairs_with_are_both_marked() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -7019,37 +5749,33 @@ mod pre_save_hook_tests {
         let rect = Rect { row: 0, col: 0, rows: 4, cols: 40 };
         let frame = |buf: &TextBuffer, mode| build_editor_frame(buf, &VimKeys::new(), mode, rect, 0, 0, None);
 
-        // On `f`, which is no bracket at all: nothing is marked, even
-        // though `%` from here would jump to the last `)`.
+        // On `f`, not a bracket: nothing, though `%` would jump to the last
+        // `)`.
         buf.set_cursor(0, 0);
         let plain = frame(&buf, EditorMode::Normal);
         assert!(!plain.contains(";7m"), "nothing marked yet:\n{plain:?}");
 
-        // On the outer `(`: it and the `)` that closes it, and neither of
-        // the inner pair between them.
+        // On the outer `(`: it and its `)`, not the inner pair.
         buf.set_cursor(0, 1);
         let marked = frame(&buf, EditorMode::Normal);
         assert!(marked.contains("\x1b[0;7m(\x1b[0ma, g(b)"), "the opening bracket marked:\n{marked:?}");
         assert!(marked.contains("\x1b[0;7m)\x1b[0m"), "the closing bracket marked:\n{marked:?}");
         assert_eq!(marked.matches("\x1b[0;7m").count(), 2, "one mark each, and no more:\n{marked:?}");
 
-        // In Insert mode the cursor sits past what was just typed, so the
-        // bracket behind it is the one that counts.
+        // In Insert mode the bracket behind the cursor counts.
         buf.set_cursor(0, 2);
         assert_eq!(frame(&buf, EditorMode::Insert).matches("\x1b[0;7m").count(), 2, "the pair behind the cursor");
         assert!(!frame(&buf, EditorMode::Normal).contains(";7m"), "and in Normal mode it does not");
 
-        // `bishopt --set matchbrackets off`, and nothing is marked.
+        // `bishopt --set matchbrackets off`: nothing.
         buf.set_cursor(0, 1);
         buf.matchbrackets = false;
         assert!(!frame(&buf, EditorMode::Normal).contains(";7m"), "nothing marked with the option off");
         assert!(!frame(&buf, EditorMode::Insert).contains(";7m"), "in Insert mode either");
     }
 
-    // A spliced hint has to leave every one of `Row`'s promises intact,
-    // because the cursor, clicks, scrolling, selections and every span
-    // layer all read the line through them and none of them know hints
-    // exist.
+    // A spliced hint keeps every promise of `Row`, which the cursor,
+    // clicks, scrolling, selections and spans read the line through.
     #[test]
     fn an_inlay_hint_is_drawn_between_characters_without_moving_any_of_them() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -7058,16 +5784,14 @@ mod pre_save_hook_tests {
         let plain = display_row(&buf, 0, None);
         assert_eq!(plain.cells.iter().collect::<String>(), "let x = 1");
 
-        // `: u32` after `x`, which is character 5.
+        // `: u32` after `x`, character 5.
         buf.inlay_hints = vec![(0, 5, ": u32".to_string())];
         let row = display_row(&buf, 0, None);
         assert_eq!(row.cells.iter().collect::<String>(), "let x: u32 = 1");
-        // The hint's own cells belong to no character of the line --
-        // which is what dims them and what makes the cursor step over
-        // the whole hint in one press.
+        // The hint's cells belong to no character, so they're dimmed and the
+        // cursor steps over them in one press.
         assert_eq!(row.source_at[5..10], [None, None, None, None, None]);
-        // Every real character still maps to itself, and the two maps
-        // still agree in both directions.
+        // Every real character maps to itself, both ways.
         for c in 0..buf.line_len(0) {
             assert_eq!(row.source_at[row.cell_of[c]], Some(c), "char {c}");
         }
@@ -7089,8 +5813,7 @@ mod pre_save_hook_tests {
     fn several_hints_on_one_line_keep_their_order_however_they_arrive() {
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "f(a, b)");
-        // Deliberately out of order: the splice sorts, because a server
-        // is not required to.
+        // Out of order on purpose: a server needn't sort.
         buf.inlay_hints = vec![(0, 5, "two: ".to_string()), (0, 2, "one: ".to_string())];
         let row = display_row(&buf, 0, None);
         assert_eq!(row.cells.iter().collect::<String>(), "f(one: a, two: b)");
@@ -7107,8 +5830,7 @@ mod pre_save_hook_tests {
         assert_eq!(row.cell_of, (0..=9).collect::<Vec<_>>());
     }
 
-    // Hints splice after tab expansion, so a tab's own width is decided
-    // by the source line and not by what got drawn into it.
+    // Hints splice after tab expansion, so a tab's width follows the source.
     #[test]
     fn a_hint_does_not_shift_the_tab_stops_of_the_line_it_is_on() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -7117,13 +5839,12 @@ mod pre_save_hook_tests {
         let without = display_row(&buf, 0, None);
         buf.inlay_hints = vec![(0, 4, "!!".to_string())];
         let with = display_row(&buf, 0, None);
-        // "ab" + two spaces to the tab stop + "c", either way.
+        // `ab`, two spaces to the stop, `c`, either way.
         assert_eq!(without.cells.iter().collect::<String>(), "ab  c");
         assert_eq!(with.cells.iter().collect::<String>(), "ab  c!!");
     }
 
-    // The hint is drawn dim so it reads as annotation; the code around
-    // it is untouched.
+    // The hint is dim; the code around it is untouched.
     #[test]
     fn hint_cells_are_dimmed_and_the_real_characters_are_not() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -7144,14 +5865,13 @@ mod pre_save_hook_tests {
         buf
     }
 
-    // What the pane actually draws, with the styling stripped, so a test
-    // reads as the screen does.
+    // What the pane draws, styling stripped, so a test reads as the screen
+    // does.
     fn drawn(buf: &TextBuffer, cols: usize) -> Vec<String> {
         let rect = Rect { row: 0, col: 0, rows: 12, cols };
         let frame = build_editor_frame(buf, &VimKeys::new(), EditorMode::Normal, rect, 0, 0, None);
         let gutter = total_gutter_width(buf);
-        // A cursor-position escape starts a row; every other escape is
-        // styling and contributes no characters.
+        // A cursor-position escape starts a row; other escapes are styling.
         let chars: Vec<char> = frame.chars().collect();
         let mut rows: Vec<String> = Vec::new();
         let mut current: Option<String> = None;
@@ -7226,30 +5946,27 @@ mod pre_save_hook_tests {
         assert_eq!(drawn(&buf, 60), vec!["name,  age, city", "alice, 30,  NYC", "bo,    7,   LA"]);
     }
 
-    // The alignment is drawn, never stored: the buffer still holds
-    // exactly what was typed, delimiters and all.
+    // The alignment is drawn, never stored: the buffer holds what was
+    // typed.
     #[test]
     fn the_alignment_never_touches_the_text() {
         let mut buf = csv_buf("name,age\nalice,30");
         assert_eq!(buffer_text(&buf), "name,age\nalice,30");
-        // ...and a delimiter is still an ordinary character: adding one
-        // splits the row into another column, which is the whole point
-        // of the alignment being cosmetic.
+        // A delimiter is still an ordinary character: adding one makes
+        // another column.
         buf.insert_text((0, 4), ",");
         assert_eq!(buffer_text(&buf), "name,,age\nalice,30");
         assert_eq!(drawn(&buf, 60).len(), 2);
     }
 
-    // A click on padding belongs to the character it was inserted after
-    // -- there is nothing else it could mean, since padding is not in
-    // the file.
+    // A click on padding belongs to the character before it.
     #[test]
     fn a_click_on_padding_lands_on_the_character_before_it() {
         let buf = csv_buf("alice,30\nbo,7");
         let gutter = total_gutter_width(&buf);
         let rect = Rect { row: 0, col: 0, rows: 12, cols: gutter + 40 };
-        // Row 1 draws "bo,    7": columns 0-1 are `bo`, 2 is the comma,
-        // 3..6 are padding, 7 is `7`.
+        // Row 1 draws `bo,    7`: `bo` at 0-1, the comma at 2, padding 3..6,
+        // `7` at 7.
         assert_eq!(position_at_screen(&buf, rect, 1, gutter), Some((1, 0)));
         assert_eq!(position_at_screen(&buf, rect, 1, gutter + 2), Some((1, 2)), "the comma itself");
         assert_eq!(position_at_screen(&buf, rect, 1, gutter + 4), Some((1, 2)), "padding belongs to the comma");
@@ -7263,8 +5980,7 @@ mod pre_save_hook_tests {
         assert_eq!(drawn(&buf, 60), vec!["name,age", "alice,30"]);
     }
 
-    // Wrapping and alignment are two answers to the same question, so
-    // only one of them applies.
+    // Wrapping and alignment answer the same question, so only one applies.
     #[test]
     fn wrapping_turns_the_alignment_off() {
         let mut buf = csv_buf("name,age\nalice,30");
@@ -7284,8 +6000,7 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_with_ext("x", "bash")), "bash");
         assert_eq!(language_of(&buf_with_ext("x", "sh")), "bash", "a .sh file is bash here too, unlike the old .bash-only check");
         assert_eq!(language_of(&buf_with_ext("x", "rs")), "rust");
-        // No table entry needed: an unknown extension is its own name,
-        // which is what makes `abbr --lang=toml` work.
+        // An unknown extension is its own name, so `abbr --lang=toml` works.
         assert_eq!(language_of(&buf_with_ext("x", "toml")), "toml");
         assert_eq!(language_of(&buf_with_ext("x", "TOML")), "toml", "case-folded, so `--lang=toml` matches either spelling");
         assert_eq!(language_of(&buf_with_ext("x", "txt")), "txt");
@@ -7296,7 +6011,6 @@ mod pre_save_hook_tests {
         TextBuffer::open(std::path::Path::new(&format!("/tmp/bish-fileeditor-name-test/{name}")), 10).unwrap()
     }
 
-    // The INI family is spread across extensions that share nothing.
     #[test]
     fn the_ini_family_is_recognized_by_extension() {
         for name in ["settings.ini", "setup.cfg", "sshd.conf", "firefox.desktop", "nginx.service", "boot.timer", "wg0.netdev"] {
@@ -7305,8 +6019,7 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_named("Desktop.INI")), "ini", "case-folded like every other extension");
     }
 
-    // ...and the most-used ones have no extension at all, which is why
-    // there is a name table too.
+    // The most-used ones have no extension, hence the name table.
     #[test]
     fn the_extension_less_ini_files_are_recognized_by_name() {
         for name in [".gitconfig", ".editorconfig", ".npmrc", ".pylintrc", "pylintrc", ".flake8"] {
@@ -7320,12 +6033,11 @@ mod pre_save_hook_tests {
             assert_eq!(language_of(&buf_named(name)), "jsonc", "{name}");
         }
         assert_eq!(language_of(&buf_named(".vscode/launch.json")), "jsonc", "everything VS Code keeps in .vscode");
-        // ...and a plain `.json` stays strict.
+        // A plain `.json` stays strict.
         assert_eq!(language_of(&buf_named("package.json")), "json");
     }
 
-    // The URL pass runs whatever the language is, because being a URL
-    // isn't a property of the language around it.
+    // URLs are found whatever the language.
     #[test]
     fn a_bare_url_becomes_a_link_in_any_buffer() {
         let buf = buf_with_ext("ticket https://bugs.example.com/42 here", "txt");
@@ -7334,7 +6046,6 @@ mod pre_save_hook_tests {
         assert_eq!(links[0].url, "https://bugs.example.com/42");
     }
 
-    // ...and the sentence's punctuation is not the URL's.
     #[test]
     fn a_url_at_the_end_of_a_sentence_stops_before_the_full_stop() {
         let buf = buf_with_ext("see https://example.com/x.", "txt");
@@ -7342,9 +6053,8 @@ mod pre_save_hook_tests {
         assert_eq!(links[0].url, "https://example.com/x");
     }
 
-    // A markdown link to a sibling document is a relative path, which no
-    // terminal can open -- resolving it against the buffer's own
-    // directory is what makes clicking it go somewhere.
+    // A relative link resolves against the buffer's directory, so clicking
+    // it goes somewhere.
     #[test]
     fn a_relative_link_target_is_resolved_against_the_buffer_directory() {
         let buf = buf_with_ext("[the plan](plan.md)", "md");
@@ -7353,9 +6063,8 @@ mod pre_save_hook_tests {
         assert!(plan.url.starts_with("file:///"), "got {}", plan.url);
     }
 
-    // An unnamed buffer has no directory to resolve against, so a
-    // relative target stays underlined and unclickable rather than
-    // being guessed at.
+    // With no directory, a relative target stays underlined and
+    // unclickable.
     #[test]
     fn a_relative_link_in_an_unnamed_buffer_produces_no_link() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -7371,8 +6080,6 @@ mod pre_save_hook_tests {
         }
     }
 
-    // direnv's file is a shell script, not a list of assignments, and
-    // the `.env` prefix rule must not take it.
     #[test]
     fn envrc_is_bash_rather_than_dotenv() {
         assert_eq!(language_of(&buf_named(".envrc")), "bash");
@@ -7386,8 +6093,6 @@ mod pre_save_hook_tests {
         assert_eq!(language_of(&buf_named(".cargo/config")), "toml", "cargo's config, which is not git's");
     }
 
-    // `config` on its own is claimed by everything; inside `.git` it
-    // isn't ambiguous at all.
     #[test]
     fn a_bare_config_is_ini_only_inside_a_git_directory() {
         assert_eq!(language_of(&buf_named(".git/config")), "ini");
@@ -7409,17 +6114,9 @@ mod pre_save_hook_tests {
         assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
     }
 
-    // The regression case: BashFormatter::check always intends exactly
-    // one trailing newline for a plain string, but `buffer_text` (unlike
-    // a file's own on-disk bytes) never has one -- so this hook's own
-    // EOF-gap fix would want to *insert* "\n" right after the buffer's
-    // last real character. Applied literally that becomes a genuine new
-    // empty last line, which `TextBuffer::save`'s own implicit trailing
-    // newline then doubles up into a real blank line at the end of the
-    // file on disk. Asserted end-to-end through a real `save()` (not
-    // just `buffer_text`, which can't see this bug -- see
-    // `strip_buffer_implicit_trailing_newline`'s own doc comment) so a
-    // regression here fails loudly rather than just in the editor.
+    // The formatter's end-of-file fix intends one trailing newline, but the
+    // buffer's text has none and `save` adds one, so applied as is it would
+    // leave a blank last line on disk. Checked through a real `save()`.
     #[test]
     fn run_pre_save_hooks_does_not_leave_a_spurious_blank_line_at_end_of_file_on_save() {
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-eof-test-{}", std::process::id()));
@@ -7462,13 +6159,8 @@ mod pre_save_hook_tests {
         assert_eq!(buffer_text(&buf), "if true; then\n\techo hi\nfi");
     }
 
-    // `buf_with_ext`'s own buffers never round-trip through a real file on
-    // disk (it splices `insert_text` into a buffer opened against a
-    // nonexistent path) -- this one does, matching exactly what `:format`
-    // sees against a file really opened via `e`: a regression test for
-    // the "an EOF-gap fix that's already a no-op still counted as
-    // applied" bug (see `strip_buffer_implicit_trailing_newline`'s own
-    // doc comment) would only have caught it through this real load path.
+    // Through a real file, as `:format` sees a file opened with `e`: an
+    // already-formatted file must report `AlreadyFormatted`.
     #[test]
     fn format_buffer_reports_already_formatted_for_a_real_file_loaded_from_disk() {
         let dir = std::env::temp_dir().join(format!("bish-fileeditor-real-load-test-{}", std::process::id()));
@@ -7497,12 +6189,8 @@ mod pre_save_hook_tests {
     }
 }
 
-// `:git blame`'s own tests -- the no-path check runs unconditionally (no
-// subprocess involved), but everything else here needs an actual git
-// repository and a real `git` on $PATH, so those skip themselves (rather
-// than failing) when crate::git::available() says there isn't one --
-// matching this whole feature's own "quietly unavailable, not a hard
-// dependency" contract (see git.rs's own module doc comment).
+// `:git blame`. Everything but the no-path check needs git and a
+// repository, and skips without git (`crate::git::available`).
 #[cfg(test)]
 mod git_blame_tests {
     use super::*;
@@ -7550,10 +6238,8 @@ mod git_blame_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // The whole point of aligning blame to the buffer rather than
-    // refusing a dirty one: a line typed just now has no blame (it's in
-    // no revision at all), and -- crucially -- every line *after* it
-    // still gets the right one despite having shifted down.
+    // A line typed just now has no blame, and every line after it still
+    // gets its own despite having moved down.
     #[test]
     fn toggle_git_blame_lines_up_with_a_dirty_buffer() {
         if !crate::git::available() {
@@ -7575,9 +6261,8 @@ mod git_blame_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // Blame at an older revision, against a buffer holding the *newer*
-    // content: "three" doesn't exist back there, so it gets no blame,
-    // while the two lines that do exist still line up.
+    // Blame at an older revision against newer content: `three` didn't
+    // exist then, so it has none, and the other two still line up.
     #[test]
     fn toggle_git_blame_at_a_revision_marks_lines_absent_from_it() {
         if !crate::git::available() {
@@ -7606,7 +6291,7 @@ mod git_blame_tests {
             let out = crate::gittest::output(&dir, &["rev-parse", name]);
             String::from_utf8(out.stdout).unwrap().trim()[..8].to_string()
         };
-        // A line on disk that no commit has, before anything is blamed.
+        // A line on disk that no commit has, before blaming.
         std::fs::write(dir.join("f.txt"), "one\nTWO\nthree\nfour\n").unwrap();
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
         assert_eq!(blamed_commit_at_cursor(&buf), None, "with blame off there is nothing to say, so `:git show` stays HEAD");
@@ -7637,8 +6322,7 @@ mod git_blame_tests {
     }
 }
 
-// `:git diff`'s own tests -- same shape/skip-if-no-git reasoning as
-// git_blame_tests above.
+// `:git diff`, skipping without git like the blame tests.
 #[cfg(test)]
 mod git_diff_tests {
     use super::*;
@@ -7663,8 +6347,7 @@ mod git_diff_tests {
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         crate::gittest::run(&dir, &["add", "f.txt"]);
         crate::gittest::run(&dir, &["commit", "-q", "-m", "initial"]);
-        // Changed on disk and reloaded, so the committed content and the
-        // buffer really do differ.
+        // Changed on disk and reloaded, so it differs from the commit.
         std::fs::write(&path, "one\nCHANGED\nthree\n").unwrap();
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
@@ -7675,8 +6358,7 @@ mod git_diff_tests {
         assert!(!toggle_git_diff(&mut buf, None).unwrap());
         assert!(buf.diff.is_none());
 
-        // ...and an *unsaved* edit counts too, which is the reason this
-        // diffs the buffer itself rather than the file on disk.
+        // An unsaved edit counts too: the buffer is diffed, not the file.
         buf.insert_text((0, 0), "TYPED\n");
         assert!(toggle_git_diff(&mut buf, None).unwrap());
         let diff = buf.diff.as_ref().unwrap();
@@ -7687,8 +6369,8 @@ mod git_diff_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // `:git diff HEAD~1` against a buffer that matches HEAD exactly: the
-    // markers describe the older revision, not the index.
+    // `:git diff HEAD~1` on a buffer matching HEAD: the markers describe
+    // the older revision.
     #[test]
     fn toggle_git_diff_at_a_revision_marks_what_changed_since_it() {
         if !crate::git::available() {
@@ -7707,14 +6389,12 @@ mod git_diff_tests {
         crate::gittest::run(&dir, &["commit", "-q", "-m", "second"]);
 
         let mut buf = TextBuffer::open(&path, 10).unwrap();
-        // Against the index (HEAD) there is nothing to show at all...
+        // Against the index there's nothing.
         assert!(toggle_git_diff(&mut buf, None).unwrap());
         assert!(buf.diff.as_ref().unwrap().is_empty());
         assert!(!toggle_git_diff(&mut buf, None).unwrap());
-        // ...but against HEAD~1, the second line onwards is a hunk that
-        // replaced `two` with two lines -- one changed hunk, exactly as
-        // real `git diff -U0` reports it (`@@ -2 +2,2 @@`), not a change
-        // plus a separate addition.
+        // Against HEAD~1, one changed hunk replacing `two` with two lines, as
+        // `git diff -U0` reports (`@@ -2 +2,2 @@`).
         assert!(toggle_git_diff(&mut buf, Some("HEAD~1")).unwrap());
         let diff = buf.diff.as_ref().unwrap();
         assert_eq!(diff.get(&1), Some(&DiffMark::Changed));
