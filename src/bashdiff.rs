@@ -1,24 +1,11 @@
-// A corpus of shell snippets that bash and bish should agree on, run
-// through both and diffed.
+// Snippets that bash and bish should agree on, run through both and diffed.
 //
-// This file is the survey that produced the second roadmap, made
-// permanent. Its value is not the cases already passing -- it is that
-// adding a case costs one line, so the next question of the form "does
-// bish do X the way bash does?" is answered by writing it down rather
-// than by a temp file that gets deleted.
+// `CASES` agree. `DIVERGENCES` don't, each with its reason, and every entry
+// is asserted to still diverge, so fixing one fails this test until its
+// entry is removed.
 //
-// The two lists matter equally:
-//
-// - `CASES` is what should agree, and does.
-// - `DIVERGENCES` is what does not agree, each with the reason. Every
-//   entry is *asserted to still diverge*, so one that gets fixed fails
-//   this test until its entry is removed. A known-issues list nobody
-//   is forced to update is worth nothing.
-//
-// bash is run with `LC_ALL=C` -- otherwise this measures the machine's
-// locale rather than the shell (a Finnish `printf %.2f` writes `3,14`)
-// -- and both shells get an empty `HOME` and a scratch cwd so neither
-// reads a config or trips over the other's files.
+// bash runs with `LC_ALL=C` (a Finnish `printf %.2f` writes `3,14`), and
+// both shells get an empty `HOME` and a scratch cwd.
 
 #[cfg(test)]
 mod tests {
@@ -35,10 +22,9 @@ mod tests {
         Case { name, script }
     }
 
-    // Deliberately no `$RANDOM`, no timestamps, no pids: a case that
-    // cannot answer the same way twice cannot be compared at all.
+    // No `$RANDOM`, timestamps or pids: a case has to answer the same way twice.
     const CASES: &[Case] = &[
-        // -- expansion ------------------------------------------------
+        // Expansion
         case("param-default", r#"unset u; echo "${u:-d}" "${u-d}" "${u:+s}""#),
         case("param-assign-default", r#"unset u; echo "${u:=set}" "$u""#),
         case("param-length", r#"x=abcd; echo "${#x}""#),
@@ -48,8 +34,7 @@ mod tests {
         case("param-subst", r#"x=aXbXc; echo "${x/X/-}" "${x//X/-}" "${x/#a/A}" "${x/%c/C}""#),
         case("param-indirect", r#"v=hello; n=v; echo "${!n}""#),
         case("param-at-split", r#"set -- "a b" c; for w in "$@"; do echo "[$w]"; done"#),
-        // A list joins on IFS's first character, not on a space, and
-        // an unquoted one is that same join split again.
+        // A list joins on IFS's first character; unquoted, the join is split again.
         case("ifs-join-star", r#"set -- a b c; IFS=-; printf '[%s]' "$*"; echo"#),
         case("ifs-join-array", r#"a=(x y z); IFS=-; printf '[%s]' "${a[*]}"; echo"#),
         case("ifs-join-unquoted", r#"set -- a b c; IFS=-; printf '[%s]' $*; printf '[%s]' $@; echo"#),
@@ -57,13 +42,11 @@ mod tests {
         case("ifs-join-multichar", r#"set -- a b c; IFS=xy; printf '[%s]' "$*"; echo"#),
         case("ifs-join-keys", r#"aa_1=; aa_2=; set -- ${!aa_*}; printf '%s' "$#""#),
         case("param-nested", r#"x=abc; echo "${x/$(printf b)/Z}""#),
-        // -- arrays ---------------------------------------------------
+        // Arrays
         case("array-basic", r#"a=(1 2 3); echo "${a[0]}" "${a[@]}" "${#a[@]}" "${!a[@]}""#),
         case("array-append", r#"a=(1); a+=(2 3); echo "${a[@]}""#),
         case("array-negative", r#"a=(1 2 3); echo "${a[-1]}""#),
-        // `:off:len` counts elements for a list and characters for a
-        // string -- the one operator whose meaning changes with what it
-        // is applied to.
+        // `:off:len` counts elements for a list and characters for a string.
         case("array-slice", r#"a=(z1 z2 z3 z4 z5); echo "${a[@]:1:2}" "${a[@]:2}" "${a[@]:0:2}" "${a[@]: -2}" "${a[@]:9}""#),
         case("array-slice-unquoted", r#"a=(z1 z2 z3); printf '[%s]' ${a[@]:1:2}; echo"#),
         case("array-slice-sparse", r#"b=(x y); b[5]=z; printf '[%s]' "${b[@]:1:2}"; echo"#),
@@ -73,7 +56,7 @@ mod tests {
         case("string-slice-negative-length", r#"x=abcdef; echo "${x:1:-1}""#),
         case("array-unset-elem", r#"a=(1 2 3); unset 'a[1]'; echo "${a[@]}" "${#a[@]}""#),
         case("assoc-basic", r#"declare -A m=([k]=v [j]=w); echo "${m[k]}" "${#m[@]}""#),
-        // -- arithmetic -----------------------------------------------
+        // Arithmetic
         case("arith-ops", r#"echo $((1+2*3)) $((7/2)) $((7%3)) $((2**10)) $((1<<4))"#),
         case("arith-base", r#"echo $((16#ff)) $((2#1011)) $((8#17))"#),
         case("arith-ternary-comma", r#"echo $((1?2:3)) $((1,2,3))"#),
@@ -81,13 +64,13 @@ mod tests {
         case("arith-compare", r#"echo $((3>2)) $((3<2)) $((3==3)) $((1&&0)) $((1||0))"#),
         case("arith-assign-ops", r#"i=10; ((i+=5)); ((i*=2)); echo $i"#),
         case("arith-let", r#"let 'a = 3 + 4'; echo $a"#),
-        // -- conditionals ---------------------------------------------
+        // Conditionals
         case("test-string", r#"[ a = a ] && echo eq; [ -n "" ] || echo empty; [ -z "" ] && echo z"#),
         case("test-numeric", r#"[ 3 -gt 2 ] && [ 2 -le 2 ] && echo num"#),
         case("dbracket-regex", r#"[[ ab12 =~ ([a-z]+)([0-9]+) ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#),
         case("dbracket-logic", r#"[[ a == a && b == b ]] && echo both; [[ a == b || c == c ]] && echo either"#),
         case("dbracket-lt", r#"[[ a < b ]] && echo lt"#),
-        // -- control flow ---------------------------------------------
+        // Control flow
         case("if-elif-else", r#"if false; then echo a; elif true; then echo b; else echo c; fi"#),
         case("for-in", r#"for i in 1 2 3; do printf '%s' "$i"; done; echo"#),
         case("for-cstyle", r#"for ((i=0;i<3;i++)); do printf '%s' "$i"; done; echo"#),
@@ -96,81 +79,53 @@ mod tests {
         case("case-fallthrough", r#"case ab in a*) echo one;;& *b) echo two;; esac"#),
         case("break-continue", r#"for i in 1 2 3 4; do [ $i = 2 ] && continue; [ $i = 4 ] && break; printf '%s' $i; done; echo"#),
         case("nested-break", r#"for i in 1 2; do for j in 1 2; do break 2; done; done; echo done"#),
-        // -- functions ------------------------------------------------
+        // Functions
         case("func-args", r#"f() { echo "$1-$2-$#"; }; f a b"#),
         case("func-return", r#"f() { return 3; }; f; echo $?"#),
         case("func-local", r#"x=out; f() { local x=in; g; }; g() { echo "$x"; }; f; echo "$x""#),
         case("func-recursion", r#"f() { [ "$1" = 0 ] && return; printf '%s' "$1"; f $(($1-1)); }; f 3; echo"#),
         case("func-in-subst", r#"f() { echo "$1"; }; echo "$(f inner)""#),
-        // -- quoting --------------------------------------------------
+        // Quoting
         case("quote-forms", r#"echo 'a$b' "a$UNSET_ZZ b" a\ b"#),
         case("quote-mixed", r#"x=v; echo "$x"'lit'"$x""#),
         case("quote-ansi-c", r#"printf '%s' $'a\tb\101\x41\n'"#),
-        // `$'...'` is quoting, so what comes out of it is no more
-        // subject to globbing than what comes out of `'...'`. bish
-        // treated it as unquoted text and listed the directory.
+        // `$'...'` is quoting, so its result isn't globbed.
         case("quote-ansi-c-does-not-glob", r#"touch afile bfile; echo $'*'; echo $'a*'"#),
         case("quote-ansi-c-keeps-its-spaces-as-one-word", r#"printf '[%s]' $'a b'; echo"#),
         case("quote-empty", r#"set -- "" a; echo "$#"; for w in "$@"; do echo "[$w]"; done"#),
-        // -- redirection ----------------------------------------------
+        // Redirection
         case("redir-basic", r#"echo hi > f; cat f; echo more >> f; wc -l < f"#),
         case("redir-stderr", r#"{ echo out; echo err >&2; } 2>/dev/null"#),
         case("redir-both", r#"{ echo out; echo err >&2; } > all 2>&1; sort all"#),
         case("redir-heredoc", "cat <<EOF\nline $((1+1))\nEOF"),
         case("redir-heredoc-quoted", "cat <<'EOF'\nno $expansion\nEOF"),
         case("redir-heredoc-tabs", "cat <<-EOF\n\tstripped\nEOF"),
-        // The two empty heredocs are different documents, and the
-        // serializer has to keep them apart: no body at all is no
-        // input, one empty line is a newline. `<<<''` says the second
-        // and there is no here-string that says the first.
-        // `declare -f` output is read -- by people, by completion
-        // scripts, by `sh -c "$(declare -f f); f"` -- so its layout is
-        // a compatibility surface and not a formatting preference.
-        // These are bash's shape, measured one construct at a time:
-        // where the `;` falls, which keyword shares a line with its
-        // condition, how deep an arm's body sits, which redirects take
-        // a space.
-        // `-ab` is two options in one word, and OPTIND names the
-        // word -- so how far into it a scan has got has to live
-        // somewhere the script cannot see. bish read the first letter
-        // and skipped the rest of the word.
+        // `-ab` is two options in one word. OPTIND names the word, so the
+        // position within it is state the script can't see.
         case(
             "getopts-clustered-options",
             r#"set -- -ab v x; while getopts ab: o; do echo "[$o:$OPTARG] OPTIND=$OPTIND"; done; echo "end=$OPTIND rest=${!OPTIND}""#,
         ),
-        // `$_` is the last word of the command before, expanded --
-        // or that command's own name when it had no arguments. It was
-        // never set at all here, so every one of these was empty.
-        //
-        // Nothing pins its *initial* value, deliberately: bash sets it
-        // from argv[0] as invoked, and the two shells are invoked by
-        // different names, so a case reading it before anything has
-        // run would be comparing the harness rather than the shells.
+        // `$_` is the last word of the previous command, or its name when it had
+        // no arguments. Its initial value isn't tested: bash sets it from argv[0],
+        // and the two shells are invoked by different names.
         case("underscore-is-the-last-argument", r#"true xyz; echo "[$_]""#),
         case("underscore-is-the-name-when-there-are-no-arguments", r#"true; echo "[$_]"; :; echo "[$_]""#),
         case("underscore-after-an-assignment-only-command", r#"true zz; x=1; echo "[$_]""#),
         case("underscore-is-the-expanded-word", r#"v=q; true "$v"; touch zz1; true zz*; echo "[$_]""#),
-        // Set after the command, so what runs *inside* one still sees
-        // the value from before it: a function body sees its caller's,
-        // and the call itself sets `$_` only once it returns.
+        // Set after the command, so a function body sees its caller's `$_`.
         case("underscore-inside-a-function-is-the-callers", r#"f(){ echo "[$_]"; }; true zz; f arg"#),
         case("underscore-after-a-function-is-the-calls-own", r#"f(){ true inner; }; true zz; f; echo "[$_]""#),
         case("underscore-through-nested-functions", r#"g(){ true deep; }; f(){ g inner; echo "[$_]"; }; true zz; f arg"#),
         case("underscore-after-a-compound", r#"if true zz; then :; fi; echo "[$_]"; for i in 1; do true loop; done; echo "[$_]""#),
-        // A pipeline stage and a subshell are not this shell, so
-        // neither touches its `$_`.
         case("underscore-is-untouched-by-a-pipeline", r#"true zz; echo a | cat > /dev/null; true ww; echo "[$_]""#),
         case("underscore-is-untouched-by-a-subshell", r#"true zz; ( true inner ); true ww; echo "[$_]""#),
         case("underscore-inside-a-command-substitution", r#"x=$(true qq; echo "[$_]"); echo "$x""#),
         case("underscore-survives-being-unset", r#"unset _; true zz; echo "[$_]""#),
-        // Having *an* expression is not the same as having consumed
-        // the input: the parser stopped at the first token it could
-        // not use and returned what it had, so `$((1 2))` was 1 and
-        // `$((sqrt 3))` was 0. Reported from real use.
         case("arith-rejects-a-trailing-token", r#"echo $((1 2)); echo rc=$?"#),
         case("arith-rejects-a-name-then-a-number", r#"echo $((sqrt 3)); echo rc=$?"#),
         case("arith-in-a-for-header-rejects-it-too", r#"for ((i=1 2; i<3; i++)); do :; done"#),
-        // The diagnostics, which had all been bish's own wording.
+        // Diagnostics, in bash's wording.
         case("arith-division-by-zero", r#"x=$((1/0)); echo rc=$?"#),
         case("arith-division-by-zero-in-a-command", r#"((1/0)); echo rc=$?"#),
         case("arith-modulo-by-zero", r#"echo $((1 % 0))"#),
@@ -179,32 +134,24 @@ mod tests {
         case("arith-ternary-without-a-colon", r#"echo $((1?2))"#),
         case("arith-a-character-that-is-not-arithmetic", r#"echo $((@))"#),
         case("arith-operand-expected", r#"echo $((1&&)); echo $((1+))"#),
-        // `++` is only an operator when there is a name to increment;
-        // otherwise it is two unary pluses, and bash answers 5.
         case("arith-increment-on-a-literal-is-two-signs", r#"echo $((++5)) $((--5))"#),
-        // A subscript that will not evaluate is the same failure as an
-        // expansion that will not, and was being swallowed.
+        // A subscript that won't evaluate fails like an expansion that won't.
         case("arith-a-subscript-that-does-not-evaluate", r#"a=(1); echo ${a[1/0]}; echo rc=$?"#),
         case("arith-a-subscript-with-a-trailing-token", r#"a=(1); echo ${a[1 2]}; echo rc=$?"#),
-        // POSIX `test` groups with `\( ... \)` and has no other way
-        // to; bish called it "too many arguments". And an operator it
-        // did not recognise answered *false* rather than erroring,
-        // which is the reading that lets a typo'd `-q` pass for a
-        // failed test forever.
+        // POSIX `test` groups with `\( ... \)`. An unknown operator is an error,
+        // not false.
         case("test-groups-with-parentheses", r#"[ \( 1 -eq 1 \) -a \( 2 -eq 2 \) ] && echo y"#),
         case("test-groups-with-or", r#"[ \( 1 -eq 2 \) -o \( 2 -eq 2 \) ] && echo y"#),
         case("test-a-negated-group", r#"[ ! \( 1 -eq 1 -o 2 -eq 2 \) ]; echo rc=$?"#),
         case("test-nested-groups", r#"[ \( \( 1 -eq 1 \) -a 1 \) -o 0 ] && echo y"#),
         case("test-a-group-of-one-word", r#"[ \( x \) ] && echo y; [ ! \( x \) ]; echo rc=$?"#),
-        // Three words where the middle one is an operator are a
-        // comparison, not a group -- which is what keeps a literal
-        // parenthesis comparable.
+        // Three words with an operator in the middle are a comparison, not a group.
         case("test-a-parenthesis-is-still-a-string", r#"[ "(" = "(" ] && echo y; [ "(" = ")" ]; echo rc=$?"#),
         case("test-an-unknown-operator-is-an-error", r#"[ x y ]; echo rc=$?"#),
         case("test-an-unknown-dash-operator-is-an-error", r#"[ -q x ]; echo rc=$?"#),
         case("test-unary-o-is-not-a-connective", r#"[ -o errexit -o -o xtrace ]; echo rc=$?"#),
         case("test-file-tests-in-a-group", r#"touch g; [ \( -e g -a -f g \) -o -d g ] && echo y"#),
-        // `return` ends a sourced file and gives the `.` its status.
+        // `return` ends a sourced file, and `.` returns its status.
         case("return-from-a-sourced-file", "printf 'echo in\\nreturn 4\\necho no\\n' > s.sh; . ./s.sh; echo rc=$?"),
         case("return-from-a-sourced-file-with-no-argument", "printf 'false\\nreturn\\n' > s.sh; . ./s.sh; echo rc=$?"),
         case(
@@ -213,20 +160,13 @@ mod tests {
         ),
         case("return-through-a-nested-source", "printf 'return 6\\n' > b.sh; printf '. ./b.sh\\necho mid=$?\\n' > a.sh; . ./a.sh; echo rc=$?"),
         case("return-at-the-top-level-is-a-usage-error", r#"return 3; echo rc=$?"#),
-        // A `#` inside a word is a character, not the start of a
-        // comment -- there is no position inside a word where one could
-        // begin. Everything from a leading `#` used to vanish.
+        // A `#` inside a word is a character, not a comment.
         case("a-hash-in-an-expansion-word", r#"echo "[${x:-# hi}]" "[${x:-#}]""#),
         case("a-hash-in-ps4", r#"PS4='# '; set -x; echo a"#),
         case("a-hash-still-starts-a-comment", r#"echo a # comment"#),
         case("a-hash-in-the-middle-of-a-word", r#"echo a#b"#),
-        // Every stage of a pipeline is traced, not just the first.
-        // Sorted, because the order is not bash's to promise: bash
-        // forks each stage and each *child* prints its own trace line,
-        // so which lands first is up to the scheduler. Measured rather
-        // than assumed -- 14 of 40 runs under load put the second stage
-        // first. Asserting the order would have been asserting a race,
-        // which is what the first version of these cases did.
+        // Sorted: each stage's child prints its own trace line, so the order is
+        // up to the scheduler in both shells.
         case("xtrace-traces-every-stage", r#"{ set -x; /bin/echo a | /bin/cat; set +x; } 2>t; sort t"#),
         case("xtrace-traces-three-stages", r#"{ set -x; /bin/echo a | /bin/cat | /bin/cat; set +x; } 2>t; sort t"#),
         case("xtrace-traces-a-stage-running-in-this-shell", r#"{ set -x; echo a | cat; set +x; } 2>t; sort t"#),
@@ -250,104 +190,67 @@ mod tests {
             "getopts-in-a-function-with-a-local-optind",
             r#"f(){ local OPTIND=1; while getopts ab: o; do echo "[$o:$OPTARG]"; done; }; f -ab v; f -a"#,
         ),
-        // A stage that will not start has exited 127; it has not ended
-        // the pipeline. Only the failing stage's own status and the
-        // last one's are asserted here: whether the stage *upstream*
-        // of a missing command finishes before its reader disappears
-        // is a race in both shells.
+        // A stage that won't start exits 127 without ending the pipeline. Only
+        // its status and the last stage's are asserted: whether the stage upstream
+        // of it finishes first is a race in both shells.
         case("a-missing-command-does-not-end-the-pipeline", r#"nosuchcmd | head -1; echo "ps=(${PIPESTATUS[@]}) q=$?""#),
         case("a-missing-command-later-in-a-pipeline", r#"echo x | nosuchcmd; echo "q=$? it=${PIPESTATUS[1]}""#),
         case("a-directory-as-a-pipeline-stage", r#"/etc | cat; echo "q=${PIPESTATUS[0]}""#),
-        // The DEBUG trap fires for every stage of a pipeline, before
-        // any of them runs -- all three traces of a three-stage
-        // pipeline arrive before its first byte. bish fired only for
-        // the stage that runs in this shell, so an all-external
-        // pipeline traced nothing at all.
-        //
-        // A *compound* stage is a subshell, and a DEBUG trap is not
-        // inherited into one, so nothing inside it traces. Firing in
-        // there was not merely an extra line: a stage's stdout is the
-        // pipe, so the trap's own output became the next stage's input.
+        // The DEBUG trap fires for every stage before any of them runs. A
+        // compound stage is a subshell, which doesn't inherit the trap, so nothing
+        // inside it traces.
         case("debug-trap-fires-for-every-pipeline-stage", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; /bin/echo a | /bin/cat | /bin/cat"),
         case("debug-trap-skips-a-compound-stage", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; { echo g; } | cat"),
         case("debug-trap-does-not-feed-the-pipe", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo a | { read v; echo \"got $v\"; }"),
         case("debug-trap-with-functrace-enters-a-subshell", "set -T; trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo a | { read v; echo \"got $v\"; }"),
-        // A loop or `case` header is a command too -- for `for`,
-        // `select` and `case`, though not for `if` or `while`, whose
-        // conditions are commands and fire on their own. The `for`
-        // header fires once per iteration, and not at all when the
-        // list is empty.
+        // A loop or `case` header is a command too, for `for`, `select` and
+        // `case` but not `if` or `while`, whose conditions fire on their own. The
+        // `for` header fires once per iteration, and not at all for an empty list.
         case("debug-trap-fires-for-a-for-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for i in a b; do :; done"),
         case("debug-trap-skips-an-empty-for", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for i in; do :; done; echo end"),
         case("debug-trap-names-the-positional-for", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; set -- z; for i; do echo $i; done"),
         case("debug-trap-fires-for-a-case-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; case x in x) echo m;; esac"),
         case("debug-trap-fires-for-a-select-header", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; select x in a b; do break; done < /dev/null"),
-        // Each section of an arithmetic `for` is its own command, and
-        // an omitted one is named `((1))`.
+        // Each section of an arithmetic `for` is its own command; an omitted one
+        // is named `((1))`.
         case("debug-trap-fires-for-each-arithmetic-section", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((i=0;i<2;i++)); do :; done"),
         case("debug-trap-names-an-omitted-section-as-one", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; for ((;;)); do break; done"),
-        // `{n,m}` was not parsed at all, and `{` is an ordinary
-        // character to this engine -- so `a{2}` matched the literal
-        // four-character text and did not match `aa`. Wrong in both
-        // directions, and silent in both.
+        // Interval expressions: `a{2}`.
         case("regex-interval-exact", r#"re="^a{2}$"; for v in a aa aaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-range", r#"re="^a{2,3}$"; for v in a aa aaa aaaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-open-ended", r#"re="^a{2,}$"; for v in a aa aaaa; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-on-a-group", r#"re="^(ab){2}$"; for v in ab abab ababab; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-on-a-class", r#"re="^[0-9]{3}$"; for v in 12 123 1234; do [[ $v =~ $re ]] && echo "$v y" || echo "$v n"; done"#),
         case("regex-interval-captures", r#"re="^(a{2})(b{1,2})$"; [[ aabb =~ $re ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#),
-        // `exit` inside a trap handler ends the script, and the
-        // statements after the signal never run. It used to run the
-        // handler and then carry on: against a `while :;` loop that
-        // meant the signal which was supposed to stop the program was
-        // the one thing that could not, and `shellbench` -- which stops
-        // every benchmark with `trap "exit 1" TERM` -- hung on bish
-        // for ever.
+        // `exit` in a trap handler ends the script there.
         case("trap-exit-ends-the-script", r#"trap 'echo TRAP; exit 7' TERM; kill -TERM $$; echo NOTREACHED"#),
         case("trap-exit-skips-the-statements-after-it", r#"trap 'exit 3' TERM; kill -TERM $$; for i in 1 2 3; do echo $i; done; echo NOTREACHED"#),
         case("trap-without-exit-carries-on", r#"trap 'echo TRAP' TERM; kill -TERM $$; echo AFTER"#),
-        // `$$` is the shell that started, in every context -- POSIX is
-        // explicit that a subshell does not change it, and `BASHPID` is
-        // the one that answers "which process is this". bish re-execs
-        // where bash forks, so a backgrounded subshell could not
-        // inherit the value through memory and reported its own pid
-        // instead. `kill -HUP -$$` from a background helper then
-        // signalled a process group that did not exist, which is how a
-        // benchmark harness came to wait for ever.
+        // `$$` is the shell that started, even in a subshell; `BASHPID` is the
+        // current process. bish re-execs where bash forks, so a background subshell
+        // has to be handed the value.
         case("dollar-dollar-is-the-same-in-a-background-subshell", r#"main=$$; ( [ "$$" = "$main" ] && echo same || echo differs ) & wait"#),
         case("dollar-dollar-is-the-same-in-a-plain-subshell", r#"main=$$; ( [ "$$" = "$main" ] && echo same || echo differs )"#),
-        // A negative target is a process group, and only the *first*
-        // argument to `kill` may be a signal. bish read the `-12345` of
-        // `kill -TERM -12345` as a second signal spec, found no such
-        // signal, and refused the whole command.
+        // A negative target is a process group; only the first argument may be
+        // a signal.
         case("kill-takes-a-process-group-as-a-target", r#"kill -TERM -999999 2>&1 | sed 's/.*kill: //'; kill -9 -999999 2>&1 | sed 's/.*kill: //'"#),
         case("kill-still-reads-a-leading-number-as-a-signal", r#"kill -999999 2>&1 | sed 's/.*kill: //'"#),
         case("kill-after-a-target-a-negative-is-another-target", r#"kill 999999 -888888 2>&1 | sed 's/.*kill: //'"#),
-        // POSIX lets a `case` arm open with `(`, and real scripts use
-        // it -- it is what keeps a `case` inside a `$( )` readable to
-        // anything counting parens. bish read `(a*)` as a subshell and
-        // called it a syntax error.
+        // POSIX lets a `case` arm open with `(`.
         case("case-arm-may-open-with-a-paren", r#"case abc in (a*) echo one;; (*) echo other;; esac"#),
         case("case-arm-paren-with-alternation", r#"for v in ab cd ef; do case $v in (a*|c*) echo "$v yes";; (*) echo "$v no";; esac; done"#),
         case("case-arm-paren-around-a-quoted-pattern", r#"case 'x|y' in ("x|y") echo quoted;; (*) echo other;; esac"#),
-        // KILL and STOP are the two signals `trap` must refuse, and
-        // bish keeps them out of the table that answers "may I catch
-        // this?" for exactly that reason. `kill` shared the table and
-        // so refused to *send* them -- while `kill -9` worked, since a
-        // number takes a different path.
+        // KILL and STOP can't be trapped, but they can be sent.
         case(
             "kill-accepts-the-uncatchable-signals-by-name",
             r#"for s in KILL SIGKILL STOP TERM; do kill -$s 2>&1 >/dev/null | grep -q 'invalid signal' && echo "$s rejected" || echo "$s ok"; done"#,
         ),
-        // A brace that does not open a well-formed interval stays an
-        // ordinary character, which is what every `awk '{print}'`
-        // pattern depends on.
+        // A brace that doesn't open a well-formed interval is an ordinary
+        // character, which `awk '{print}'` patterns depend on.
         case("regex-a-lone-brace-is-a-character", r#"[[ "a{" =~ ^a\{$ ]] && echo y || echo n; [[ "a{,}" =~ ^a{,}$ ]] && echo y || echo n"#),
-        // Which match a pattern finds, not merely whether it finds
-        // one. POSIX takes the longest match at the leftmost place one
-        // can start; a backtracker takes the first its own branch
-        // order reaches, and this engine was one. `(a|ab)` against
-        // `abc` is the shortest way to see the difference.
+        // Which match is found: POSIX takes the longest at the leftmost
+        // position, where a backtracker takes the first its branch order reaches.
+        // `(a|ab)` against `abc` shows the difference.
         case(
             "regex-takes-the-longest-match-not-the-first-branch",
             r#"re='(a|ab)'; [[ abc =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='x|xy'; [[ xy =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='ab|abc'; [[ abc =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
@@ -362,14 +265,7 @@ mod tests {
             "regex-leftmost-outranks-longest",
             r#"re='b|abc'; [[ xabc =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='a|bcd'; [[ abcd =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
         ),
-        // The pattern that used to be the end of the process: every
-        // way of splitting a run of `a`s, none of which works. Thirty
-        // characters was already 2^30 of them, so four hundred settles
-        // it -- either this returns at once or it never returns.
-        // Escapes that mean something other than the character after
-        // the backslash. Every one of these used to be that character:
-        // `\bbar` was `bbar`, so it matched nothing in `foo bar`, and
-        // said so without a word.
+        // Escapes that mean something other than the character after the backslash.
         case(
             "regex-word-boundaries",
             r#"for re in '\bbar' 'foo\b' '\Bar' '\<bar' 'bar\>'; do [[ "foo bar" =~ $re ]] && echo "$re [${BASH_REMATCH[0]}]" || echo "$re no"; done"#,
@@ -378,9 +274,7 @@ mod tests {
             "regex-shorthand-classes",
             r#"re='\w+'; [[ 'a_1 %' =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='\S+'; [[ '  xy' =~ $re ]]; echo "[${BASH_REMATCH[0]}]"; re='\s'; [[ 'ab cd' =~ $re ]]; echo "[${BASH_REMATCH[0]}]""#,
         ),
-        // `\d` is Perl's and glibc does not have it, so bash reads it
-        // as a literal `d`. Recorded because agreeing with the habit
-        // instead of with the shell would have been the easy mistake.
+        // `\d` is Perl's, and glibc doesn't have it, so bash reads a literal `d`.
         case(
             "regex-a-perl-shorthand-is-a-literal",
             r#"re='\d+'; [[ ab123 =~ $re ]] && echo "digits [${BASH_REMATCH[0]}]" || echo none; [[ add =~ $re ]] && echo "letters [${BASH_REMATCH[0]}]""#,
@@ -393,98 +287,67 @@ mod tests {
             "regex-a-nested-quantifier-does-not-hang",
             r#"t=$(printf 'a%.0s' {1..400}); re='^(a+)+$'; [[ $t =~ $re ]] && echo "y ${#BASH_REMATCH[0]}"; [[ ${t}b =~ $re ]] && echo bad || echo "n"; re='(a|aa)*b'; [[ $t =~ $re ]] && echo bad || echo n"#,
         ),
-        // A redirect a builtin will never read is still a redirect,
-        // and one that cannot be performed fails the command before it
-        // runs. `echo z <nosuch` printed `z` and returned 0, and
-        // `echo z <nosuch >out` created `out` -- bash reaches neither,
-        // because it performs them in order and stops at the first
-        // that will not open.
+        // A redirect is performed even for a builtin that never reads it, in
+        // order, and the first that won't open fails the command before it runs.
         case("a-builtin-fails-on-an-input-it-never-reads", r#"echo z <nosuch; echo rc=$?; : <nosuch; echo rc=$?"#),
         case("a-numbered-input-redirect-on-a-builtin", r#"echo z 3<nosuch; echo rc=$?"#),
         case("redirects-are-performed-in-order", r#"echo z <nosuch >out; echo rc=$?; ls out 2>&1 | head -1"#),
         case("a-builtin-still-reads-what-it-can-open", r#"printf x > have; echo z <have; echo rc=$?; printf "L\n" > f2; read v <f2; echo "[$v]""#),
-        // Opening the target to check it must not consume it: a
-        // process substitution is a pipe with a producer already
-        // writing into it.
+        // Opening the target to check it must not consume it: a process
+        // substitution is a pipe with a producer already writing.
         case(
             "checking-an-input-does-not-consume-a-process-substitution",
             r#"read v < <(echo hi); echo "[$v]"; mapfile -t a < <(printf "1\n2\n"); echo "${#a[@]}""#,
         ),
-        // Job control, probed as a whole. `jobs` accepted `-r` and
-        // `-s` and ignored them, so `jobs -s` listed a job that was
-        // plainly running; `disown` did not know `-h` was a flag at
-        // all, so `disown -h %1` said "no such job" and disowned it
-        // anyway.
+        // Job-control flags: `jobs -r` and `-s`, `disown -h`.
         case("jobs-r-lists-only-the-running", r#"sleep 0.3 & jobs -r | wc -l; jobs -s | wc -l; jobs | wc -l; wait"#),
         case("jobs-narrowed-after-a-job-finished", r#"true & wait; jobs -s | wc -l; jobs -r | wc -l"#),
         case("disown-h-keeps-the-job", r#"sleep 0.2 & disown -h %1; jobs | wc -l; wait 2>/dev/null; echo done"#),
         case("disown-h-with-no-spec", r#"sleep 0.2 & disown -h; jobs | wc -l; wait 2>/dev/null; echo done"#),
-        // The real-time signals did not exist here: `kill -l` stopped
-        // at 31, `kill -RTMIN` was an invalid specification, and a
-        // `trap` on one was accepted and then silently dropped --
-        // the pending-signal bitmask was 32 bits wide, so a signal
-        // above 32 could not be recorded when it arrived.
         case("kill-l-lists-the-real-time-signals", r#"kill -l | wc -w; kill -l | tr -s " \t\n" "\n" | tail -4 | tr "\n" " ""#),
         case("kill-l-names-the-real-time-range", r#"kill -l RTMIN; kill -l RTMAX; kill -l SIGRTMIN+1; kill -l RTMAX-14"#),
         case("kill-l-numbers-the-real-time-range", r#"kill -l 34; kill -l 49; kill -l 50; kill -l 64"#),
         case("a-real-time-signal-can-be-trapped", r#"trap "echo caught" RTMIN; kill -RTMIN $$; sleep 0.1; echo done"#),
         case("a-real-time-signal-by-offset", r#"trap "echo caught" SIGRTMIN+3; kill -s RTMIN+3 $$; sleep 0.1; echo done"#),
         case("a-signal-above-thirty-two-by-number", r#"trap "echo n" 40; kill -40 $$; sleep 0.1; echo done"#),
-        // 16 was missing from the named range entirely.
         case("sigstkflt-is-a-signal", r#"kill -l 16; trap "echo s" 16; kill -16 $$; sleep 0.1; echo done"#),
-        // `$BASH_COMMAND` names the command being run, as *written*.
-        // It was built from the expanded argv and assigned after the
-        // expansion, so a command reading it in its own words got the
-        // previous one -- and `echo "$v" a*` reported itself as
-        // `echo q a*`.
+        // `$BASH_COMMAND` is the command being run, as written, so a command that
+        // reads it sees itself.
         case("bash-command-names-the-command-being-run", r#"true; echo "[$BASH_COMMAND]""#),
         case("bash-command-is-the-unexpanded-text", "v=q; trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo \"$v\" a*"),
         case("bash-command-in-an-err-trap", "trap 'echo \"err=[$BASH_COMMAND]\"' ERR; false"),
         case("bash-command-names-a-redirect", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo z > /dev/null; echo z 2>&1 >>f; echo z >&2"),
         case("bash-command-keeps-backticks", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; echo `true`"),
-        // A trap's own body does not rename the command the trap is
-        // about, even though the body is made of commands too.
+        // A trap's own body doesn't change the command the trap is about.
         case("bash-command-survives-the-traps-own-body", "trap 'echo \"[$BASH_COMMAND]\"' DEBUG; true one; true two"),
-        // And the DEBUG trap fires before the command's expansions, so
-        // a `$( )` in it runs after the trap rather than before.
+        // The DEBUG trap fires before the command's expansions.
         case("debug-trap-fires-before-expansion", "trap \"echo TRAP >&2\" DEBUG; echo $(echo SUB >&2)"),
-        // A backslash before a newline is a line continuation: both
-        // characters go. bish turned it into a literal newline, so a
-        // wrapped command came out as two of them and `then
-        // \<newline>echo t` looked for a command called "<newline>echo".
+        // A backslash-newline is a line continuation: both characters go.
         case("a-backslash-newline-is-removed", "echo a\\\nb"),
         case("a-backslash-newline-inside-double-quotes", "echo \"a\\\nb\""),
         case("a-backslash-newline-in-an-assignment", "x=a\\\nb; echo \"[$x]\""),
         case("a-backslash-newline-between-words", "echo one \\\ntwo"),
         case("a-backslash-newline-before-a-command", "if true; then \\\necho t; fi"),
         case("a-backslash-newline-is-literal-in-single-quotes", "echo 'a\\\nb'"),
-        // The form every wrapped command in a real config file is
-        // written in: the continued line is *indented*. The lexer
-        // consumed the continuation from inside `read_word`, so the
-        // word it had started ended at the first of those spaces and
-        // came out as an extra empty argument between the two real
-        // ones -- which a `--flag=value` list quietly turns into a
-        // command with `''` in the middle of it.
+        // The usual form in config files: the continued line is indented. The
+        // indent must not become an empty argument.
         case("a-backslash-newline-before-an-indented-word", "printf '[%s]\\n' a \\\n    b \\\n    c"),
         case("a-backslash-newline-then-a-tab", "printf '[%s]\\n' a \\\n\tb"),
         case("a-trailing-backslash-newline-adds-no-word", "printf '[%s]\\n' a \\\n"),
-        // A status is the low byte of what was asked for: `exit -1` is
-        // 255 and `exit 300` is 44. bish handed the number back whole.
+        // A status is the low byte: `exit -1` is 255 and `exit 300` is 44.
         case("exit-status-is-one-byte", r#"(exit -1); echo $?; (exit 300); echo $?; (exit 256); echo $?"#),
         case("return-status-is-one-byte", r#"f(){ return -1; }; f; echo $?; g(){ return 300; }; g; echo $?"#),
-        // What `exit` does with arguments it cannot use. A word that is
-        // not a number is reported and *not* obeyed: bash 5.3 carries
-        // on with a status of 2 (posix mode aside). Two numbers is an
-        // error that still leaves, with 1. `--` ends the options.
+        // `exit` with a non-numeric word reports it and carries on with status 2
+        // (bash 5.3, outside posix mode). Two numbers is an error that still exits,
+        // with 1. `--` ends the options.
         case("exit-with-a-word-carries-on", r#"exit x 2>/dev/null; echo "rc=$?""#),
         case("exit-with-two-numbers-leaves-with-one", r#"( exit 5 2 ) 2>/dev/null; echo "rc=$?""#),
         case("exit-after-a-double-dash", r#"( exit -- 5 ); echo "rc=$?""#),
-        // The EXIT trap sees the status being left with, not the one
-        // the command before `exit` left behind.
+        // The EXIT trap sees the status being exited with, not the previous
+        // command's.
         case("the-exit-trap-sees-the-status-being-left-with", r#"trap 'echo "rc=$?"' EXIT; true; exit 4"#),
-        // A numbered-descriptor redirect on a construct used to send the
-        // whole construct to a separate bish, and everything it did to
-        // the shell went with it: assignments, `cd`, and `exit` itself.
+        // A numbered-descriptor redirect on a construct keeps what the construct
+        // does in this shell: assignments, `cd`, `exit`.
         case(
             "a-construct-with-a-numbered-fd-redirect-runs-in-this-shell",
             r#"{ x=1; } 3>f; while :; do y=2; break; done 3>g; f(){ z=3; }; f 4>h; mkdir -p d; { cd d; } 3>f2; echo "$x$y$z $(basename "$PWD")"; { exit 3; } 3>f; echo not-reached"#,
@@ -497,11 +360,9 @@ mod tests {
         ),
         // `. /dev/stdin` reads this command's stdin, wherever that is.
         case("source-reads-a-here-string-through-dev-stdin", r#". /dev/stdin <<< 'echo sourced'; { . /dev/stdin; } <<< 'echo grouped'"#),
-        // The shell itself, a command substitution and a process
-        // substitution all put back what a group, loop, `if` or builtin
-        // redirected before the EXIT trap runs. `"$BASH" -c` is the shell
-        // itself, whichever shell this is, with a trap whose output can be
-        // read back afterwards.
+        // The shell, a command substitution and a process substitution all
+        // restore what a group, loop, `if` or builtin redirected before the EXIT
+        // trap runs. `"$BASH" -c` is whichever shell is under test.
         case(
             "the-exit-trap-runs-once-the-shells-redirects-are-undone",
             r#""$BASH" -c 'trap "echo bye rc=\$?" EXIT; { echo in; exit 4; } > f'; "$BASH" -c 'trap "echo bye" EXIT; eval exit > g'; x=$(trap 'echo sub' EXIT; { exit; } > h); cat <(trap 'echo psub' EXIT; { exit; } > p); echo "f=[$(cat f)] g=[$(cat g)] h=[$(cat h)] p=[$(cat p)] x=[$x]""#,
@@ -520,10 +381,7 @@ mod tests {
         // `-c` alone is not a login shell, so `logout` refuses and the
         // script carries on. The login side is LOGIN_CASES.
         case("logout-outside-a-login-shell", r#"logout 2>/dev/null; echo "rc=$?"; logout 5 2>/dev/null; echo "rc=$?"; shopt login_shell"#),
-        // A prefix assignment belongs to the command it prefixes --
-        // all three kinds of command. It was expanded wherever each
-        // consumer wanted it, which meant twice for an external, never
-        // for a function's body, and never in the trace.
+        // A prefix assignment is expanded once, for every kind of command.
         case("prefix-assignment-is-expanded-once", r#"x=$(echo A >&2; echo a) /bin/echo hi"#),
         // The words first, then the assignments: `B` before `A`.
         case("prefix-assignment-is-expanded-after-the-words", r#"x=$(echo A >&2; echo a) /bin/echo $(echo B >&2; echo b)"#),
@@ -531,57 +389,49 @@ mod tests {
         case("prefix-assignment-is-restored-after-a-function", r#"p=old; f(){ echo "in=[$p]"; }; p=new f; echo "after=[$p]""#),
         case("prefix-assignment-reaches-a-redirected-function", r#"f(){ echo "[$p]"; }; p=1 f > /dev/null; f"#),
         case("prefix-assignment-reaches-a-builtin", r#"IFS=: read a b <<< "x:y"; echo "[$a][$b]""#),
-        // Traced before the command, in `=` form with the value the
-        // command will see -- so an appending prefix shows the result.
+        // Traced before the command, in `=` form with the value the command
+        // will see, so an appending prefix shows the result.
         case("xtrace-traces-a-prefix-assignment", r#"set -x; p=1 /bin/true; set +x"#),
         case("xtrace-traces-a-prefix-on-a-builtin", r#"set -x; p=1 read q < /dev/null; set +x"#),
         case("xtrace-traces-a-prefix-on-a-function", r#"f(){ :; }; set -x; p=1 f; set +x"#),
         case("xtrace-traces-an-appending-prefix", r#"p=x; set -x; p+=y /bin/true; set +x"#),
-        // A word is written back the way it was *spelled*, not merely
-        // the way it means. The tree records the meaning, so every
-        // literal used to come back single-quoted: `trap "echo t" EXIT`
-        // printed as `trap 'echo t' EXIT`, and `"x${y}z"` as
-        // `'x'"${y}"'z'`.
+        // `declare -f` output is re-sourced and read by scripts, so its layout
+        // follows bash's. A word is written back the way it was spelled:
+        // `trap "echo t" EXIT` keeps its double quotes.
         case("declare-f-keeps-each-kind-of-quote", "f() { echo \"a\" 'b' c\\ d; }; declare -f f"),
         case("declare-f-keeps-one-pair-of-double-quotes", r#"f() { echo "x${y}z" "a$x b"; }; declare -f f"#),
         case("declare-f-escapes-inside-double-quotes", r#"f() { echo "a\"b" "a\\b" "\$x"; }; declare -f f"#),
-        // An empty pair of quotes is a word, and `a""b` is one word
-        // with a pair in the middle. Only when the quotes held nothing
-        // at all, though: `"${a[@]:9}"` holds an expansion that
-        // vanishes, and must vanish with it.
+        // An empty pair of quotes is a word, and `a""b` one word with a pair in
+        // the middle; but `"${a[@]:9}"`, holding an expansion that vanishes,
+        // vanishes with it.
         case("declare-f-keeps-an-empty-quoted-word", r#"f() { echo "" '' a""b ""a; }; declare -f f"#),
         case("an-empty-expansion-in-quotes-is-not-a-word", r#"a=(1); c(){ echo $#; }; c "x" "${a[@]:9}" "y"; c "" x"#),
-        // `$'...'` is the exception bash makes: it prints the text that
-        // was resolved, as an ordinary literal.
+        // `$'...'` is the exception: bash prints the resolved text as an ordinary
+        // literal.
         case("declare-f-resolves-dollar-single-quotes", "f() { echo $'a\\tb'; }; declare -f f"),
         case("declare-f-keeps-backticks", r#"f() { echo `pwd` "`pwd`" $(pwd); }; declare -f f"#),
-        // A heredoc comes back as a heredoc, delimiter and all -- body
-        // below the line, then a blank one. `<<-` and a quoted
-        // delimiter both change what the body means, so both survive.
+        // A heredoc comes back as a heredoc: body below the line, then a blank
+        // one. `<<-` and a quoted delimiter change what the body means, so both
+        // survive.
         case("declare-f-keeps-a-heredoc", "f() { cat <<EOF\nhi\nEOF\n}; declare -f f"),
         case("declare-f-keeps-a-quoted-heredoc-delimiter", "f() { cat <<'E'\n$x\nE\n}; declare -f f"),
         case("declare-f-keeps-a-tab-stripping-heredoc", "f() { cat <<-T\n\tx\nT\n}; declare -f f"),
         case("declare-f-a-heredoc-with-a-command-after-it", "f() { cat <<EOF\nhi\nEOF\necho after; }; declare -f f"),
         case("declare-f-a-heredoc-in-a-pipeline", "f() { cat <<EOF | wc -l\na\nEOF\n}; declare -f f"),
-        // A dup comes back with the operator it was written with -- `<&`
-        // stays `<&`, where every dup used to come back as `>&` -- the
-        // descriptor always in front of a number, and in front of a
-        // variable only when it is not the one the operator means anyway.
-        // A close is `>&-` whichever way it was written, as bash has it.
+        // A dup keeps its operator (`<&` stays `<&`). The descriptor is printed
+        // before a number always, and before a variable only when it isn't the
+        // operator's default. A close is `>&-` however it was written.
         case(
             "declare-f-writes-a-dup-back-the-way-it-was-written",
             r#"f() { read a <&3; cat 3<&0; echo x >&2; echo y 4>&1; read b <&-; echo z 3>&-; fd=3; read c <&$fd; echo w >&$fd; cat 3<&$fd; echo v 4>&$fd; read d 0<&$fd; }; declare -f f"#,
         ),
-        // A heredoc on a group, or on the function itself, keeps its body
-        // too -- only a simple command's used to, so these printed a
-        // `<<EOF` with no document under it.
+        // A heredoc on a group, or on the function itself, keeps its body too.
         case(
             "declare-f-keeps-a-heredoc-on-a-group-and-on-a-function",
             "f() { { cat; } <<EOF\nhi\nEOF\n}\nh() { cat; } <<EOF\nx\nEOF\nf; h; declare -f f h",
         ),
-        // A command inside a redirected group or function reads that
-        // redirect -- which in a pane it did not, getting the pane's own
-        // terminal instead and waiting on it for ever.
+        // A command inside a redirected group or function reads that redirect,
+        // in a pane too.
         case("a-group-hands-its-stdin-redirect-to-the-command-inside", "echo data > f; { cat; } < f; k() { cat; } < f; k"),
         case("declare-f-two-heredocs-on-one-command", "f() { cat <<A <<B\n1\nA\n2\nB\n}; declare -f f"),
         case("declare-f-a-heredoc-inside-a-branch", "f() { if :; then cat <<E\nb\nE\nfi; }; declare -f f"),
@@ -591,14 +441,14 @@ mod tests {
         case("declare-f-two-statements", r#"f() { echo a; echo b; }; declare -f f"#),
         case("declare-f-a-bare-variable-stays-bare", r#"f() { echo $x ${y}; }; declare -f f"#),
         case("declare-f-if-then-else", r#"f() { if :; then echo a; else echo b; fi; echo c; }; declare -f f"#),
-        // bash does not print `elif` at all -- it nests the second
-        // `if` inside the first one's `else`.
+        // bash doesn't print `elif`; it nests the second `if` in the first one's
+        // `else`.
         case("declare-f-elif-becomes-a-nested-else", r#"f() { if :; then echo a; elif :; then echo b; fi; }; declare -f f"#),
         case("declare-f-a-condition-of-two-statements", r#"f() { if a; b; then echo t; fi; }; declare -f f"#),
         case("declare-f-while-keeps-do-on-its-line", r#"f() { while :; do break; done; }; declare -f f"#),
         case("declare-f-until", r#"f() { until :; do echo u; done; }; declare -f f"#),
-        // ...where `for` does not, and a `for` with no list prints the
-        // one it stands for.
+        // ...where `for` doesn't, and a `for` with no list prints the one it
+        // stands for.
         case("declare-f-for-puts-do-on-its-own-line", r#"f() { for i in 1 2; do echo $i; done; }; declare -f f"#),
         case("declare-f-for-without-a-list", r#"f() { for x; do echo $x; done; }; declare -f f"#),
         case("declare-f-arithmetic-for", r#"f() { for ((i=0;i<2;i++)); do echo $i; done; }; declare -f f"#),
@@ -620,28 +470,16 @@ mod tests {
         case("redir-heredoc-with-one-empty-line", "wc -c <<EOF\n\nEOF"),
         case("redir-herestring", r#"cat <<< "here string""#),
         case("redir-fd", r#"exec 3> three; echo x >&3; exec 3>&-; cat three"#),
-        // A bare `exec` moves this *process's* descriptors, and the
-        // shell has to write through them afterwards. It does not do so
-        // directly -- a builtin writes to its own sink, a spawned
-        // command is handed its own stdio -- and at the top level those
-        // amount to the same thing, so this only ever went wrong where
-        // something else answered first: inside a `$( )`, whose sink is
-        // the capture, and in a pane. `v=$(exec > f; echo hi)` put `hi`
-        // in `v` where bash puts it in the file.
-        //
-        // The builtin and the spawned command have to share a write
-        // position too, or the second one starts at nothing and
-        // overwrites the first.
+        // A bare `exec` moves this process's descriptors, and the shell's own
+        // output has to follow, including inside `$( )`: `v=$(exec > f; echo hi)`
+        // puts `hi` in the file. A builtin and a spawned command share the write
+        // position, or the second overwrites the first.
         case("a-bare-exec-redirect-catches-what-the-shell-prints-next", r#"exec > out; echo builtin; /bin/echo external; exec 1>&2; cat out"#),
         case("a-bare-exec-redirect-inside-a-substitution", r#"v=$(exec > out; echo builtin; /bin/echo external); echo "[$v]"; cat out"#),
         case("a-bare-exec-redirect-inside-a-subshell", r#"( exec > out; echo builtin; /bin/echo external ); echo after; cat out"#),
         case("a-bare-exec-redirect-of-stderr", r#"( exec 2> err; echo e >&2; /bin/ls /nosuch ); echo after; wc -l < err"#),
-        // The last command of a subshell is the one allowed to hand a
-        // pty-backed job off to be driven elsewhere -- and inside a
-        // subshell there is nowhere to drive it from, so in a pane its
-        // output was dropped and its status came back 0. Only in a pane,
-        // and only for the last one: `( /bin/echo a; /bin/echo b )`
-        // printed just `a`.
+        // The last command of a subshell, which in a pane could be handed off
+        // to a pty: its output and status still arrive.
         case(
             "a-subshells-last-command-is-waited-for",
             r#"( /bin/echo one ); ( /bin/echo a; /bin/echo b ); ( /bin/false ); echo "rc=$?"; ( /bin/sh -c 'exit 7' ); echo "rc=$?""#,
@@ -650,34 +488,26 @@ mod tests {
             "a-subshells-last-command-decides-a-condition",
             r#"if ( /bin/false ); then echo t; else echo f; fi; if ( /bin/true ); then echo t; else echo f; fi"#,
         ),
-        // -- pipelines and subshells ----------------------------------
+        // Pipelines and subshells
         case("pipeline", r#"printf 'b\na\n' | sort | head -1"#),
         // A half-line from a builtin has to reach fd 1 before the child
         // that writes to the same fd next.
         case("flush-order", r#"printf A; printf B | cat; printf C; echo"#),
         case("flush-order-stderr", r#"printf E >&2; printf F | cat; echo"#),
         case("pipeline-status", r#"false | true; echo $?; set -o pipefail; false | true; echo $?"#),
-        // A pipeline stage that needs a shell runs in this process
-        // rather than as a re-exec'd bish, when it is the only such
-        // stage -- see run_multi's own `inproc_stage`. Everything below
-        // is what must not change because of that: the stage is still a
-        // subshell, it still reports its own status positionally, and
-        // it still dies when the thing reading it goes away.
+        // A lone stage that needs a shell runs in this process (`run_multi`'s
+        // `inproc_stage`). It must still behave as a subshell, report its own
+        // status, and die when its reader goes away.
         case("pipeline-stage-is-a-subshell", r#"x=1; { x=2; echo "in=$x"; } | cat; echo "out=$x""#),
-        // The whole of what the re-exec'd stage could not carry across.
-        // Each of these was individually fixable by adding one more
-        // thing to the preamble a re-exec'd stage is handed; none of
-        // them needed fixing once the stage stopped being a re-exec.
+        // What a re-exec'd stage couldn't carry across.
         case("dirs-in-a-pipeline", r#"cd /; pushd /usr >/dev/null; dirs | cat"#),
         case("alias-in-a-pipeline", r#"alias q=x; alias | cat"#),
         case("trap-in-a-pipeline", r#"trap 'echo t' INT; trap -p | cat"#),
         case("complete-in-a-pipeline", r#"complete -W 'a b' foo; complete -p foo | cat"#),
         case("jobs-in-a-pipeline", r#"sleep 0.2 & jobs -p | grep -cE '^[0-9]+$'"#),
         case("pipeline-stage-cd-does-not-escape", r#"cd /; { cd /usr; echo "in=$PWD"; } | cat; echo "out=$PWD""#),
-        // Paths a script names resolve against the *shell's* directory.
-        // Indistinguishable from the process's until two shells share
-        // one process, which is what an in-process pipeline stage is --
-        // so these pin the behaviour that has to survive that.
+        // Paths resolve against the shell's directory, not the process's. An
+        // in-process stage shares the process with the shell.
         case("redirect-is-relative-to-the-shells-cwd", r#"mkdir -p d/e; cd d/e; echo hi > rel.txt; cat rel.txt; cd ../..; cat d/e/rel.txt"#),
         case("source-is-relative-to-the-shells-cwd", r#"mkdir -p d; printf 'echo sourced\n' > d/s.sh; cd d; . ./s.sh"#),
         case("glob-is-relative-to-the-shells-cwd", r#"mkdir -p d/e; : > d/e/a.rs; : > d/e/b.txt; : > top.rs; cd d/e; echo *.rs"#),
@@ -688,20 +518,10 @@ mod tests {
         case("pipeline-stage-exit-status", r#"{ exit 3; } | cat; echo "${PIPESTATUS[*]} rc=$?""#),
         case("pipeline-stage-pipefail", r#"set -o pipefail; { exit 3; } | cat; echo "rc=$?""#),
         case("pipeline-stage-in-the-middle", r#"/bin/echo a b | { read x y; echo "$y $x"; } | cat"#),
-        // Every pipeline case above this point ends in `cat`, and `cat`
-        // cannot tell a stage that wrote *into* the pipe from one that
-        // wrote straight past it -- both come out looking identical.
-        // That blind spot hid a real bug for the whole life of this
-        // corpus: a builtin stage writes to the shell's own output
-        // sink, and at the top level that sink *is* fd 1, so the pipe
-        // got the bytes by luck. Put the same pipeline inside `$( )`,
-        // where the sink is a capture buffer instead, and the builtin
-        // wrote into the capture while the next stage read an empty
-        // pipe -- `x=$(echo hello | wc -c)` gave "hello" for bash's 6.
-        //
-        // So: a last stage that *transforms* what it reads, and a
-        // capture around the pipeline. Both halves are needed. Either
-        // one alone still passes with the bug in place.
+        // Every case above ends in `cat`, which can't tell a stage that wrote
+        // into the pipe from one that wrote past it to fd 1. A last stage that
+        // transforms its input, inside a capture, catches that: `x=$(echo hello |
+        // wc -c)` is 6. Either half alone passes with the bug in place.
         case("capture-a-pipeline-from-a-builtin", r#"x=$(echo hello | wc -c); echo "[$x]""#),
         case("capture-a-pipeline-through-tr", r#"echo "[$(echo a b c | tr ' ' -)]""#),
         case(
@@ -722,13 +542,11 @@ b
         ),
         case("capture-a-pipeline-from-a-group", r#"x=$({ echo one; echo two; } | wc -l); echo "[$x]""#),
         case("capture-a-pipeline-in-a-subshell", r#"x=$( (echo hi | wc -c) ); echo "[$x]""#),
-        // The same shape one level further in: a capture inside a
-        // capture, since the sink a stage must not write to is then the
-        // *inner* one.
+        // The same one level further in, where the sink to avoid is the inner
+        // capture.
         case("capture-inside-a-captured-pipeline", r#"x=$(echo "$(echo hi | wc -c)" | tr -d ' '); echo "[$x]""#),
-        // Transforming last stages at the top level too -- the same
-        // pipelines with no capture around them, so a fix that broke
-        // the ordinary case would be caught here rather than in a pane.
+        // The same pipelines without a capture, so a fix that breaks the plain
+        // case shows up here.
         case(
             "pipeline-into-a-transforming-stage",
             r#"echo hello | wc -c; printf 'a
@@ -736,33 +554,29 @@ b
 ' | wc -l; echo hi | tr a-z A-Z"#,
         ),
         case("pipeline-stage-through-three", r#"echo a b c | tr ' ' '\n' | wc -l"#),
-        // More than a pipe buffer's worth, so the stage has to be
-        // running at the same time as the thing draining it.
+        // More than a pipe buffer, so the stage has to run while its output is
+        // drained.
         case("pipeline-stage-outlasts-the-pipe-buffer", r#"for i in $(seq 1 5000); do echo "line $i"; done | wc -l"#),
-        // The reader leaves first. A stage that is its own process dies
-        // of SIGPIPE here; one running in the shell has to stop anyway,
-        // with the same status, or this never terminates at all.
+        // The reader leaves first. A stage that is its own process dies of
+        // SIGPIPE; one running in the shell has to stop too, with the same
+        // status.
         case("pipeline-stage-reader-leaves-early", r#"for i in $(seq 1 100000); do echo "l$i"; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
         case("pipeline-stage-unbounded-reader-leaves", r#"while true; do echo x; done | head -2; echo "ps=${PIPESTATUS[*]}""#),
-        // Two or more stages that need a shell cannot take turns by
-        // running one of them in this shell: each would be waiting on a
-        // pipe the other is on the far end of. Those run as coroutines
-        // over one thread -- see run_multi_scheduled -- and everything
-        // below is what that has to keep true.
+        // Two or more stages that need a shell run as coroutines on one thread
+        // (`run_multi_scheduled`): each would otherwise wait on a pipe the other
+        // holds.
         case("two-shell-stages", r#"echo x | while read l; do echo "[$l]"; done"#),
         case("two-shell-stages-both-compound", r#"{ echo one; echo two; } | { read a; read b; echo "$b $a"; }"#),
         case("three-shell-stages", r#"echo hi | { read v; echo "$v $v"; } | { read a b; echo "$b-$a"; }"#),
         case("shell-stage-between-two-externals", r#"/bin/echo a b | { read x y; echo "$y $x"; } | cat"#),
-        // More than a pipe buffer, so neither stage can finish without
-        // the other running -- the thing a single-threaded shell could
-        // not do at all before.
+        // More than a pipe buffer, so neither stage finishes without the other
+        // running.
         case(
             "two-shell-stages-outlast-the-pipe-buffer",
             r#"for i in $(seq 1 5000); do echo "l$i"; done | { c=0; while read l; do c=$((c+1)); done; echo "$c"; }"#,
         ),
-        // A stage's pipes have to be its *real* fd 0 and fd 1, or none
-        // of this works: an external inheriting the rest of the input,
-        // and `exec {fd}<&0`, both go through the descriptors.
+        // A stage's pipes have to be its real fds 0 and 1: an external inheriting
+        // the rest of the input, and `exec {fd}<&0`, both use them.
         case("shell-stage-hands-the-rest-to-an-external", r#"{ echo a; echo b; } | { read -r x; echo "x=$x"; cat; }"#),
         case("shell-stage-can-dup-its-own-stdin", r#"echo x | { exec {fd}<&0; read -r -u "$fd" l; echo "[$l]"; }"#),
         case("two-shell-stages-status", r#"{ exit 3; } | { read v; }; echo "ps=${PIPESTATUS[*]}""#),
@@ -770,10 +584,8 @@ b
         case("two-shell-stages-are-subshells", r#"x=1; { x=2; echo "$x"; } | { read v; echo "in=$v"; }; echo "out=$x""#),
         case("two-shell-stages-cd-does-not-escape", r#"{ echo a; } | { read v; cd /tmp; }; echo "$PWD""#),
         case("two-shell-stages-reader-leaves-early", r#"while true; do echo x; done | { read v; echo "got=$v"; }"#),
-        // Every shape where one side stops before the other is done.
-        // These are the cases that hang rather than answer wrongly,
-        // which is why the harness reports a timeout as its own kind of
-        // failure -- every one of them printed the right thing first.
+        // Every shape where one side stops first. These hang rather than answer
+        // wrongly, which is why the harness reports a timeout separately.
         case("unbounded-shell-producer-into-an-external-head", r#"while true; do echo x; done | head -1"#),
         case("unbounded-external-producer-into-a-shell-reader", r#"yes | { read v; echo "got=$v"; }"#),
         case("unbounded-producer-in-the-middle", r#"echo start | { while read l; do echo "$l"; done; } | head -1"#),
@@ -781,11 +593,9 @@ b
         case("both-sides-bounded-but-uneven", r#"seq 1 10000 | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
-        // The real process environment is shared by every in-process
-        // construct here, so what a foreground subshell exports must not
-        // outlive it -- a real fork gets that isolation from the kernel,
-        // and this shell has to put it back by hand. See the env journal
-        // in exec.rs.
+        // In-process constructs share the real environment, so what a
+        // foreground subshell exports has to be undone by hand (the env journal in
+        // exec.rs).
         case("subshell-export-does-not-escape", r#"(export E=inner); echo "[${E-unset}]""#),
         case("subshell-export-restores-the-old-value", r#"export E=outer; (export E=inner); echo "$E""#),
         case("subshell-unset-does-not-escape", r#"export E=outer; (unset E); echo "$E""#),
@@ -793,19 +603,16 @@ b
         case("nested-subshell-exports-unwind-in-order", r#"export E=a; (export E=b; (export E=c); echo "$E"); echo "$E""#),
         case("subshell-export-is-visible-to-a-child-of-that-subshell", r#"(export E=inner; env | grep '^E='); echo "[${E-unset}]""#),
         case("exported-var-still-reaches-an-external-command", r#"export E=v; env | grep '^E='"#),
-        // What a child's environment is built from -- see
-        // `Shell::command`. Each of these is a way the shell's own view
-        // and the process environment can disagree.
+        // Ways the shell's view and the process environment can disagree, in
+        // what a child gets (see `Shell::command`).
         case("exported-local-shadows-the-global-for-a-child", r#"export E=outer; f() { local -x E=inner; env | grep '^E='; }; f; env | grep '^E='"#),
         case("exported-but-unset-exports-nothing", r#"export E; env | grep -c '^E=' || true"#),
         case("exported-then-unset-is-gone-from-a-child", r#"export E=v; unset E; env | grep -c '^E=' || true"#),
         case("export-n-removes-it-from-a-child", r#"export E=v; export -n E; env | grep -c '^E=' || true"#),
         case("assignment-after-export-is-seen-by-a-child", r#"export E=first; E=second; env | grep '^E='"#),
         case("a-child-sees-a-var-exported-inside-a-function", r#"f() { export E=fromfn; }; f; env | grep '^E='"#),
-        // `export` is global even inside a function; `declare` and
-        // `local -x` are not. bish stored all three as locals, which
-        // appeared to work only because the value was also written to
-        // the real process environment and read back from there.
+        // `export` is global even inside a function; `declare` and `local -x`
+        // are not.
         case("export-in-a-function-is-global", r#"f() { export E=fromfn; }; f; echo "[$E]""#),
         case("declare-in-a-function-is-not", r#"f() { declare Z=5; }; f; echo "[$Z]""#),
         case("local-x-in-a-function-is-not", r#"export E=outer; f() { local -x E=inner; echo "in=[$E]"; }; f; echo "out=[$E]""#),
@@ -822,44 +629,25 @@ b
         case("command-subst", r#"echo "$(printf a)$(printf b)""#),
         case("command-subst-backtick", "echo \"`printf a`\""),
         case("process-subst", r#"cat <(printf 'p\n')"#),
-        // The content is right whichever way round, and only reached a
-        // builtin's redirect once every simple command drained.
         case("proc-sub-out-to-a-builtins-redirect", r#"echo hi > >(cat)"#),
         case("proc-sub-out-to-an-externals-redirect", r#"/bin/echo hi > >(cat)"#),
         case("proc-sub-out-that-answers-at-eof", r#"printf 'a\nb\n' > >(wc -l)"#),
         case("proc-sub-out-as-an-argument", r#"tee >(wc -l) < /etc/hostname > /dev/null"#),
-        // `>( )` runs concurrently with the command writing to it, so
-        // a body that answers only at end-of-input still answers.
+        // `>( )` runs concurrently with the command writing to it, so a body that
+        // answers only at end of input still answers.
         //
-        // Both of these are piped into `sort` on purpose. Where the
-        // body's output lands relative to the *next* command is a race
-        // neither shell settles: the substitution is not waited for, so
-        // it comes down to whether the body gets scheduled before the
-        // shell's next write. bash reliably wins that race because it
-        // does almost nothing between closing the pipe and the next
-        // command; bish unlinks, pumps and reaps in between, and loses
-        // it about one run in five under load. Asserted directly, the
-        // case passed four whole-suite runs and then failed one --
-        // which is worse than not asserting it, because a corpus that
-        // fails at random stops being read. `sort` makes the case about
-        // what is actually promised: the body runs, and everything it
-        // writes arrives.
+        // Piped into `sort` because where the body's output lands relative to the
+        // next command is a race in both shells: the substitution isn't waited
+        // for. What's promised is that everything it writes arrives.
         case("proc-sub-out-body-output-all-arrives", r#"{ echo hi > >(cat); echo done; } | sort"#),
         case("proc-sub-out-with-a-shell-body", r#"printf 'a\nb\n' > >(while read l; do echo "<$l>"; done)"#),
         case("proc-sub-out-two-at-once", r#"{ printf 'x\n' > >(cat) 2>/dev/null; printf 'y\n' > >(cat); } | sort"#),
         case("proc-sub-out-larger-than-a-pipe-buffer", r#"seq 1 20000 > >(wc -l)"#),
-        // A redirect target is expanded once. It used to be expanded
-        // twice for an external command -- once to build a sink that
-        // an external does not use, once for the spawn -- so a target
-        // with a side effect had it twice, and one that is not stable
-        // could name two different files.
+        // A redirect target is expanded once, even for an external command.
         case("redirect-target-is-expanded-once", r#"/bin/echo x > $(echo side >&2; echo out.txt); cat out.txt"#),
         case("redirect-target-expanded-once-for-a-builtin", r#"echo x > $(echo side >&2; echo out.txt); cat out.txt"#),
-        // `<( )` streams: the producer is a coroutine given time while
-        // the shell waits for whatever is consuming it, rather than
-        // being run to completion into a temp file first. The two that
-        // could not work the old way are the unbounded producers --
-        // running those to completion never finishes.
+        // `<( )` streams: the producer runs as a coroutine while the shell waits
+        // on its consumer, so an unbounded producer works.
         case("process-subst-streams-from-an-unbounded-producer", r#"head -2 <(yes)"#),
         case("process-subst-streams-from-an-unbounded-shell-producer", r#"head -3 <(while true; do echo x; done)"#),
         case("process-subst-two-at-once", r#"cat <(echo a) <(echo b)"#),
@@ -870,12 +658,10 @@ b
         case("process-subst-producer-sees-the-shells-variables", r#"x=v; cat <(echo "$x")"#),
         case("process-subst-does-not-leak-descriptors", r#"for i in 1 2 3 4 5; do cat <(echo $i) >/dev/null; done; ls /proc/self/fd | wc -l"#),
         case("group-command", r#"{ echo a; echo b; } | wc -l"#),
-        // `time` is a reserved word, so it takes a whole pipeline and
-        // a group, and `echo time` is still a word. The numbers vary,
-        // so these look at the shape.
-        // The numbers vary, so the cases that can be compared are the
-        // ones a format makes stable. `format_times`' own unit test
-        // covers the arithmetic.
+        // `time` is a reserved word, so it takes a whole pipeline and a group,
+        // and `echo time` is still a word. The numbers vary, so only output a
+        // format makes stable is compared; `format_times`' unit test covers the
+        // arithmetic.
         case("time-format-literal", r#"TIMEFORMAT='timed'; time true"#),
         case("time-format-percent", r#"TIMEFORMAT='%%'; time true"#),
         case("time-status", r#"TIMEFORMAT='t'; time false; echo "status=$?""#),
@@ -883,7 +669,7 @@ b
         case("time-group", r#"TIMEFORMAT='t'; time { echo g; }"#),
         case("time-negated", r#"TIMEFORMAT='t'; ! time false; echo "status=$?""#),
         case("time-not-a-word", r#"echo time; x=time; echo "$x"; echo "$(echo time)""#),
-        // -- globbing -------------------------------------------------
+        // Globbing
         case("glob-star", r#": > ga; : > gb; printf '%s,' g*; echo"#),
         case("glob-class", r#": > g1; : > g2; printf '%s,' g[12]; echo"#),
         case("glob-question", r#": > gx; printf '%s,' g?; echo"#),
@@ -893,16 +679,14 @@ b
         case("shopt-nullglob", r#": > kept; shopt -s nullglob; printf '[%s]' zz_no_match*; printf '[%s]' kept; echo"#),
         case("shopt-dotglob", r#": > .hidden; : > shown; shopt -s dotglob; printf '[%s]' *; echo"#),
         case("shopt-nocaseglob", r#": > ABC; shopt -s nocaseglob; printf '[%s]' abc*; echo"#),
-        // A quoted word is not a pattern however many metacharacters
-        // it has in it, so none of the above may touch it.
+        // A quoted word is never a pattern.
         case("shopt-nullglob-quoted", r#"shopt -s nullglob; printf '[%s]' 'a*b'; echo"#),
         // Every component may be a pattern, not only the last.
         case("glob-multi-component", r#"mkdir -p m/one m/two; : > m/one/f.c; : > m/two/f.c; printf '[%s]' m/*/f.c */*.c; echo"#),
         case("glob-question-component", r#"mkdir -p m/one; : > m/one/f; printf '[%s]' m/?ne/f; echo"#),
         case("glob-missing-dir", r#"printf '[%s]' nodir_zz/*; echo"#),
-        // `**` is any number of directories, none included, and it
-        // does not descend through a symlink where a single `*` still
-        // steps through one.
+        // `**` is any number of directories, including none, and doesn't descend
+        // through a symlink, where `*` does.
         case("globstar-all", r#"mkdir -p a/b/c; : > x; : > a/x; : > a/b/x; shopt -s globstar; printf '[%s]' **; echo"#),
         case("globstar-suffix", r#"mkdir -p a/b/c; : > x; : > a/x; : > a/b/c/x; shopt -s globstar; printf '[%s]' **/x; echo"#),
         case("globstar-middle", r#"mkdir -p a/b/c; : > a/x; : > a/b/c/x; shopt -s globstar; printf '[%s]' a/**/x; echo"#),
@@ -914,10 +698,8 @@ b
         case("brace-range", r#"echo {1..5} {a..e} {1..9..3}"#),
         case("brace-nested", r#"echo {a,b{1,2}}"#),
         case("tilde", r#"echo ~ | grep -c /"#),
-        // A word ends at an operator as much as at a space, and a tilde
-        // that is the whole of the last word in a command is where that
-        // shows: `cd ~; pwd` is how anyone types it. Compared against
-        // `$HOME` rather than printed, so the case says nothing about
+        // A tilde that is the whole last word before an operator still expands:
+        // `cd ~; pwd`. Compared against `$HOME` so the case doesn't depend on
         // where the corpus put the directory.
         case("tilde-before-semicolon", r#"[ "$(echo ~;)" = "$HOME" ] && echo expanded || echo literal"#),
         case("tilde-before-and", r#"[ "$(echo ~&&true)" = "$HOME" ] && echo expanded || echo literal"#),
@@ -926,10 +708,8 @@ b
         case("tilde-in-a-for-list", r#"for i in ~; do [ "$i" = "$HOME" ] && echo expanded || echo literal; done"#),
         // ...and `#` still does not end one, mid-word.
         case("tilde-then-hash-is-literal", r#"echo ~#"#),
-        // An assignment's value is the other place a tilde prefix can
-        // begin: after the `=`, and after every unquoted `:` in it, which
-        // is what makes `PATH=~/bin:~/sbin` work. Compared against
-        // `$HOME` for the same reason as the cases above.
+        // In an assignment a tilde prefix can start after the `=` and after every
+        // unquoted `:`, which makes `PATH=~/bin:~/sbin` work.
         case("tilde-in-an-assignment", r#"x=~/y; [ "$x" = "$HOME/y" ] && echo expanded || echo literal"#),
         case("tilde-after-a-colon-in-an-assignment", r#"p=~/a:~/b; [ "$p" = "$HOME/a:$HOME/b" ] && echo expanded || echo literal"#),
         case("tilde-in-an-appending-assignment", r#"x=1; x+=:~/y; [ "$x" = "1:$HOME/y" ] && echo expanded || echo literal"#),
@@ -937,15 +717,14 @@ b
         case("tilde-in-an-exported-assignment", r#"export e=~/z; [ "$e" = "$HOME/z" ] && echo expanded || echo literal"#),
         case("tilde-in-a-local-assignment", r#"f() { local v=~/l; [ "$v" = "$HOME/l" ] && echo expanded || echo literal; }; f"#),
         case("tilde-in-an-assignment-shaped-argument", r#"[ "$(echo x=~/y)" = "x=$HOME/y" ] && echo expanded || echo literal"#),
-        // And the four shapes bash leaves alone, which say nothing about
-        // any path and so can simply be printed: a flag is not a name, a
-        // name does not start with a digit, a quoted name is not one
-        // either, and a `:` outside an assignment is just a colon.
+        // The four shapes bash leaves alone: a flag isn't a name, a name doesn't
+        // start with a digit, a quoted name isn't one, and a `:` outside an
+        // assignment is a colon.
         case("tilde-after-a-flag-equals-is-literal", r#"echo --opt=~/y"#),
         case("tilde-after-a-digit-name-is-literal", r#"echo 9x=~/y"#),
         case("tilde-after-a-quoted-name-is-literal", r#"echo "a"=~/b"#),
         case("tilde-after-a-colon-outside-an-assignment-is-literal", r#"echo a:~/b"#),
-        // -- builtins -------------------------------------------------
+        // Builtins
         case("echo-flags", r#"echo -n a; echo; echo -e 'a\tb'"#),
         case("printf-recycle", r#"printf '%s-%s\n' a b c d"#),
         case("printf-width", r#"printf '[%5s][%-5s][%05d]\n' a b 42"#),
@@ -969,28 +748,23 @@ b
         case("type-builtin", r#"type -t echo; type -t nosuchthing_zz; echo $?"#),
         case("getopts", r#"set -- -a -b val; while getopts "ab:" o; do echo "$o=${OPTARG-}"; done"#),
         case("trap-exit", r#"trap 'echo bye' EXIT; echo body"#),
-        // `trap -p` prints `trap -- 'code' SIG`, so the builtin has to
-        // be able to read that back -- without `--` ending the options
-        // it set a trap whose action was `--`.
+        // `trap -p` prints `trap -- 'code' SIG`, and `trap` has to read that back.
         case("trap-reads-its-own-output", r#"trap -- 'echo t' USR1; trap -p | head -1"#),
         case("pushd-n-adds-without-moving", r#"cd /; pushd -n /usr >/dev/null; pushd -n /tmp >/dev/null; dirs; echo "cwd=$PWD""#),
-        // What a construct that still re-execs can see of the shell
-        // that started it. A co-process starts once and lives, so
-        // replaying these costs nothing per use -- unlike a pipeline
-        // stage, which is why they are carried here and the pipeline
-        // stopped re-execing instead.
+        // What a construct that still re-execs can see of its parent shell. A
+        // co-process starts once, so carrying this state costs nothing per use.
         case("coproc-sees-the-directory-stack", r#"pushd /usr >/dev/null; coproc CP { dirs; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
         case("coproc-sees-traps", r#"trap 'echo t' USR1; coproc CP { trap -p | head -1; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
         case("coproc-sees-completions", r#"complete -W 'a b' foo; coproc CP { complete -p foo; }; read -r l <&"${CP[0]}"; echo "[$l]""#),
         case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; read -r l <&"${CP[0]}"; echo "[$l]""#),
         case("eval", r#"x=1; eval 'x=$((x+1))'; echo $x"#),
         case("source-file", "printf 'sourced=1\\n' > lib.sh; . ./lib.sh; echo $sourced"),
-        // -- errors and status ----------------------------------------
+        // Errors and status
         case("exit-status", r#"true; echo $?; false; echo $?"#),
         case("set-e", r#"set -e; (false; echo unreached); echo $?"#),
         case("set-u", r#"set -u; echo "${undefined_zz-ok}""#),
         case("and-or", r#"true && echo t; false || echo f; false && echo no; echo $?"#),
-        // -- the roadmap-9 builtin gaps -------------------------------
+        // Builtin flags
         case(
             "test-v",
             r#"x=1; a=(q); declare -A m; m[k]=1; [[ -v x ]] && echo x; [[ -v a[0] ]] && echo a; [[ -v m[k] ]] && echo m; [[ -v nope_zz ]] || echo no"#,
@@ -1002,21 +776,17 @@ b
         case("export-f", r#"f() { :; }; export -f f; echo $?; export -f nosuch_zz; echo $?"#),
         case("read-t0", r#"read -t 0 < /dev/null; echo $?"#),
         case("set-o", r#"set -C -o pipefail; set -o > oo; grep -E '^(noclobber|pipefail|xtrace) ' oo"#),
-        // `set -r` has to survive becoming a real process. Every one of
-        // these shapes re-execs, and every one of them used to arrive
-        // unrestricted and run whatever it was given -- the preamble
-        // replayed the `-o` options and restriction has no `-o` name.
+        // `set -r` has to survive a re-exec. Restriction has no `-o` name, so
+        // replaying the `-o` options doesn't carry it.
         case("restricted-keeps-a-backgrounded-subshell", r#"set -r; ( /bin/echo X ) & wait"#),
         case("restricted-keeps-a-backgrounded-group", r#"set -r; { /bin/echo X; } & wait"#),
         case("restricted-keeps-a-redirected-compound", r#"set -r; ( /bin/echo X ) <> /dev/null"#),
         // `<>` writes, so a restricted shell may not have it either.
         case("restricted-refuses-an-in-out-redirect", r#"set -r; exec 3<>/dev/null; echo "status=$?""#),
-        // ...and the things it may still do, so this is a fence and not
-        // a wall: a bare name is allowed, and a builtin always was.
+        // ...and what it may still do: a bare name, and any builtin.
         case("restricted-still-runs-a-bare-name", r#"set -r; ( env true && echo ran ) & wait"#),
-        // `set -n`: the one flag whose whole job is that what follows
-        // does not happen. Every case here is about something *not*
-        // appearing, which is why the first of them names what should.
+        // `set -n`: what follows doesn't run. The first case names what should
+        // appear.
         case("noexec-stops-what-follows", r#"echo before; set -n; echo after"#),
         case("noexec-cannot-be-undone", r#"echo before; set -n; set +n; echo after"#),
         case("noexec-by-its-long-name", r#"echo before; set -o noexec; echo after"#),
@@ -1024,7 +794,7 @@ b
         case("noexec-skips-a-trap", r#"echo before; trap 'echo trapped' EXIT; set -n; echo after"#),
         case("noexec-leaves-the-status-alone", r#"true; set -n; false; echo "never=$?""#),
         case("ulimit-p", r#"ulimit -p"#),
-        // -- roadmap 10: what bish used to accept and bash never did --
+        // Things bash never accepted
         case("readonly-array", r#"readonly a=(1); echo "[${a[*]}]"; a+=(2); echo "rc=$?""#),
         case("readonly-scalar-is-fatal", r#"readonly x=1; x=2; echo unreached"#),
         case("readonly-unset", r#"readonly x=1; unset x; echo "rc=$?""#),
@@ -1039,17 +809,11 @@ b
         case("declare-bad-identifier", r#"export 1bad=1"#),
         case("bad-array-subscript", r#"declare -A m; m[]=1; echo unreached"#),
         case("bad-substitution", r#"echo ${x!y}; echo unreached"#),
-        // stderr goes to /dev/null throughout: the *wording* of an
-        // arithmetic error differs between the two shells (bish's
-        // arith.rs names its own tokens), and what this case is about
-        // is that a `$(( ))` failure stops the script while the `(( ))`
-        // command below does not.
+        // stderr is discarded because the two shells word arithmetic errors
+        // differently. What matters is that a `$(( ))` failure stops the script
+        // and the `(( ))` command below doesn't.
         case("arith-expansion-is-fatal", r#"{ echo $((1+)); } 2>/dev/null; echo unreached"#),
         case("arith-command-is-not", r#"((1+)) 2>/dev/null; echo after"#),
-        // A parameter expansion with an operator in it, inside `$(( ))`.
-        // The plain `${x}` form was read by the arithmetic lexer itself
-        // and everything else came out as 0 -- which is how
-        // `f $((${1:-0}+1))` came to pass 1 for ever.
         case("arith-parameter-default", r#"unset u; echo "$(( ${u:-5} + 1 ))" "$(( ${u-5} + 1 ))""#),
         case("arith-parameter-length", r#"x=abcde; echo "$(( ${#x} ))""#),
         case("arith-array-length", r#"a=(1 2 3); echo "$(( ${#a[@]} + 1 ))""#),
@@ -1058,8 +822,7 @@ b
         case("arith-unset-plain-is-zero", r#"unset u; echo "$(( ${u} ))" "$(( u ))""#),
         case("arith-empty-is-zero", r#"echo "[$(( ))]"; (( )); echo "rc=$?""#),
         case("error-if-unset", r#": ${x:?}; echo unreached"#),
-        // A NUL cannot survive into a shell word -- the word ends up as
-        // an argument to `execve`, which stops at the first one -- so
+        // A NUL can't survive into a word, since `execve` would stop at it, so
         // both shells drop it and say so once per substitution.
         case("command-substitution-drops-a-nul", r#"x=$(printf 'a\0b'); printf '%s\n' "$x""#),
         case("command-substitution-warns-once-per-nul-run", r#"x=$(printf 'a\0b\0c'); printf '%s\n' "$x""#),
@@ -1067,23 +830,21 @@ b
         case("funcnest-limits-recursion", r#"FUNCNEST=5; f() { f; }; f; echo unreached"#),
         case("funcnest-ignores-a-non-number", r#"FUNCNEST=abc; f() { echo in; }; f"#),
         case("funcnest-zero-is-no-limit", r#"FUNCNEST=0; f() { echo in; }; f"#),
-        // Sourced from a file, with stderr discarded: a syntax error
-        // is reported differently by the two shells (bash echoes the
-        // offending line back, bish does not), and what these are about
-        // is that the construct is rejected at all -- which `.` turns
-        // into an ordinary non-zero status the script can see.
+        // Sourced with stderr discarded: the two shells report a syntax error
+        // differently (bash echoes the line), and `.` turns the rejection into a
+        // status the script can see.
         case("array-assignment-needs-attached-parens", "printf 'arr= (a b)\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("function-body-must-be-compound", "printf 'f() echo hi\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("empty-if-body", "printf 'if true; then fi\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("empty-loop-condition", "printf 'while; do :; done\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("declare-subscript", r#"declare 'a[0]=5'; echo "${a[0]}""#),
-        // -- roadmap 11: variables are not the environment ------------
+        // Variables are not the environment
         case("plain-assignment-is-not-exported", r#"x=1; env | grep -c '^x=1$'"#),
         case("export-is", r#"export y=2; env | grep -c '^y=2$'"#),
         case("export-n-keeps-the-value", r#"export z=1; export -n z; env | grep -c '^z='; echo "[$z]""#),
         case("a-child-sees-only-exports", r#"a=1; export b=2; env | grep -cE '^(a|b)='"#),
         case("read-nul-delimited", "printf 'a\\0b\\0' | while read -r -d '' v; do printf '[%s]' \"$v\"; done; echo"),
-        // -- roadmap 12: an array is many words -----------------------
+        // An array is many words
         case("array-copy", r#"a=(1 2 3); b=("${a[@]}"); c=(x "${a[@]}" y); echo "${#b[@]} ${#c[@]}""#),
         case("array-literal-splits", r#"s="p q"; d=($s); e=("$s"); echo "${#d[@]} ${#e[@]}""#),
         case("array-transform-per-element", r#"a=("x y" z); printf '[%s]' "${a[@]@Q}"; echo"#),
@@ -1093,14 +854,14 @@ b
         case("nested-subscript-assign", r#"a=(1 2); b=(0); a[b[0]]=9; echo "${a[0]}""#),
         case("index-append", r#"declare -A m; m[k]+=v; m[k]+=w; a=(x); a[0]+=y; echo "${m[k]} ${a[0]}""#),
         case("nameref-to-an-array", r#"a=(1 2); declare -n r=a; echo "${r[1]} ${#r[@]} ${r[*]}"; r[0]=9; echo "${a[0]}""#),
-        // -- roadmap 13: a pipeline stage is this shell's child --------
+        // A pipeline stage is this shell's child
         case("stage-sees-globals", r#"x=1; f() { echo "[$x]"; }; { echo "[$x]"; } | cat; f | cat; (echo "[$x]") | cat"#),
         case("stage-sees-shell-options", r#"set -u; { echo "${nosuch-ok}"; } | cat; shopt -s nullglob; { shopt nullglob; } | cat"#),
         case("read-leaves-the-rest-of-the-pipe", r#"{ echo a; echo b; } | { read -r x; echo "x=$x"; cat; }"#),
         case("lastpipe", r#"shopt -s lastpipe; set +m; n=0; seq 1 3 | while read -r l; do n=$((n+1)); done; echo "$n""#),
         case("lastpipe-status", r#"shopt -s lastpipe; set +m; false | true; echo "${PIPESTATUS[*]}"; true | false; echo "rc=$?""#),
         case("shopt-status", r#"shopt nullglob; echo "rc=$?"; shopt -s nullglob; shopt nullglob; echo "rc=$?""#),
-        // -- roadmap 14: the descriptors the shell owns ----------------
+        // The descriptors the shell owns
         case(
             "builtin-reads-a-shell-fd",
             r#"exec 3</etc/hostname; read -r a <&3; exec 3<&-; exec 4</etc/hostname; read -r -u 4 b; exec 4<&-; [ "$a" = "$b" ] && echo same"#,
@@ -1110,7 +871,7 @@ b
         case("varfd-dup", r#"echo x | { exec {fd}<&0; read -r -u "$fd" l; echo "[$l]"; }"#),
         case("mapfile-counted-options", "printf '1\\n2\\n3\\n4\\n' | { mapfile -t -s 1 -n 2 a; echo \"${#a[@]} ${a[*]}\"; }"),
         case("mapfile-origin", "printf '1\\n2\\n' | { mapfile -t -O 5 a; echo \"${!a[*]}\"; }"),
-        // -- roadmap 15: errexit's actual rules ------------------------
+        // errexit's rules
         case("errexit-exempts-a-chain-member", r#"set -e; f() { false; }; f && echo ok; false && echo no; echo after"#),
         case("errexit-still-fires-on-the-last", r#"set -e; true && false; echo unreached"#),
         case("errexit-and-pipefail", r#"set -euo pipefail; false | true; echo unreached"#),
@@ -1118,7 +879,7 @@ b
         case("errexit-on-a-failed-capture", r#"set -e; x=$(false); echo unreached"#),
         case("inherit-errexit", r#"set -e; x=$(false; echo reached); echo "[$x]""#),
         case("set-cluster-ending-in-o", r#"set -euo pipefail; set -o | grep -cE '^(errexit|nounset|pipefail) +on'"#),
-        // -- roadmap 16: expansions that nest, diagnostics that read --
+        // Nested expansions and diagnostics
         case(
             "dollar-lt-file",
             r#"printf 'x
@@ -1132,17 +893,14 @@ y
         case("not-executable-is-126", r#"/etc/hosts; echo "rc=$?"; /etc; echo "rc=$?""#),
         case("missing-path-is-127", r#"./nosuchpath_zz; echo "rc=$?""#),
         case("source-a-directory", r#". /etc; echo "rc=$?"; source /nosuch_zz; echo "rc=$?""#),
-        // -- roadmap 17: local, FUNCNAME and the call stack ------------
+        // local, FUNCNAME and the call stack
         case("local-shadows-as-unset", r#"x=out; f() { local x; echo "[${x-unset}]"; }; f; echo "[$x]""#),
         case("declare-with-no-value-is-unset", r#"declare z; echo "[${z-unset}]"; g() { declare y; echo "[${y-unset}]"; }; y=out; g"#),
         case("nounset-status", r#"set -u; echo "$nosuch_zz""#),
         case("bare-array-is-element-zero", r#"a=(1 2); echo "[$a]"; declare -A m=([k]=v); echo "[$m]""#),
         case("funcname-scalar", r#"f() { echo "[$FUNCNAME]"; }; f"#),
         case("funcname-has-no-main-frame-under-c", r#"f() { g; }; g() { echo "${FUNCNAME[*]} n=${#FUNCNAME[@]}"; }; f"#),
-        // -- roadmap 18: the last of the parser's leniency -------------
-        // Sourced with stderr discarded, so what is compared is that
-        // the construct is rejected -- the two shells word a syntax
-        // error differently (bash echoes the offending line back).
+        // Parser strictness. Sourced, as above.
         case("two-defs-no-separator", "printf 'f() { :; } f() { :; }\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case(
             "brace-group-needs-a-terminator",
@@ -1150,27 +908,18 @@ y
         ),
         case("unterminated-brace-expansion", "printf 'echo ${x\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("c-for-needs-both-parens", "printf 'for ((i=0; i<2; i++) do :; done\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
-        // bash rejects this at parse time and abandons the whole
-        // input; bish rejects it when the condition runs. Sourced, so
-        // both are an ordinary non-zero status the script can see.
+        // bash rejects this at parse time and bish when the condition runs;
+        // sourced, both are a non-zero status.
         case("dbracket-rejects-a-fourth-operand", "printf '[[ a == b == c ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
-        // An operator with nothing to operate on. Every one of these
-        // used to be answered rather than refused -- `[[ -z ]]` was
-        // "the string `-z` is not empty, so true", which is a wrong
-        // answer wearing a right one's clothes. Sourced, same as the
-        // case above, so the status is something the script can see.
-        // Inside `${...}` there is no word to end, so a metacharacter
-        // is text -- the body was already scanned to its matching brace.
-        // Breaking on one truncated both halves: `${s//:/a|b}` replaced
-        // with `a`, and `${s//|/x}` searched for the empty string and so
-        // matched everywhere.
+        // Inside `${...}` a shell metacharacter is text: the body was already
+        // scanned to its matching brace.
         case(
             "expansion-operands-keep-shell-metacharacters",
             r#"s=a:b; echo "${s//:/|}" "${s//:/a|b}" "${s//:/;}" "${s//:/>}" "${s//:/(}" "${s//|/x}" "${s:-x|y}""#,
         ),
-        // `&` in a replacement is the matched text, and `\&` is an
-        // ampersand. The difference has to survive quote removal, which
-        // is why it is decided on the chunks and not on the string.
+        // `&` in a replacement is the matched text and `\&` an ampersand. The
+        // difference has to survive quote removal, so it's decided on the chunks,
+        // not the string.
         case(
             "ampersand-in-a-replacement-is-the-match",
             r#"s=aXb; echo "${s//X/&}" "${s//X/[&]}" "${s//X/&&}" "${s//X/\&}" "${s//X/\\&}" "${s/#a/&&}""#,
@@ -1180,15 +929,13 @@ y
         case("dbracket-binary-with-no-right-side", "printf '[[ a -eq ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("dbracket-two-words-and-no-operator", "printf '[[ a b ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
         case("dbracket-with-nothing-in-it", "printf '[[ ]]\\n' > s.sh; . ./s.sh 2>/dev/null; echo \"rc=$?\""),
-        // `-a` is the one word that is both a unary operator and a
-        // binary one, and only the count of words around it says which.
-        // Two words is the file test, three is the `and`.
+        // `-a` is both a unary and a binary operator, decided by the word count:
+        // two words is the file test, three the `and`.
         case(
             "dash-a-is-a-file-test-or-an-and-depending-on-arity",
             r#"[[ -a /etc/passwd ]] && echo exists; [ x -a y ] && echo both; [[ -a /nope ]] || echo gone"#,
         ),
-        // These answered "does it exist" rather than "may I", so a
-        // read-only file read as writable.
+        // The permission tests ask "may I", not "does it exist".
         case(
             "permission-tests-ask-the-kernel",
             r#"[ -r /etc/passwd ] && echo r; [ -w / ] || echo "not w"; [ -x /bin/sh ] && echo x; [ -w /etc/passwd ] || echo "passwd not w""#,
@@ -1197,19 +944,15 @@ y
             "nocasematch-covers-case",
             r#"shopt -s nocasematch; case AB in ab) echo ci;; esac; [[ ABC == abc ]] && echo dbracket; [ ABC = abc ] || echo literal"#,
         ),
-        // -- roadmap 19: the builtins and flags nobody had needed -------
+        // Less common builtins and flags
         case("printf-star-width", r#"printf '%*d|%-*d|%.*f|%*.*f|\n' 5 42 5 42 2 3.14159 8 2 3.14159"#),
         case("tilde-user-and-dirs", r#"cd /tmp; cd /; echo "$(echo ~+) $(echo ~-)"; echo ~nosuchuser_zz"#),
-        // Not through a pipe: `jobs` as a pipeline stage is its own
-        // divergence (see jobs-in-a-pipeline).
+        // Not through a pipe: `jobs` as a pipeline stage is its own divergence.
         case("jobs-p-and-l", r#"sleep 0.2 & jobs -p > p; jobs > j; grep -cE '^[0-9]+$' p; grep -c Running j"#),
         case("type-a-lists-every-match", r#"type -a echo"#),
-        // Declaring a name an array is not assigning one to it: bash
-        // prints `declare -a A` for the first and `declare -a A=()` for
-        // the second, and the attribute is what makes a later plain
-        // `B=x` mean `B[0]=x`. All of it hangs on keeping the attribute
-        // and the value apart, which is why the empty cases are here
-        // next to the ones that carry a value.
+        // Declaring an array isn't assigning one: bash prints `declare -a A` for
+        // the first and `declare -a A=()` for the second. The attribute is what
+        // makes a later `A=x` mean `A[0]=x`.
         case("declare-p-of-a-declared-but-unassigned-array", r#"declare -a A; declare -p A; A=(); declare -p A"#),
         case("declare-p-of-a-declared-but-unassigned-assoc", r#"declare -A M; declare -p M; M=(); declare -p M"#),
         case("plain-assignment-to-an-array-writes-element-zero", r#"declare -a B; B=x; declare -p B; declare -A N; N=y; declare -p N"#),
@@ -1227,129 +970,95 @@ y
         case("source-takes-arguments", "printf 'echo \"[$1][$#]\"\\n' > s.sh; set -- outer; . ./s.sh a b; echo \"after=[$1]\""),
         case("xtrace-traces-assignments", r#"PS4='XX '; set -x; x=1; y="a b"; a=(1 2)"#),
         case("true-and-false-are-builtins", r#"type -t true; type -t false; true; echo "rc=$?"; false; echo "rc=$?""#),
-        // -- roadmap 21: the redirects that were syntax errors ---------
+        // Redirects
         case("stderr-to-a-saved-fd", r#"exec 3>&1; echo a 2>&3; exec 3>&-; echo b 3>&1 >&2 2>&3 3>&-"#),
         case("close-an-unopened-fd", r#"{ echo a; } 3>&-; echo b 4>&-"#),
         case("dup-to-a-word-fd", r#"exec 3>&1; f=3; echo hi >&$f; echo two >&$((1+2)); exec 3>&-"#),
         case("dup-to-a-closed-fd", r#"echo x >&9; echo "rc=$?""#),
-        // The whole redirect list, in source order, for a real child as
-        // well as for a builtin. A descriptor names what it names *at
-        // that point*, which is what makes the swap idiom work -- and
-        // doing fds 0/1/2 first, through the Command builder, and the
-        // numbered ones afterwards meant `3>&1` copied stdout's final
-        // destination instead of the one it had when the dup was
-        // written. Both spellings, since a builtin and an external
-        // reach it by different routes.
+        // The redirect list runs in source order, for an external as well as a
+        // builtin, and a descriptor names what it names at that point: that's what
+        // makes the swap idiom work. Both spellings, since builtins and externals
+        // get there by different routes.
         case("fd-swap-then-redirect-external", r#"/bin/echo x 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
         case("fd-swap-then-redirect-compound", r#"{ echo o; echo e >&2; } 3>&1 1>&2 2>&3 3>&- 2>/dev/null"#),
-        // Every file the list names is opened, even one a later
-        // redirect supersedes: only `b` survives, and `a` is still
-        // created and truncated.
+        // Every file the list names is opened, even one a later redirect
+        // supersedes: `a` is still created and truncated.
         case("a-superseded-redirect-still-creates-its-file", r#"/bin/echo x > a > b; ls a b; echo x 2>c 2>d; ls c d"#),
-        // A construct's `2>` reaches an *external* inside it, not just
-        // the builtins: it used to reach the output sink and nothing
-        // else, so the commonest way of silencing a block did nothing
-        // for the commands it was written for.
+        // A construct's `2>` reaches the externals inside it too.
         case("a-compounds-stderr-reaches-externals", r#"{ /bin/ls /nosuch; } 2>/dev/null; echo done; { /bin/ls /nosuch; } 2>e; wc -l < e"#),
         case("a-loops-stderr-reaches-externals", r#"for i in 1; do /bin/ls /nosuch; done 2>/dev/null; echo done"#),
         case("a-functions-stderr-reaches-externals", r#"f() { /bin/ls /nosuch; }; f 2>/dev/null; echo done"#),
-        // A dup names the descriptor as it stands *at that point in the
-        // list*, so these two are different destinations and not one
-        // rule with an exception. Both spellings, because a builtin
-        // resolves its redirects through the output sink and a compound
-        // command through its child shell's -- two code paths that both
-        // used to collapse the pair into "wherever the other stream
-        // ends up", which silently sent the first case to /dev/null.
+        // A dup names the descriptor as it stands at that point in the list, so
+        // these are two different destinations. Both spellings, because a builtin
+        // and a compound command resolve redirects by different paths.
         case("dup-to-stderr-that-is-itself-redirected", r#"echo e >&2 2>/dev/null; echo done"#),
         case("dup-to-stderr-that-was-already-redirected", r#"echo e 2>/dev/null >&2; echo done"#),
         case("compound-dup-to-stderr-that-is-itself-redirected", r#"{ echo e; } >&2 2>/dev/null; echo done"#),
         case("compound-dup-to-stderr-that-was-already-redirected", r#"{ echo e; } 2>/dev/null >&2; echo done"#),
-        // Both streams on one destination share a write position --
-        // opened once, or duped, but never opened twice.
+        // Both streams on one destination share a write position: opened once,
+        // or duped, never opened twice.
         case("both-streams-one-file-keeps-one-position", r#"{ echo out; echo err >&2; } >f 2>&1; cat f"#),
         case("dup-before-the-redirect-it-would-have-followed", r#"{ echo a; echo b >&2; } 2>&1 >f; cat f; echo "--""#),
         case("coproc-round-trip", r#"coproc CP { cat; }; echo hi >&"${CP[1]}"; sleep 0.2; read -r l <&"${CP[0]}"; echo "back=[$l]""#),
-        // -- roadmap 20: a lone bracket is not a pattern ---------------
+        // A lone bracket is not a pattern
         case("lone-bracket-is-literal", r#"printf '%s,' [ ] '[abc'; echo; [ 1 -lt 2 ] && echo test-works"#),
-        // -- roadmap 22: parameter expansion's last corners ------------
+        // Parameter expansion corners
         case("count-of-the-positionals", r#"set -- a b c; echo "${#@} ${#*} $#""#),
         case("omitted-slice-offset", r#"a=(1 2 3); echo "${a[@]::2}"; x=abcdef; echo "${x::3}"; set -- a b c; echo "${@:1:1}""#),
-        // -- roadmap 24: a redirect on a function call -----------------
+        // A redirect on a function call
         case("function-call-redirect", r#"f() { echo a; /bin/echo b; echo e >&2; }; f > o 2> e; cat o e; rm -f o e"#),
         case("function-call-redirect-fd", r#"f() { echo x; }; f 3>&1 >o; cat o; rm -f o"#),
         case(
             "dbracket-quoted-pattern",
             r#"[[ abc == a* ]] && echo glob; [[ abc == "a*" ]] || echo literal; p='a*'; [[ abc == $p ]] && echo var-globs; [[ abc == "$p" ]] || echo var-literal"#,
         ),
-        // -- roadmap 23: the command line the shell is invoked with ----
+        // How the shell was invoked
         case("bash-versinfo", r#"echo "${#BASH_VERSINFO[@]} ${BASH_VERSINFO[3]} ${BASH_VERSINFO[4]}""#),
-        // The harness clears the environment, so both shells start
-        // from no SHLVL at all and must reach 1 -- the increment is
-        // what is being checked, not the inherited value.
+        // The harness clears the environment, so both shells start with no SHLVL
+        // and must reach 1.
         case("shlvl-starts-at-one", r#"echo "$SHLVL""#),
-        // -- what a sweep of untested ground turned up ------------------
-        // `cd` reads the *shell's* HOME and OLDPWD. Reading the process
-        // environment instead meant a plain assignment was invisible to
-        // it (while `echo ~`, which does read the shell, honoured the
-        // same assignment) and `unset` did not take.
+        // `cd` reads the shell's HOME and OLDPWD, not the process environment's.
         case("cd-uses-the-shells-home", r#"mkdir -p h; HOME=$PWD/h; cd; [ "$PWD" = "$(cd h 2>/dev/null; pwd)" ] || pwd"#),
         case("cd-dash-uses-the-shells-oldpwd", r#"mkdir -p a b; cd a; cd ../b; cd - > /dev/null; basename "$PWD""#),
         case("cd-with-no-home-fails", r#"unset HOME; cd 2>/dev/null; echo "rc=$?""#),
-        // A shell remembers the route, not the destination: `cd link`
-        // leaves `$PWD` ending in `link`, and `cd ..` from there goes
-        // back to where `link` sits rather than to the parent of what
-        // it points at. Storing what `getcwd` reported resolved every
-        // symlink instead, so `pwd` answered what only `pwd -P` should
-        // -- and `cd -P`, documented here as an accepted no-op, was in
-        // fact the only behaviour there was.
+        // A shell remembers the route, not the destination: after `cd link`,
+        // `$PWD` ends in `link`, and `cd ..` goes back to where `link` sits. Only
+        // `pwd -P` resolves symlinks.
         case("cd-keeps-the-route-it-was-given", r#"mkdir -p b/c; ln -s b/c link; cd link; echo "${PWD##*/}"; pwd -P | sed 's|.*/\(.\)$|\1|'"#),
         case("cd-dot-dot-is-lexical", r#"mkdir -p b/c; ln -s b/c link; cd link; cd ..; echo "${PWD##*/}""#),
         case("cd-physical-resolves-first", r#"mkdir -p b/c; ln -s b/c link; cd -P link; echo "${PWD##*/}"; cd ..; echo "${PWD##*/}""#),
         case("cd-normalises-dots-it-was-given", r#"mkdir -p b/c; cd ./b/../b/c; echo "${PWD##*/}""#),
         case("cd-dash-with-no-oldpwd-fails", r#"unset OLDPWD; cd - 2>/dev/null; echo "rc=$?""#),
-        // Unsetting a variable that came from the environment has to
-        // actually unset it. The lookups ended in a real-environment
-        // fallback, so the name came straight back -- while a child's
-        // environment, built from the shell's own tables, really had
-        // lost it. The two answers disagreed about the same variable.
+        // Unsetting a variable inherited from the environment unsets it for
+        // lookups and children alike.
         case("unset-an-inherited-variable", r#"echo "[${HOME-gone}]"; unset HOME; echo "[${HOME-gone}]""#),
         case("unset-an-inherited-variable-under-nounset", r#"unset HOME; set -u; echo "$HOME" 2>/dev/null; echo "rc=$?""#),
         case("unset-then-set-again", r#"unset HOME; HOME=/x; echo "$HOME""#),
-        // `type` knows five kinds, in this order, and knew two.
+        // `type` knows five kinds, in this order.
         case("type-of-a-keyword", r#"type if; type -t for; type -t "[["; type -t "!"; type -t time"#),
-        // Reported only where it would actually be expanded, which is
-        // why the case turns the shopt on: `alias -p` lists it either
-        // way, but under `-c` bash's `type` says "not found".
+        // Reported only where it would be expanded, hence the shopt: under `-c`
+        // without it, bash's `type` says "not found".
         case("type-of-an-alias", r#"shopt -s expand_aliases; alias ll="ls -l"; type ll; type -t ll"#),
         case("type-of-an-unexpanded-alias", r#"alias ll="ls -l"; alias -p; type -t ll; echo "rc=$?""#),
-        // An alias starts applying to the statements *after* the one
-        // that defined it, which bish could not do at all: it read a
-        // whole source before running any of it, so `alias ll="ls -d"`
-        // on one line and `ll /` on the next found no alias.
+        // An alias applies from the statement after the one that defined it.
         //
-        // The lines are written into a file and sourced rather than
-        // being newlines of the case itself, so that the case still
-        // means the same thing after the serializer round-trip test has
-        // flattened it -- which is the whole point here, since what is
-        // being tested is precisely that newlines matter. The wording of
-        // "command not found" differs between the shells, so these ask
-        // the status instead.
+        // The lines go through a sourced file, not newlines in the case itself, so
+        // the case means the same after the serializer round-trip test flattens
+        // it: newlines are what's being tested. "command not found" is worded
+        // differently by the shells, so these check the status.
         case(
             "an-alias-applies-to-later-lines",
             r#"shopt -s expand_aliases; printf '%s\n' 'alias hi="echo A"' 'hi' 'hi extra' 'true; hi' > al; . ./al"#,
         ),
-        // ...but not within the statement that defined it: bash reads a
-        // whole statement before running any of it, so an alias defined
-        // in one cannot reach the rest of the same one. This one needs
-        // no file -- it is all on one line already.
+        // ...but not within the statement that defined it, since bash reads a
+        // whole statement before running any of it.
         case(
             "an-alias-does-not-apply-within-its-own-statement",
             r#"shopt -s expand_aliases; alias hi="echo A"; hi 2>/dev/null; echo "rc=$?"; alias ho="echo B" ; true ; ho 2>/dev/null; echo "rc=$?""#,
         ),
-        // A statement spanning lines is still one statement, so a use on
-        // the line it *ends* on is inside it and does not expand, while
-        // the next line does. Start lines alone cannot tell those apart,
-        // which is what ListItem::end_line is for.
+        // A statement spanning lines is one statement, so a use on the line it
+        // ends on doesn't expand, while the next line's does. Start lines alone
+        // can't tell those apart; that's what `ListItem::end_line` is for.
         case(
             "an-alias-defined-inside-a-multi-line-statement",
             r#"shopt -s expand_aliases; printf '%s\n' 'for i in 1; do alias hi="echo A"' 'done; hi 2>/dev/null; echo "rc=$?"' 'hi' > al; . ./al"#,
@@ -1358,116 +1067,86 @@ y
             "an-alias-defined-in-a-function-applies-after-the-call",
             r#"shopt -s expand_aliases; printf '%s\n' 'f(){ alias hi="echo A"; }; f' 'hi' 'g(){ alias ho="echo B"; ho; }; g 2>/dev/null; echo "rc=$?"' > al; . ./al"#,
         ),
-        // A `$( )` body is read on its own, so an alias defined in one
-        // applies to the rest of it -- while a `( )` body was read along
-        // with the source around it, and does not.
+        // A `$( )` body is read on its own, so an alias defined in it applies to
+        // the rest of it. A `( )` body is read with the source around it.
         case(
             "an-alias-defined-inside-a-substitution-and-inside-a-subshell",
             r#"shopt -s expand_aliases; printf '%s\n' 'v=$(alias hi="echo A"' 'hi); echo "[$v]"' '( alias ho="echo B"' 'ho ) 2>/dev/null; echo "rc=$?"' > al; . ./al"#,
         ),
-        // Without the option there is no expansion to be had, whichever
-        // line it is on -- and `unalias` takes it away again.
+        // Without the option nothing expands, on any line, and `unalias` undoes
+        // it.
         case(
             "an-alias-with-expansion-off-and-an-unaliased-one",
             r#"printf '%s\n' 'alias hi="echo A"' 'hi 2>/dev/null; echo "rc=$?"' > al; . ./al; shopt -s expand_aliases; alias ho="echo B"; unalias ho; ho 2>/dev/null; echo "rc=$?""#,
         ),
         case("keyword-completions", r#"compgen -A keyword | sort | tr '\n' ' '; echo"#),
-        // Every getopts branch that does not set OPTARG leaves it unset;
-        // the argument of the *previous* option used to stay visible.
+        // Every getopts branch that doesn't set OPTARG unsets it.
         case("getopts-clears-optarg", r#"f(){ while getopts "ab:c" o; do echo "$o=[${OPTARG-UNSET}]"; done; }; f -a -b val -c"#),
         case("getopts-silent-missing-argument", r#"f(){ while getopts ":ab:" o; do echo "$o=[${OPTARG-UNSET}]"; done; }; f -a -b"#),
         // `$-` is every option letter currently on, lowercase first,
         // then uppercase, then how the shell was invoked.
         case("dollar-dash", r#"echo "$-""#),
         case("dollar-dash-with-options-set", r#"set -e -f -u -x -C -m -T -E; echo "$-""#),
-        // `select` reads through the redirect on the loop, like `read`
-        // does -- it read the real stdin, so a here-string was never
-        // seen and the body never ran. And an empty list is not a menu
-        // with no entries: bash prints nothing and leaves at once.
+        // `select` reads through the loop's redirect, like `read`. An empty list
+        // prints nothing and leaves at once.
         case("select-reads-its-own-redirect", r#"select x in a b; do echo "[$x][$REPLY]"; break; done <<< "2""#),
         case("select-of-nothing", r#"select x in; do echo hi; done; echo "rc=$?""#),
         case("select-at-end-of-input", r#"select x in a b; do break; done < /dev/null; echo done"#),
         case("select-without-an-in-clause", r#"set -- p q; select x; do echo "[$x]"; break; done <<< "2""#),
-        // -- and what a second sweep turned up ------------------------
-        // `read`'s short options cluster like every other builtin's.
-        // Matching whole argument strings took `-ra` for a *variable
-        // name*, so the commonest spelling of the commonest idiom read
-        // into nothing at all.
+        // `read`'s short options cluster: `-ra` is two options.
         case("read-clustered-short-options", r#"read -ra p <<< "a b c"; echo "${#p[@]}${p[2]}""#),
         case("read-clustered-option-with-its-value", r#"read -rn2 v <<< "abcd"; echo "[$v]""#),
-        // And `-r` was parsed and then not recorded, so every read
-        // behaved as if it were given. Without it a backslash escapes
-        // the next character -- including a separator, which then stays
-        // part of its field, and the delimiter, which continues the
-        // line.
+        // Without `-r`, a backslash escapes the next character, including a
+        // separator, which then stays in its field, and the delimiter, which
+        // continues the line.
         case("read-without-r-takes-escapes-off", r#"read v <<< 'a\tb'; echo "[$v]"; read -r v <<< 'a\tb'; echo "[$v]""#),
         case("read-without-r-keeps-an-escaped-separator", r#"read a b <<< 'x\ y z'; echo "[$a][$b]""#),
         case("read-without-r-continues-a-line", "printf 'a\\\\\nb\\n' | { read v; echo \"[$v]\"; }"),
-        // `+=` on a name with the integer attribute is addition.
         case("integer-append-is-addition", r#"declare -i I=3; I+=2; echo $I; declare -i J; J+=5; echo $J; x=a; x+=b; echo $x"#),
-        // Unsetting a local leaves the name unset for the rest of the
-        // function; it does not hand the enclosing variable back.
+        // Unsetting a local leaves the name unset for the rest of the function,
+        // without uncovering the global.
         case("unset-a-local-does-not-uncover-the-global", r#"f() { local x=1; unset x; echo "[${x-gone}]"; }; x=outer; f; echo "[$x]""#),
         case("assign-after-unsetting-a-local", r#"f() { local x=1; unset x; x=2; echo "[$x]"; }; x=outer; f; echo "[$x]""#),
-        // A pseudo-trap fires at the depth it was set and in what it
-        // returns into, not in what it calls -- which is what "not
-        // inherited" means, and what `functrace` turns off. RETURN was
-        // gated on `functrace` alone, so the ordinary way of writing
-        // one never ran at all.
+        // A pseudo-trap fires at the depth it was set and in what it returns
+        // into, not in what it calls. That's what "not inherited" means, and what
+        // `functrace` turns off.
         case("return-trap-set-inside-a-function", r#"f() { trap "echo RET" RETURN; :; }; f"#),
         case("return-trap-set-at-the-top-level", r#"trap "echo RET" RETURN; f() { :; }; f; echo end"#),
         case("return-trap-under-functrace", r#"set -T; trap "echo RET" RETURN; f() { :; }; f"#),
         case("return-trap-does-not-follow-a-call", r#"f() { trap "echo RET" RETURN; g; }; g() { echo ing; }; f"#),
         case("return-trap-fires-on-the-way-out", r#"g() { trap "echo RET" RETURN; :; }; f() { g; echo after; }; f"#),
-        // `trap -p` reports the three pseudo-signals too, and reports
-        // only what it was asked for.
+        // `trap -p` reports the three pseudo-signals too, and only those asked for.
         case("trap-p-of-a-pseudo-signal", r#"trap "echo x" RETURN; trap -p RETURN; trap "echo y" ERR; trap -p ERR"#),
         case("trap-p-names-only-what-it-was-asked", r#"trap "echo a" USR1; trap "echo b" USR2; trap -p USR2"#),
         case("trap-p-of-an-unknown-signal", r#"trap -p NOSUCH 2>/dev/null; echo "rc=$?""#),
-        // -- and a third sweep -----------------------------------------
-        // `base#digits` in bash goes up to base 64: 0-9, then a-z for
-        // 10-35, then A-Z for 36-61, then `@` and `_`. Rust's
-        // `from_str_radix` stops at 36 and *panics* past it, so
-        // `$((64#zZ))` killed the shell. Below 37 there is no room for
-        // two letter ranges and bash folds case instead, which is what
-        // makes `16#FF` 255 while `64#zZ` is 35*64+61.
+        // Bases above 36 use bash's digit set (see `arith::base_number`).
         case("arithmetic-bases-above-36", r#"echo $((64#zZ)) $((64#@)) $((64#_)) $((62#z))"#),
-        // A numeric literal runs to the end of the digit-set run and is
-        // checked against its base *afterwards*. Stopping at the first
-        // character that did not fit read `12a` as 12 and `1e2` as 1,
-        // each with something left over that quietly went nowhere.
+        // A literal runs to the end of the digit-set run and is checked against
+        // its base afterwards: `12a` and `1e2` are errors.
         case(
             "a-literal-is-checked-after-it-is-read",
             r#"( echo $((1e2)) ) 2>/dev/null; echo "rc=$?"; ( echo $((12a)) ) 2>/dev/null; echo "rc=$?"; ( echo $((0b101)) ) 2>/dev/null; echo "rc=$?"; ( echo $((08)) ) 2>/dev/null; echo "rc=$?""#,
         ),
         case("a-bare-hex-prefix-is-zero", r#"echo $((0x)) $((0X)) $((00)) $((010)) $((0x1f))"#),
-        // `${!name}` is refused three ways, each fatal the way `${x:?}`
-        // is: `name` unset, its value empty, and its value not a
-        // parameter name. Expanding to nothing meant a typo in the
-        // indirection quietly became an empty string.
+        // `${!name}` is fatal, like `${x:?}`, when `name` is unset, empty, or not
+        // a parameter name.
         case("indirect-expansion-of-an-unset-name", r#"echo "[${!nosuch}]"; echo after"#),
         case("indirect-expansion-of-an-empty-name", r#"x=""; echo "[${!x}]"; echo after"#),
         case("indirect-expansion-of-a-non-name", r#"x="1bad"; echo "[${!x}]"; echo after"#),
         case("indirect-expansion-follows-a-subscript", r#"a=(u v); x="a[1]"; echo "[${!x}]"; declare -A m=([k]=w); y="m[k]"; echo "[${!y}]""#),
         case("indirect-expansion-of-a-positional", r#"set -- p q; x=1; echo "[${!x}]"; x=@; echo "[${!x}]"; x=#; echo "[${!x}]""#),
         case("arithmetic-bases-fold-case-below-37", r#"echo $((16#FF)) $((16#ff)) $((36#ZZ)) $((36#zz))"#),
-        // In a subshell so the message, which each shell words its own
-        // way, is redirected away: it is emitted during *expansion*,
-        // before the command's own `2>` is in place.
+        // In a subshell, so the message can be redirected away: it's printed
+        // during expansion, before the command's own `2>` applies.
         case(
             "arithmetic-base-out-of-range",
             r#"( echo $((65#a)) ) 2>/dev/null; echo "rc=$?"; ( echo $((37#Z)) ) 2>/dev/null; echo "rc=$?"; ( echo $((1#a)) ) 2>/dev/null; echo "rc=$?""#,
         ),
-        // `${a[@]OP}` applies OP to each element. Applied to the joined
-        // text instead, the ops that act at most once per string acted
-        // once for the whole array -- and the globally-acting ones came
-        // out right by accident, which is why it went unnoticed.
+        // `${a[@]OP}` applies OP to each element, not to the joined text.
         case("array-wide-replace-is-per-element", r#"a=(one two three); echo "${a[@]/o/0}"; echo "${a[@]//o/0}""#),
         case("array-wide-strip-is-per-element", r#"a=(one two); echo "${a[@]%e}"; echo "${a[@]#o}"; a=(a.txt b.txt); echo "${a[@]%.txt}""#),
-        // POSIX character classes, in both matchers: a `[:name:]`
-        // carries its own `]`, which does not close the bracket around
-        // it. Scanning for the first `]` read `[[:space:]]` as the set
-        // `[:space:` plus a literal `]`.
+        // POSIX character classes, in both matchers: `[:name:]` carries its own
+        // `]`, which doesn't close the bracket around it.
         case(
             "character-classes-in-a-regex",
             r#"[[ "a b" =~ [[:space:]] ]] && echo s; [[ ab =~ ^[[:alpha:]]+$ ]] && echo a; [[ 5 =~ [^[:digit:]] ]] || echo neg"#,
@@ -1476,74 +1155,60 @@ y
             "character-classes-in-a-glob",
             r#"case "a b" in *[[:space:]]*) echo s;; esac; case a] in [[:alpha:]]]) echo bracket;; esac; x="a b c"; echo "${x//[[:space:]]/_}""#,
         ),
-        // Quoting decides whether a metacharacter in a `${v/pat}`
-        // pattern is syntax or text, exactly as it does on the right of
-        // `[[ x == pat ]]`. Expanding the pattern to a plain `String`
-        // first threw that away, so `${x//\*/Y}` globbed.
+        // Quoting decides whether a metacharacter in a `${v/pat}` pattern is
+        // syntax or text, as on the right of `[[ x == pat ]]`.
         case(
             "quoting-in-a-parameter-expansion-pattern",
             r#"x="a*b"; echo "${x//\*/Y}" "${x//"*"/Y}" "${x#a\*}" "${x%\*b}" "${x#"a*"}"; y=axb; echo "${y#a\*}" "${y//\?/Y}""#,
         ),
-        // ...including inside a bracket expression, where `]`, `^` and
-        // `-` are the class's own syntax rather than the matcher's.
+        // ...including inside a bracket expression, where `]`, `^` and `-` are
+        // the class's syntax.
         case(
             "escaped-characters-inside-a-pattern-bracket",
             r#"x=a^b; echo "${x//[\^]/X}"; y=aqz; echo "${y//[a\-z]/X}"; z="a]b"; echo "${z//[\]]/X}"; w=a-b; echo "${w//[\-]/X}""#,
         ),
-        // `&` in a replacement stands for the matched text unless it was
-        // quoted -- and the array and positional-parameter paths were
-        // expanding the replacement without preserving that, where the
-        // scalar path already did.
+        // A quoted `&` in a replacement is an ampersand on the array and
+        // positional paths too.
         case(
             "an-escaped-ampersand-in-a-replacement-is-literal",
             r#"a=(abc); echo "${a[@]//b/\&}" "${a[0]//b/\&}" "${a[@]//b/[&]}"; set -- abc; echo "${1//b/\&}" "${@//b/\&}"; r="&"; echo "${a[@]//b/$r}""#,
         ),
-        // A match that reaches the end of the string ends the walk --
-        // bash's own loop is `while (*s)`. Without that, `${s//*/Z}`
-        // matched all of "abc" and then matched empty at the end, and
-        // replaced twice.
+        // A match that reaches the end of the string ends the walk (bash's loop
+        // is `while (*s)`), so `${s//*/Z}` replaces once.
         case(
             "a-replacement-match-that-reaches-the-end-of-the-string",
             r#"s=abc; echo "${s//*/Z}" "${s//c*/Z}" "${s//b*/Z}" "${s//?*/Z}"; t=abab; echo "${t//a/Z}"; u=aa; echo "${u//a*/Z}""#,
         ),
-        // An *empty* pattern matches nothing at all when unanchored,
-        // though `/#` and `/%` still fire. (A pattern that merely *can*
-        // match empty, like `@()`, is a different case and does splice;
-        // it needs extglob, so it lives in a unit test.)
+        // An empty pattern matches nothing unanchored, though `/#` and `/%` still
+        // fire. A pattern that can match empty, like `@()`, does splice; it needs
+        // extglob, so it's in a unit test.
         case(
             "an-empty-replacement-pattern-matches-nothing",
             r#"s=abc; echo "${s//""/Z}" "${s/""/Z}" "${s/#""/Z}" "${s/%""/Z}"; e=; echo "${s//$e/Z}""#,
         ),
-        // A fixed-width pattern wider than the string cannot match. The
-        // fast path that knows the width used to slice that many
-        // characters out anyway and panic.
+        // A fixed-width pattern wider than the string can't match.
         case(
             "a-replacement-pattern-longer-than-the-string",
             r#"s=ab; echo "[${s//abc/Z}]" "[${s//[ab]c/Z}]"; e=; echo "[${e//?/Z}]" "[${e//[a]/Z}]" "[${e//a/Z}]""#,
         ),
-        // `kill -0` is not a signal but the "is it still there" probe,
-        // and `-s`/`-n` name the signal in the next argument.
+        // `kill -0` probes whether a process exists, and `-s`/`-n` take the
+        // signal from the next argument.
         case("kill-signal-zero", r#"kill -0 $$ && echo alive; kill -s 0 $$ && echo alive2; kill -n 0 $$ && echo alive3"#),
         case("kill-of-a-process-that-is-gone", r#"kill -0 999999 2>/dev/null; echo "rc=$?""#),
-        // `-o OPTNAME` is a unary test, not the OR connective -- which
-        // is what it was read as, so `test -o errexit` was "empty OR
-        // errexit" and always true. A connective needs something on its
-        // left; at the start of a clause it is the test.
+        // `-o OPTNAME` is a unary test. A connective needs something on its
+        // left, so at the start of a clause `-o` is the test.
         case("test-o-asks-about-a-shell-option", r#"test -o errexit; echo "rc=$?"; set -e; test -o errexit; echo "rc=$?""#),
         case("test-o-still-combines", r#"set -e; set -u; [ -o errexit -a -o nounset ] && echo both; [ a -o b ] && echo or"#),
         case("test-v-in-the-bracket-form", r#"x=1; [ -v x ] && echo set; [ -v nosuch ]; echo "rc=$?""#),
-        // The xtrace line is meant to read as the command that ran.
         case("xtrace-quotes-what-needs-it", r#"set -x; echo "a b"; echo "*"; echo ""; [ x = x ]"#),
         // `-P` forces the PATH search past a builtin of the same name;
         // `-p` prints a path only where `type` would say "file".
         case("type-capital-p-forces-the-path-search", r#"type -P echo; type -p echo; f(){ :; }; type -P f; echo "rc=$?""#),
-        // `mapfile -d` was parsed and thrown away, so it read lines; and
-        // its options did not cluster, so `-d,` was rejected as `-,`.
+        // `mapfile -d` sets the delimiter, and its options cluster: `-d,`.
         case("mapfile-delimiter", r#"mapfile -t -d, arr <<< "a,b,c"; printf "[%s]" "${arr[@]}"; echo"#),
         case("mapfile-clustered-options", r#"mapfile -td, arr <<< "a,b,c"; echo "${#arr[@]}""#),
-        // A quoted part of a `case` pattern is literal text. The whole
-        // pattern was expanded as text and then matched as a glob, so
-        // a variable holding `*` matched everything.
+        // A quoted part of a `case` pattern is literal, so a variable holding `*`
+        // matches only `*`.
         case(
             "a-quoted-case-pattern-is-literal",
             r#"p="*"; case abc in "$p") echo lit;; *) echo no;; esac; case abc in '*') echo sq;; *) echo no2;; esac"#,
@@ -1552,28 +1217,20 @@ y
             "an-unquoted-case-pattern-is-still-a-glob",
             r#"p="*"; case abc in $p) echo glob;; *) echo no;; esac; x=/tmp; case /tmp/f in "$x"/*) echo prefix;; esac"#,
         ),
-        // The variables the shell answers for without storing them.
-        // `$BASHPID` is the same as `$$` here where bash's differs
-        // inside a subshell -- a subshell is not a process here -- so
-        // the case asks only what both can agree on.
+        // Variables the shell computes. `$BASHPID` equals `$$` here even in a
+        // subshell, which isn't a process of its own, so this asks only what both
+        // shells agree on.
         case("bash-subshell-counts-nesting", r#"echo "$BASH_SUBSHELL"; (echo "$BASH_SUBSHELL"; (echo "$BASH_SUBSHELL"))"#),
         case("bashpid-at-the-top-level", r#"[ "$BASHPID" = "$$" ] && echo same"#),
         case("shellopts-lists-what-is-on", r#"[[ $SHELLOPTS == *errexit* ]] || echo off; set -e; [[ $SHELLOPTS == *errexit* ]] && echo on"#),
         case("bashopts-lists-what-is-on", r#"[[ $BASHOPTS == *dotglob* ]] || echo off; shopt -s dotglob; [[ $BASHOPTS == *dotglob* ]] && echo on"#),
-        // A computed variable is still a name: enumeration has to find
-        // it, or `${!SHELL*}` reports only the stored half.
+        // A computed variable is still a name, so `${!PREFIX*}` finds it.
         case("prefix-listing-finds-computed-names", r#"echo "${!BASHO*}" "${!BASHP*}" "${!BASH_SUB*}" "${!EUI*}""#),
-        // BASH_VERSINFO is readonly, which `declare -p` reports.
         case("bash-versinfo-is-readonly", r#"declare -p BASH_VERSINFO | cut -c1-14"#),
-        // -- roadmap 05 ------------------------------------------------
-        // An EXIT trap fires for the exit of the shell that armed it and
-        // for no other. A subshell inherits it and can still see it --
-        // `trap -p EXIT` inside one prints it -- but reaching the end of
-        // a subshell is not that exit. Running it there is silently
-        // destructive, because the shape this trap is nearly always
-        // written in is a cleanup: the first command substitution ended
-        // a subshell and removed the directory the script was still
-        // using.
+        // An EXIT trap fires only for the exit of the shell that armed it. A
+        // subshell inherits it, and `trap -p EXIT` shows it there, but ending a
+        // subshell isn't that exit. The trap is nearly always a cleanup, so firing
+        // early removes what the script still uses.
         case("an-exit-trap-does-not-fire-in-a-subshell", r#"trap "echo E" EXIT; ( echo s ); echo m"#),
         case("an-exit-trap-does-not-fire-in-a-substitution", r#"trap "echo E" EXIT; x=$(echo s); echo "$x""#),
         case("an-exit-trap-does-not-fire-per-pipeline-stage", r#"trap "echo E" EXIT; echo a | cat; echo m"#),
@@ -1583,56 +1240,37 @@ y
             "the-cleanup-idiom-survives-a-substitution",
             r#"d=$(mktemp -d); trap "rmdir $d" EXIT; x=$(echo hi); [ -d "$d" ] && echo "still there: $x""#,
         ),
-        // A positional is set only when there is one at that position,
-        // which is exactly what `set -u` is for. Every digit counted as
-        // always-set, so the whole family was exempt from it.
+        // A positional is set only when there is one at that position, so
+        // `set -u` covers `$1`.
         case("nounset-covers-the-positionals", r#"set -u; f() { echo "$1"; }; f"#),
         case("nounset-leaves-the-specials-alone", r#"set -u; echo "$@$*$#"; echo "${1-d}"; f() { echo "${1:-e}"; }; f; echo ok"#),
         case("a-positional-past-the-end-is-unset", r#"set -- a; echo "[${1+set}][${2+set}]"; set -u; echo "$2""#),
-        // The right-hand side of an array assignment is expanded before
-        // the old value is thrown away. Clearing first meant the array
-        // could not be built from itself: `a=("${a[@]/x/y}")`, the
-        // ordinary way to rewrite one in place, emptied it.
+        // The right-hand side of an array assignment is expanded before the old
+        // value goes, so `a=("${a[@]/x/y}")` rewrites in place.
         case("an-array-can-be-built-from-itself", r#"a=(1 2); a=("${a[@]/1/9}"); echo "${a[*]}"; b=(1 2); b=("${b[@]}" 3); echo "${b[*]}""#),
         case("an-array-can-be-prepended-to", r#"a=(1 2); a=(0 "${a[@]}"); echo "${a[*]}"; a+=("${a[@]}"); echo "${a[*]}""#),
-        // The whole arithmetic expression is expanded before any of it
-        // is evaluated. A bare `$x` was left for the arithmetic lexer,
-        // which reads it where it stands alone and not where it is part
-        // of a larger token -- so `$((10#$x))`, the idiom for forcing
-        // base ten on a zero-padded number, failed outright.
+        // The whole arithmetic expression is expanded before evaluation, so
+        // `$((10#$x))` forces base ten on a zero-padded number.
         case("a-base-prefix-in-front-of-an-expansion", r#"x=010; echo $((10#$x)) $((16#$x)); v=07; echo $((10#$v)) $((8#$v))"#),
         case("an-expansion-inside-arithmetic", r#"x=1+1; echo $((x)) $(($x)); n=3; echo $(( n * $n )); echo $((2#$(echo 101)))"#),
-        // The flag letters of the declare family cluster, like every
-        // other builtin's. Matching whole arguments saw neither letter
-        // of `declare -ir`, so the attributes were silently dropped --
-        // and `local` had no `-r` at all, which made a readonly local
-        // not readonly.
+        // The declare family's flags cluster, and `local` takes `-r`.
         case("declare-clusters-its-flags", r#"declare -ix n=1; echo "${n@a}"; declare -ir m=1; declare -p m; declare -ax a=(1); declare -p a"#),
         case("local-clusters-its-flags", r#"f(){ local -ir v=1; declare -p v; local -ax a=(1); declare -p a; }; f"#),
         case("a-readonly-local-is-readonly", r#"f(){ local -r v=1; v=2; }; f 2>/dev/null; echo "rc=$?""#),
         // `declare -F name` prints the bare name; `declare -F` with no
         // names prints a re-readable `declare -f NAME` line for each.
         case("declare-capital-f-with-and-without-a-name", r#"f(){ :; }; g(){ :; }; declare -F f; declare -F | head -2"#),
-        // `${v@u}` uppercases the first character.
         case("the-upper-first-transform", r#"x=abc; echo "${x@u}${x@U}${x@L}"; a=(one two); echo "${a[@]@u}""#),
-        // `umask -p` prints the command that would set it again, which
-        // is the whole point of the flag.
+        // `umask -p` prints the command that would set it again.
         case("umask-p-is-re-readable", r#"umask 022; umask -p; umask -S; umask -pS"#),
-        // The working directory and the umask belong to the *process*,
-        // which a `( )` or `$( )` shares with the shell around it -- it
-        // is a Shell of its own but not a process of its own. So each
-        // has to be put back on the way out, nested and at one level.
+        // The working directory and the umask belong to the process, which a
+        // `( )` or `$( )` shares with the shell around it, so each is put back on
+        // the way out. The restore relies on whatever moves them leaving a note
+        // (see ProcessRestore), and these catch a `cd` or `umask` that doesn't.
+        // fds 0-2 are pinned in tests/.
         //
-        // Load-bearing beyond the behaviour: the restore is no longer a
-        // snapshot taken on the way in, but a note made by whatever does
-        // the moving (see ProcessRestore). A `cd` or `umask` that forgot
-        // to leave the note would leak out of every subshell, and these
-        // are what would say so. Fd 0/1/2 is the third of the three and
-        // is pinned in tests/, for the reason given there.
-        //
-        // Builtins throughout, deliberately: an external command inside
-        // a `( )` loses its output when the shell is a pane, which is a
-        // separate defect and not what these are about.
+        // Builtins only: an external inside `( )` loses its output in a pane,
+        // which is a separate defect.
         case(
             "a-cd-inside-a-subshell-does-not-escape",
             r#"mkdir -p a b; cd a; ( cd ../b ); echo "${PWD##*/}"; v=$(cd ../b && echo "${PWD##*/}"); echo "$v ${PWD##*/}""#,
@@ -1643,64 +1281,48 @@ y
         ),
         case("a-umask-inside-a-subshell-does-not-escape", r#"umask 022; ( umask 077 ); umask; v=$(umask 077; umask); echo "$v $(umask)""#),
         case("a-umask-inside-a-nested-subshell-does-not-escape", r#"umask 022; ( umask 077; ( umask 002; umask ); umask ); umask"#),
-        // ...and the shell that changed nothing has nothing to put back,
-        // which is the case the whole arrangement exists for.
+        // ...and a subshell that changed nothing has nothing to put back.
         case(
             "a-subshell-that-moves-nothing-leaves-everything",
             r#"mkdir -p a; cd a; umask 022; ( : ); v=$(:); echo "${PWD##*/}"; umask; echo "[$v]after""#,
         ),
-        // `printf -v 'arr[0]'` writes an array element -- the way a
-        // loop fills an array without a subshell.
+        // `printf -v 'arr[0]'` writes an array element.
         case(
             "printf-v-into-an-array-element",
             r#"for i in 0 1; do printf -v "a[$i]" "v$i"; done; echo "${a[*]}"; declare -A m; printf -v "m[k]" z; echo "${m[k]}""#,
         ),
-        // `$BASH_COMMAND` names the command being run, which is what a
-        // DEBUG or ERR trap reads to say what it fired for. It was
-        // unset, so the commonest error-handling idiom reported
-        // nothing at all.
+        // `$BASH_COMMAND` is what a DEBUG or ERR trap reads to say what it fired
+        // for.
         case("bash-command-in-an-err-trap", r#"trap "echo E:\$BASH_COMMAND" ERR; grep -q zz /dev/null"#),
         case("bash-command-names-an-assignment-as-written", r#"trap "echo D:\$BASH_COMMAND" DEBUG; x=1"#),
         case("bash-command-in-an-err-trap-from-a-function", r#"f(){ false; }; trap "echo E:\$BASH_COMMAND" ERR; f"#),
         case("bash-command-in-a-debug-trap", r#"trap "echo D:\$BASH_COMMAND" DEBUG; true; echo two"#),
-        // PS4 is expanded before it is printed. Printed as written,
-        // every traced line carried a literal `+$LINENO` -- and that
-        // expansion is the only reason anyone sets PS4 at all.
+        // PS4 is expanded before it's printed.
         case("ps4-expands-a-parameter", r#"PS4='+$LINENO '; set -x; echo t"#),
         case("ps4-expands-a-substitution", r#"PS4='$(echo S) '; set -x; echo t"#),
-        // A real variable with a default, not a fallback for a missing
-        // one: `unset PS4` traces with no prefix at all.
+        // `unset PS4` traces with no prefix at all.
         case("ps4-unset-is-no-prefix", r#"unset PS4; set -x; echo t"#),
         case("ps4-defaults-to-plus", r#"set -x; echo t"#),
-        // A nameref is the one case where `${!x}` is not an indirection
-        // at all: it names what the reference points at, following a
-        // chain of them to the end. Reading it as an indirection made
-        // it a second hop, which lands on whatever the target's value
-        // happens to spell -- usually nothing.
+        // For a nameref, `${!x}` names what the reference points at, following
+        // the chain to the end, rather than indirecting.
         case("indirect-expansion-of-a-nameref", r#"declare -n r=v; v=x; echo "${!r}"; echo "$r""#),
         case("indirect-expansion-follows-a-nameref-chain", r#"declare -n a=b; declare -n b=c; c=1; echo "${!a}""#),
         case("a-nameref-parameter-names-its-argument", r#"f() { local -n r=$1; echo "${!r}"; }; v=x; f v"#),
-        // A subshell resets the traps it caught, so a DEBUG trap does
-        // not fire once per command inside a `$( )` and an ERR trap
-        // does not fire both inside `( false )` and again for the
-        // subshell. A pipeline stage is not reset that way.
+        // A subshell resets the traps it caught, so a DEBUG trap doesn't fire
+        // per command inside `$( )`, and an ERR trap doesn't fire both inside
+        // `( false )` and for the subshell. A pipeline stage isn't reset.
         case("a-debug-trap-does-not-follow-a-substitution", r#"trap "echo D" DEBUG; x=$(echo hi); echo done"#),
         case(
             "an-err-trap-does-not-fire-twice-for-a-subshell",
             r#"trap "echo E" ERR; ( false ); echo done; trap "echo F" ERR; x=$(false); echo done"#,
         ),
         case("a-return-trap-does-not-follow-a-substitution", r#"trap "echo R" RETURN; x=$(echo hi); echo done"#),
-        // `&` makes a job, which means a child. Only an external and a
-        // subshell took any notice of it: a builtin, a function, a
-        // group, a loop and a bare assignment all ran in this shell,
-        // synchronously, registering nothing -- so `$!` was unset,
-        // `wait` had nothing to collect, the construct's own state
-        // leaked into the shell, and an `exit` inside one took the
-        // whole shell down.
+        // `&` makes a job, whatever the command: a builtin, function, group,
+        // loop or bare assignment runs in a child too, sets `$!`, and is collected
+        // by `wait`.
         //
-        // Nothing here asserts an *ordering* between what a background
-        // job prints and what the shell prints next: that is a race in
-        // both shells. `wait` first, then look.
+        // Nothing here asserts an order between a background job's output and the
+        // shell's next; that's a race in both shells. `wait` first, then look.
         case("backgrounding-a-builtin", r#": & wait -n; echo "rc=$?"; false & wait -n; echo "rc=$?""#),
         case("backgrounding-a-function", r#"f(){ echo a; }; f & wait -n; echo "rc=$?""#),
         case("an-exit-in-a-background-job-is-the-jobs-exit", r#"f(){ exit 5; }; f & wait -n; echo "rc=$?"; echo alive"#),
@@ -1712,142 +1334,83 @@ y
         case("a-backgrounded-builtin-sets-the-pid-variable", r#"echo "[$!]"; : & echo "[${!:+pid}]""#),
         case("a-backgrounded-builtin-keeps-its-redirect", r#"echo a > o & wait; cat o"#),
         case("two-background-jobs-are-both-collected", r#": & : & wait -n; echo "rc=$?"; wait -n; echo "rc=$?""#),
-        // `declare -f`'s layout is this shell's own (recorded as a
-        // divergence), but what the output has to *do* is the same in
-        // both: define the function again when another shell reads it
-        // back, with a command straight after it. That is the idiom the
-        // output exists for -- `ssh host "$(declare -f f); f"` -- and a
-        // trailing `;` after the `}` made it `};; f`, a syntax error.
+        // `declare -f`'s layout is bish's own (a recorded divergence), but its
+        // output still has to define the function again in another shell with a
+        // command straight after it: `ssh host "$(declare -f f); f"`.
         case("a-function-definition-can-be-shipped-to-another-shell", r#"f(){ echo hi; }; bash -c "$(declare -f f); f""#),
         case(
             "a-shipped-function-keeps-its-compound-commands",
             r#"f() { local x=1; if [ "$x" = 1 ]; then echo "yes $x"; fi; for i in a b; do echo $i; done; }; bash -c "$(declare -f f); f""#,
         ),
         case("two-shipped-functions", r#"f(){ echo a; }; g(){ echo b; }; bash -c "$(declare -f f g); f; g""#),
-        // -- roadmap 10: the last of the grammar's leniency ------------
-        // A `;` where a command is expected is a syntax error, not an
-        // empty statement -- in front of the first command of a list as
-        // much as between two of them. Through `eval` so the case can
-        // check the status and keep running: a syntax error takes the
-        // whole script down otherwise, and bish's own wording for it is
-        // its own, not bash's.
+        // A `;` where a command is expected is a syntax error, before the first
+        // command as much as between two. Through `eval`, so the script keeps
+        // running and the status can be checked.
         case("empty-command-between-separators", r#"eval "echo a; ; echo b" 2>/dev/null; echo "rc=$?""#),
         case("leading-semicolon", r#"eval "; echo a" 2>/dev/null; echo "rc=$?""#),
         case("leading-semicolon-in-a-group", r#"eval "{ ; echo a; }" 2>/dev/null; echo "rc=$?""#),
         case("leading-semicolon-in-a-then-branch", r#"eval "if true; then ; echo x; fi" 2>/dev/null; echo "rc=$?""#),
         case("semicolon-after-a-background-ampersand", r#"eval "echo a &; echo b" 2>/dev/null; echo "rc=$?""#),
-        // The other side of the same rule: blank lines are skippable
-        // anywhere, and an empty case arm is still an empty case arm.
+        // Blank lines are skippable anywhere, and an empty case arm is still an
+        // empty case arm.
         case("blank-lines-between-commands", "eval 'echo a\n\n\necho b' 2>/dev/null; echo \"rc=$?\""),
         case("an-empty-case-arm-is-not-an-empty-command", r#"eval "case x in x) ;; esac" 2>/dev/null; echo "rc=$?""#),
     ];
 
-    // Cases bish does not match today, each with why. Asserted to
-    // *still* diverge -- fixing one fails this test until its line is
-    // removed, which is the only way a list like this stays true.
-    // The list is the point, not its length: anything found and not yet
-    // fixed belongs here with its reason, so that "bish agrees with
-    // bash" never quietly means "except where it doesn't".
+    // Cases bish doesn't match today, each with why. Asserted to still
+    // diverge, so fixing one fails this test until its line is removed.
     const DIVERGENCES: &[(&str, &str)] = &[
-        // `( )` and `$( )` run in this shell rather than in a forked
-        // copy of it, so there is no second process to have a pid.
-        // Reporting a made-up one would break `kill $BASHPID`, which is
-        // most of what it is for.
+        // `( )` and `$( )` run in this shell, so there's no second process to
+        // have a pid; a made-up one would break `kill $BASHPID`.
         ("bashpid-is-the-shells-own-in-a-subshell", "`( echo $BASHPID )` names this shell; bash forks a subshell, so its BASHPID differs from `$$`"),
-        // A deliberate choice, not an oversight: bish's `set -o` lists
-        // only the ten names that gate real behaviour here, where bash
-        // lists twenty-seven. Printing `allexport off` for an option
-        // this shell does nothing with would read as support for it,
-        // and `set -o allexport` would then silently not take. The same
-        // principle keeps `compgen -A setopt` short. Recorded because
-        // it is still a difference a script can see.
-        // bish's extended globbing is not optional -- `@(a|b)` and its
-        // relatives always work -- so `shopt` reports `extglob` on and
-        // `shopt -u extglob` cannot turn it off. bash defaults it off.
-        // Answering "off" would be untrue of this shell, and honouring
-        // the `-u` would mean building a second, weaker matcher to
-        // switch to.
+        // Extended globbing is always on here, so `shopt -u extglob` can't turn
+        // it off; honouring it would mean a second, weaker matcher.
         ("extglob-cannot-be-turned-off", "`shopt extglob` says on where bash says off, because here it is always on"),
+        // `set -o` lists only the options that do something here. Listing
+        // `allexport off` would read as support for it.
         ("set-o-lists-fewer-options", "`set -o` lists 10 options; bash lists 27, most of which bish does not implement"),
-        // The builtin *set* differs, legitimately: bish has builtins
-        // bash does not (`abbr`, `win`, `::bish`) and lacks `bind`, which
-        // it will not have: key bindings are bish's own keymap, not
-        // readline's. Listed rather than fixed because the difference is
-        // the point -- the list is honest about what this shell has.
+        // bish has builtins bash doesn't (`abbr`, `win`, `::bish`) and no `bind`:
+        // key bindings are bish's keymap, not readline's.
         ("compgen-b-lists-this-shells-builtins", "`compgen -b` lists bish's own builtins and not bash's `bind`"),
-        // Where the *whole* match lands, both shells now agree on:
-        // leftmost, then longest. What is left is which spelling of an
-        // equally long match the capture groups report. bash's answer
-        // is glibc's regexec, which is not the POSIX rule either --
-        // POSIX hands each subexpression, left to right, the longest it
-        // can take, and glibc only sometimes does. This engine breaks
-        // the tie by the pattern's own branch order, which is a rule
-        // that can be stated in one line and is right whenever the
-        // groups are not ambiguous to begin with. Matching glibc's
-        // would mean reproducing its inconsistencies: a fuzz of 3000
-        // random patterns disagreed 34 times, every one of them a
-        // pattern with two ways to spell the same match -- mostly an
-        // empty alternation branch, the rest a top-level `|` whose
-        // branches both reach the same text.
+        // Both shells agree on where the whole match lands: leftmost, then
+        // longest. They differ on which spelling of an equally long match the
+        // groups report. bash's answer is glibc's, which isn't consistently POSIX
+        // either; this engine breaks the tie by branch order. The differences are
+        // all patterns with two ways to spell the same match, mostly an empty
+        // alternation branch.
         (
             "regex-submatch-of-an-ambiguous-empty-branch",
             "`(|a)(a|)` against `a` fills the first group in bash and the second here; the whole match agrees",
         ),
     ];
 
-    // The cases the divergence list is about. Kept apart from `CASES`
-    // so that list stays a description of what works.
+    // The divergent cases, apart from `CASES` so that list is only what works.
     const PENDING: &[Case] = &[
         case("set-o-lists-fewer-options", r#"set -o | wc -l"#),
         case("bashpid-is-the-shells-own-in-a-subshell", r#"echo $(( $$ == BASHPID )); ( echo $(( $$ == BASHPID )) )"#),
         case("extglob-cannot-be-turned-off", r#"shopt extglob; shopt -u extglob; shopt -q extglob; echo "q=$?""#),
         case("compgen-b-lists-this-shells-builtins", r#"compgen -b | sort | head -3 | tr '\n' ' '; echo"#),
         case("regex-submatch-of-an-ambiguous-empty-branch", r#"re='(|a)(a|)'; [[ a =~ $re ]]; echo "[${BASH_REMATCH[1]}][${BASH_REMATCH[2]}]""#),
-        // -- roadmap 10: parser leniency, the part still standing -----
-        // Also not recordable, and for the same kind of reason: a
-        // signal this shell was *started* with ignored is reported by
-        // bash's `trap -p` as `trap -- '' SIGX`, and bish says nothing
-        // about it. Seeing the difference needs the parent to have
-        // ignored a signal first, which a case cannot arrange for the
-        // shell that runs it.
-        //
-        // Not recordable here, and worth saying why: `SHLVL` counts one
-        // higher through two levels of `-c`, because bash decrements it
-        // before `exec`ing the last command of a `-c` and bish spawns
-        // there instead. Seeing it needs the shell under test invoked
-        // *by path*, and both shells report `$0` as a bare name, so a
-        // case cannot name the thing it is testing.
+        // Not recordable as a case: through two levels of `-c`, `SHLVL` counts
+        // one higher in bish, because bash decrements it before `exec`ing the last
+        // command and bish spawns instead. Seeing it needs the shell invoked by
+        // path, and both shells report `$0` as a bare name.
     ];
 
-    // `target/<profile>/bish`, worked out from the test binary's own
-    // path (`target/<profile>/deps/bish-<hash>`). `cargo test` builds
-    // the binary too, so it is there and current -- but the test skips
-    // rather than fails if it is not, the same as when there is no
-    // bash.
-    /// The built shell, which is what this corpus actually measures.
-    ///
-    /// Kept current by a file that does nothing else -- see
-    /// `tests/the_binary_under_test_is_the_one_just_built.rs`. Without
-    /// it `cargo test` leaves this binary at whatever `cargo build`
-    /// last made, and a corpus can pass against a shell that no longer
-    /// exists.
+    /// `target/<profile>/bish`, worked out from the test binary's path
+    /// (`target/<profile>/deps/bish-<hash>`). Kept current by
+    /// `tests/the_binary_under_test_is_the_one_just_built.rs`; without it
+    /// `cargo test` would leave whatever `cargo build` last made. Missing, the
+    /// tests skip, as they do without bash.
     // A signal ignored before the shell started is the shell's to report
-    // and not to change. Both halves are bash's behaviour and both are
-    // checked here against the real thing.
-    //
-    // Not an ordinary corpus case, because the setup is outside the
-    // script: the disposition has to already be SIG_IGN when the shell is
-    // exec'd, which is what `nohup` does to SIGHUP and what this does by
-    // hand. That is also how the gap was found -- one suite run launched
-    // under nohup, reporting it as three unrelated `trap` cases differing
-    // from bash -- and a case the corpus can only see by accident is a
-    // case worth pinning on purpose.
+    // and not to change, as in bash. The disposition has to be SIG_IGN when
+    // the shell is exec'd, as `nohup` leaves SIGHUP, so this can't be an
+    // ordinary corpus case.
     #[test]
     fn a_signal_ignored_before_the_shell_started_is_listed_and_cannot_be_trapped() {
         let Some(bish) = bish_binary() else { return };
-        // The listing first (HUP is signal 1, so it sorts above the trap
-        // actually set here), then an attempt to trap it: accepted with a
-        // successful status, and with no effect whatsoever.
+        // The listing first (HUP is signal 1, so it sorts above the INT trap),
+        // then a trap on it, which succeeds and has no effect.
         let script = r#"trap 'echo t' INT; trap -p; trap 'echo h' HUP; echo "status=$?"; trap -p HUP"#;
         let dir = std::env::temp_dir().join(format!("bish-entry-ignored-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -1864,25 +1427,16 @@ y
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A shell's own state must not be readable by other users. bish
-    // re-execs for a backgrounded subshell, a coproc and some pipeline
-    // stages, and the child needs the parent's functions *and
-    // variables* to start from -- which used to be handed over in argv,
-    // where `/proc/<pid>/cmdline` (mode 0444) shows it to everybody on
-    // the machine. bash forks and keeps that state in memory nobody else
-    // has a name for, so the two shells should agree that nothing is
-    // visible.
-    //
-    // Linux-only by nature; elsewhere there is no /proc to look in and
-    // the test says nothing rather than pretending.
+    // A shell's state must not be readable by other users. bish re-execs for
+    // a background subshell, a coproc and some pipeline stages, and the child
+    // needs the parent's functions and variables. In argv they'd show in
+    // `/proc/<pid>/cmdline`, mode 0444. Linux only.
     #[test]
     fn a_backgrounded_subshell_does_not_publish_the_shells_variables() {
         let Some(bish) = bish_binary() else { return };
         if !std::path::Path::new("/proc/self/cmdline").exists() {
             return;
         }
-        // The shell starts a child, waits long enough for this test to
-        // be able to look, and reports what its own /proc entry shows.
         let script = r#"SECRET=hunter2; ( sleep 0.4 ) & p=$!; sleep 0.1; tr '\0' '\n' < /proc/$p/cmdline | grep -c hunter2"#;
         let dir = std::env::temp_dir().join(format!("bish-proc-leak-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -1896,19 +1450,10 @@ y
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `run_with`, with SIGHUP already ignored when the shell starts.
-    ///
-    /// The disposition is set in the child between fork and exec, which is
-    /// the only window where it is this process's business and not the
-    /// shell's -- and SIG_IGN is one of the two dispositions that survive
-    /// `exec` at all, which is the whole reason the rule being tested
-    /// exists.
-    ///
-    /// `dir` is the shell's HOME and its cwd, for the reason `run_with`
-    /// gives: a shell that can see the machine's own configuration is a
-    /// test that can fail for reasons that have nothing to do with the
-    /// shell. Leaving HOME unset is not neutral -- it sends the shell to
-    /// look the answer up for itself, and it finds the real one.
+    /// `run_with`, with SIGHUP ignored when the shell starts. It's set between
+    /// fork and exec; SIG_IGN is one of the two dispositions that survive
+    /// `exec`, which is why the rule under test exists. `dir` is HOME and cwd,
+    /// as in `run_with`.
     fn run_with_sighup_ignored(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> String {
         let mut command = Command::new(shell);
         command
@@ -1925,17 +1470,13 @@ y
             .stderr(std::process::Stdio::piped());
         use std::os::unix::process::CommandExt;
         let sighup = crate::term::SIGHUP;
-        // Put back by hand, because this test process is a Rust program
-        // and its runtime ignored SIGPIPE before `main` (see
-        // `record_signals_ignored_at_entry`). Without this the child
-        // inherits that too, and the comparison below stops being about
-        // one signal -- bash would list the inherited `SIGPIPE` and bish,
-        // for the reason that function documents, would not. Resolved
-        // before `pre_exec` so the closure only makes syscalls.
+        // The Rust runtime ignored SIGPIPE before `main` (see
+        // `record_signals_ignored_at_entry`), so it's restored here or the child
+        // inherits it and bash lists it too. Looked up before `pre_exec` so the
+        // closure only makes syscalls.
         let sigpipe = crate::exec::signal_number("PIPE").expect("every platform names PIPE");
-        // SAFETY: two sigaction calls, which are async-signal-safe and
-        // allocate nothing -- the same bar every other pre_exec hook in
-        // this codebase meets (see exec.rs's own setpgid hook).
+        // SAFETY: two sigaction calls, which are async-signal-safe and allocate
+        // nothing.
         unsafe {
             command.pre_exec(move || {
                 crate::platform::default_signal(sigpipe);
@@ -1944,10 +1485,8 @@ y
             });
         }
         let (out, timed_out) = command.spawn().and_then(|child| wait_with_timeout(child, CASE_TIMEOUT)).expect("the shell under test must run");
-        // Said out loud rather than folded into the text: a killed shell
-        // reports whatever it printed first, which would come back here as
-        // an ordinary mismatch and send the next reader looking at the
-        // listing code.
+        // A killed shell's partial output would otherwise read as an ordinary
+        // mismatch.
         assert!(!timed_out, "{shell:?} did not finish within {CASE_TIMEOUT:?}");
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
     }
@@ -1958,38 +1497,23 @@ y
         path.exists().then_some(path)
     }
 
-    /// The oldest bash worth comparing against.
-    ///
-    /// 3.2 is what Apple still ships -- it is from 2007, predates a third
-    /// of what this corpus exercises (`declare -A`, `mapfile`, `coproc`,
-    /// `;&`, `${v@Q}`, negative substring offsets, `wait -n`) and would
-    /// report hundreds of divergences that are bash's age rather than
-    /// bish's behaviour. Comparing against it would not be a weaker
-    /// oracle, it would be a misleading one.
+    /// The oldest bash worth comparing against. 3.2, which macOS ships,
+    /// predates much of what the corpus uses (`declare -A`, `mapfile`,
+    /// `coproc`, `${v@Q}`, `wait -n`, ...) and would report bash's age as
+    /// divergences.
     const OLDEST_USABLE_BASH: u32 = 4;
 
-    /// What the oracle is spawned as: a bare name, resolved through the
-    /// PATH each case is given.
-    ///
-    /// Deliberately not the path `oracle_bash` resolved, though it is the
-    /// same binary: bash puts its own `argv[0]` in front of every error
-    /// it reports, so spawning it as `/usr/bin/bash` makes it say
-    /// `/usr/bin/bash: line 1: ...` where the corpus -- which compares
-    /// what an error said about the input, not what the shell calls
-    /// itself -- normalises `bash: ` away. Found by doing it the other
-    /// way: 56 cases "differed" on nothing but that prefix.
+    /// What the oracle is spawned as: a bare name, resolved through each
+    /// case's PATH. bash prefixes its errors with its `argv[0]`, and the corpus
+    /// normalises `bash: ` away; spawned by path it would say
+    /// `/usr/bin/bash: line 1: ...`.
     fn oracle() -> &'static std::ffi::OsStr {
         std::ffi::OsStr::new("bash")
     }
 
-    /// The bash this corpus compares against, or `None` when this machine
-    /// has none worth comparing against.
-    ///
-    /// Resolved on PATH rather than assumed to be `/bin/bash`, and the
-    /// version *asked* rather than inferred from the OS: a Mac with a
-    /// modern bash installed has it ahead of the system one on PATH, and
-    /// then the corpus runs there like anywhere else. Worked out once per
-    /// test binary, since every case would otherwise pay for it.
+    /// The bash to compare against, or `None` when there's none worth it.
+    /// Looked up on PATH and its version asked, so a newer bash installed ahead
+    /// of the system one is used. Resolved once per test binary.
     fn oracle_bash() -> Option<&'static std::path::Path> {
         static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
         FOUND
@@ -2002,71 +1526,33 @@ y
             .as_deref()
     }
 
-    // Both shells get the same scratch directory as HOME and cwd, so
-    // neither reads a config file and neither sees the other's
-    // leftovers -- and both get the *same, minimal* environment.
+    // Both shells get the same scratch directory as HOME and cwd and the same
+    // minimal environment. `env_clear` matters because a shell run in-process
+    // by another test writes its exports into the real process environment
+    // (see `raw_var_write`), so a leaked GLOBIGNORE would fail cases depending
+    // on test order.
     //
-    // env_clear matters more than it looks: these are subprocesses of
-    // the test binary, and a shell run in-process by some other test in
-    // this suite writes its exported variables straight into the real
-    // process environment (see raw_var_write). Without this, a case's
-    // result depends on which other tests happened to run first --
-    // which showed up as every glob case failing, from a leaked
-    // GLOBIGNORE, in whole-suite runs only.
-    // Then killed. A case that deadlocks -- and the divergence list has
-    // one, a coproc whose descriptors go nowhere -- would otherwise
-    // wedge the whole test run rather than reporting a difference.
-    //
-    // Twenty seconds, and it was five. Five is a guess about how fast a
-    // machine is, and on a developer's own machine doing its own work
-    // -- load average around 8, this suite taking 1450 seconds where it
-    // normally takes 620 -- *bash* failed to get through
-    // `two-shell-stages-outlast-the-pipe-buffer` in time, and the
-    // corpus duly reported a difference between two shells that had
-    // both simply been stopped. A timeout is for catching a deadlock,
-    // not for measuring throughput, so it should be far longer than any
-    // case needs rather than close to it.
-    //
-    // The cost is paid only by cases that really do hang: one, four
-    // times over (two corpora, two shells), so fifteen seconds each.
+    // Then killed after a timeout, so a deadlocking case reports instead of
+    // wedging the run. The timeout catches deadlocks, not slowness, so it's
+    // far longer than any case needs: under load even bash can take
+    // seconds.
     const CASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
     fn run(shell: &std::ffi::OsStr, script: &str, dir: &std::path::Path) -> Outcome {
         run_with(shell, &[], script, dir)
     }
 
-    /// `run`, with both streams landing in one place in the order they
-    /// were written -- which is the only way to compare with a pane.
-    ///
-    /// The ordinary corpus reads stdout and stderr from separate pipes
-    /// and concatenates them, so its `want` is every stdout line
-    /// followed by every stderr line whatever order they happened in. A
-    /// pane has one grid and writes both into it as they come, so
-    /// anything touching both streams -- xtrace, `select`'s menu, every
-    /// diagnostic followed by an echoed `$?` -- looked like a
-    /// difference when it was only a difference in how the answer was
-    /// collected. Two descriptors onto one file share an offset, so
-    /// this is bash writing them interleaved exactly as a terminal
-    /// would receive them.
-    /// The grid `--promoted -c` runs a case in -- see main.rs's
-    /// `run_source_in_a_pane`, which has to agree with this.
+    /// The grid `--promoted -c` runs a case in; main.rs's
+    /// `run_source_in_a_pane` has to agree.
     const PANE_ROWS: usize = 400;
     const PANE_COLS: usize = 400;
 
-    /// Waits for a file to stop being written to.
-    ///
-    /// Length-stability rather than a fixed sleep: a consumer that has
-    /// already finished costs one poll, and a slow one is waited for as
-    /// long as it keeps producing. The budget is generous because being
-    /// slow is what a loaded machine is, and the cost of guessing short
-    /// is a case that reports a difference between the shells when what
-    /// it saw was a difference in scheduling.
+    /// Waits for a file to stop being written to: length-stability rather
+    /// than a fixed sleep, so a finished consumer costs one poll and a slow one
+    /// is waited for while it produces.
     fn settle(path: &std::path::Path) {
-        // Five quiet polls, not one. The consumer these cases are about
-        // has typically not written anything *yet* when the shell
-        // exits, so the file is zero bytes long and stays that way
-        // across two reads taken too close together -- which reads as
-        // "finished" and is the very failure this is here to stop.
+        // Five quiet polls: a consumer that hasn't written yet leaves the file
+        // empty across two close reads, which would look finished.
         const QUIET: usize = 5;
         let poll = std::time::Duration::from_millis(20);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2080,14 +1566,13 @@ y
         }
     }
 
+    /// `run`, with both streams written to one file in the order they were
+    /// written, as a pane's grid receives them. Two descriptors on one file
+    /// share an offset, so bash interleaves them exactly as a terminal
+    /// would see them.
     fn run_merged(shell: &std::ffi::OsStr, options: &[&str], script: &str, dir: &std::path::Path) -> Outcome {
-        // Outside the case's own directory, because several cases glob
-        // their cwd and one of them (`shopt-dotglob`) duly listed this
-        // file -- and unique per call, because the two pane tests run
-        // concurrently over the same case list, and a shared name had
-        // each truncating the other's output mid-run. That showed up as
-        // *bash* producing nothing, which is a memorable way to learn
-        // that the harness is the thing under test.
+        // Outside the case's directory, since cases glob their cwd, and unique
+        // per call, since the two pane tests run the same cases concurrently.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("bish-bashdiff-merged-{}-{n}", std::process::id()));
@@ -2116,18 +1601,10 @@ y
             Ok((_, timed_out)) => timed_out,
             Err(e) => return Outcome { text: format!("<could not run: {e}>"), timed_out: false },
         };
-        // The shell exiting does not mean the output is complete. A
-        // `>( )` consumer is a separate process holding this same file
-        // open, and it writes *after* the shell that started it has
-        // gone -- so reading here reads whatever happened to have
-        // landed. That is not a difference between the two shells; it
-        // is the harness measuring at the wrong moment, and it showed
-        // up as bash printing nothing for `echo hi > >(cat)` in a
-        // whole-suite run and `hi` in sixty runs of its own.
-        //
-        // So the file is given a moment to stop growing. Only for the
-        // scripts that can have a writer outliving the shell, because
-        // the wait costs real time and 500 cases do not need it.
+        // The shell exiting doesn't mean the output is complete: a `>( )`
+        // consumer holds the file open and can write after the shell is gone. So
+        // the file gets a moment to stop growing, only for scripts that can have
+        // such a writer, since the wait costs real time.
         if script.contains(">(") {
             settle(&path);
         }
@@ -2136,30 +1613,20 @@ y
         Outcome { text: normalise(&as_a_terminal_would_show_it(&text)), timed_out }
     }
 
-    /// What a terminal would be displaying after `text` was written to
-    /// it -- bash's bytes put through the same vt100 grid a pane's are.
-    ///
-    /// Otherwise every difference between a byte stream and a screen
-    /// reads as a difference between the shells: a grid expands tabs to
-    /// the next stop, has no trailing spaces because every row is the
-    /// full width, and wraps a long line rather than letting it run.
-    /// `set -o`'s aligned columns and `printf 'a\tb'` were both
-    /// reported as divergences on that basis alone.
-    ///
-    /// The same size as the pane the case ran in, so a line wraps in
+    /// What a terminal would show after `text` was written to it: bash's bytes
+    /// through the same vt100 grid as a pane's. A grid expands tabs, has no
+    /// trailing spaces and wraps long lines, and those aren't differences
+    /// between the shells. The same size as the case's pane, so a line wraps in
     /// both or neither.
     fn as_a_terminal_would_show_it(text: &str) -> String {
         let mut screen = crate::vt100::Screen::new(PANE_ROWS, PANE_COLS);
-        // A terminal moves down on a linefeed and left only on a
-        // carriage return; a pipe's `\n` means both. The grid sink
-        // applies exactly this to everything a shell writes into it
-        // (see exec.rs's `onlcr`), so bash's stream needs it too.
+        // A pipe's `\n` is a terminal's `\r\n`; the grid sink does the same to
+        // everything a shell writes (exec.rs's `onlcr`).
         screen.feed(text.replace('\n', "\r\n").as_bytes());
         screen.text_unwrapped()
     }
 
-    // `run`, with room for an option ahead of `-c` -- which is how the
-    // pane corpus asks for `--promoted`.
+    // `run`, with options ahead of `-c`: the pane corpus passes `--promoted`.
     fn run_with(shell: &std::ffi::OsStr, options: &[&str], script: &str, dir: &std::path::Path) -> Outcome {
         let out = Command::new(shell)
             .args(options)
@@ -2187,23 +1654,16 @@ y
 
     /// What one shell did with one case.
     ///
-    /// `timed_out` is separate from the text on purpose. A case that
-    /// hangs gets killed and reports whatever it managed to print,
-    /// which can easily be *the right answer* -- every hang found in
-    /// the pipeline and process-substitution work printed exactly what
-    /// bash printed and then failed to exit. Folding that into the
-    /// comparison would have called all of them passes, and did: none
-    /// of them was caught by this corpus, they were found by running
-    /// shapes by hand and noticing a stray process.
+    /// `timed_out` is separate from the text because a hung case is killed and
+    /// reports what it printed, which is often the right answer. Comparing
+    /// text alone would call those passes.
     struct Outcome {
         text: String,
         timed_out: bool,
     }
 
-    // Each shell names itself, and bash adds a line number, when it
-    // reports a problem. That is not a difference worth failing over --
-    // what a case about an error is asking is whether the error
-    // happened and what it said about the input.
+    // Each shell names itself in an error, and bash adds a line number. A
+    // case about an error is about whether it happened and what it said.
     fn normalise(text: &str) -> String {
         text.lines()
             .map(|line| {
@@ -2218,10 +1678,8 @@ y
             .join("\n")
     }
 
-    // `Child::wait_with_output` with a deadline: polled rather than
-    // blocked on, and killed if it runs out. Its output is still
-    // collected afterwards, so a case that produced something before
-    // hanging still reports it.
+    // `Child::wait_with_output` with a deadline, killing the child when it
+    // runs out. Output so far is still collected.
     fn wait_with_timeout(mut child: std::process::Child, limit: std::time::Duration) -> std::io::Result<(std::process::Output, bool)> {
         let deadline = std::time::Instant::now() + limit;
         let mut timed_out = false;
@@ -2243,41 +1701,22 @@ y
         compare_with(cases, bish, &[])
     }
 
-    /// `compare`, running bish with `options` ahead of `-c`.
-    ///
-    /// The pane corpus passes `--promoted`, which runs the case the way
-    /// a split or tabbed window runs one and prints the pane's own grid
-    /// afterwards -- see main.rs's `run_source_in_a_pane`. bash is run
-    /// exactly as it is for the ordinary corpus: the question is
-    /// whether a pane agrees with bash, not whether it agrees with the
-    /// other bish.
+    /// `compare`, running bish with `options` ahead of `-c`. With
+    /// `--promoted` a case runs the way a split or tabbed window runs one (see
+    /// main.rs's `run_source_in_a_pane`); bash runs as in the ordinary corpus.
     fn compare_with(cases: &[Case], bish: &std::path::Path, options: &[&str]) -> Vec<(&'static str, String, String)> {
-        // A root per *call*, not per process. Several of these tests run
-        // concurrently, and more than one of them now runs the same case
-        // list with the same options -- so a root shared by case name
-        // had one run deleting the directory another run's shell was
-        // sitting in. bash reports that as "getcwd: cannot access parent
-        // directories", which names neither the cause nor the culprit.
+        // A root per call, not per process: tests running the same cases
+        // concurrently would delete each other's working directories.
         static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let attempt = NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("bish-bashdiff-{}-{attempt}", std::process::id()));
         let mut differing = Vec::new();
         for case in cases {
-            // A directory per case, named after the case: several of
-            // them create files, and a glob is only predictable in a
-            // directory it owns. The *name* rather than an index
-            // because the two tests that call this run concurrently in
-            // one process -- indices would collide, and one test would
-            // then delete the directory the other's shell is sitting in
-            // (which shows up as bash's "getcwd: cannot access parent
-            // directories", not as anything resembling its cause).
-            // A directory per case, named after the case: several of
-            // them create files, and a glob is only predictable in a
-            // directory it owns.
+            // A directory per case: cases create files, and a glob is only
+            // predictable in a directory it owns.
             let dir = root.join(case.name);
             std::fs::create_dir_all(&dir).unwrap();
-            // A pane merges the two streams, so bash has to be read
-            // the same way for the comparison to mean anything.
+            // A pane merges the two streams, so bash is read the same way.
             let merged = !options.is_empty();
             let want = match merged {
                 true => run_merged(oracle(), &[], case.script, &dir),
@@ -2287,10 +1726,8 @@ y
             std::fs::create_dir_all(&dir).unwrap();
             let got = run_with(bish.as_os_str(), options, case.script, &dir);
             std::fs::remove_dir_all(&dir).ok();
-            // A hang is its own kind of wrong, and not one the text can
-            // express: a case that hangs is killed and reports whatever
-            // it printed first, which is very often exactly right. Said
-            // out loud here so it cannot be mistaken for agreement.
+            // A hung case is killed and reports what it printed, often exactly
+            // right, so a timeout is reported on its own.
             if got.timed_out || want.timed_out {
                 let who = match (want.timed_out, got.timed_out) {
                     (true, true) => "both shells hung",
@@ -2304,47 +1741,24 @@ y
                 differing.push((case.name, want.text, got.text));
             }
         }
-        // This root belongs to this call alone, so it goes whole.
         std::fs::remove_dir_all(&root).ok();
         differing
     }
 
-    /// Every corpus case again, run the way a split or tabbed window
-    /// runs one.
+    /// Losing the oracle quietly is the failure this guards against. Every
+    /// corpus test returns early without a usable bash, and a run that skips
+    /// every case still reports `ok`.
     ///
-    /// A pane is a different execution path, not a different coat of
-    /// paint: a pty per foreground external command, `ExecResult::Fg`
-    /// handed back for something else to drive, and a vt100 grid where
-    /// a pipe would otherwise be. Three separate bugs lived there
-    /// unnoticed -- a builtin pipeline stage writing past its pipe,
-    /// `$(external)` coming back empty, and every command after an
-    /// external one being dropped -- and every one of them was found by
-    /// hand, because all 488 cases ran the other way.
-    /// Losing the oracle quietly is the failure this guards against.
-    ///
-    /// Every corpus test here returns early when there is no bash worth
-    /// comparing against, and a run that skips 733 cases while still
-    /// reporting `ok` is the worst way for a comparison corpus to fail:
-    /// nothing is red, and the thing that was being checked simply is not
-    /// checked any more. So the absence has to be deliberate somewhere,
-    /// and this is where.
-    ///
-    /// macOS is where it is accepted for now: the system bash is 3.2,
-    /// older than a third of what the corpus exercises, and bish is
-    /// therefore not compared against bash there at all. Installing a
-    /// modern one (Homebrew puts it ahead of the system bash on PATH) is
-    /// all it takes for the corpus to start running there.
-    ///
-    /// Anywhere else, a missing or too-old bash fails the suite rather
-    /// than shrinking it. `BISH_NO_BASH_ORACLE=1` accepts it for a
-    /// deliberate run without one -- a minimal container, say.
+    /// macOS is accepted for now: its system bash is 3.2, too old to compare
+    /// against. A newer one ahead of it on PATH (Homebrew's) makes the corpus
+    /// run there. Anywhere else a missing or too-old bash fails the suite;
+    /// `BISH_NO_BASH_ORACLE=1` accepts a run without one, in a minimal
+    /// container say.
     #[test]
     fn the_corpus_goes_unrun_only_where_that_is_accepted() {
         if oracle_bash().is_some() || std::env::var_os("BISH_NO_BASH_ORACLE").is_some() {
             return;
         }
-        // macOS is the one machine where going without is accepted, so
-        // there is nothing to report there.
         if cfg!(target_os = "macos") {
             return;
         }
@@ -2354,6 +1768,10 @@ y
         );
     }
 
+    /// Every corpus case again, run the way a split or tabbed window runs
+    /// one. A pane is a different execution path: a pty per foreground
+    /// external, `ExecResult::Fg` handed back to be driven elsewhere, and a
+    /// vt100 grid where a pipe would be.
     #[test]
     fn bish_agrees_with_bash_in_a_pane() {
         let Some(bish) = bish_binary() else { return };
@@ -2374,52 +1792,22 @@ y
         );
     }
 
-    /// Cases the pane corpus does not run at all.
-    ///
-    /// Empty, and it took two goes to get here. Both halves of process
-    /// substitution used to be on this list as load-dependent noise,
-    /// and neither was noise: a foreground command in a pane is stashed
-    /// rather than run, so `drain_proc_subs` was tearing the
-    /// substitution down before the command that needed it had started.
-    /// A `<( )` producer lost everything past one pipe buffer; a `>( )`
-    /// consumer was handed end-of-input before its writer had written.
-    ///
-    /// Deferring that teardown past the pending job fixed both. The
-    /// reading half was un-skipped when the fix landed; the writing
-    /// half was held back one more round on the strength of a single
-    /// intermittent failure, which measurement did not reproduce --
-    /// nine `proc-sub-out-` cases, alone and under load, four whole
-    /// pane corpus runs, and the full suite twice. The entry it used to
-    /// have claimed nothing waits for a `>( )` consumer, which is true
-    /// and, now that the teardown happens at the right moment, not
-    /// something these cases can tell.
+    /// Cases the pane corpus doesn't run at all.
     const PANE_SKIPPED: &[(&str, &str)] = &[];
 
-    /// The cases the pane corpus actually compares.
     fn pane_cases() -> Vec<Case> {
         CASES.iter().filter(|c| !PANE_SKIPPED.iter().any(|(prefix, _)| c.name.starts_with(prefix))).copied().collect()
     }
 
-    /// Cases whose *pane* answer differs from bash, with the reason.
-    ///
-    /// Empty is the goal. A name here is a claim that the difference is
-    /// the pane's nature rather than a bug -- and every one of those
-    /// claims has to say why, because the last three that looked like
-    /// nature turned out to be bugs.
+    /// Cases whose pane answer differs from bash, with the reason. Each one
+    /// claims the difference is the pane's nature, not a bug, and has to say why.
     const PANE_DIVERGENCES: &[(&str, &str)] = &[
-        // A pane is a terminal, and the corpus reads bash through a
-        // pipe. `ls a b` columns its output for one and lists it one
-        // per line for the other, which is both programs behaving
-        // correctly and the only thing left on this list. Fixing it
-        // would mean making the pane *less* like a terminal.
+        // A pane is a terminal and bash's side is a pipe, so `ls a b` columns its
+        // output in one and not the other. Both are right.
         ("a-superseded-redirect-still-creates-its-file", "`ls a b` columns its output, because a pane is a tty and bash's side here is a pipe"),
     ];
 
-    /// The same guard `DIVERGENCES` has: a name on the pane list is a
-    /// claim that the case *does* differ, and a claim that stops being
-    /// true has to be removed rather than left standing. Fixing one of
-    /// these fails the suite until its line goes, which is the whole
-    /// reason a list like this is safe to keep.
+    /// As with `DIVERGENCES`: fixing one fails the suite until its line goes.
     #[test]
     fn the_known_pane_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };
@@ -2462,12 +1850,10 @@ y
         );
     }
 
-    /// Cases that only mean something in a login shell, run under `-l`
-    /// by both shells.
-    ///
-    /// The status of a shell that has left is not in the text compared,
-    /// so each case shows it from where it can still be seen: a `$( )`
-    /// (which bash counts as the login shell) or an EXIT trap.
+    /// Cases that only mean something in a login shell, run under `-l` by
+    /// both shells. The exit status isn't in the compared text, so each case
+    /// shows it from a `$( )` (which bash counts as the login shell) or an EXIT
+    /// trap.
     const LOGIN_CASES: &[Case] = &[
         case("logout-leaves-from-a-command-substitution", r#"x=$(echo a; logout 3; echo b); echo "[$x] rc=$?""#),
         case("logout-runs-the-exit-trap", r#"trap 'echo "trapped rc=$?"' EXIT; logout 4; echo not-reached"#),
@@ -2511,42 +1897,12 @@ y
         );
     }
 
-    /// The scripts that do *not* survive the round trip, and why.
-    ///
-    /// Empty. It was 72, then 36, then four unrelated one-line
-    /// omissions, then one -- `PS4='+$LINENO '`, which printed the line
-    /// a command was on and so noticed that the serializer re-laid the
-    /// script. Statements go back on the lines they came from now, so
-    /// it does not.
-    ///
-    /// Keeping it empty is the point. Every corpus script is run as
-    /// written and again after a trip through the serializer, and the
-    /// two have to do the same thing -- because that trip is how a
-    /// construct reaches a self-exec'd child, and a round trip that
-    /// loses something is not a formatting bug, it is that construct
-    /// quietly doing something else.
+    /// Scripts that don't survive the round trip, and why. Kept empty: the
+    /// round trip is how a construct reaches a self-exec'd child, so losing
+    /// something there means the construct quietly does something else.
     const ROUND_TRIP_BREAKS: &[&str] = &[];
 
-    /// Every corpus script, run as written and again after a round trip
-    /// through the serializer, must do the same thing.
-    ///
-    /// That serializer is load-bearing and had no property test. It is
-    /// how a construct reaches a self-exec'd child -- a subshell, a
-    /// command substitution, a pipeline stage, a redirected compound,
-    /// the function preamble, and now every backgrounded builtin -- so
-    /// a round trip that loses something is not a formatting bug, it is
-    /// that construct quietly doing something else. Its own header says
-    /// it "just needs to round-trip whatever a function body can
-    /// contain", which is exactly the claim this checks.
-    ///
-    /// Behaviour rather than shape: comparing ASTs would need
-    /// `PartialEq` across the whole parse tree, and would still not say
-    /// whether the text *means* the same thing. Running it does.
-    /// The same guard the divergence lists have: a name on
-    /// `ROUND_TRIP_BREAKS` is a claim that the script *does* break, and
-    /// a claim that stops being true has to be removed rather than left
-    /// standing. Without this the list only ever grows -- it went from
-    /// 72 to 36 in one change, and nothing would have said so.
+    /// As with `DIVERGENCES`: fixing one fails the suite until its line goes.
     #[test]
     fn the_known_round_trip_breaks_are_still_broken() {
         let Some(bish) = bish_binary() else { return };
@@ -2586,6 +1942,10 @@ y
         }
     }
 
+    /// Every corpus script, run as written and again after a round trip
+    /// through the serializer, must do the same thing. Behaviour rather
+    /// than AST equality, because the question is whether the text means
+    /// the same.
     #[test]
     fn every_corpus_script_survives_a_round_trip_through_the_serializer() {
         let Some(bish) = bish_binary() else { return };
@@ -2639,25 +1999,11 @@ y
         assert!(unlisted.is_empty(), "differing but not listed: {unlisted:?}");
     }
 
-    /// How far a producer gets before its reader is given a turn.
-    ///
-    /// Not differential, and it used to be. Two stages of a pipeline
-    /// share one thread here, and a stage gives it up when it blocks --
-    /// so a producer whose reader was keeping up never blocked, and ran
-    /// 32768 times before the reader took its first turn. Exactly
-    /// 32768: a 64KB pipe buffer and two bytes a line.
-    ///
-    /// Comparing that count against bash asks the kernel a question
-    /// rather than the shell. bash forks its stages, so how far its
-    /// producer gets is scheduling: measured on an idle machine it
-    /// ranges from 1 to 93, and on a loaded one it reached 256 and
-    /// failed a case whose threshold was 200. bish is 1, every time,
-    /// because its scheduler decides rather than the kernel.
-    ///
-    /// So the bound is asserted directly. Generously -- what is being
-    /// guarded against is four orders of magnitude away, and the point
-    /// is to notice a producer running away again, not to pin a number
-    /// nobody chose.
+    /// How far a producer gets before its reader is given a turn. Not
+    /// differential: bash forks its stages, so its count is up to the kernel's
+    /// scheduler and varies with load. bish's stages share a thread, and a
+    /// producer that never blocks would run a pipe buffer ahead. The bound is
+    /// generous; it's there to catch a runaway, not to pin a number.
     #[test]
     fn a_producer_does_not_run_away_from_its_reader() {
         let Some(bish) = bish_binary() else { return };
@@ -2672,16 +2018,11 @@ y
         assert!(produced < 1000, "the producer ran {produced} times before its reader had a turn");
     }
 
-    // Also not differential -- bash has no equivalent. A recursion that
-    // has run no command and changed no argument since the last time it
-    // entered the same function is not "probably" a loop: the whole
-    // reachable state is identical to what it was at that earlier entry,
-    // so the program is at a fixed point. That is reportable at the
-    // second call rather than after a thousand of them, which is the
-    // difference between naming the bug and naming the stack.
-    //
-    // The false-positive half matters more than the true-positive half:
-    // a recursion that does anything at all must be left alone.
+    // Not differential; bash has nothing like it. A recursion that has run
+    // no command and changed no argument since it last entered the same
+    // function is at a fixed point, so it's reported at the second call
+    // rather than at the stack limit. A recursion that does anything at all
+    // must be left alone.
     #[test]
     fn a_recursion_that_cannot_terminate_is_reported_as_such() {
         let Some(bish) = bish_binary() else { return };
@@ -2692,8 +2033,7 @@ y
             ("f() { f; }; f", "called itself"),
             ("a() { b; }; b() { a; }; a", "cycle of 2 calls"),
             ("a() { b; }; b() { c; }; c() { a; }; a", "cycle of 3 calls"),
-            // Looks like it does something and does not: an empty
-            // branch runs no command, so this really is a fixed point.
+            // An empty branch runs no command, so this is a fixed point.
             ("f() { case a in a) ;; esac; f; }; f", "called itself"),
         ];
         for (script, expected) in proven {
@@ -2702,29 +2042,17 @@ y
             assert!(out.text.contains(expected), "{script:?} misdescribed the cycle: {:?}", out.text);
         }
 
-        // Each of these recurses forever too, but *productively* -- it
-        // runs a command, assigns something, or reads a variable whose
-        // value comes from outside the shell. None is a fixed point, so
-        // none may be reported as one; they hit the stack limit instead,
-        // which says "nesting level exceeded".
+        // These recurse forever but productively: a command, an assignment, or
+        // a value from outside the shell. They hit the stack limit instead.
         for script in [
             "f() { x=1; f; }; f",
             "f() { true; f; }; f",
             "f() { f $((${1:-0}+1)); }; f",
             "f() { f $RANDOM; }; f",
             "f() { f $SECONDS; }; f",
-            // Deliberately no case that spawns an external command
-            // per frame. Each of these recurses until the stack runs
-            // out, so that would be a thousand spawns, and the case
-            // took longer than the harness's own per-case timeout once
-            // the suite ran it under load. `true` above is a builtin
-            // and reaches the same "this ran a command" bookkeeping;
-            // an external adds a process, not coverage.
-            // Arithmetic that assigns, in each of its spellings. The
-            // `(( ))` command is not a simple command and so does not
-            // pass the dispatch where effects are counted -- this was
-            // reported as a fixed point until an arithmetic assignment
-            // became an effect in its own right.
+            // No external command per frame: that would be a thousand spawns, and
+            // `true` reaches the same bookkeeping. Arithmetic that assigns counts as
+            // an effect, in each of its spellings.
             "f() { ((i++)); f; }; f",
             "f() { : $(( j = j + 1 )); f; }; f",
             "f() { x[0]=$((n++)); f; }; f",
@@ -2740,12 +2068,10 @@ y
             assert!(out.text.contains("nesting level exceeded"), "{script:?} should have run into the stack limit: {:?}", out.text);
         }
 
-        // A recursion that terminates is not touched by any of this.
         let out = run(bish.as_os_str(), r#"f() { if [ "$1" -gt 0 ]; then f $(($1-1)); else echo done; fi; }; f 50"#, &root);
         assert_eq!(out.text, "done", "a bounded recursion must simply run");
 
-        // Reported once, and the script stops there -- the same unwind
-        // `FUNCNEST` gets, since there is nothing useful to run after.
+        // Reported once, and the script stops there, as with `FUNCNEST`.
         let out = run(bish.as_os_str(), "f() { f; }; f; echo unreached", &root);
         assert_eq!(out.text.matches("cannot terminate").count(), 1, "reported once per runaway, not once per frame: {:?}", out.text);
         assert!(!out.text.contains("unreached"), "the script should have stopped: {:?}", out.text);
@@ -2753,18 +2079,11 @@ y
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // Not a differential case: real bash dies on a signal for three of
-    // these four, so there is nothing to compare against. What is being
-    // asserted is only that bish does not -- an unbounded recursion is
-    // a typo, and a typo should not dump core.
-    //
-    // Each shape reaches the stack by a different route. A function
-    // calling itself and an `eval` calling itself both go through
-    // `call_function`; a file that sources itself never makes a
-    // function call at all; and a deeply parenthesised arithmetic
-    // expression is the parser recursing, not the executor. One stack
-    // measurement covers all four -- see stackguard's own doc comment
-    // for why it is a measurement rather than a depth counter.
+    // Not differential: bash dies on a signal for three of these four. bish
+    // must not, since an unbounded recursion is usually a typo. Each reaches
+    // the stack by a different route (function call, `eval`, a self-sourcing
+    // file, the arithmetic parser), and one stack measurement covers all four
+    // (see stackguard).
     #[test]
     fn a_runaway_recursion_is_an_error_rather_than_a_crash() {
         let Some(bish) = bish_binary() else { return };
@@ -2777,9 +2096,7 @@ y
             ("a function whose body is two self-calls", "f() { f; f; }; f".to_string()),
             ("eval calling itself", r#"f() { eval "f"; }; f"#.to_string()),
             ("a file sourcing itself", format!("source {}", root.join("self.sh").display())),
-            // A `FUNCNEST` set high enough never to be reached must not
-            // be a way back to the crash: the stack backstop applies
-            // under it, not instead of it.
+            // A `FUNCNEST` too high to reach doesn't disable the stack backstop.
             ("a FUNCNEST too large to ever be reached", "FUNCNEST=1000000; f() { x=1; f; }; f".to_string()),
         ];
         for (what, script) in cases.iter().map(|(w, s)| (*w, s.clone())).chain([("arithmetic nested very deeply", deep)]) {
