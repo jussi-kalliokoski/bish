@@ -1,26 +1,19 @@
-//! How bish's one OS-facing surface is satisfied on a target that is not
-//! a Unix at all.
+//! bish's OS surface on a target that isn't a Unix: the replacement for
+//! `unix.rs` that `mod.rs` describes, for WASI preview 1, which a browser
+//! build runs on.
 //!
-//! `mod.rs` names this case directly: "a target that is not a Unix at
-//! all (a browser, an embedded runtime) replaces `unix.rs`, and this
-//! surface is the contract it has to satisfy." This is that file, for
-//! WASI preview 1 -- the shape a browser build runs through.
+//! Three kinds of capability:
 //!
-//! The capabilities split three ways:
+//!   * Real: files, time, descriptor reads and writes, `access`-style
+//!     questions, done with `std`.
+//!   * Absent but harmless: signals, process groups, resource limits,
+//!     terminal modes. With no child processes and no controlling
+//!     terminal they never need to do anything, so they're no-ops or
+//!     neutral answers.
+//!   * Absent and refused: ptys, a pipe to a child, a stack to switch to,
+//!     which return errors; nothing here could use them.
 //!
-//!   * Real. Files, time, descriptor reads and writes, `access`-style
-//!     questions: WASI has these, so they are done with `std` and work.
-//!   * Absent but harmless. Signals, process groups, resource limits,
-//!     terminal modes: a shell with no child processes and no
-//!     controlling terminal never needs them to *do* anything, so they
-//!     are no-ops or neutral answers that keep the callers above
-//!     running.
-//!   * Absent and refused. Ptys, a pipe to a child, a stack to switch
-//!     onto: these return an error a caller can report. Nothing on this
-//!     platform can spawn the thing that would use them.
-//!
-//! Everything here is `std`-only; there is not a single `extern "C"`,
-//! which is why `mod.rs`'s `os_guard` has nothing to say about it.
+//! All `std`, no `extern "C"`, so `os_guard` has nothing to say.
 #![allow(dead_code)]
 
 use std::fs::File;
@@ -33,20 +26,15 @@ fn unsupported<T>(what: &str) -> std::io::Result<T> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("{what} is not available on this platform")))
 }
 
-/// Borrows an fd as a `File` without owning it: the `ManuallyDrop` is
-/// what keeps the descriptor open when the borrow ends, so a read or a
-/// write through it does not close stdin out from under the shell.
+/// Borrows an fd as a `File` without owning it: `ManuallyDrop` keeps the
+/// descriptor open, so using it doesn't close stdin.
 fn borrow_fd(fd: RawFd) -> ManuallyDrop<File> {
-    // SAFETY: we never drop it, so no double-close; the fd outlives the
-    // borrow by construction.
+    // SAFETY: never dropped, so no double close; the fd outlives the borrow.
     ManuallyDrop::new(unsafe { File::from_raw_fd(fd) })
 }
 
-// ---------------------------------------------------------------------
-// Coroutine stacks. There is no second stack to switch onto here, so the
-// coroutine machinery that would call these is itself stubbed out (see
-// `coroutine.rs`); these exist only to satisfy the contract.
-// ---------------------------------------------------------------------
+// Coroutine stacks: there's no second stack here, and the coroutine code
+// that would call these is stubbed (`coroutine.rs`).
 
 pub(crate) fn map_guarded_stack(_guard: usize, _usable: usize) -> std::io::Result<*mut u8> {
     unsupported("a guarded stack")
@@ -54,17 +42,13 @@ pub(crate) fn map_guarded_stack(_guard: usize, _usable: usize) -> std::io::Resul
 
 pub(crate) unsafe fn unmap(_base: *mut u8, _len: usize) {}
 
-// ---------------------------------------------------------------------
-// Temp files. WASI can create files in a preopened directory, so these
-// are real -- `None` only when there is no writable directory to use,
-// which the callers already handle.
-// ---------------------------------------------------------------------
+// Temp files: real, in a preopened directory; `None` only without a
+// writable one, which callers handle.
 
 pub(crate) fn unlinked_temp_file(tag: &str) -> Option<File> {
     exclusive_temp_file(tag).map(|(file, path)| {
-        // Best effort: on a filesystem that allows it this makes the
-        // file nameless as the Unix side does; where it does not, the
-        // named file still works.
+        // Best effort: nameless where the filesystem allows, as on Unix; the
+        // named file works otherwise.
         let _ = std::fs::remove_file(&path);
         file
     })
@@ -83,12 +67,9 @@ pub(crate) fn exclusive_temp_file(tag: &str) -> Option<(File, PathBuf)> {
     None
 }
 
-// ---------------------------------------------------------------------
-// Directory snapshots: the poll-based change detection `watch.rs` falls
-// back to. Built from `std` metadata -- no inode here, so a rename that
-// keeps size and mtime would be missed, which is the one case the Unix
-// inode guards against and the price of having no kernel to ask.
-// ---------------------------------------------------------------------
+// Directory snapshots, from `std` metadata, for `unix.rs`'s contract;
+// nothing polls them here. No inode, so a rename keeping size and mtime
+// would be missed.
 
 #[derive(Default)]
 pub(crate) struct DirSnapshot {
@@ -135,11 +116,8 @@ impl DirSnapshot {
     }
 }
 
-// ---------------------------------------------------------------------
-// Terminal modes. There is no controlling terminal; the type stays
-// opaque (as on Unix) but carries nothing, and the mode transforms are
-// identities so a caller that saves and restores a mode is harmless.
-// ---------------------------------------------------------------------
+// Terminal modes: no controlling terminal, so the opaque type carries
+// nothing and the transforms are identities.
 
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalMode(());
@@ -168,9 +146,7 @@ pub(crate) fn echoless_mode(from: &TerminalMode) -> TerminalMode {
     *from
 }
 
-// ---------------------------------------------------------------------
-// Descriptor reads and writes. Real: WASI descriptors read and write.
-// ---------------------------------------------------------------------
+// Descriptor reads and writes: real.
 
 pub(crate) fn raise_signal(_signal_number: i32) {}
 
@@ -182,9 +158,7 @@ pub(crate) fn write_bytes(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
     borrow_fd(fd).write(bytes)
 }
 
-// ---------------------------------------------------------------------
-// Ptys and window size. No controlling terminal here.
-// ---------------------------------------------------------------------
+// Ptys and window size: no controlling terminal.
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -204,8 +178,8 @@ pub(crate) fn attach_to_pty_slave(_slave_path: &std::ffi::CStr) -> std::io::Resu
 }
 
 pub(crate) fn terminal_size(_fd: RawFd) -> std::io::Result<Winsize> {
-    // A sensible default rather than an error: callers use this to lay
-    // out output, and 80x24 is the conventional fallback everywhere.
+    // 80x24, the conventional fallback, rather than an error: callers lay
+    // out output with it.
     Ok(Winsize { rows: 24, cols: 80, xpixel: 0, ypixel: 0 })
 }
 
@@ -219,10 +193,8 @@ pub(crate) fn set_foreground_pgrp(_fd: RawFd, _pgrp: i32) -> std::io::Result<()>
 
 pub(crate) fn set_nonblocking(_fd: RawFd) {}
 
-// ---------------------------------------------------------------------
-// Access, identity. `access`-style questions are answerable from std
-// metadata; identity is a single fixed user, since WASI has no uids.
-// ---------------------------------------------------------------------
+// Access and identity: `access` questions from `std` metadata, and one
+// fixed user, since WASI has no uids.
 
 pub(crate) enum Access {
     Read,
@@ -233,8 +205,8 @@ pub(crate) enum Access {
 pub(crate) fn is_accessible(path: &str, mode: Access) -> bool {
     match std::fs::metadata(path) {
         Ok(meta) => match mode {
-            // Nothing on WASI distinguishes read from execute at this
-            // level; existence is the honest answer for both.
+            // Nothing distinguishes read from execute here; existence
+            // answers both.
             Access::Read | Access::Execute => true,
             Access::Write => !meta.permissions().readonly(),
         },
@@ -242,9 +214,8 @@ pub(crate) fn is_accessible(path: &str, mode: Access) -> bool {
     }
 }
 
-/// The one user there is. WASI has no uids; bish's ownership checks all
-/// compare against this, so a fixed value makes "owned by me" uniformly
-/// true, which is the truth in a single-user sandbox.
+/// The one user. WASI has no uids, so ownership checks against this all
+/// pass, which is true in a single-user sandbox.
 pub(crate) fn effective_user() -> u32 {
     1000
 }
@@ -257,8 +228,7 @@ pub(crate) fn real_user() -> u32 {
     1000
 }
 
-/// The owner of a file, for the trust store's ownership check. There
-/// are no owners here, so everything reads as owned by the one user.
+/// A file's owner, for the trust store: everything is the one user's.
 pub(crate) fn file_owner(_metadata: &std::fs::Metadata) -> u32 {
     effective_user()
 }
@@ -267,9 +237,7 @@ pub(crate) fn is_terminal(_fd: RawFd) -> bool {
     false
 }
 
-// ---------------------------------------------------------------------
-// File locking. Single process, so a lock is uncontended by definition.
-// ---------------------------------------------------------------------
+// File locking: one process, so never contended.
 
 pub(crate) fn lock_exclusive(_fd: RawFd) -> std::io::Result<()> {
     Ok(())
@@ -277,10 +245,8 @@ pub(crate) fn lock_exclusive(_fd: RawFd) -> std::io::Result<()> {
 
 pub(crate) fn unlock(_fd: RawFd) {}
 
-// ---------------------------------------------------------------------
-// Time. `epoch_seconds` is real; `local_time_at` is UTC, there being no
-// timezone database in the sandbox.
-// ---------------------------------------------------------------------
+// Time: `epoch_seconds` is real; `local_time_at` is UTC, with no
+// timezone database here.
 
 #[repr(C)]
 pub(crate) struct CTm {
@@ -319,9 +285,8 @@ pub(crate) fn epoch_seconds() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// `epoch_seconds` broken into the UTC calendar, by the civil-from-days
-/// algorithm (Howard Hinnant's) -- self-contained arithmetic, no C
-/// library and no timezone, which is all a sandbox has to offer.
+/// `epoch_seconds` in the UTC calendar by Howard Hinnant's
+/// civil-from-days algorithm: plain arithmetic, no C library.
 pub(crate) fn local_time_at(epoch_seconds: i64) -> CTm {
     let days = epoch_seconds.div_euclid(86_400);
     let secs = epoch_seconds.rem_euclid(86_400);
@@ -369,10 +334,8 @@ pub(crate) fn local_time_at(epoch_seconds: i64) -> CTm {
 #[cfg(test)]
 pub(crate) fn reload_timezone() {}
 
-// ---------------------------------------------------------------------
-// Resource limits. None here; everything is unlimited, and no `ulimit`
-// flag maps to a real resource.
-// ---------------------------------------------------------------------
+// Resource limits: none; everything unlimited, no `ulimit` flag maps to
+// a resource.
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -412,10 +375,8 @@ pub(crate) fn cpu_seconds() -> Option<(f64, f64, f64, f64)> {
     None
 }
 
-// ---------------------------------------------------------------------
-// umask. WASI has no umask; report the conventional default and accept
-// a set without doing anything.
-// ---------------------------------------------------------------------
+// umask: none in WASI; reports the conventional default and ignores a
+// set.
 
 pub(crate) fn current_umask() -> u32 {
     0o022
@@ -425,10 +386,8 @@ pub(crate) fn set_umask(_mask: u32) -> u32 {
     0o022
 }
 
-// ---------------------------------------------------------------------
-// Polling. The event loop asks this to sleep until a descriptor is
-// ready; with nothing async to wait on, every wait is a timeout.
-// ---------------------------------------------------------------------
+// Polling: with nothing asynchronous to wait on, every wait is a
+// timeout.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -471,14 +430,12 @@ pub(crate) fn wake_pipe() -> std::io::Result<(RawFd, RawFd)> {
 
 pub(crate) fn wake(_fd: RawFd) {}
 
-// ---------------------------------------------------------------------
-// Descriptor plumbing. Close and duplicate are real (std does them);
-// the nonblocking/cloexec flag twiddling is a no-op the callers tolerate.
-// ---------------------------------------------------------------------
+// Descriptor plumbing: close and duplicate are real; the flag changes
+// are no-ops callers tolerate.
 
 pub(crate) fn close_fd(fd: RawFd) {
     if fd >= 0 {
-        // SAFETY: taking ownership to drop it, which closes it once.
+        // SAFETY: owned to drop it, closing it once.
         drop(unsafe { File::from_raw_fd(fd) });
     }
 }
@@ -513,10 +470,7 @@ pub(crate) fn restore_flags(_fd: RawFd, _flags: i32) {}
 
 pub(crate) fn clear_cloexec(_fd: RawFd) {}
 
-// ---------------------------------------------------------------------
-// Process identity and signals. No processes, no signals: neutral
-// answers all the way down.
-// ---------------------------------------------------------------------
+// Process identity and signals: none, so neutral answers.
 
 pub(crate) fn parent_process_id() -> i32 {
     0
@@ -556,10 +510,7 @@ pub(crate) fn process_group() -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------
-// Children. Nothing can spawn one, so there is never anything to wait
-// for.
-// ---------------------------------------------------------------------
+// Children: nothing can spawn one, so nothing to wait for.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Waited {
@@ -574,10 +525,8 @@ pub(crate) fn wait_for_child(_pid: i32, _block: bool) -> Waited {
     Waited::Gone
 }
 
-// ---------------------------------------------------------------------
-// Directories. `create_dir_with_mode` ignores the mode -- WASI has no
-// permission bits -- but still creates the directory.
-// ---------------------------------------------------------------------
+// Directories: created, the mode ignored, since WASI has no permission
+// bits.
 
 pub(crate) fn create_dir_with_mode(path: &Path, _mode: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
@@ -587,9 +536,8 @@ pub(crate) fn create_dir_all_with_mode(path: &Path, _mode: u32) -> std::io::Resu
     std::fs::create_dir_all(path)
 }
 
-/// A file for writing. There are no permission bits to set here, so it
-/// is simply opened; the privacy the mode buys on Unix is the sandbox's
-/// own problem, not something bish can enforce.
+/// A file for writing, just opened: there are no permission bits, and
+/// privacy is the sandbox's business.
 pub(crate) fn create_private_file(path: &Path, append: bool) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true);
@@ -611,8 +559,8 @@ pub(crate) fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-/// There is one process and it is this one; `std::process::id` aborts on
-/// WASI, so bish's `$$`/`$BASHPID` get a fixed, stable value instead.
+/// One process, this one. `std::process::id` aborts on WASI, so `$$` and
+/// `$BASHPID` get a fixed value.
 pub(crate) fn process_id() -> u32 {
     1
 }
@@ -622,8 +570,7 @@ pub(crate) fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-/// None of these file kinds exist in the sandbox, so `test` answers
-/// `false` for all of them -- which is the truth here.
+/// None of these kinds exist in the sandbox, so `test` answers `false`.
 pub(crate) fn is_fifo(_file_type: &std::fs::FileType) -> bool {
     false
 }
