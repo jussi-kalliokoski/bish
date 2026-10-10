@@ -1,19 +1,14 @@
-// `echo`, `printf`, `test`: the builtins that write, and the one that
-// only answers. `test`'s own expression evaluator is in `mod.rs`,
-// where it has always been.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
+// `echo`, `printf` and `test`. `test`'s expression evaluator is in
+// `mod.rs`.
 
 use crate::exec::{ExecResult, Shell, echo_expand_escapes, printf_format_once, sh_eprintln, sh_print};
 use crate::parser;
 
-// `echo [-neE] [arg...]`: writes each arg separated by a single
-// space, then a trailing newline unless -n was given. Flags must
-// come first and be one of exactly n/e/E (bundled, e.g. "-ne") --
-// the first argument that doesn't fit that shape ends flag parsing,
-// matching bash's own echo (no long options, no "--" special case).
-// -e enables the same backslash escapes real bash's echo recognizes
-// (see echo_expand_escapes); -E (the default) leaves them untouched.
+// `echo [-neE] [arg...]`: the args separated by spaces, then a newline
+// unless `-n`. Flags come first and are only `n`, `e` and `E`, bundled or
+// not; the first argument that isn't one ends them, with no `--`, as in
+// bash. `-e` enables bash's echo escapes (see `echo_expand_escapes`); `-E`,
+// the default, leaves them.
 pub(crate) fn run_echo(sh: &Shell, args: &[String]) -> i32 {
     let mut interpret_escapes = false;
     let mut trailing_newline = true;
@@ -57,21 +52,14 @@ pub(crate) fn run_echo(sh: &Shell, args: &[String]) -> i32 {
     0
 }
 
-// `printf FORMAT [ARGS...]` / `printf -v NAME FORMAT [ARGS...]`:
-// bash-compatible subset -- %s %d %i %o %u %x %X %c %b %q %%
-// conversions, with "-" (left-align) and "0" (zero-pad) flags, a
-// numeric width, and a ".precision" (applied to %s only -- a
-// truncation length; other conversions ignore it, a minor
-// simplification against real printf's %d minimum-digit-count
-// behavior). FORMAT's own backslash escapes (\n, \t, ...) are
-// always interpreted -- unlike echo, there's no -e/-E switch, POSIX
-// printf's format string is escape-interpreted unconditionally.
-// FORMAT is cycled -- reused from the start -- for as long as
-// there's still at least one unconsumed argument left, matching
-// real printf (`printf "%s\n" a b c` prints three lines); a numeric
-// conversion given a missing or non-numeric argument is treated as
-// 0, a string conversion given a missing one as "". -v NAME assigns
-// the formatted result to a shell variable instead of printing it.
+// `printf FORMAT [ARGS...]` and `printf -v NAME FORMAT [ARGS...]`: the
+// conversions `%s %d %i %o %u %x %X %c %b %q %%`, the `-` and `0` flags, a
+// width, and a precision that only truncates `%s` (real printf also uses
+// it as `%d`'s minimum digits). FORMAT's backslash escapes are always
+// interpreted, as POSIX says. FORMAT is reused while arguments remain
+// (`printf "%s\n" a b c` prints three lines); a missing or non-numeric
+// argument is 0 for a number and "" for a string. `-v NAME` assigns the
+// result instead of printing it.
 pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     let (var_name, rest) = if args.first().map(String::as_str) == Some("-v") {
         match args.get(1) {
@@ -96,9 +84,9 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     let mut errors: Vec<String> = Vec::new();
     loop {
         let before = idx;
-        // `\c` in a `%b` argument ends the output there -- including
-        // the reruns the remaining arguments would have caused. So does
-        // a malformed conversion, which bash abandons the format over.
+        // `\c` in a `%b` argument ends the output there, including the
+        // reruns for remaining arguments. So does a malformed conversion,
+        // as in bash.
         let outcome = printf_format_once(format, values, &mut idx, &mut out);
         errors.extend(outcome.errors);
         if outcome.status != 0 {
@@ -111,18 +99,14 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
             break;
         }
     }
-    // Before the output, the way bash orders them -- the diagnostic is
-    // on stderr and the result on stdout, and a reader watching both
-    // sees the complaint first.
+    // Diagnostics before the output, as bash orders them.
     for e in errors {
         sh_eprintln!(sh, "bish: printf: {}", e);
     }
 
     match var_name {
-        // `printf -v 'arr[0]'` writes an array *element*, which is how
-        // a loop fills an array without a subshell. It was assigning to
-        // a variable literally named `arr[0]`, which nothing can then
-        // expand.
+        // `printf -v 'arr[0]'` writes an array element, so a loop can fill an
+        // array without a subshell.
         Some(name) => match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|i| (base, i))) {
             Some((base, index)) => {
                 let (base, index) = (base.to_string(), index.to_string());
@@ -137,9 +121,8 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     status
 }
 
-// `[[ expr ]]`. Real recursive-descent precedence over the flat
-// TestAtom stream the parser built: NOT binds tightest, then simple
-// tests (unary/binary), then AND, then OR (loosest) -- matching bash.
+// `[[ expr ]]`, by recursive descent over the parser's `TestAtom`s: NOT
+// binds tightest, then simple tests, then AND, then OR, as in bash.
 pub(crate) fn run_test(sh: &mut Shell, atoms: &[parser::TestAtom]) -> ExecResult {
     let mut pos = 0;
     match sh.eval_test_or(atoms, &mut pos) {
