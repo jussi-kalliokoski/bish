@@ -1,34 +1,21 @@
 #!/bin/sh
-# A minimal language server for bish's own tests.
+# A minimal language server for bish's tests. Speaks LSP over stdio:
+# reads `Content-Length`-framed JSON-RPC, answers requests, and appends
+# every message received to the file named by $1, one per line, for
+# tests to assert on what bish sent.
 #
-# Speaks real LSP over stdio: reads `Content-Length`-framed JSON-RPC,
-# answers `initialize` and `textDocument/hover`, and appends every
-# message it received to the file named by $1, one per line, so a test
-# can assert on what bish actually sent.
+# Tests can't depend on an installed language server. This is
+# `include_str!`'d from a `#[cfg(test)]` module, so it's in the test
+# binary only, not shipped as a user-reachable command.
 #
-# This exists because the tests cannot depend on a real language server
-# being installed -- that would be an external dependency in a project
-# whose whole point is not having any. It lives in `src/testdata/`
-# alongside the other fixtures and is pulled in with `include_str!` from
-# inside a `#[cfg(test)]` module, so it is part of the test harness
-# binary and of no other build. A `bish tool lsp-mock` subcommand would
-# have shipped in the release binary as a user-reachable command that
-# exists only to serve tests.
-#
-# Earlier phases got by with an echo server (`printf <reply>; exec cat`)
-# and let bish's own decoder read back what it sent. That stops working
-# here: hover is a *request*, so the reply has to depend on what
-# arrived, which means actually parsing the framing.
-#
-# POSIX sh only. `read` consumes one byte at a time from a pipe, which
-# is what makes the `dd` that follows it land on the body rather than
-# somewhere inside it.
+# POSIX sh only. `read` takes one byte at a time from a pipe, so the
+# `dd` after it lands on the body.
 
 log="$1"
 : >"$log"
 
-# Frames and writes one message. `${#1}` counts characters, which is a
-# byte count for the ASCII these replies are made of.
+# Frames and writes one message. `${#1}` counts characters, which is
+# bytes for these ASCII replies.
 send() {
 	printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"
 }
@@ -57,11 +44,9 @@ while :; do
 	id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
 	case "$body" in
 	*'"applied"'*)
-		# The client's answer to the `workspace/applyEdit` sent below.
-		# Only now does the command that asked for it finish -- which
-		# is the whole shape this fixture exists to exercise: a server
-		# does its work *during* `workspace/executeCommand`, not in
-		# its result.
+		# The client's answer to the `workspace/applyEdit` sent below. Only
+		# now does the command that asked finish: a server works during
+		# `workspace/executeCommand`, not in its result.
 		if [ -n "$cmd_id" ]; then
 			send '{"jsonrpc":"2.0","id":'"$cmd_id"',"result":null}'
 			cmd_id=""
@@ -76,48 +61,40 @@ while :; do
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{"positionEncoding":"utf-32","hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"completionProvider":{"triggerCharacters":["."]},"documentFormattingProvider":true,"renameProvider":true,"codeActionProvider":true,"executeCommandProvider":{"commands":["mock.run"]},"workspaceSymbolProvider":true,"semanticTokensProvider":{"legend":{"tokenTypes":["keyword","parameter","bishInvented"],"tokenModifiers":["declaration"]},"full":true},"textDocumentSync":{"openClose":true,"change":1,"save":true}}}}'
 		;;
 	*'"method":"textDocument/didOpen"'*)
-		# Remembered so `textDocument/definition` can answer about
-		# the document the client actually opened.
+		# Remembered so `textDocument/definition` answers about the opened
+		# document.
 		uri=$(printf '%s' "$body" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')
-		# Diagnostics are *pushed*, so this is the only chance to send
-		# any: nothing ever asks for them.
+		# Diagnostics are pushed, so this is the chance to send some.
 		send '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$uri"'","diagnostics":[
 		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},
 		  "severity":1,"source":"mock","message":"first problem"},
 		 {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":4}},
 		  "severity":2,"source":"mock","message":"second problem"}]}}'
-		# `$4` set to `die` makes the server walk away right after
-		# publishing -- the case where its findings must not linger on
-		# screen as claims nobody stands behind any more.
+		# `$4` set to `die` makes the server exit right after publishing: its
+		# findings must not linger.
 		[ "$4" = "die" ] && break
 		;;
 	*'"method":"textDocument/didChange"'*)
-		# A second, *different* publication -- one finding where the
-		# first had two. What the client does with a count that moves
-		# while its diagnostics pane is open is the thing this exists
-		# to exercise.
+		# A second, different publication, one finding where the first had
+		# two, while the client's diagnostics pane is open.
 		send '{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"'"$uri"'","diagnostics":[
 		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},
 		  "severity":1,"source":"mock","message":"the only problem left"}]}}'
 		;;
 	*'"method":"textDocument/definition"'*)
-		# $2, when the test gave one, is a URI in another file, so
-		# the cross-file path can be exercised; otherwise the
-		# document the client opened.
+		# $2, if given, is a URI in another file, for the cross-file path;
+		# otherwise the opened document.
 		target=${2:-$uri}
-		# Three of them, so `n`/`N` cycling has somewhere to go. The
-		# first is the one `gd` itself lands on.
+		# Three, so `n`/`N` have somewhere to go; `gd` lands on the first.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
 		 {"uri":"'"$target"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}]}'
 		;;
 	*'"method":"codeAction/resolve"'*)
-		# Only the action that said it needed resolving gets an edit
-		# back. A real server does the same: resolving something that
-		# only runs a command returns it unchanged, with nothing to
-		# apply -- which is the case the client must refuse rather
-		# than silently do nothing.
+		# Only the action needing resolving gets an edit. Resolving one that
+		# only runs a command returns it unchanged, which the client must
+		# refuse rather than silently do nothing.
 		case "$body" in
 		*'"title":"Resolve me"'*)
 			send '{"jsonrpc":"2.0","id":'"$id"',"result":{"title":"Resolve me","edit":{"changes":{"'"$uri"'":[
@@ -129,9 +106,8 @@ while :; do
 		esac
 		;;
 	*'"method":"textDocument/codeAction"'*)
-		# Three, on purpose: one carrying its edit, one that must be
-		# resolved, and one that only runs a server command and so
-		# must be refused with a reason.
+		# Three: one with its edit, one needing resolving, and one that only
+		# runs a server command and must be refused with a reason.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
 		 {"title":"Fix it","kind":"quickfix","edit":{"changes":{"'"$uri"'":[
 		   {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"FIXED"}]}}},
@@ -139,10 +115,9 @@ while :; do
 		 {"title":"Run it","command":{"title":"r","command":"mock.run"}}]}'
 		;;
 	*'"method":"textDocument/rename"'*)
-		# Two files: the one the client opened, and $2 when the test
-		# gave one -- so the open-buffer and on-disk halves are both
-		# exercised. `$3` set to `resource` makes it also ask for a
-		# file rename, which bish must refuse outright.
+		# Two files: the opened one, and $2 if given, covering open-buffer and
+		# on-disk edits. `$3` set to `resource` also asks for a file rename,
+		# which bish must refuse.
 		new=$(printf '%s' "$body" | sed -n 's/.*"newName":"\([^"]*\)".*/\1/p')
 		extra=""
 		[ -n "$2" ] && extra=',
@@ -155,17 +130,15 @@ while :; do
 		  "edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"'"$new"'"}]}'"$extra"']}}'
 		;;
 	*'"method":"textDocument/formatting"'*)
-		# Two edits, given ascending as a server sends them, on
-		# different lines -- so applying them in the wrong order
-		# would visibly corrupt the result.
+		# Two edits, ascending as servers send them, on different lines, so
+		# applying them in the wrong order would corrupt the result.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
 		 {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"FIRST"},
 		 {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":7}},"newText":"THIRD"}]}'
 		;;
 	*'"method":"textDocument/completion"'*)
-		# A mix on purpose: a plain label, one whose insertText
-		# differs from its label, one that is a snippet, and one
-		# ordered ahead of the others by sortText.
+		# A plain label, one whose insertText differs, a snippet, and one
+		# sorted ahead by sortText.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"isIncomplete":false,"items":[
 		 {"label":"beta","kind":6,"detail":"a variable"},
 		 {"label":"alpha","kind":3,"insertText":"alpha()","sortText":"0"},
@@ -173,19 +146,17 @@ while :; do
 		 {"label":"belta","kind":6}]}}'
 		;;
 	*'"method":"textDocument/semanticTokens/full"'*)
-		# Deltas, as the protocol requires: line 0 col 0 for 5 chars
-		# (a keyword), then the same line 6 chars further along for 4
-		# (a parameter), then two lines down for 5 -- of a type this
-		# client has no colour for, which must simply not be painted.
+		# Deltas, as the protocol has it: line 0 col 0 for 5 (a keyword),
+		# 6 further along for 4 (a parameter), then two lines down for 5, of a
+		# type the client has no colour for and must not paint.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"data":[
 		 0,0,5,0,0,
 		 0,6,4,1,1,
 		 2,0,5,2,0]}}'
 		;;
 	*'"method":"workspace/symbol"'*)
-		# The flat `SymbolInformation` shape, which is the only one a
-		# workspace query comes back in: each result names its own
-		# file, since the point is that they are elsewhere.
+		# The flat `SymbolInformation` shape, the only one a workspace query
+		# returns: each names its file.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
 		 {"name":"Outer","kind":23,"location":{"uri":"'"$uri"'",
 		  "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}}},
@@ -203,16 +174,15 @@ while :; do
 		    "selectionRange":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}}]}]}'
 		;;
 	*'"method":"textDocument/references"'*)
-		# Three uses in the document the client opened, so the list
-		# pane has something to show and scroll.
+		# Three uses in the opened document, for the list pane.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":[
 		 {"uri":"'"$uri"'","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":5}}},
 		 {"uri":"'"$uri"'","range":{"start":{"line":2,"character":0},"end":{"line":2,"character":5}}}]}'
 		;;
 	*'"method":"textDocument/hover"'*)
-		# Markdown with a fenced signature, which is the shape a real
-		# server's hover almost always takes.
+		# Markdown with a fenced signature, as real servers' hovers usually
+		# are.
 		send '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":{"kind":"markdown","value":"```sh\necho [args...]\n```\n\nWrites its arguments."}}}'
 		;;
 	*'"method":"exit"'*)
