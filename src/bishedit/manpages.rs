@@ -1,25 +1,10 @@
-// Hand-rolled man-page mining for context-aware highlighting -- fish has a
-// similar built-in man-page parser it uses to drive completions; this is
-// the same idea, scoped (for now) to extracting a command's own flags and
-// its immediate subcommands, used by highlight.rs to bold-highlight
-// recognized unquoted arguments. No regex crate, no `col` dependency --
-// pure hand-written line scanning, matching this codebase's existing
-// hand-rolled lexer/parser style.
+// Man-page mining: a command's flags (with their descriptions), its
+// subcommands and its NAME line, from the page's roff source via
+// `crate::roff`. Used by highlighting, completion and `K` hover.
 //
-// Fetching a man page is genuinely slow (~250-280ms measured for `man
-// git`/`man ls` in this environment -- spawning `man`, groff rendering,
-// etc. isn't free), and highlight.rs's caller (editor.rs::redraw) runs on
-// every keystroke, so this can never block: `query()` always returns
-// immediately, either with cached data or a `Pending` marker, and kicks off
-// a background thread (this module's own first-ever use of
-// std::thread/Mutex/Arc in this codebase -- see `query`'s own doc comment
-// for why the single-lock-acquisition design avoids a duplicate-spawn
-// race).
-//
-// Not yet wired into highlight.rs -- lands ahead of its consumer, same
-// "build the seam, wire it in later" pattern as several other modules in
-// this crate (vt100.rs, pty.rs before the M9 compositor; highlight.rs
-// itself before editor.rs::redraw wired it in).
+// Highlighting runs on every keystroke, so `query` never blocks: it
+// returns cached data or `Pending` and parses the page on a background
+// thread.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -28,35 +13,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub struct ManPageData {
     pub flags: Vec<String>,
     pub subcommands: Vec<String>,
-    // The one-line summary from the page's own "NAME" section (e.g. "ls
-    // - list directory contents"), the same text `whatis`/`apropos`
-    // show -- debugger.rs's own `K` hover uses this as its "show a
-    // snippet from the manpage" fallback for an identifier that isn't a
-    // known variable/function. `None` when the page has no such section
-    // (rare, but not every page follows the convention) rather than
-    // guessing at some other line.
+    // The NAME section's one line (`ls - list directory contents`), as
+    // `whatis` shows it; `K` hover's fallback. `None` when the page has no
+    // NAME section.
     pub name_section: Option<String>,
-    // A recognized flag's own description text, keyed by exactly the
-    // spelling `flags` itself uses (`extract_flag_token`'s own output --
-    // no `=value`/bundled-short-flag normalization beyond what that
-    // already does) -- `K`-hover's own "which flag, and what does it
-    // do" lookup (docs.rs), once it's already found which command a
-    // flag under the cursor belongs to. A flag with no entry here either
-    // had no description this parser could isolate, or (for a bundled
-    // short flag like the `-la` in `ls -la`) was never a `flags` entry
-    // on its own to begin with.
+    // Each flag's description, keyed by the spelling `flags` uses (from
+    // `extract_flag_token`), for `K` hover on a flag. A flag with no entry
+    // had no description to isolate, or was never a flag on its own (the
+    // `-la` in `ls -la`).
     pub flag_descriptions: HashMap<String, String>,
 }
 
 pub enum ManStatus {
-    // No man page found for this command (or it failed to parse into
-    // anything useful) -- cached permanently, never retried within this
-    // process's lifetime (simplest possible negative-caching policy).
+    // No page, or nothing useful in it. Cached for the life of the process.
     Missing,
-    // A background fetch is in flight; nothing to show yet. The caller
-    // should just skip flag/subcommand highlighting for this command on
-    // this redraw -- the very next redraw (next keystroke) will re-query
-    // and pick up whatever landed by then.
+    // A fetch is in flight. Skip this command for now; the next redraw
+    // queries again.
     Pending,
     Ready(Arc<ManPageData>),
 }
@@ -69,15 +41,9 @@ enum CacheEntry {
 
 static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
 
-// The one entry point highlight.rs calls. Never blocks: does a *single*
-// lock acquisition that both checks for an existing entry and, only if
-// none exists, inserts Pending and spawns the fetch thread -- all before
-// releasing the lock. This is what prevents a duplicate-spawn race: a
-// second query() call for the same in-flight command (e.g. the next
-// keystroke's redraw) takes the same lock, sees the Pending entry already
-// there, and returns without ever reaching thread::spawn. There's no
-// separate "check" then "insert" as two lock acquisitions, so there's no
-// window for two threads to both decide "nothing here yet, I'll spawn."
+// Never blocks. One lock acquisition both checks for an entry and, if
+// there's none, inserts Pending and spawns the fetch, so two queries for
+// the same command can't both spawn.
 pub fn query(command: &str) -> ManStatus {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap();
@@ -94,20 +60,13 @@ pub fn query(command: &str) -> ManStatus {
     ManStatus::Pending
 }
 
-/// `query`, for a caller that has nothing else to do until the answer
-/// arrives: the page is found and parsed on *this* thread instead of a
-/// background one, so the result is never `Pending`.
+/// `query`, parsing on this thread so the answer is never `Pending`. For
+/// a caller with nothing else to do until it arrives, like
+/// `bish tool lsp-server` answering a hover. Never from the editor, whose
+/// redraw would stutter.
 ///
-/// The editor must never call this -- a redraw that stops to read a man
-/// page is a redraw that stutters, which is the whole reason `query`
-/// spawns. `bish tool lsp-server` is the opposite case: a hover request
-/// is one question with one answer, the client is showing a spinner
-/// until it comes, and "press K again in a moment" is advice about a
-/// key that does not exist there.
-///
-/// Shares the cache with `query`, so a page either has already fetched
-/// is returned rather than fetched twice. A fetch already in flight is
-/// waited for rather than duplicated.
+/// Shares `query`'s cache, and waits for a fetch already in flight rather
+/// than duplicating it.
 pub fn query_blocking(command: &str) -> ManStatus {
     loop {
         let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -115,9 +74,8 @@ pub fn query_blocking(command: &str) -> ManStatus {
         match guard.get(command) {
             Some(CacheEntry::Ready(data)) => return ManStatus::Ready(Arc::clone(data)),
             Some(CacheEntry::Missing) => return ManStatus::Missing,
-            // Somebody else's background fetch. Waiting for it is what
-            // the caller asked for; the lock is released first, since
-            // the fetch needs it to finish.
+            // Another thread's fetch. Released first, since that fetch
+            // needs the lock to finish.
             Some(CacheEntry::Pending) => {
                 drop(guard);
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -145,21 +103,10 @@ fn fetch_and_store(command: String) {
     );
 }
 
-// Finds and parses the page itself -- no `man` subprocess, no groff.
-// This used to spawn `man` and scan its *rendered* output, which cost
-// roughly 250ms per lookup and meant recovering structure by measuring
-// indentation. Now the page's own source is read (gunzipped with
-// crate::archive if it needs it) and run through crate::roff, so a
-// flag and its description are paired because the page's own `.TP`
-// paired them, not because they happened to line up in a column.
-/// A command's man page as raw roff, for a caller that wants to *render*
-/// it rather than mine facts out of it.
-///
-/// Synchronous, unlike `query`: this is answering a key someone just
-/// pressed, and what it costs is one file read plus a decompress -- not
-/// the roff parse and flag extraction `query` spawns a thread for.
-/// `None` for a command with no page, which is every miss the caller
-/// needs to distinguish.
+/// A command's man page as raw roff, for rendering rather than mining.
+/// Synchronous: it answers a keypress and costs a file read and a
+/// decompress, not the parse `query` uses a thread for. `None` when there's
+/// no page.
 pub fn source_for(command: &str) -> Option<String> {
     read_page(&find_page(command)?)
 }
@@ -169,9 +116,8 @@ fn fetch_and_parse(command: &str) -> Option<ManPageData> {
     Some(extract(&crate::roff::parse(&source), command))
 }
 
-// Where man pages live: `$MANPATH` when it is set, otherwise the
-// conventional roots. No `manpath` subprocess and no config file parsing
-// -- the point of this change is to stop shelling out.
+// Where man pages live: `$MANPATH` if set, otherwise the conventional
+// roots. No `manpath` subprocess, no config parsing.
 fn man_roots() -> Vec<std::path::PathBuf> {
     if let Ok(path) = std::env::var("MANPATH")
         && !path.trim().is_empty()
@@ -181,14 +127,12 @@ fn man_roots() -> Vec<std::path::PathBuf> {
     ["/usr/share/man", "/usr/local/share/man", "/usr/local/man", "/usr/man"].iter().map(std::path::PathBuf::from).collect()
 }
 
-// Sections in the order a user means them: a bare name is a command
-// first, an admin command next, and only then the library and file
-// formats -- the same precedence `man` itself uses.
+// A bare name is a command first, then an admin command, then the rest,
+// as `man` orders sections.
 const SECTION_ORDER: [&str; 8] = ["1", "8", "6", "5", "7", "3", "2", "4"];
 
 fn find_page(command: &str) -> Option<std::path::PathBuf> {
-    // A command with a slash or a leading dash is not a page name, and
-    // must never be turned into one.
+    // A name with a slash, a leading dash or `..` is never a page name.
     if command.is_empty() || command.contains('/') || command.starts_with('-') || command.contains("..") {
         return None;
     }
@@ -202,8 +146,8 @@ fn find_page(command: &str) -> Option<std::path::PathBuf> {
                     return Some(path);
                 }
             }
-            // Pages with a suffixed section (`perl.1p`, `foo.3ssl`) need
-            // a scan, which only runs when the direct paths missed.
+            // Suffixed sections (`perl.1p`, `foo.3ssl`) need a scan, done
+            // only when the direct paths missed.
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 let prefix = format!("{command}.{section}");
                 for entry in entries.flatten() {
@@ -219,11 +163,9 @@ fn find_page(command: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-// The page's text, gunzipped when it needs it, following the one-line
-// `.so` redirect a page like `bunzip2.1` is (its whole content is
-// `.so man1/bzip2.1`). Followed once: a redirect to a redirect is not a
-// thing real pages do, and refusing to loop matters more than serving
-// one that did.
+// The page's text, gunzipped if needed, following a one-line `.so`
+// redirect such as `bunzip2.1` (`.so man1/bzip2.1`). Followed once:
+// refusing to loop matters more than a redirect to a redirect.
 fn read_page(path: &std::path::Path) -> Option<String> {
     let text = read_text(path)?;
     let redirect = text.lines().find(|l| !l.trim().is_empty() && !l.starts_with(".\\\""))?;
@@ -245,13 +187,9 @@ fn read_page(path: &std::path::Path) -> Option<String> {
     Some(text)
 }
 
-// The largest man page on a normal system is a few hundred kilobytes,
-// so this is two orders of magnitude of headroom -- and it is a much
-// tighter budget than `gunzip`'s own on purpose. Nothing on this path
-// was asked for: `query` reads whatever `man -w` points at, on a
-// background thread, while you type. A crafted `.gz` anywhere on
-// MANPATH would otherwise get to name its own memory and CPU cost the
-// moment the matching command name appears in the line.
+// Far above any real page, and tighter than `gunzip`'s default: pages
+// are read in the background as names appear in the line, so a crafted
+// `.gz` on MANPATH mustn't choose its own memory cost.
 const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 fn read_text(path: &std::path::Path) -> Option<String> {
@@ -259,14 +197,12 @@ fn read_text(path: &std::path::Path) -> Option<String> {
         let (_, bytes) = crate::archive::gunzip_within(path, MAX_PAGE_BYTES).ok()?;
         return Some(crate::encoding::decode(&bytes).text);
     }
-    // Manual pages are older than UTF-8 and plenty of them are still
-    // latin-1; one that is should render, not vanish.
+    // Plenty of pages are still latin-1.
     Some(crate::encoding::decode(&std::fs::read(path).ok()?).text)
 }
 
-// Everything this module wants out of a parsed page. Public so the
-// tests can drive it from roff source directly, which is what these
-// pages actually are.
+// Everything this module wants from a parsed page. Visible to the tests,
+// which drive it from roff source.
 pub(crate) fn extract(doc: &crate::roff::Document, command: &str) -> ManPageData {
     let mut tags = Vec::new();
     collect_tagged(&doc.blocks, &mut tags);
@@ -274,8 +210,8 @@ pub(crate) fn extract(doc: &crate::roff::Document, command: &str) -> ManPageData
     let mut flags = Vec::new();
     let mut flag_descriptions = HashMap::new();
     for (tag, body) in &tags {
-        // `-a, --all` and `-b [WHEN]` alike: split the tag into pieces
-        // and keep the ones that are really flags.
+        // `-a, --all` and `-b [WHEN]`: split the tag and keep the pieces that
+        // are flags.
         for piece in tag.split([',', '|']) {
             let Some(token) = extract_flag_token(piece.trim()) else { continue };
             if !flags.contains(&token) {
@@ -294,7 +230,7 @@ pub(crate) fn extract(doc: &crate::roff::Document, command: &str) -> ManPageData
     ManPageData { flags, subcommands, name_section, flag_descriptions }
 }
 
-// Every tagged paragraph in the page, at any depth, as (tag, body text).
+// Every tagged paragraph, at any depth, as (tag, body text).
 fn collect_tagged(blocks: &[crate::roff::Block], out: &mut Vec<(String, String)>) {
     use crate::roff::Block;
     for block in blocks {
@@ -341,10 +277,9 @@ fn collect_text(blocks: &[crate::roff::Block], out: &mut String) {
     }
 }
 
-// Two conventions, because tools split into two camps. git/apt/ip give
-// each subcommand its own page and cross-reference them as
-// `git-add(1)`; docker/systemctl-style tools list them as tagged
-// paragraphs in a COMMANDS section.
+// Two conventions: git, apt and ip give each subcommand its own page and
+// cross-reference it as `git-add(1)`; docker and systemctl list them as
+// tagged paragraphs in a COMMANDS section.
 fn collect_subcommands(doc: &crate::roff::Document, tags: &[(String, String)], command: &str) -> Vec<String> {
     let mut subs = Vec::new();
     let prefix = format!("{command}-");
@@ -386,7 +321,7 @@ fn collect_subcommands(doc: &crate::roff::Document, tags: &[(String, String)], c
     subs
 }
 
-// The NAME section's own one line -- `ls - list directory contents`.
+// The NAME section's line: `ls - list directory contents`.
 fn name_line(doc: &crate::roff::Document) -> Option<String> {
     for block in doc.section("NAME") {
         if let crate::roff::Block::Paragraph { content, .. } = block {
@@ -400,8 +335,8 @@ fn name_line(doc: &crate::roff::Document) -> Option<String> {
     None
 }
 
-// One flag out of a piece of a tag, or `None` when the piece is prose
-// that merely starts with a dash.
+// A flag from one piece of a tag, or `None` for prose that starts with a
+// dash.
 pub(crate) fn extract_flag_token(piece: &str) -> Option<String> {
     if !piece.starts_with('-') {
         return None;
@@ -418,10 +353,6 @@ pub(crate) fn extract_flag_token(piece: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Written as roff, because that is what a man page is. The old
-    // tests here were excerpts of `man`'s *rendered* output, which is
-    // what this module used to parse; keeping them would test a
-    // pipeline that no longer exists.
     const LS_STYLE: &str = r#".TH LS 1 "March 2024" "GNU coreutils" "User Commands"
 .SH NAME
 ls \- list directory contents
@@ -447,8 +378,7 @@ with \fB\-lt\fR: sort by, and show, ctime
     fn a_flags_description_is_the_body_its_tag_paired_it_with() {
         let data = extract(&crate::roff::parse(LS_STYLE), "ls");
         assert_eq!(data.flag_descriptions.get("-a").map(String::as_str), Some("do not ignore entries starting with ."));
-        // Both spellings on one tag get the same description, because
-        // the page gave them one description.
+        // Both spellings on one tag share its description.
         assert_eq!(data.flag_descriptions.get("--all"), data.flag_descriptions.get("-a"));
         assert_eq!(data.flag_descriptions.get("-c").map(String::as_str), Some("with \u{2d}lt: sort by, and show, ctime"));
     }
@@ -459,8 +389,8 @@ with \fB\-lt\fR: sort by, and show, ctime
         assert_eq!(data.name_section.as_deref(), Some("ls - list directory contents"));
     }
 
-    // A dash that opens prose is not an option -- but `--`, which real
-    // pages document as the end-of-options marker, is one.
+    // A dash opening prose isn't an option, but `--`, the documented
+    // end-of-options marker, is.
     #[test]
     fn prose_that_merely_starts_with_a_dash_is_not_a_flag() {
         let page = ".SH DESCRIPTION\n.TP\n\\- a bullet point, not an option\ntext\n.TP\n\\-\\-\nend of options marker\n";
@@ -468,8 +398,6 @@ with \fB\-lt\fR: sort by, and show, ctime
         assert_eq!(data.flags, vec!["--"], "the bullet is not a flag; `--` is");
     }
 
-    // git/apt/ip give each subcommand its own page and cross-reference
-    // it by name.
     #[test]
     fn subcommands_are_read_from_cross_referenced_page_names() {
         let page = ".TH GIT 1\n.SH GIT COMMANDS\n.TP\ngit-add(1)\nAdd file contents to the index\n.TP\ngit-commit(1)\nRecord changes\n";
@@ -500,8 +428,7 @@ with \fB\-lt\fR: sort by, and show, ctime
         assert_eq!(extract_flag_token("-"), None);
     }
 
-    // The end-to-end path, against whatever this machine actually has.
-    // Skipped where there are no man pages at all.
+    // End to end, against this machine's pages; skipped if there are none.
     #[test]
     fn reads_a_real_page_from_this_machine_with_no_subprocess() {
         let Some(path) = find_page("ls") else { return };
@@ -523,9 +450,8 @@ with \fB\-lt\fR: sort by, and show, ctime
 
     #[test]
     fn query_returns_pending_then_eventually_ready_or_missing() {
-        // A command guaranteed not to exist -- confirms the full
-        // Pending -> (background thread) -> Missing pipeline runs without
-        // panicking and without blocking the calling thread.
+        // A command that can't exist: Pending, then Missing, with no panic
+        // and no blocking.
         let bogus = "bish-test-definitely-not-a-real-command-xyz";
         match query(bogus) {
             ManStatus::Pending | ManStatus::Missing => {}
