@@ -1,10 +1,7 @@
-// Small regex engine for `[[ str =~ pattern ]]`, and for the editor's
-// `/`, `:s` and `:g`. Supports the common ERE subset: literals, `.`,
-// `*`/`+`/`?` (greedy), `{n,m}` intervals, `^`/`$` anchors,
-// `[...]`/`[^...]` character classes (with `-` ranges), `|` alternation,
-// and `(...)` grouping, including capture extraction for BASH_REMATCH. No
-// external crate -- hand-rolled recursive-descent parser plus a Pike VM,
-// same spirit as glob.rs.
+// A small regex engine for `[[ str =~ pattern ]]` and the editor's `/`,
+// `:s` and `:g`: the common ERE subset (literals, `.`, greedy `*` `+` `?`,
+// `{n,m}`, `^` `$`, bracket classes with ranges, `|`, groups with captures
+// for BASH_REMATCH). A recursive-descent parser and a Pike VM.
 
 #[derive(Debug, Clone)]
 enum Re {
@@ -14,28 +11,22 @@ enum Re {
     Star(Box<Re>),
     Plus(Box<Re>),
     Opt(Box<Re>),
-    // `{n}`, `{n,}` and `{n,m}` -- ERE's interval quantifier, with
-    // `None` for an open upper bound. It was not parsed at all, and a
-    // `{` is an ordinary character to this engine, so `a{2}` matched
-    // the four-character text `a{2}` and did not match `aa`. Both
-    // directions silently: no pattern was ever rejected for it.
+    // `{n}`, `{n,}`, `{n,m}`, ERE's interval quantifier; `None` is an open
+    // upper bound.
     Repeat(Box<Re>, usize, Option<usize>),
     Concat(Vec<Re>),
     Alt(Vec<Re>),
     Start,
     End,
-    /// `\b` and `\B`: a position where a word character is on exactly
-    /// one side, or on both/neither. Consumes nothing -- which is what
-    /// made it worth having a matcher that can express "a predicate on
-    /// where you are" at all.
+    /// `\b` and `\B`: a word character on exactly one side, or on both or
+    /// neither. Consumes nothing.
     WordBoundary(bool),
-    /// `\<` and `\>`: the two halves of `\b`, told apart by which side
-    /// the word is on. GNU's own extension, and bash has it.
+    /// `\<` and `\>`: `\b`'s halves, by which side the word is on; GNU's
+    /// extension, which bash has.
     WordStart,
     WordEnd,
-    // Numbered per ERE convention: by position of the opening paren, left
-    // to right, regardless of nesting depth -- so `((a)(b))` is group 1 =
-    // "(a)(b)" (the whole outer), group 2 = "(a)", group 3 = "(b)".
+    // Numbered by opening paren, left to right, whatever the nesting:
+    // `((a)(b))` is group 1 `(a)(b)`, 2 `(a)`, 3 `(b)`.
     Group(usize, Box<Re>),
 }
 
@@ -90,9 +81,8 @@ impl<'a> ReParser<'a> {
                 self.pos += 1;
                 Re::Opt(Box::new(atom))
             }
-            // A `{` that does not open a well-formed interval is an
-            // ordinary character, which is what POSIX leaves it as and
-            // what every `awk '{print}'` pattern relies on.
+            // A `{` not opening a well-formed interval is a character, as
+            // POSIX leaves it and `awk '{print}'` patterns rely on.
             Some('{') => match self.parse_interval() {
                 Some((min, max)) => Re::Repeat(Box::new(atom), min, max),
                 None => atom,
@@ -101,9 +91,8 @@ impl<'a> ReParser<'a> {
         }
     }
 
-    /// `{n}`, `{n,}`, `{n,m}` -- consumed only if the whole thing is
-    /// there and well formed, so the parser can fall back to treating
-    /// the brace as text.
+    /// `{n}`, `{n,}`, `{n,m}`, consumed only when whole and well formed, so
+    /// the brace can fall back to text.
     fn parse_interval(&mut self) -> Option<(usize, Option<usize>)> {
         let start = self.pos;
         self.pos += 1;
@@ -198,10 +187,9 @@ impl<'a> ReParser<'a> {
                 self.pos += 1;
                 break;
             }
-            // `[[:space:]]`: a class *name*, whose own `]` does not end
-            // the bracket expression around it. Expanded into the same
-            // ranges this class is already made of -- see
-            // glob::posix_class_ranges.
+            // `[[:space:]]`: a class name, whose `]` doesn't end the
+            // bracket around it, expanded to its ranges
+            // (`glob::posix_class_ranges`).
             if c == '[' {
                 let rest: String = self.chars[self.pos..].iter().collect();
                 if let Some((name, len)) = crate::glob::posix_class_at(rest.as_bytes()) {
@@ -228,20 +216,11 @@ impl<'a> ReParser<'a> {
     }
 }
 
-/// What a backslash escape means.
-///
-/// GNU's set, because that is what bash has: `\b`/`\B` and `\<`/`\>`
-/// for word boundaries, `\w`/`\W`/`\s`/`\S` for the two classes
-/// people reach for, and `` \` ``/`\'` for the ends of the text. Every
-/// other escape is the character itself, which is what makes `\.` a
-/// dot and `\\` a backslash.
-///
-/// `\d` is deliberately *not* here. It is Perl's, not POSIX's and not
-/// GNU's: bash matches `\d+` against `ab123` and finds nothing, because
-/// to glibc that pattern is one or more letter `d`s. Adding it would
-/// have been a silent disagreement with the shell this one is measured
-/// against -- the probe is what said so, not the guess that preceded
-/// it.
+/// What a backslash escape means, GNU's set as bash has: `\b`/`\B` and
+/// `\<`/`\>` for word boundaries, `\w`/`\W`/`\s`/`\S`, and `` \` ``/`\'`
+/// for the text's ends. Any other escape is the character itself (`\.`,
+/// `\\`). No `\d`: it's Perl's, and bash finds nothing in `ab123` for
+/// `\d+`, which to glibc is one or more `d`s.
 fn escaped_atom(c: char) -> Re {
     let class = |name: &[u8], negated: bool, extra: &[(char, char)]| {
         let mut ranges: Vec<(char, char)> =
@@ -254,22 +233,20 @@ fn escaped_atom(c: char) -> Re {
         'B' => Re::WordBoundary(false),
         '<' => Re::WordStart,
         '>' => Re::WordEnd,
-        // A word character is alphanumeric or an underscore -- glibc's
-        // own `[_[:alnum:]]`, which is why `a_1` is one word to both.
+        // A word character is alphanumeric or `_`, glibc's `[_[:alnum:]]`.
         'w' => class(b"alnum", false, &[('_', '_')]),
         'W' => class(b"alnum", true, &[('_', '_')]),
         's' => class(b"space", false, &[]),
         'S' => class(b"space", true, &[]),
-        // The ends of the *text*, which in this engine is what `^` and
-        // `$` already mean: there is no multi-line mode for them to
-        // differ from.
+        // The text's ends, which `^` and `$` already are: there's no
+        // multi-line mode.
         '`' => Re::Start,
         '\'' => Re::End,
         _ => Re::Char(c),
     }
 }
 
-/// Alphanumeric or underscore -- what sits on either side of a `\b`.
+/// Alphanumeric or `_`: what sits beside a `\b`.
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -280,24 +257,15 @@ fn parse(pattern: &str) -> (Re, usize) {
     (re, p.group_count)
 }
 
-// One slot per capture group, indexed by group number (index 0 is the
-// whole match). `None` for a group the winning match never entered --
-// distinct from a group that matched emptily, which every caller that
-// reports captures flattens back to the empty string.
+// One slot per capture group by number (0 is the whole match). `None`
+// for a group the winning match never entered, which callers report as
+// empty.
 type CapSlots = Vec<Option<(usize, usize)>>;
 
-// The other case(s) of `c`, for a case-insensitive comparison.
-//
-// **Simple** case folding, not full: a mapping that expands to more than
-// one character is skipped, so `ß` does not match `SS` and `ﬁ` does not
-// match `FI`. Full folding would have to change how many input
-// characters a single pattern character consumes, which this matcher --
-// one character, one position -- has no shape for, and every editor
-// search this exists for treats it the same way.
-//
-// std's own `to_lowercase`/`to_uppercase` carry the Unicode tables. This
-// module hand-rolls its engine because no crate may be taken; it does
-// not hand-roll data the standard library already has.
+// The other cases of `c`, for case-insensitive comparison. Simple
+// folding, not full: a mapping to several characters is skipped, so `ß`
+// doesn't match `SS`; this matcher consumes one input character per
+// pattern character, as editor searches do. The tables are std's.
 fn case_variants(c: char) -> impl Iterator<Item = char> {
     let lower = one_char(c.to_lowercase().collect::<Vec<char>>());
     let upper = one_char(c.to_uppercase().collect::<Vec<char>>());
@@ -319,11 +287,9 @@ fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
     ranges.iter().any(|&(lo, hi)| c >= lo && c <= hi)
 }
 
-// Escapes every character `parse` treats as a metacharacter, so the result
-// -- fed back through `parse` -- matches only the literal input text. Used
-// for `[[ ]]`'s `=~` when the pattern operand was quoted/escaped in the
-// source (bash: quoting any part of a `=~` pattern forces that part to
-// match literally instead of as regex).
+// Escapes every metacharacter, so the result matches only the literal
+// text. For a quoted part of `=~`'s pattern, which bash matches
+// literally.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -335,36 +301,20 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------
-// The matcher
-// ---------------------------------------------------------------------
+// The matcher, a Pike VM: the pattern compiles to a small instruction
+// list, and matching advances a set of threads (a program counter and
+// captures) one input character at a time. Two threads at the same
+// instruction are interchangeable, so only one is kept; the set never
+// exceeds the program, and matching is one pass, O(text x pattern). A
+// backtracker would explode on patterns like `^(a+)+$` against many
+// `a`s and a `b`.
 //
-// A Pike VM: the pattern is compiled to a small instruction list, and
-// matching advances a *set* of threads through it one input character
-// at a time. A thread is a program counter and its capture slots;
-// two threads at the same instruction are indistinguishable from that
-// point on, so only one is kept. The live set is therefore never larger
-// than the program, and the whole match is one pass -- O(text x
-// pattern), with no path explored twice.
-//
-// It replaced a backtracker, which is the same shape as the parser and
-// is much the easier thing to write: try a branch, and on failure come
-// back and try the next. The trouble is that failure can be discovered
-// arbitrarily far away, so the branches multiply -- `^(a+)+$` against
-// thirty a's and a `b` explored every one of the 2^30 ways to split
-// them and never came back. In the editor, where this same engine backs
-// `/`, `:s` and `:g`, that is the process gone.
-//
-// The other thing that changed with it is *which* match is found.
-// POSIX wants the longest match at the leftmost position it can start,
-// and a backtracker naturally gives the first one its branch order
-// reaches instead: `(a|ab)` against `abc` matched `a` here and matches
-// `ab` in bash. A thread set has no branch order to prefer -- every
-// alternative is live at once -- so the rule falls out of letting every
-// thread run to the end and keeping the longest. Branch order survives
-// only as a tie-break between matches of the same start and the same
-// length, where all it decides is what the capture groups say -- see
-// `Threads::add` and the one divergence from bash that leaves.
+// The match found is POSIX's: the longest at the leftmost start. Every
+// alternative is live at once, so every thread runs to the end and the
+// longest is kept (`(a|ab)` against `abc` is `ab`, as in bash). Branch
+// order only breaks ties between matches of the same start and length,
+// deciding the captures; see `Threads::add` for the one divergence from
+// bash.
 
 #[derive(Debug, Clone)]
 enum Inst {
@@ -386,15 +336,13 @@ enum Inst {
     Match,
 }
 
-/// An interval's upper bound is expanded into that many copies of the
-/// body, so a large one costs program size. POSIX puts the portable
-/// limit at 255 and this is the same number: past it the pattern is
-/// compiled as though the bound were open, which matches more rather
-/// than refusing outright.
+/// An interval's upper bound expands to that many copies of the body,
+/// costing program size. POSIX's portable limit is 255; past it the bound
+/// compiles as open, matching more rather than refusing.
 const MAX_REPEAT_EXPANSION: usize = 255;
 
-// Slots 0 and 1 are the whole match, so the program brackets the
-// pattern with them exactly as a `Group` brackets its own.
+// Slots 0 and 1 are the whole match, so the program brackets the pattern
+// with them, as a `Group` does its own.
 fn compile(re: &Re) -> Vec<Inst> {
     let mut prog = vec![Inst::Save(0)];
     emit(re, &mut prog);
@@ -418,8 +366,8 @@ fn emit(re: &Re, prog: &mut Vec<Inst>) {
                 emit(p, prog);
             }
         }
-        // Each branch jumps past the rest once it is done; the last
-        // needs no jump, and every jump is patched to the end.
+        // Each branch jumps past the rest when done; the last needs none, and
+        // every jump is patched to the end.
         Re::Alt(branches) => {
             let mut jumps = Vec::new();
             for (i, b) in branches.iter().enumerate() {
@@ -463,11 +411,10 @@ fn emit(re: &Re, prog: &mut Vec<Inst>) {
             let end = prog.len();
             prog[split] = Inst::Split(split + 1, end);
         }
-        // `{n,m}` is n copies, then m - n optional ones; `{n,}` is n
-        // copies and a star. There is no counting instruction, and
-        // adding one would need a counter per thread -- expansion keeps
-        // a thread a program counter and its captures, which is what
-        // makes the set dedupable at all.
+        // `{n,m}` is n copies then m - n optional ones; `{n,}` n copies and
+        // a star. A counting instruction would need a counter per thread,
+        // and a thread that's just a pc and captures is what makes the set
+        // dedupable.
         Re::Repeat(inner, min, max) => {
             for _ in 0..*min {
                 emit(inner, prog);
@@ -497,29 +444,22 @@ fn emit(re: &Re, prog: &mut Vec<Inst>) {
     }
 }
 
-/// A thread's captures. Cloned when a thread forks, which is why they
-/// are a plain `Rc`-free vector: the slot count is twice the group
-/// count plus two, and patterns are small.
+/// A thread's captures, cloned when a thread forks: twice the group count
+/// plus two slots, and patterns are small.
 type Slots = Vec<Option<usize>>;
 
-/// Two threads at the same instruction are indistinguishable from
-/// there on, so only one survives, and the one that got there first
-/// wins: the epsilon walk below is depth-first in the pattern's own
-/// branch order, so "first" means the branch written first.
-///
-/// That is a tie-break, and it only ever runs after leftmost-longest
-/// has already decided the extent of the match -- it settles nothing
-/// but which spelling of an equally long match the capture groups
-/// report. Bash's own answer there is glibc's, which is not the POSIX
-/// rule (POSIX would hand each subexpression, left to right, the
-/// longest it can take): `(|a)(a|)` against `a` fills the first group
-/// in bash and the second here. See `bashdiff::DIVERGENCES`.
+/// Two threads at one instruction are interchangeable, so the first to
+/// arrive survives; the epsilon walk is depth-first in branch order, so
+/// first means written first. That's only a tie-break after
+/// leftmost-longest decided the extent, settling which spelling the
+/// captures report. bash's answer there is glibc's, not POSIX's rule:
+/// `(|a)(a|)` against `a` fills the first group in bash and the second
+/// here. See `bashdiff::DIVERGENCES`.
 struct Threads {
     /// The threads waiting on an input character, in priority order.
     dense: Vec<(usize, Slots)>,
-    /// Which instructions this walk has already reached, counting the
-    /// ones that consume nothing. That is also what keeps the epsilon
-    /// walk finite over `(a*)*` and friends.
+    /// Which instructions this walk reached, zero-width ones included, which
+    /// also keeps the walk finite over `(a*)*`.
     on_list: Vec<bool>,
 }
 
@@ -533,17 +473,10 @@ impl Threads {
         self.on_list.iter_mut().for_each(|f| *f = false);
     }
 
-    /// Follows every instruction that consumes no input -- jumps,
-    /// splits, saves and the assertions -- and adds the pcs that do.
-    /// Depth-first and in priority order, so the list stays ordered by
-    /// the branch order the pattern was written in.
-    ///
-    /// The whole text is here, not just the position, because an
-    /// assertion is a question about where `pos` *is*: `\b` needs the
-    /// character on either side of it. Consuming nothing and looking at
-    /// its neighbours is the entire shape of a zero-width assertion,
-    /// and it is why they belong in this walk rather than in the step
-    /// that eats a character.
+    /// Follows every instruction that consumes nothing (jumps, splits,
+    /// saves, assertions) and adds those that do, depth-first in priority
+    /// order. It takes the whole text, since an assertion like `\b` asks
+    /// about the characters around `pos`.
     fn add(&mut self, prog: &[Inst], pc: usize, chars: &[char], pos: usize, slots: &Slots) {
         if self.on_list[pc] {
             return;
@@ -592,8 +525,8 @@ impl Threads {
     }
 }
 
-/// A compiled pattern: the instructions, and how many capture groups
-/// their `Save`s refer to.
+/// A compiled pattern: instructions, and how many groups their `Save`s
+/// refer to.
 struct Program {
     insts: Vec<Inst>,
     group_count: usize,
@@ -605,24 +538,14 @@ impl Program {
     }
 }
 
-/// Runs the program over `chars` from `from`, returning the match as
-/// `(start, end, slots)`.
-///
-/// `anchored` says whether the match must begin at `from` exactly.
-/// Unanchored, the search is still one pass: a fresh thread is started
-/// at every position until something matches, so the whole set of
-/// candidate starts advances together rather than the pattern being
-/// re-run from each one in turn. That is the difference between
-/// O(text x pattern) and O(text^2 x pattern), and on a 2000-character
-/// line the editor feels it.
-///
-/// Which match wins is POSIX's rule, leftmost-longest: an earlier start
-/// always beats a later one, and among matches sharing a start the
-/// longest wins. So a thread reaching `Match` does not end the search;
-/// it records a candidate, and the rest keep running. Equal starts and
-/// equal lengths keep the earlier thread -- the one the pattern's own
-/// branch order reached first -- and that is what settles the capture
-/// slots.
+/// Runs the program over `chars` from `from`, returning
+/// `(start, end, slots)`. `anchored` requires starting at `from`.
+/// Unanchored, a new thread starts at each position until something
+/// matches, so all candidate starts advance together in one pass, not
+/// O(text^2 x pattern). Leftmost-longest: an earlier start beats a later
+/// one, and the longest wins among equal starts, so reaching `Match`
+/// records a candidate and the rest run on; equal ones keep the earlier
+/// thread, which settles the captures.
 fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case: bool) -> Option<(usize, usize, CapSlots)> {
     let insts = &prog.insts;
     let empty: Slots = vec![None; (prog.group_count + 1) * 2];
@@ -632,9 +555,8 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
 
     let mut at = from;
     loop {
-        // A new start goes in behind the threads already running, which
-        // is what makes an earlier start outrank it. Once anything has
-        // matched, no later start could win, so none is added.
+        // A new start goes behind the running threads, so an earlier start
+        // outranks it; once anything matched, no later start could win.
         if best.is_none() && (!anchored || at == from) {
             clist.add(insts, 0, chars, at, &empty);
         }
@@ -652,8 +574,7 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
         let c = chars[at];
         nlist.clear();
         for (pc, slots) in &clist.dense {
-            // A thread that began after the best match so far can only
-            // lose; carrying it costs the rest of the line.
+            // A thread begun after the best match can only lose.
             if best.as_ref().is_some_and(|(bs, _, _)| slots[0].is_some_and(|s| s > *bs)) {
                 continue;
             }
@@ -661,12 +582,10 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
                 Inst::Char(x) => chars_equal(c, *x, ignore_case),
                 Inst::Any => true,
                 // The input character is folded, not the class: folding
-                // the *ranges* would mean flipping their endpoints,
-                // which is only right for a range that stays inside one
-                // script's own alphabet. Testing the input's other
-                // cases against the ranges as written is exact --
-                // `[a-z]` matches `A` because `a` is in it, and `[A-Z]`
-                // matches `a` for the mirror reason.
+                // ranges would flip endpoints, right only within one
+                // alphabet. Testing the input's cases against the ranges as
+                // written is exact: `[a-z]` matches `A` because `a` is in
+                // it.
                 Inst::Class(ranges, negated) => {
                     let hit = in_ranges(ranges, c) || (ignore_case && case_variants(c).any(|v| in_ranges(ranges, v)));
                     hit != *negated
@@ -691,9 +610,8 @@ fn run(prog: &Program, chars: &[char], from: usize, anchored: bool, ignore_case:
     Some((start, end, caps))
 }
 
-// A group the winning match never entered is reported as the empty
-// string rather than as absent -- BASH_REMATCH's own shape, which the
-// editor's `:s` backreferences follow.
+// A group the match never entered is the empty string, BASH_REMATCH's
+// shape, which `:s` backreferences follow.
 fn capture_texts(chars: &[char], start: usize, end: usize, caps: CapSlots) -> Vec<String> {
     let mut out = Vec::with_capacity(caps.len());
     out.push(chars[start..end].iter().collect());
@@ -712,59 +630,39 @@ pub struct Regex {
 }
 
 impl Regex {
-    /// `ignore_case` rides on the compiled pattern rather than on each
-    /// search because that is where every caller has the answer: an
-    /// editor knows its `ignorecase` setting once per search, not once
-    /// per line.
-    ///
-    /// There is deliberately no one-argument shorthand. Every caller
-    /// answering the question explicitly is what stops a new search
-    /// site from quietly defaulting to case-sensitive -- which is
-    /// exactly how `/` stayed case-sensitive while `:s`, reaching the
-    /// same buffer by a different route, did not.
+    /// `ignore_case` is fixed at compile time, where callers know it (once
+    /// per search). No shorthand without it, so a new search site can't
+    /// silently default to case-sensitive.
     pub fn compile(pattern: &str, ignore_case: bool) -> Regex {
         let (re, group_count) = parse(pattern);
         Regex { prog: Program::new(&re, group_count), ignore_case }
     }
 
-    /// Does this pattern match starting at exactly `pos`? Returns the
-    /// match's end position (char index) if so. Unlike `find_at`, doesn't
-    /// scan forward -- a caller wanting "the next match at or after some
-    /// position" wants `find_at`; a caller that already knows the exact
-    /// start it cares about (e.g. scanning backward one position at a
-    /// time) wants this instead.
+    /// Whether this pattern matches starting exactly at `pos`, returning the
+    /// end. Doesn't scan forward, unlike `find_at`; for a caller that knows
+    /// the start (scanning backward a position at a time).
     pub fn match_at(&self, chars: &[char], pos: usize) -> Option<usize> {
         run(&self.prog, chars, pos, true, self.ignore_case).map(|(_, end, _)| end)
     }
 
-    /// Leftmost match starting at or after `from` (char index into
-    /// `chars`), ERE-style. `None` if nothing matches anywhere in
-    /// `chars[from..]`.
+    /// The leftmost match at or after `from`, ERE-style, or `None`.
     pub fn find_at(&self, chars: &[char], from: usize) -> Option<(usize, usize)> {
         run(&self.prog, chars, from, false, self.ignore_case).map(|(start, end, _)| (start, end))
     }
 
-    /// Same search as `find_at`, but also returns captures in
-    /// `match_captures`'s own shape: index 0 is the whole match, indices
-    /// 1..=N are each group (empty string, not absent, for one the
-    /// winning path never entered). For a caller (`:s`'s own
-    /// substitution loop, repl.rs) that needs backreferences/`&` in a
-    /// replacement rather than just knowing a match happened.
+    /// `find_at` with captures in `match_captures`' shape (0 the whole match,
+    /// then each group, empty if never entered), for backreferences and `&`
+    /// in `:s`.
     pub fn find_at_with_captures(&self, chars: &[char], from: usize) -> Option<(usize, usize, Vec<String>)> {
         let (start, end, caps) = run(&self.prog, chars, from, false, self.ignore_case)?;
         Some((start, end, capture_texts(chars, start, end, caps)))
     }
 }
 
-// `[[ str =~ pattern ]]`: true (with Some(...)) if `pattern` matches
-// anywhere in `str` (unanchored, like ERE regexec), honoring explicit
-// `^`/`$` when present. On success also returns BASH_REMATCH-style
-// captures: index 0 is the whole matched substring, indices 1..=N are each
-// group's substring (empty string, not absent, for a group the winning
-// match path never entered -- matches real bash's own behavior).
-/// `ignore_case` is `shopt -s nocasematch`'s own question, answered by
-/// the caller -- that option was registered with nothing to act on until
-/// this engine could fold case at all.
+/// `[[ str =~ pattern ]]`: on a match anywhere in `str` (unanchored, like
+/// ERE regexec, honouring `^` and `$`), BASH_REMATCH-style captures: 0
+/// the whole match, then each group, empty if never entered, as in bash.
+/// `ignore_case` is `shopt -s nocasematch`.
 pub fn match_captures(text: &str, pattern: &str, ignore_case: bool) -> Option<Vec<String>> {
     let (re, group_count) = parse(pattern);
     let prog = Program::new(&re, group_count);
@@ -793,19 +691,17 @@ mod tests {
         assert!(!m("^foo$", "FOOD", true));
     }
 
-    // The input is folded, not the class: folding the ranges would mean
-    // flipping their endpoints, which is only right for a range that
-    // stays inside one alphabet.
+    // The input is folded, not the class.
     #[test]
     fn a_class_is_tested_against_the_inputs_other_cases() {
         assert!(m("^[a-z]", "Hello", true));
         assert!(m("^[A-Z]", "hello", true));
         assert!(!m("^[a-z]", "Hello", false));
-        // A negated class has to agree with itself: `H` is in `[a-z]`
-        // case-insensitively, so it is not in `[^a-z]`.
+        // A negated class agrees with itself: `H` is in `[a-z]` ignoring
+        // case, so not in `[^a-z]`.
         assert!(!m("^[^a-z]", "Hello", true));
         assert!(m("^[^a-z]", "Hello", false));
-        // A range that is not about letters is untouched either way.
+        // A range not about letters is unaffected.
         assert!(m("^[0-9]", "5", true));
         assert!(!m("^[0-9]", "x", true));
     }
@@ -814,10 +710,8 @@ mod tests {
     fn folding_reaches_past_ascii_but_stays_simple() {
         assert!(m("äpfel", "ÄPFEL", true));
         assert!(m("ÄPFEL", "äpfel", true));
-        // Simple folding only: `ß` does not become `SS`, because a
-        // mapping that expands to two characters would have to consume
-        // two input positions for one pattern character. Real bash's own
-        // `nocasematch` says no here too.
+        // Simple folding only: `ß` isn't `SS`, which would take two input
+        // positions for one pattern character. bash's `nocasematch` agrees.
         assert!(!m("STRASSE", "straße", true));
         assert!(m("stra\u{df}e", "STRA\u{df}E", true), "but it still matches itself");
     }
@@ -836,8 +730,7 @@ mod tests {
         assert_eq!(case_variants('5').collect::<Vec<char>>(), Vec::<char>::new());
         assert_eq!(case_variants('a').collect::<Vec<char>>(), vec!['A']);
         assert_eq!(case_variants('A').collect::<Vec<char>>(), vec!['a']);
-        // Expands to more than one character, so simple folding declines
-        // it -- see `case_variants`' own doc comment.
+        // Expands to more than one character, so declined (`case_variants`).
         assert_eq!(case_variants('\u{df}').collect::<Vec<char>>(), Vec::<char>::new());
     }
 
@@ -875,10 +768,8 @@ mod tests {
         let (_, _, caps) = re.find_at_with_captures(&chars("b"), 0).unwrap();
         assert_eq!(caps, vec!["b".to_string(), String::new(), "b".to_string()]);
     }
-    // The pattern every backtracker dies on: thirty ways to split each
-    // run of a's, and a `b` at the end so none of them works. The old
-    // engine explored 2^30 of them; a thread set has one state per
-    // instruction and cannot.
+    // The pattern that kills a backtracker: every way to split thirty a's,
+    // with a `b` so none works. A thread set has one state per instruction.
     #[test]
     fn a_pattern_that_used_to_take_forever_finishes() {
         let text: String = std::iter::repeat_n('a', 2000).collect();
@@ -887,10 +778,8 @@ mod tests {
         assert!(re.find_at(&chars(&(text + "b")), 0).is_none());
     }
 
-    // POSIX picks the longest match at the leftmost start, not the
-    // first one the pattern's branch order reaches. `(a|ab)` against
-    // `abc` is the discriminator: a backtracker says `a`, bash and this
-    // say `ab`.
+    // Leftmost-longest: `(a|ab)` against `abc` is `ab`, as in bash, not the
+    // first branch's `a`.
     #[test]
     fn the_longest_match_wins_at_the_leftmost_start() {
         fn whole(pattern: &str, text: &str) -> String {
@@ -900,14 +789,13 @@ mod tests {
         assert_eq!(whole("x|xy", "xy"), "xy");
         assert_eq!(whole("(|a)", "abc"), "a");
         assert_eq!(whole("ab|abc", "abc"), "abc");
-        // Leftmost still outranks longest: the shorter match starts first.
+        // Leftmost still beats longest.
         assert_eq!(match_captures("xabc", "b|abc", false), Some(vec!["abc".to_string()]));
         assert_eq!(whole("a|bcd", "abcd"), "a");
     }
 
-    // Ties in length keep the earlier branch, which is what decides
-    // where the capture groups land when both spellings match the same
-    // text.
+    // Equal lengths keep the earlier branch, which decides where captures
+    // land.
     #[test]
     fn branch_order_settles_the_captures_of_equally_long_matches() {
         assert_eq!(match_captures("ab", "(ab)|(ab)", false), Some(vec!["ab".into(), "ab".into(), String::new()]));
@@ -920,23 +808,19 @@ mod tests {
         assert!(m("a{2}", "aa", false));
         assert!(m("a{2,}", "aaaa", false));
         assert_eq!(match_captures("aaaa", "a{2,3}", false), Some(vec!["aaa".to_string()]));
-        // Past the expansion limit the bound is treated as open, which
-        // matches more rather than refusing.
+        // Past the expansion limit the bound is open, matching more.
         assert!(m(&format!("a{{1,{}}}", MAX_REPEAT_EXPANSION + 10), "aaa", false));
     }
 
-    // An unanchored search advances every candidate start together
-    // rather than restarting the pattern at each one, so a long line
-    // costs one pass and not one per character.
+    // Unanchored search advances every start together: one pass per line.
     #[test]
     fn a_search_that_fails_over_a_long_line_stays_linear() {
         let text: String = std::iter::repeat_n('a', 20_000).collect();
         let re = Regex::compile("(a|aa)*b", false);
         assert!(re.find_at(&chars(&text), 0).is_none());
     }
-    // Assertions consume nothing and ask about where they are, which is
-    // the one thing a matcher that only ever eats characters cannot
-    // express. The set is GNU's, because that is what bash has.
+    // Assertions consume nothing and ask about their position. GNU's set,
+    // as bash has.
     #[test]
     fn word_boundaries_are_positions_not_characters() {
         assert!(m("\\bbar", "foo bar", false));
@@ -958,10 +842,7 @@ mod tests {
         assert_eq!(match_captures("  xy", "\\S+", false), Some(vec!["xy".to_string()]));
     }
 
-    // `\d` is Perl's, not GNU's. bash finds nothing in `ab123` for
-    // `\d+`, because to glibc that pattern is one or more letter `d`s,
-    // and this agrees with the shell it is measured against rather than
-    // with the habit.
+    // `\d` is Perl's; bash finds nothing in `ab123` for `\d+`.
     #[test]
     fn a_perl_shorthand_this_engine_does_not_have_is_a_literal() {
         assert!(!m("\\d+", "ab123", false));
@@ -976,8 +857,7 @@ mod tests {
         assert!(!m("ab\\'", "abc", false));
     }
 
-    // Every other escape is still the character itself, which is what
-    // makes `\.` a dot rather than any character.
+    // Other escapes are the character itself: `\.` is a dot.
     #[test]
     fn an_escape_with_no_meaning_is_the_character() {
         assert!(m("a\\.b", "a.b", false));
@@ -985,9 +865,7 @@ mod tests {
         assert!(m("a\\nb", "anb", false), "\\n is the letter n here, as it is in bash");
     }
 
-    // An assertion inside a repetition still has to hold every time
-    // round, which is the case a matcher that treated it as a character
-    // would get wrong in the other direction.
+    // An assertion inside a repetition must hold every time round.
     #[test]
     fn an_assertion_inside_a_repetition_holds_each_time() {
         assert_eq!(match_captures("one two", "(\\w+\\s*)+", false), Some(vec!["one two".to_string(), "two".to_string()]));
