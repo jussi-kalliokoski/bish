@@ -1,48 +1,32 @@
-// A scrollable, read-only view over already-styled lines: what `:help`
-// and `:preview` show. Its own module because it is a genuine view --
-// state, layout and rendering, all testable without a terminal -- with
-// repl.rs owning only the small driving loop, the same split browser.rs
-// and the diagnostics pane already use.
+// A scrollable read-only view over styled lines, for `:help` and
+// `:preview`: state, layout and rendering, testable without a terminal,
+// with repl.rs driving it, as for browser.rs and the diagnostics pane.
 //
-// **Why pre-styled lines rather than a buffer.** The obvious way to make
-// a document scrollable here would be a read-only `TextBuffer` in a
-// `Frame::Edit`, which would bring vim motions and search along for
-// free. It can't work: a `TextBuffer` holds plain characters and the
-// editor colours it by *language*, so a rendered markdown document --
-// whose whole point is that it already carries colour, box-drawing and
-// weight -- would arrive as literal escape sequences on screen. So this
-// takes the lines as rendered and scrolls them, and pays for that by
-// re-deriving a small navigation vocabulary instead of inheriting one.
-//
-// It takes over the terminal for its own duration and hands control back
-// -- the same "blocks until it exits" shape `:dbg`'s own run already has
-// (see repl.rs's `dbg` arm), rather than a pane of its own. A document
-// someone is reading wants the whole screen, and wants it to go away
-// completely when they're done.
+// Styled lines rather than a read-only `TextBuffer` in a `Frame::Edit`:
+// a `TextBuffer` holds plain characters coloured by language, so a
+// rendered document's colours, box drawing and weight would show as
+// literal escapes. The price is a small navigation vocabulary of its
+// own.
 
 use crate::bishedit::unicode_width::char_width;
 use crate::window::Rect;
 
 pub struct Pager {
-    // What the title bar says this is: `:help`, or a previewed file's
-    // own name.
+    // What the title bar says: `:help`, or a previewed file's name.
     title: String,
     lines: Vec<String>,
     // First visible line.
     top: usize,
-    // First visible *column*, for a document wider than the pane --
-    // which a table is, whenever `table_wrap` is off. Prose never needs
-    // it (it was wrapped to fit), so this is 0 for the whole life of
-    // most documents.
+    // The first visible column, for a document wider than the pane, as a
+    // table is with `table_wrap` off. Prose is wrapped to fit, so this is
+    // usually 0.
     left: usize,
-    // The widest line's display width, measured once. What decides how
-    // far `left` may go, and asking it of every line on every keystroke
-    // would be a scan of the whole document per press.
+    // The widest line's display width, measured once, bounding `left`
+    // without scanning the document per key.
     widest: usize,
     rows: usize,
     cols: usize,
-    // The last search and where the matches are, so `n`/`N` can step
-    // between them without re-scanning.
+    // The last search and its matches, so `n`/`N` step without rescanning.
     query: String,
     matches: Vec<usize>,
     current_match: Option<usize>,
@@ -56,16 +40,14 @@ pub struct Pager {
 pub enum Outcome {
     Continue,
     Quit,
-    /// A left click this view has no use for. Reported rather than
-    /// swallowed so the host can hit-test it against the tab bar and
-    /// the other panes -- which only became a sensible thing to do once
-    /// the pager stopped painting over them.
+    /// A left click this view has no use for, reported so the host can
+    /// hit-test it against the tab bar and other panes.
     Click(crate::editor::MouseEvent),
 }
 
-// How far one press moves sideways. A column at a time is too slow to
-// cross a table with and a screen at a time loses the columns you were
-// comparing; eight is about a cell.
+// How far one sideways press moves: a column is too slow across a
+// table, a screen loses the columns being compared; eight is about a
+// cell.
 const SIDE_STEP: usize = 8;
 
 impl Pager {
@@ -88,23 +70,19 @@ impl Pager {
         }
     }
 
-    // Which line is at the top, so a re-render at a new width can come
-    // back to roughly where the reader was.
+    // The top line, so a re-render at a new width can come back near it.
     pub fn top_line(&self) -> usize {
         self.top
     }
 
-    // Clamped, because the caller's remembered line may be past the end
-    // of a document that has just been re-wrapped narrower or wider.
+    // Clamped: the remembered line may be past the end of a re-wrapped
+    // document.
     pub fn scroll_to(&mut self, line: usize) {
         self.top = line;
         self.clamp();
     }
 
-    // The largest `top` that still shows content: scrolling stops with
-    // the last line on screen rather than running off into blank rows.
-    // Which column is at the left, so a re-render at a new width can
-    // come back to it -- the same reason `top_line` exists.
+    // The left column, so a re-render at a new width can come back to it.
     pub fn left_column(&self) -> usize {
         self.left
     }
@@ -113,13 +91,14 @@ impl Pager {
         self.left = column.min(self.max_left());
     }
 
+    // The largest `top` that still shows content: scrolling stops with the
+    // last line on screen.
     fn max_top(&self) -> usize {
         self.lines.len().saturating_sub(self.rows)
     }
 
-    // Never past the last column that has anything on it: scrolling into
-    // empty space would leave the reader looking at a blank pane with no
-    // clue which way is back.
+    // Never past the last column with anything on it, or the reader would
+    // face a blank pane with no clue which way is back.
     fn max_left(&self) -> usize {
         self.widest.saturating_sub(self.cols)
     }
@@ -139,8 +118,8 @@ impl Pager {
         self.left = next.clamp(0, self.max_left() as isize) as usize;
     }
 
-    // Puts `line` on screen, roughly a third from the top when it isn't
-    // already visible -- enough context above a search hit to read it in.
+    // Puts `line` on screen, about a third from the top if not already
+    // visible: context above a search hit.
     fn reveal(&mut self, line: usize) {
         if line >= self.top && line < self.top + self.rows {
             return;
@@ -186,8 +165,7 @@ impl Pager {
                 self.scroll_by(-1);
                 Outcome::Continue
             }
-            // Half a screen, whole screen: less(1)'s own pair, which is
-            // also vim's.
+            // Half a screen, a whole screen: less(1)'s pair, and vim's.
             Key::CtrlD => {
                 self.scroll_by(self.rows as isize / 2);
                 Outcome::Continue
@@ -212,9 +190,8 @@ impl Pager {
                 self.scroll_sideways_by(-(SIDE_STEP as isize));
                 Outcome::Continue
             }
-            // Back to the left edge, vim's own `0`. There is no `$` to
-            // go with it: the right edge of the widest line is not where
-            // any particular line ends, so landing there means nothing.
+            // Back to the left edge, vim's `0`. No `$`: the widest line's
+            // right edge isn't where any particular line ends.
             Key::Char('0') => {
                 self.left = 0;
                 Outcome::Continue
@@ -242,9 +219,8 @@ impl Pager {
             }
             Key::Mouse(ev) if ev.is_left_click() => Outcome::Click(ev),
             Key::Mouse(ev) => {
-                // The same notch the editor and Normal mode use, from
-                // the one constant, so a wheel feels the same wherever
-                // it is turned.
+                // The editor's and Normal mode's wheel step, from the one
+                // constant.
                 let step = crate::fileeditor::MOUSE_WHEEL_LINES as isize;
                 if ev.is_scroll_down() {
                     self.scroll_by(step);
@@ -257,9 +233,8 @@ impl Pager {
         }
     }
 
-    // Search is over the *visible* text: the lines carry SGR sequences,
-    // and a reader looking for "table" means the word, not whatever
-    // escape happens to sit inside it.
+    // Search is over the visible text: lines carry SGR sequences, and a
+    // search for "table" means the word.
     fn run_search(&mut self) {
         self.matches.clear();
         self.current_match = None;
@@ -276,8 +251,8 @@ impl Pager {
             self.message = Some(format!("no match for {:?}", self.query));
             return;
         }
-        // Start from the first match at or after what's on screen, so
-        // searching doesn't jump backwards for no reason.
+        // From the first match at or after the top, so searching doesn't jump
+        // backwards.
         let from = self.matches.iter().position(|&l| l >= self.top).unwrap_or(0);
         self.current_match = Some(from);
         let line = self.matches[from];
@@ -300,17 +275,9 @@ impl Pager {
         self.reveal(line);
     }
 
-    // The whole screen: title, the visible slice, and a status bar.
-    /// Renders into `rect` -- one pane's rectangle, not the whole
-    /// screen.
-    ///
-    /// It used to paint from `\x1b[H` across the full terminal, which
-    /// made it an overlay: every other pane and the tab bar disappeared
-    /// while a `:help` or a manpage was up, and there was nothing on
-    /// screen for a click to mean. Positioning against a rect is the
-    /// same thing browser.rs and the hex view already do, and it is what
-    /// lets a click be hit-tested against panes that are actually
-    /// visible.
+    /// Renders into `rect`, one pane's rectangle, like browser.rs and the
+    /// hex view, so other panes and the tab bar stay visible and a click can
+    /// be hit-tested against them.
     pub fn render(&self, rect: Rect) -> String {
         let mut out = String::new();
         out.push_str("\x1b[?25l");
@@ -322,9 +289,8 @@ impl Pager {
             let line = self.lines.get(self.top + row).map(String::as_str).unwrap_or("");
             out.push_str(&window_to_width(line, self.left, self.cols));
         }
-        // The status row is this pane's own last row, never the
-        // terminal's -- with a split above or below, those are different
-        // rows and the old code would have written over a neighbour.
+        // The status row is this pane's last row, not the terminal's, which
+        // differ with a split above or below.
         out.push_str(&at(rect.rows.saturating_sub(1)));
         out.push_str(&format!("\x1b[7m{}\x1b[0m", pad_to_width(&self.status(), self.cols)));
         out
@@ -351,31 +317,27 @@ impl Pager {
             (Some(i), n) if n > 0 => format!("  match {}/{}", i + 1, n),
             _ => String::new(),
         };
-        // The sideways half of the vocabulary is only mentioned when
-        // there is something off to the side to reach -- which for a
-        // document of prose there never is.
+        // The sideways keys are mentioned only when there's something off to
+        // the side, which prose never has.
         let keys = if self.max_left() > 0 { "j/k h/l scroll" } else { "j/k \u{2191}\u{2193} scroll" };
         format!("{}-{} of {}  {}{}   {keys}  / search  q quit", self.top + 1, last, self.lines.len(), position, found)
     }
 }
 
-// Pads (or truncates) to exactly `cols` columns, from the left edge --
-// what the title and status rows want, which never scroll.
+// Pads or truncates to exactly `cols` columns from the left edge, for
+// the title and status rows, which don't scroll.
 fn pad_to_width(line: &str, cols: usize) -> String {
     window_to_width(line, 0, cols)
 }
 
-// The `cols` columns of `line` starting at column `left`, padded to
-// exactly that width. Measures what the line draws rather than how many
-// bytes it holds, and keeps every SGR sequence it passes -- including
-// the ones belonging to characters scrolled off to the left, since the
-// style at the left edge is whatever they last said, and dropping one
-// would leave the rest of the screen in whatever style happened to be
-// active.
+// The `cols` columns of `line` from column `left`, padded to that width,
+// by drawn width, keeping every SGR sequence passed, including those of
+// characters scrolled off: the style at the left edge is whatever they
+// last set.
 fn window_to_width(line: &str, left: usize, cols: usize) -> String {
     let mut out = String::new();
-    // Where we are in the line, and how much of the window is filled --
-    // the same number only when `left` is 0.
+    // Where we are in the line and how much of the window is filled, equal
+    // only when `left` is 0.
     let mut col = 0;
     let mut width = 0;
     let mut chars = line.chars().peekable();
@@ -396,8 +358,8 @@ fn window_to_width(line: &str, left: usize, cols: usize) -> String {
         if col <= left {
             continue;
         }
-        // A wide glyph straddling the left edge has no half to draw, so
-        // the columns of it that are on screen are blank.
+        // A wide glyph straddling the left edge has no half to draw, so its
+        // visible columns are blank.
         let (text, drawn) = if start < left { (" ".repeat(col - left), col - left) } else { (c.to_string(), col - start) };
         if width + drawn > cols {
             break;
@@ -405,8 +367,8 @@ fn window_to_width(line: &str, left: usize, cols: usize) -> String {
         width += drawn;
         out.push_str(&text);
     }
-    // The reset matters: a line that ended mid-style would otherwise
-    // paint the padding, and the row below it, in that style.
+    // The reset: a line ending mid-style would paint the padding and the
+    // row below in that style.
     out.push_str("\x1b[0m");
     if width < cols {
         out.push_str(&" ".repeat(cols - width));
@@ -444,7 +406,7 @@ mod tests {
 
     #[test]
     fn scrolling_stops_with_the_last_line_on_screen() {
-        // 10 lines, 12 terminal rows -> 10 content rows.
+        // 10 lines, 12 terminal rows: 10 content rows.
         let mut p = pager(10, 12);
         assert_eq!(p.rows, 10);
         p.handle_key(Key::Char('G'));
@@ -481,8 +443,8 @@ mod tests {
         assert_eq!(pager(10, 12).handle_key(Key::Char('j')), Outcome::Continue);
     }
 
-    // Search is over what the line *shows*: the lines carry styling, and
-    // a word split by an escape sequence still has to be findable.
+    // Search is over what a line shows: a word split by an escape is still
+    // found.
     #[test]
     fn search_ignores_the_styling_in_a_line() {
         let lines = vec!["plain".to_string(), "a \x1b[1mstyled\x1b[0m word".to_string()];
@@ -490,7 +452,7 @@ mod tests {
         for c in "styled".chars() {
             p.handle_key(Key::Char(c));
         }
-        // ...that was typed outside search mode, so it did nothing.
+        // Typed outside search mode, so it did nothing.
         assert!(p.matches.is_empty());
         p.handle_key(Key::Char('/'));
         for c in "styled".chars() {
@@ -529,9 +491,8 @@ mod tests {
         assert_eq!(p.handle_key(Key::Escape), Outcome::Quit);
     }
 
-    // Every rendered row is exactly the terminal's width, styling or no
-    // styling -- a row that came up short would leave whatever was on
-    // screen before showing through.
+    // Every row is exactly the terminal's width, or what was there before
+    // shows through.
     #[test]
     fn every_rendered_row_is_exactly_the_width() {
         let lines = vec!["short".to_string(), "\x1b[1mstyled\x1b[0m".to_string(), "\u{65e5}\u{672c}\u{8a9e} wide".to_string(), "x".repeat(200)];
@@ -539,8 +500,7 @@ mod tests {
         for row in p.render(Rect { row: 0, col: 0, rows: 10, cols: 80 }).split("\x1b[").filter(|s| s.ends_with('H') || s.contains('H')) {
             let _ = row;
         }
-        // Measured directly rather than by parsing the frame back out:
-        // pad_to_width is what every row goes through.
+        // Measured directly: every row goes through `pad_to_width`.
         for line in ["short", "\x1b[1mstyled\x1b[0m", "\u{65e5}\u{672c}\u{8a9e} wide", &"x".repeat(200)] {
             assert_eq!(visible_width(&pad_to_width(line, 40)), 40, "{line:?}");
         }
@@ -550,8 +510,8 @@ mod tests {
         strip_sgr(s).chars().map(char_width).sum()
     }
 
-    // With `table_wrap` off a table keeps its own width and runs off the
-    // side, so the view has to be able to go and get the rest of it.
+    // With `table_wrap` off a table runs off the side, and the view can go
+    // and get the rest.
     #[test]
     fn a_document_wider_than_the_pane_scrolls_sideways() {
         let wide: String = ('a'..='z').chain('A'..='Z').collect();
@@ -560,13 +520,12 @@ mod tests {
 
         p.handle_key(Key::Char('l'));
         assert_eq!(visible_row(&p, 1), "ijklmnopqrstuvwxyzAB", "one step is SIDE_STEP columns");
-        // ...and the line that ran out is blank rather than repeating
-        // its last character.
+        // The line that ran out is blank, not repeating its last character.
         assert_eq!(visible_row(&p, 0), " ".repeat(20));
 
         p.handle_key(Key::Char('h'));
         assert_eq!(visible_row(&p, 1), "abcdefghijklmnopqrst");
-        // `h` at the left edge stays there rather than wrapping around.
+        // `h` at the left edge stays there.
         p.handle_key(Key::Char('h'));
         assert_eq!(p.left_column(), 0);
 
@@ -575,8 +534,7 @@ mod tests {
         assert_eq!(p.left_column(), 0, "0 comes straight back to the left edge");
     }
 
-    // Never into empty space: the last column that has anything on it is
-    // as far right as there is anything to see.
+    // Never into empty space.
     #[test]
     fn scrolling_sideways_stops_at_the_widest_line() {
         let mut p = Pager::new("t", vec!["x".repeat(30)], 6, 20);
@@ -585,23 +543,21 @@ mod tests {
         }
         assert_eq!(p.left_column(), 10, "30 columns of line, 20 of pane");
         assert_eq!(visible_row(&p, 0), "x".repeat(20));
-        // A document narrower than the pane has nowhere to go at all.
+        // A document narrower than the pane has nowhere to go.
         let mut narrow = Pager::new("t", vec!["x".to_string()], 6, 20);
         narrow.handle_key(Key::Right);
         assert_eq!(narrow.left_column(), 0);
     }
 
-    // Every row is still exactly the pane's width once scrolled, and the
-    // style that applied to the characters now off to the left still
-    // applies to what replaced them -- the escape sequences are kept
-    // even where the text they styled was dropped.
+    // Scrolled rows are still the pane's width, and the style of characters
+    // now off to the left still applies: their escapes are kept.
     #[test]
     fn a_scrolled_row_keeps_its_width_and_its_styling() {
         let line = format!("\x1b[1m{}\x1b[0m", "x".repeat(30));
         assert_eq!(visible_width(&window_to_width(&line, 8, 20)), 20);
         assert!(window_to_width(&line, 8, 20).starts_with("\x1b[1m"), "the style survives the columns it was applied to");
-        // A wide glyph cut in half by the left edge draws as the blank
-        // columns of it that are on screen, not as itself.
+        // A wide glyph halved by the left edge draws as its visible blank
+        // columns.
         assert_eq!(strip_sgr(&window_to_width("\u{65e5}\u{672c}", 1, 4)), " \u{672c} ");
     }
 
@@ -609,10 +565,9 @@ mod tests {
         strip_sgr(&window_to_width(&p.lines[p.top + row], p.left, p.cols))
     }
 
-    // A resize re-renders the whole *document* (the wrap width changed,
-    // and so did every table's layout), so the driving loop builds a
-    // fresh pager and puts it back where the reader was -- which has to
-    // survive the document having become shorter.
+    // A resize re-renders the document (the wrap width and every table
+    // changed), so the loop builds a fresh pager and returns it to where the
+    // reader was, even if the document got shorter.
     #[test]
     fn restoring_a_position_into_a_shorter_document_stays_inside_it() {
         let mut p = pager(100, 12);
