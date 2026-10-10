@@ -1,29 +1,21 @@
-// The tiling window manager: the pane tree, the frame stack each pane
-// holds, and the geometry that turns one into rectangles on a terminal.
+// The tiling window manager: the pane tree, each pane's frame stack, and
+// the geometry turning them into rectangles on a terminal.
 //
-// Tree algebra over `PaneId`, and nothing else. Nothing here knows what
-// a session is, what a shell is, or how to draw -- which is the line
-// the split follows. `repl.rs` keeps everything that touches a
-// `SessionState` or puts bytes on a terminal: `compositor_redraw`, the
-// `split_*_pane` functions (they allocate a session), the `render_*`
-// family, `sync_*_pane`. This file keeps everything that is only about
-// the shape of a window.
-//
-// It was already a separate concern; it had simply never been given a
-// file. The three test modules at the bottom moved here unchanged, and
-// they were already testing exactly this and nothing else.
+// Tree algebra over `PaneId` only: nothing here knows about sessions,
+// shells or drawing. repl.rs keeps what touches a `SessionState` or the
+// terminal (`compositor_redraw`, the `split_*_pane` functions, which
+// allocate sessions, the `render_*` family, `sync_*_pane`).
 
 use std::path::PathBuf;
 
-// Vim keeps 100. Same number, same reason: a list you cannot walk out
-// of is no more useful than a short one, and each entry is a path.
+// Long enough: a list you can't walk out of is no more useful than a
+// short one, and each entry holds a path.
 const MAX_JUMPS: usize = 100;
 
-// Reserves the terminal's real last two rows for global chrome: the tab
-// bar (render_compositor_frame, pinned to term_rows itself) and, one row
-// above it, the global mode-line/command row (render_global_status_row,
-// command_mode_row) -- everything panes/compute_regions ever divide up
-// lives above both.
+// Reserves the terminal's last two rows: the tab bar (on the last row)
+// and above it the global mode line and command row
+// (`render_global_status_row`, `command_mode_row`). Panes divide what's
+// above both.
 pub(crate) fn content_rows(term_rows: usize) -> usize {
     term_rows.saturating_sub(2).max(1)
 }
@@ -36,45 +28,24 @@ pub(crate) type EditFrameId = u32;
 
 pub(crate) type HexFrameId = u32;
 
-// One layer of a pane's view stack. Session is the vim-like "same
-// session shown in multiple windows" case (see WindowEntry's doc
-// comment); Job is a fg'd background job, poll-driven against its own
-// pty (see exec::FgJob and drive_fg_job below) instead of blocking the
-// whole process the way exec.rs's old Shell-local drive_pending_fg did.
-// A Job frame holds an id into `job_frames` (owned by repl::run, see
-// below) rather than the FgJob itself, since -- unlike a session, which
-// can legitimately be the SAME live thing shown in two places at once --
-// a running job is inherently a one-place-at-a-time resource, and
-// keeping Frame Copy (an FgJob owns a real OS process + pty, definitely
-// not Copy) matters for how cheaply `window fg` can duplicate a Session
-// frame onto another window's stack. Edit is `e`'s own equivalent of
-// Job -- a builtin editor session (fileeditor::EditSession) that can
-// likewise be detached (Ctrl+G) and resumed later, holding an id
-// into `edit_frames` for exactly the same Copy-ness reason (a
-// TextBuffer's own content is definitely not Copy either). Diagnostics
-// is different from all three: it's never the *only* frame a pane ever
-// shows (see split_diagnostics_pane) -- it names the `:diag`-triggered
-// sibling pane that sits below a specific Edit frame's own pane,
-// browsing that same `EditFrameId`'s buffer.diagnostics. It carries no
-// persistent state of its own (unlike Job/Edit, there's no third
-// `diag_frames` map) -- everything it shows is re-read from
-// `edit_frames[&id]` fresh each time it's focused, since nothing about
-// a diagnostics list is worth preserving across a collapse.
+// One layer of a pane's view stack; the top one is shown.
 //
-// Hex is `e --hex`'s own frame: the same shape as Edit in every way
-// that matters here (a detachable, resumable editor view holding an id
-// into its own `hex_frames` map, for the same Copy-ness reason), just
-// over a byte buffer rather than a text one -- see hexedit.rs's own
-// module doc comment for why a hex view is a frame in this stack rather
-// than a separate program.
-//
-// DebugRun is the same shape as Diagnostics (a `:dbg`-triggered sibling
-// under a specific Edit frame's own pane, named by that same
-// `EditFrameId`, see split_debug_run_pane) but -- like Job/Edit, unlike
-// Diagnostics -- it *does* carry real persistent state worth keeping
-// across a focus change (the debugged script's own Shell, output,
-// pause/run state): a `debug_frames: HashMap<EditFrameId, debugger::
-// DebugSession>` map, alongside `job_frames`/`edit_frames`.
+// - `Session`: a shell; one session can show in several panes.
+// - `Job`: a foregrounded job, driven by polling its pty
+//   (`exec::FgJob`, `drive_fg_job` in repl.rs). An id into `job_frames`
+//   rather than the job itself, as a job is in one place at a time and
+//   this stays `Copy`.
+// - `Edit`: an `e` editor session (`fileeditor::EditSession`),
+//   detachable with Ctrl+G; an id into `edit_frames`, for the same reason.
+// - `Hex`: `e --hex`, like `Edit` over bytes (see hexedit.rs); an id
+//   into `hex_frames`.
+// - `Diagnostics`: the `:diag` sibling pane below an `Edit` frame's
+//   pane, listing that buffer's diagnostics, named by its
+//   `EditFrameId`. Holds no state: it's reread from `edit_frames` each
+//   time (see `split_diagnostics_pane`).
+// - `DebugRun`: the `:dbg` sibling under an `Edit` frame's pane (see
+//   `split_debug_run_pane`), with state worth keeping (the script's
+//   shell, output, pause state) in `debug_frames`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Frame {
     Session(SessionId),
@@ -82,36 +53,20 @@ pub(crate) enum Frame {
     Edit(EditFrameId),
     Hex(HexFrameId),
     Diagnostics(EditFrameId),
-    /// A list of places -- `gr`'s references today, and whatever else
-    /// answers with `lsp::Location`s later. A sibling pane of the
-    /// editor frame it was asked from, exactly like `Diagnostics`, and
-    /// for the same reason: the list is *about* that buffer, and
-    /// collapsing to a title row when unfocused is what keeps it from
-    /// costing anything while you go on editing.
-    ///
-    /// Its contents live in `repl::run`'s own `location_lists`, keyed
-    /// the same way `debug_frames` is -- unlike diagnostics, a list of
-    /// places in *other* files is not a property of any one buffer, so
-    /// it has nowhere on `TextBuffer` it could honestly live.
+    /// A list of places, such as `gr`'s references: a sibling pane of the
+    /// editor frame it was asked from, like `Diagnostics`, collapsing to a
+    /// title row when unfocused. Its contents are in `repl::run`'s
+    /// `location_lists`: places in other files aren't a property of one
+    /// buffer.
     Locations(EditFrameId),
     DebugRun(EditFrameId),
 }
 
 pub(crate) type PaneId = u32;
 
-// One pane of a (possibly split) window: exactly what a window's view
-// stack used to be before panes existed (see Frame's doc comment) --
-// the last (top) entry is what's currently rendered/driven in this
-// pane. `window close`/EOF pops the top frame; once a pane's stack
-// empties the pane itself closes (see apply_window_action's Close arm),
-// collapsing the split, or -- if it was the window's only pane -- falls
-// through to the existing "close the whole window" logic unchanged.
-/// One position in the jump list: which file, and where in it.
-///
-/// The path is what makes this cross-file, and is the whole reason the
-/// list cannot live where `VimKeys` keeps its own -- a `VimKeys`
-/// belongs to one `EditSession`, so a file opened by `gd` gets a fresh
-/// one and the history stops at the door.
+/// One position in the jump list: which file, and where. The path makes
+/// it cross-file, and is why the list can't live in `VimKeys`, which
+/// belongs to one `EditSession`: a file opened by `gd` gets a fresh one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JumpEntry {
     pub(crate) path: PathBuf,
@@ -119,14 +74,10 @@ pub(crate) struct JumpEntry {
     pub(crate) col: usize,
 }
 
-/// `Ctrl-O`/`Ctrl-I`'s history, vim's semantics: a jump pushes where
-/// you were and discards the forward history, `Ctrl-O` steps back
-/// pushing where you are so `Ctrl-I` can return, and `Ctrl-I` mirrors
-/// it.
-///
-/// Lives on the `Pane` because vim's is per *window*, which is what a
-/// pane is here -- and because it has to outlive any one buffer, which
-/// is exactly what the first attempt at cross-file `gd` got wrong.
+/// `Ctrl-O`/`Ctrl-I`'s history, as in vim: a jump pushes where you were
+/// and drops the forward history; `Ctrl-O` steps back, pushing where you
+/// are so `Ctrl-I` can return; `Ctrl-I` mirrors it. On the `Pane`, as
+/// vim's is per window, and it must outlive any one buffer.
 #[derive(Debug, Default)]
 pub(crate) struct JumpList {
     pub(crate) back: Vec<JumpEntry>,
@@ -134,13 +85,11 @@ pub(crate) struct JumpList {
 }
 
 impl JumpList {
-    /// Records where a jump is leaving from. Discards the forward
-    /// history, exactly as taking a new branch does in a browser -- and
-    /// as vim does.
+    /// Records where a jump leaves from, dropping the forward history, as
+    /// following a new link in a browser does.
     pub(crate) fn push(&mut self, entry: JumpEntry) {
-        // Vim collapses a repeat of the same line rather than stacking
-        // it, which is what keeps `Ctrl-O` from needing several presses
-        // to leave one spot.
+        // A repeat of the same line collapses rather than stacks, as in
+        // vim, so `Ctrl-O` leaves a spot in one press.
         if self.back.last().is_some_and(|last| last.path == entry.path && last.row == entry.row) {
             self.back.pop();
         }
@@ -164,10 +113,14 @@ impl JumpList {
     }
 }
 
+// One pane of a window, with its own frame stack; the top frame is what's
+// shown and driven. `window close` or EOF pops it; an emptied pane closes
+// (see `apply_window_action`'s Close arm), collapsing its split, or closes
+// the window if it was the only pane.
 pub(crate) struct Pane {
     pub(crate) id: PaneId,
     pub(crate) stack: Vec<Frame>,
-    /// See `JumpList` -- per pane, the way vim's is per window.
+    /// See `JumpList`: per pane, as vim's is per window.
     pub(crate) jumps: JumpList,
 }
 
@@ -182,40 +135,21 @@ impl Pane {
     }
 }
 
-// One child of a Split: its own subtree, plus how large a share of the
-// split's space it gets relative to its siblings there. Weights are
-// relative, not normalized to any fixed total -- compute_regions always
-// divides a Split's available space in proportion to weight/(sum of all
-// siblings' weights), so a fresh 2-way split with both sides at the
-// default 1.0 divides evenly (1/2 each), and `window +`/`-`/`size` (see
-// repl.rs's resize_focused_pane/set_focused_pane_size) only ever need
-// to change *this* pane's own weight, never touch its siblings' -- the
-// division naturally renormalizes around whatever's there.
+// One child of a Split: its subtree and its share of the split relative
+// to its siblings. Weights aren't normalised: `compute_regions` divides
+// by weight over the sum, so two children at 1.0 split evenly, and
+// `window +`/`-`/`size` (`resize_focused_pane`,
+// `set_focused_pane_size` in repl.rs) change only this child's weight.
 //
-// `fixed`, when `Some`, overrides all of that for this one child: it
-// always gets exactly that many rows (a horizontal split) or columns (a
-// vertical one), taken off the top before whatever's left divides among
-// the `fixed: None` siblings by weight exactly as before (see
-// compute_regions/split_sizes). `weight` is simply ignored while `fixed`
-// is set, rather than the two interacting -- there's no case yet where
-// a pane needs both "resizable" and "pinned" at once. The diagnostics
-// pane (see Frame::Diagnostics) uses this while *expanded*, to size
-// itself to its own list content -- capped by its own caller at half of
-// whatever space was available before it expanded (see
-// diagnostics_pane_rows), so this alone can't be used to demand more
-// than half the split.
+// `fixed`, when set, gives this child exactly that many rows (horizontal
+// split) or columns (vertical), taken before the rest divide by weight;
+// `weight` is ignored meanwhile. The expanded diagnostics pane uses it to
+// fit its list, capped at half the space by `diagnostics_pane_rows`.
 //
-// `minimized` is a separate, more drastic state, for the same pane
-// while *collapsed*: it folds down to exactly one row/column, and --
-// unlike an ordinary `fixed: Some(1)` -- compute_regions skips
-// reserving a *separate* divider line on either side of it, since a
-// minimized pane's own single row already reads as that divider (see
-// its own doc comment for the exact rule and render_diagnostics_title
-// for what actually gets drawn into it: a title "pill" set into an
-// otherwise ordinary-looking divider line, not a full-width bar).
-// `fixed`/`weight` are simply irrelevant while `minimized` is set. Every
-// `SplitChild` anywhere else stays `fixed: None, minimized: false` and
-// behaves identically to before these fields existed.
+// `minimized` folds the child to one row or column, and
+// `compute_regions` reserves no divider beside it, as that row reads as
+// the divider (see `render_diagnostics_title` for the pill drawn there).
+// `fixed` and `weight` don't apply meanwhile.
 pub(crate) struct SplitChild {
     pub(crate) layout: PaneLayout,
     pub(crate) weight: f64,
@@ -223,14 +157,10 @@ pub(crate) struct SplitChild {
     pub(crate) minimized: bool,
 }
 
-// How a window's screen area is currently divided among its panes.
-// Leaf is the common case (an unsplit window, or one of a split's
-// occupied regions); Split recurses, so nested splits (a horizontal
-// divide with one side further vsplit) are represented naturally.
-// `horizontal` names the divider's own orientation, matching vim's
-// :split (horizontal divider, panes stacked top/bottom) vs :vsplit
-// (vertical divider, panes side by side) -- see compute_regions for how
-// this becomes actual screen rectangles.
+// How a window's area is divided among its panes. `Leaf` is one pane;
+// `Split` recurses for nested splits. `horizontal` names the divider's
+// orientation, as vim's `:split` (stacked) versus `:vsplit` (side by
+// side); see `compute_regions`.
 pub(crate) enum PaneLayout {
     Leaf(PaneId),
     Split { horizontal: bool, children: Vec<SplitChild> },
@@ -242,51 +172,34 @@ pub(crate) enum PaneLayout {
 // references it at any depth (`close_orphaned_sessions`).
 pub(crate) struct WindowEntry {
     pub(crate) id: u32,
-    // What this window is called, if anything -- `window create --name`
-    // or `window rename`. Shown in the tab bar instead of the cwd, and
-    // what `window select` finds it by. `None` is the ordinary case and
-    // shows the cwd, which is what every window showed before names
-    // existed.
+    // The window's name, from `window create --name` or `window rename`:
+    // shown in the tab bar instead of the cwd, and what `window select`
+    // finds. Usually `None`.
     pub(crate) name: Option<String>,
     pub(crate) layout: PaneLayout,
     pub(crate) panes: Vec<Pane>,
     pub(crate) focused_pane: PaneId,
     pub(crate) next_pane_id: PaneId,
-    // The `divider_budget` bishopt, kept here rather than read where it
-    // is used: it is a *layout* parameter, and the geometry helpers that
-    // need it (`pane_rect` above all) are pure functions of a window,
-    // called from far more places than have a Shell to ask. Refreshed
-    // from the owning session on every compositor redraw, so a change
-    // lands on the next frame -- one frame's staleness for a setting
-    // nobody changes mid-keystroke.
+    // The `divider_budget` bishopt, kept here because it's a layout
+    // parameter and the geometry helpers (`pane_rect` above all) are pure
+    // functions of a window, called where there's no shell to ask. Refreshed
+    // from the owning session on every compositor redraw.
     pub(crate) divider_budget: usize,
-    // The one pane temporarily filling this whole window, if any --
-    // `<C-w>z`/`<C-w>o`, tmux's `prefix z`. Not a layout change: the
-    // split tree underneath is left exactly as it was, so unzooming
-    // restores the arrangement down to the weights, and -- because
-    // `pane_rect` keeps answering for the hidden panes out of that
-    // untouched tree -- no hidden pane's grid gets resized by a zoom it
-    // cannot be seen through. A grid resize reflows its scrollback,
-    // which is destructive; tmux saves and restores the layout for the
-    // same reason.
-    //
-    // Only ever holds the focused pane (every action that moves focus
-    // clears it first, matching tmux), which is what lets `pane_rect`
-    // treat "not the zoomed pane" and "not visible" as the same case.
+    // The pane temporarily filling the window (`<C-w>z`/`<C-w>o`). The
+    // split tree is left as it was, so unzooming restores it, weights and
+    // all, and `pane_rect` keeps answering for hidden panes from that tree,
+    // so no hidden grid is resized (a resize reflows scrollback). Only ever
+    // the focused pane: every focus move clears it first, so `pane_rect` can
+    // treat "not zoomed" as "not visible".
     pub(crate) zoomed: Option<PaneId>,
-    // The last named arrangement `::bish window layout` put this window
-    // into, which is only what `layout next` cycles from -- not a claim
-    // that the window still *is* that layout. A split or a resize
-    // afterwards leaves this alone: "the one after the last one I
-    // asked for" is still the useful answer for the next press, and
-    // recomputing which named layout an arbitrary tree happens to
-    // match would be both expensive and usually "none of them".
+    // The last named arrangement `::bish window layout` applied, which
+    // `layout next` cycles from; not a claim the window still is that
+    // layout. Later splits and resizes leave it alone.
     pub(crate) last_layout: Option<NamedLayout>,
 }
 
-// What `divider_budget` is when nothing has said otherwise -- the same
-// number KNOWN_BISHOPTS defaults it to, and what a window built outside
-// a session (a test) uses.
+// `divider_budget`'s default, as in KNOWN_BISHOPTS, for a window built
+// outside a session (a test).
 const DEFAULT_DIVIDER_BUDGET: usize = 25;
 
 impl WindowEntry {
@@ -304,32 +217,26 @@ impl WindowEntry {
         }
     }
 
-    /// Every pane's rectangle and every divider for this window as it
-    /// stands right now, zoom included.
-    ///
-    /// The only way to get a *window's* geometry: `compute_regions`
-    /// below is the layout-tree half and is deliberately private to
-    /// this module, so no caller outside it can lay a window out as if
-    /// it weren't zoomed by simply forgetting that zoom exists.
+    /// Every pane's rectangle and every divider for this window now, zoom
+    /// included. The only way to a window's geometry: `compute_regions`, the
+    /// tree half, is private, so nobody can lay a window out forgetting the
+    /// zoom.
     pub(crate) fn regions(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
         match self.zoomed {
-            // A zoomed pane has no siblings on screen to be divided
-            // from, so there is nothing to draw a divider between.
+            // A zoomed pane has no siblings on screen, so no dividers.
             Some(id) => out.push((id, area)),
             None => compute_regions(&self.layout, area, self.focused_pane, self.divider_budget, out, dividers),
         }
     }
 
-    /// Adds a pane holding `stack`, splitting the focused one, and
-    /// returns its id. The new pane is deliberately *not* focused --
-    /// an ordinary split wants that and does it itself, the sibling
-    /// panes (diagnostics, locations, a debug run) explicitly don't.
+    /// Adds a pane holding `stack` by splitting the focused one, and returns
+    /// its id. It isn't focused: an ordinary split does that itself, and
+    /// sibling panes (diagnostics, locations, a debug run) don't want it.
     ///
-    /// The only way a pane enters a window, which is the point: a
-    /// caller cannot forget that the window might be zoomed (a new pane
-    /// added under a zoom would be invisible, so the split goes back
-    /// first) any more than it can get the SplitChild flags wrong.
-    /// `insert_sibling` below is private for the same reason.
+    /// The only way a pane enters a window, so callers can't forget a zoom
+    /// (the split comes back first, or the new pane would be invisible) or
+    /// get the `SplitChild` flags wrong; `insert_sibling` is private for the
+    /// same reason.
     pub(crate) fn add_pane(&mut self, stack: Vec<Frame>, horizontal: bool, minimized: bool) -> PaneId {
         self.unzoom();
         let new_id = self.next_pane_id;
@@ -341,21 +248,13 @@ impl WindowEntry {
         new_id
     }
 
-    /// Rebuilds the whole layout as one of the named arrangements --
-    /// `::bish window layout tiled`, tmux's `select-layout`.
+    /// Rebuilds the layout as a named arrangement (`::bish window layout
+    /// tiled`). Panes keep their identity and contents; weights go back to
+    /// even and minimized or fixed sizes are cleared, as an arrangement asked
+    /// for by name shouldn't carry the last drag's proportions.
     ///
-    /// Every pane keeps its identity and its contents; only where they
-    /// sit changes, and every weight goes back to even (an arrangement
-    /// you asked for by name is not one you also want the last drag's
-    /// proportions applied to). A minimized or fixed-size pane loses
-    /// that too, for the same reason.
-    ///
-    /// Which pane is "main" for the two `Main*` layouts is the focused
-    /// one, not the first. tmux picks the first and gives you
-    /// `swap-pane` to change it; picking the focused one means the key
-    /// that arranges the window is also the key that says what it is
-    /// arranged around, which is the whole of what anyone does with
-    /// those two layouts.
+    /// "Main" in the `Main*` layouts is the focused pane, so the key that
+    /// arranges the window also says what it's arranged around.
     pub(crate) fn apply_layout(&mut self, layout: NamedLayout) {
         self.unzoom();
         let mut panes = Vec::new();
@@ -363,8 +262,8 @@ impl WindowEntry {
         if panes.len() < 2 {
             return;
         }
-        // The focused pane leads, which is what the Main* layouts mean
-        // by "main" and what keeps the others' order stable around it.
+        // The focused pane leads, as the `Main*` layouts mean, keeping the
+        // others' order stable around it.
         if let Some(at) = panes.iter().position(|id| *id == self.focused_pane) {
             panes.rotate_left(at);
         }
@@ -372,8 +271,8 @@ impl WindowEntry {
         self.last_layout = Some(layout);
     }
 
-    /// What `::bish window layout next` moves to: the one after the
-    /// last named layout applied here, or the first if there is none.
+    /// `::bish window layout next`: the layout after the last one applied, or
+    /// the first.
     pub(crate) fn next_layout(&self) -> NamedLayout {
         match self.last_layout {
             Some(current) => current.next(),
@@ -381,13 +280,9 @@ impl WindowEntry {
         }
     }
 
-    /// Exchanges two panes' places in the layout -- `<C-w>x`.
-    ///
-    /// Only the leaf labels move, so each *position* keeps the size it
-    /// had and the panes trade places within it. That is what "exchange"
-    /// means in vim, and it is also the only version that cannot go
-    /// wrong: no subtree is rebuilt, so no weight, fold or minimized
-    /// flag can be lost on the way.
+    /// Exchanges two panes' places (`<C-w>x`). Only the leaf labels move, so
+    /// each position keeps its size and no weight, fold or minimized flag can
+    /// be lost.
     pub(crate) fn swap_panes(&mut self, a: PaneId, b: PaneId) {
         fn relabel(layout: &mut PaneLayout, a: PaneId, b: PaneId) {
             match layout {
@@ -402,22 +297,22 @@ impl WindowEntry {
         }
     }
 
-    /// Every pane, in layout order -- the order `::bish window focus
-    /// <n>` counts in, and the order a saved layout replays in.
+    /// Every pane in layout order: what `::bish window focus <n>` counts, and
+    /// how a saved layout replays.
     pub(crate) fn panes_in_layout_order(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         leaves_of(&self.layout, &mut out);
         out
     }
 
-    /// Where the focused pane sits in that order, counting from 1 --
-    /// the number `window focus` would take to come back here.
+    /// The focused pane's place in that order, from 1: what `window focus`
+    /// would take to come back.
     pub(crate) fn focused_position(&self) -> usize {
         self.panes_in_layout_order().iter().position(|id| *id == self.focused_pane).map_or(1, |at| at + 1)
     }
 
-    /// `::bish window focus <n>`: focuses the nth pane in layout order,
-    /// counting from 1. `false` if there is no such pane.
+    /// `::bish window focus <n>`: focuses the nth pane in layout order, from
+    /// 1. `false` if there's none.
     pub(crate) fn focus_position(&mut self, position: usize) -> bool {
         let panes = self.panes_in_layout_order();
         match position.checked_sub(1).and_then(|at| panes.get(at)) {
@@ -430,28 +325,22 @@ impl WindowEntry {
         }
     }
 
-    /// The `::bish window` commands that rebuild this window's pane
-    /// tree, starting from the single pane a new window has.
+    /// The `::bish window` commands that rebuild this window's pane tree
+    /// from a new window's single pane.
     ///
-    /// Replay works because of exactly how `insert_sibling` behaves: a
-    /// split puts the new pane immediately after the one it split, and
-    /// the new pane takes focus -- so N consecutive splits of the same
-    /// orientation, each following the last, lay N+1 panes out in
-    /// order with no focus juggling at all. Nesting is the other half:
-    /// a split whose orientation matches its parent's flattens into it,
-    /// which is why no tree here ever has two same-orientation splits
-    /// nested, and why splitting inside a subtree always nests the way
-    /// the target says it should.
+    /// Replay relies on `insert_sibling`: a split puts the new pane right
+    /// after the one split, and the new pane takes focus, so consecutive
+    /// same-orientation splits lay panes out in order. A split matching its
+    /// parent's orientation flattens into it, so no tree nests two alike,
+    /// and splitting inside a subtree nests as the target says.
     ///
-    /// Sizes are not part of this. A pane's share is a weight, and the
-    /// commands that set one are in real rows and columns against the
-    /// terminal that was there at the time -- replaying those on a
-    /// different terminal would be worse than replaying none.
+    /// Sizes aren't included: the commands that set them work in rows and
+    /// columns of the terminal at the time, which another terminal would
+    /// get wrong.
     pub(crate) fn rebuild_commands(&self) -> Vec<String> {
-        // The replay is planned against a mirror of the real thing --
-        // the same `insert_sibling`, the same focus rule -- so the
-        // positions it emits are the positions the commands will
-        // actually find, rather than something worked out on paper.
+        // Planned against a mirror of the real tree (the same
+        // `insert_sibling` and focus rule), so the positions emitted are
+        // the ones the commands will find.
         struct Replay {
             layout: PaneLayout,
             focused: PaneId,
@@ -502,13 +391,9 @@ impl WindowEntry {
         replay.commands
     }
 
-    /// The pane after `from` in layout order, wrapping -- what `<C-w>x`
-    /// exchanges with when nothing says which pane to pick.
-    ///
-    /// Layout order rather than anything spatial: it is the order the
-    /// tree already has, it is stable, and walking it repeatedly visits
-    /// every pane, which is the property that makes `<C-w>x` pressed
-    /// again and again cycle rather than oscillate between two.
+    /// The pane after `from` in layout order, wrapping: what `<C-w>x`
+    /// exchanges with by default. Layout order is stable and visits every
+    /// pane, so repeated `<C-w>x` cycles rather than oscillating.
     pub(crate) fn pane_after(&self, from: PaneId) -> PaneId {
         let mut leaves = Vec::new();
         leaves_of(&self.layout, &mut leaves);
@@ -518,11 +403,9 @@ impl WindowEntry {
         }
     }
 
-    /// Takes `pane_id` out of this window, handing back everything that
-    /// made it a pane -- for `window break`, which then makes a window
-    /// out of it. `None` when it is the only pane there, since a window
-    /// with no panes is not a thing and breaking the only pane out of
-    /// its window would just rename the window.
+    /// Takes `pane_id` out of this window, returning it, for `window break`.
+    /// `None` when it's the only pane: breaking it out would just rename the
+    /// window.
     pub(crate) fn detach_pane(&mut self, pane_id: PaneId) -> Option<Pane> {
         if self.panes.len() < 2 {
             return None;
@@ -540,21 +423,17 @@ impl WindowEntry {
         Some(pane)
     }
 
-    /// The other half of `detach_pane`: puts an existing pane into this
-    /// window beside the focused one. Its id is reassigned, since ids
-    /// are only unique within a window and the one it had belonged to a
-    /// different one.
+    /// `detach_pane`'s other half: puts a pane in this window beside the
+    /// focused one, with a new id, as ids are unique only per window.
     pub(crate) fn attach_pane(&mut self, pane: Pane, horizontal: bool) -> PaneId {
         let id = self.add_pane(pane.stack, horizontal, false);
         self.pane_mut(id).jumps = pane.jumps;
         id
     }
 
-    /// `<C-w>z` / `::bish window zoom`. Returns what the window is now:
-    /// true if the focused pane has just been zoomed, false if a zoom
-    /// was just undone -- or if there was nothing to zoom, since one
-    /// pane already fills its window and toggling would be a no-op
-    /// either way.
+    /// `<C-w>z` / `::bish window zoom`. Returns whether the focused pane is
+    /// now zoomed: false after unzooming, or when one pane already fills
+    /// the window.
     pub(crate) fn toggle_zoom(&mut self) -> bool {
         self.zoomed = match self.zoomed {
             Some(_) => None,
@@ -564,17 +443,15 @@ impl WindowEntry {
         self.zoomed.is_some()
     }
 
-    /// Called by everything that moves focus or reshapes the layout --
-    /// splitting, focusing a neighbour, balancing, resizing. tmux
-    /// unzooms on all of them for the same reason: the effect would
-    /// otherwise happen invisibly, underneath the one pane on screen.
+    /// Called by everything that moves focus or reshapes the layout
+    /// (splitting, focusing a neighbour, balancing, resizing), whose effect
+    /// would otherwise happen unseen under the zoomed pane.
     pub(crate) fn unzoom(&mut self) {
         self.zoomed = None;
     }
 
-    /// A new window whose single pane is one taken out of another --
-    /// `window break`. Keeps the whole frame stack and the jump list:
-    /// it is the same pane, it is just somewhere else now.
+    /// A new window whose single pane came from another (`window break`),
+    /// keeping its frame stack and jump list.
     pub(crate) fn from_pane(id: u32, pane: Pane) -> WindowEntry {
         let mut window = WindowEntry::single(id, pane.stack[0]);
         window.panes[0].stack = pane.stack;
@@ -594,8 +471,7 @@ impl WindowEntry {
         self.pane(self.focused_pane)
     }
 
-    // The focused pane's own frame stack -- everywhere this used to be
-    // a plain field access (`window.stack`) before panes existed.
+    // The focused pane's frame stack.
     pub(crate) fn stack(&self) -> &Vec<Frame> {
         &self.focused().stack
     }
@@ -605,25 +481,18 @@ impl WindowEntry {
         &mut self.pane_mut(id).stack
     }
 
-    // The nearest Session frame at or below the top of the *focused*
-    // pane's stack. In practice this only ever needs to look one level
-    // down (a Job frame is always pushed onto a stack that already has
-    // a Session beneath it, and nothing currently pushes a *second* Job
-    // frame on top of a first), but walks generally rather than
-    // assuming that.
+    // The nearest Session frame at or below the top of the focused pane's
+    // stack. A Job is always pushed onto a Session, so one level suffices
+    // in practice, but this walks the whole stack.
     pub(crate) fn owning_session(&self) -> SessionId {
         self.focused().owning_session()
     }
 }
 
 /// The arrangements `::bish window layout` knows, by tmux's names.
-///
-/// `horizontal`/`vertical` in these names is tmux's reading -- the axis
-/// the panes are spread *along* -- which is the opposite of what
-/// `PaneLayout::Split`'s own `horizontal` field names (the divider
-/// line). `split`/`vsplit` already carry that same inversion, for the
-/// same reason: the user's word and the field's word disagree, and the
-/// user's word is the one on the outside.
+/// `horizontal`/`vertical` there mean the axis panes spread along, the
+/// opposite of `PaneLayout::Split`'s `horizontal` (the divider), as with
+/// `split`/`vsplit`: the user's word wins on the outside.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum NamedLayout {
     /// Panes in one row, left to right.
@@ -654,8 +523,7 @@ impl NamedLayout {
         NamedLayout::ALL.iter().copied().find(|l| l.name() == name)
     }
 
-    /// In the order `window layout next` cycles them -- tmux's own
-    /// order, so the muscle memory of holding the key down transfers.
+    /// In the order `window layout next` cycles them.
     pub(crate) const ALL: [NamedLayout; 5] =
         [NamedLayout::EvenHorizontal, NamedLayout::EvenVertical, NamedLayout::MainHorizontal, NamedLayout::MainVertical, NamedLayout::Tiled];
 
@@ -666,10 +534,9 @@ impl NamedLayout {
     }
 }
 
-// One `Split` holding each of `parts` at even weight. A single part is
-// handed back bare rather than wrapped, since a split of one is not a
-// split -- which is what keeps `main-vertical` with two panes from
-// growing a pointless nested level around the second.
+// One `Split` of `parts` at even weight. A single part comes back bare:
+// a split of one isn't a split, so `main-vertical` with two panes gains
+// no pointless level.
 fn even_split(horizontal: bool, parts: Vec<PaneLayout>) -> PaneLayout {
     match parts.len() {
         1 => parts.into_iter().next().expect("length checked"),
@@ -684,20 +551,18 @@ fn leaf_row(ids: &[PaneId]) -> Vec<PaneLayout> {
     ids.iter().map(|id| PaneLayout::Leaf(*id)).collect()
 }
 
-// `apply_layout`'s pure half: the tree a named arrangement makes out of
-// `panes`, which is always at least two long and leads with the one the
-// Main* layouts treat as main.
+// `apply_layout`'s pure half: the tree a named layout makes of `panes`,
+// at least two, led by the main pane.
 fn build_named_layout(layout: NamedLayout, panes: &[PaneId]) -> PaneLayout {
     match layout {
         NamedLayout::EvenHorizontal => even_split(false, leaf_row(panes)),
         NamedLayout::EvenVertical => even_split(true, leaf_row(panes)),
-        // The main pane gets half, the rest share the other half --
-        // even_split's own even weighting across the two children.
+        // The main pane gets half; the rest share the other half.
         NamedLayout::MainVertical => even_split(false, vec![PaneLayout::Leaf(panes[0]), even_split(true, leaf_row(&panes[1..]))]),
         NamedLayout::MainHorizontal => even_split(true, vec![PaneLayout::Leaf(panes[0]), even_split(false, leaf_row(&panes[1..]))]),
         NamedLayout::Tiled => {
-            // As square as the count allows, filling rows left to right:
-            // 4 panes make 2x2, 5 make a row of 3 over a row of 2.
+            // As square as the count allows, rows filled left to right: 4
+            // panes make 2x2, 5 a row of 3 over a row of 2.
             let columns = (1..).find(|c| c * c >= panes.len()).unwrap_or(1);
             let rows: Vec<PaneLayout> = panes.chunks(columns).map(|row| even_split(false, leaf_row(row))).collect();
             even_split(true, rows)
@@ -705,15 +570,10 @@ fn build_named_layout(layout: NamedLayout, panes: &[PaneId]) -> PaneLayout {
     }
 }
 
-// Finds `target`'s Leaf within the tree and turns it into a 2-way
-// Split holding the original pane plus `new_id` -- UNLESS `target` is
-// already a direct child of a Split whose own orientation matches
-// `horizontal`, in which case `new_id` is simply inserted as another
-// sibling of that same Split instead of nesting. That distinction is
-// what keeps repeated same-direction splits an even N-way division
-// (compute_regions splits one Split's area evenly among however many
-// children it has) rather than each new split only ever halving
-// whatever was there before.
+// Turns `target`'s Leaf into a 2-way Split of it and `new_id`, unless
+// `target`'s parent Split already has the same orientation, in which
+// case `new_id` joins it as a sibling, so repeated same-direction splits
+// divide evenly instead of halving the last pane each time.
 fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal: bool, new_fixed: Option<usize>, new_minimized: bool) -> PaneLayout {
     match layout {
         PaneLayout::Leaf(id) if id == target => PaneLayout::Split {
@@ -748,12 +608,9 @@ fn insert_sibling(layout: PaneLayout, target: PaneId, new_id: PaneId, horizontal
     }
 }
 
-// Removes `target`'s Leaf from the tree, collapsing any Split left with
-// only one child down to that child directly (so a 2-way split closing
-// one side goes back to a plain unsplit Leaf, and a 3-way split closing
-// one side stays a 2-way split, not a redundant 1-child Split node --
-// the survivors keep whatever weights they already had, same as
-// closing a pane never touches its siblings' sizes).
+// Removes `target`'s Leaf, collapsing a Split left with one child into
+// that child, so closing one side of a 2-way split leaves a Leaf. The
+// survivors keep their weights.
 fn remove_from_layout(layout: PaneLayout, target: PaneId) -> Option<PaneLayout> {
     match layout {
         PaneLayout::Leaf(id) => {
@@ -786,23 +643,16 @@ fn first_leaf(layout: &PaneLayout) -> PaneId {
     }
 }
 
-// Closes the currently focused pane of a window that has more than one
-// -- called only once WindowAction::Close has already confirmed the
-// focused pane's own stack has nothing left to reveal underneath (see
-// its call site). Picks the new focused pane deterministically (the
-// layout tree's own first leaf) rather than trying to guess a
-// spatially "nearest" one -- simple and predictable, matching this
-// first pane-support pass's plain-layout scope.
+// Closes the focused pane of a window with more than one, once
+// `WindowAction::Close` has found nothing left under it in the stack.
+// Focus goes to the tree's first leaf: predictable, not spatial.
 pub(crate) fn close_focused_pane(window: &mut WindowEntry) {
     close_pane(window, window.focused_pane);
 }
 
-// Generalizes close_focused_pane to any pane in the window, not just the
-// focused one -- used to close a diagnostics sibling (never focused at
-// the moment its own Edit frame quits, see run_edit_frame's NavExit::
-// Quit arm) alongside close_focused_pane's own original call site. Only
-// reassigns `focused_pane` when `pane_id` actually was the focused one;
-// closing some *other* pane leaves focus exactly where it was.
+// Closes any pane of the window (a diagnostics sibling, say, when its
+// editor quits; see `run_edit_frame`'s `NavExit::Quit` arm). Focus moves
+// only if it was on `pane_id`.
 pub(crate) fn close_pane(window: &mut WindowEntry, pane_id: PaneId) {
     let old_layout = std::mem::replace(&mut window.layout, PaneLayout::Leaf(0));
     window.layout = remove_from_layout(old_layout, pane_id).expect("closing one of >1 panes always leaves at least one behind");
@@ -810,19 +660,15 @@ pub(crate) fn close_pane(window: &mut WindowEntry, pane_id: PaneId) {
     if window.focused_pane == pane_id {
         window.focused_pane = first_leaf(&window.layout);
     }
-    // A zoom naming a pane that no longer exists would have `regions`
-    // handing out a dead id; a zoom on the last pane standing is
-    // meaningless. Both end the same way.
+    // A zoom on a pane that's gone would hand out a dead id; a zoom on the
+    // last pane means nothing. Both end it.
     if window.zoomed == Some(pane_id) || window.panes.len() == 1 {
         window.unzoom();
     }
 }
 
-// A screen-coordinate rectangle within the compositor's content area
-// (everything above the pinned tab-bar row), 0-indexed. Produced by
-// compute_regions from a window's PaneLayout tree. pub(crate): fileeditor
-// needs this shape too (a pane's own rect, exactly the same meaning) --
-// see its own `drive`/`build_editor_frame` signatures.
+// A rectangle in the content area (above the tab bar), 0-based, made by
+// `compute_regions` from a layout. Also what fileeditor draws into.
 #[derive(Clone, Copy)]
 pub(crate) struct Rect {
     pub(crate) row: usize,
@@ -831,42 +677,26 @@ pub(crate) struct Rect {
     pub(crate) cols: usize,
 }
 
-// Floor under any single child's weight when computing shares below --
-// keeps a pane resized all the way down (or a pathological/negative
-// weight from ever existing in the first place) from making its own
-// share, or another sibling's via a tiny total, degenerate. The actual
-// on-screen size still can't go below 1 row/col either way (see the
-// `.max(1)` below), this only guards the weight arithmetic itself.
+// Floor under a child's weight in the share arithmetic, so a pane
+// shrunk all the way (or a bad weight) can't make a share degenerate.
+// Sizes are also at least 1 (the `.max(1)` below).
 pub(crate) const MIN_PANE_WEIGHT: f64 = 0.05;
 
-// Whether a divider line is drawn between `children[i]` and
-// `children[i + 1]` -- every adjacent pair, except where either side is
-// `minimized` (see SplitChild's own doc comment): a minimized pane's
-// own single row already reads as the boundary between it and its
-// neighbor, so a further, separate divider line right next to it would
-// just be a redundant blank line. Shared by split_sizes (to know how
-// much of the axis dividers actually consume) and compute_regions (to
-// know where to actually draw one).
-// Which children of a split are folded away behind a single "flipper"
-// divider, as half-open index ranges.
+// Which children of a split fold behind one divider, as half-open
+// ranges.
 //
-// Every divider costs a row (or a column), and past a certain number of
-// panes the dividers are most of what a split contains. So once they
-// take more than `divider_budget` of the space (see that bishopt), the
-// panes that are furthest from what you are actually looking at fold
-// into one divider that stands for all of them, and unfold again as the
-// focus moves back towards them.
+// Each divider costs a row or column, and with many panes the dividers
+// are most of a split. Once they take more than `divider_budget` of the
+// space, the panes furthest from focus fold into one divider for all of
+// them, unfolding as focus moves back.
 //
-// What stays is: the first child, the last child, the focused one, and
-// the one either side of it. Keeping the ends is what makes the split
-// still readable as a whole; keeping the neighbours is what makes moving
-// the focus feel continuous rather than teleporting.
+// The first child, the last, the focused one and one either side of it
+// stay: the ends keep the split readable, the neighbours make moving
+// focus continuous.
 //
-// **A run of exactly one child is never folded**, which is the rule that
-// makes this behave sensibly rather than mechanically: a folded run and
-// an ordinary divider both cost exactly one line, so folding a single
-// child away buys nothing and costs you a pane. With eight panes `a`..`h`
-// that produces, as the focus moves:
+// A run of one child never folds: a folded run costs a line, like an
+// ordinary divider, so folding one child gains nothing. With eight
+// panes `a`..`h`, as focus moves:
 //
 //     a [b] c ... h        focus b -- d,e,f,g fold
 //     a b [c] d ... h      focus c -- e,f,g fold
@@ -889,32 +719,26 @@ fn collapsed_runs(n: usize, focused: usize) -> Vec<std::ops::Range<usize>> {
     anchors.windows(2).map(|pair| pair[0] + 1..pair[1]).filter(|run| run.len() >= 2).collect()
 }
 
-// Whether the dividers a split needs take more of it than they are
-// allowed to. `budget` is a percentage; 100 means never fold.
+// Whether a split's dividers take more of it than allowed. `budget` is
+// a percentage; 100 never folds.
 fn dividers_overflow(divider_count: usize, axis: usize, budget: usize) -> bool {
     budget < 100 && axis > 0 && divider_count * 100 > axis * budget
 }
 
+// Whether a divider is drawn between `children[i]` and `children[i + 1]`:
+// every adjacent pair, unless either is minimized, whose one row already
+// reads as the boundary (see `SplitChild`). Shared by `split_sizes` and
+// `compute_regions`.
 fn dividers_after(children: &[SplitChild]) -> Vec<bool> {
     (0..children.len().saturating_sub(1)).map(|i| !(children[i].minimized || children[i + 1].minimized)).collect()
 }
 
-// One Split's own children resolved down to how many cells each gets
-// along the split's own axis (`usable` -- the area already minus every
-// *actually drawn* divider strip, see dividers_after). A `minimized`
-// child always claims exactly one cell, first, regardless of `fixed`/
-// `weight` (both irrelevant while minimized). Of what's left, every
-// `fixed`-child (see SplitChild's own doc comment) claims its own
-// requested count next, clamped so it can never squeeze a plain
-// `fixed: None` sibling below 1 cell; whatever's left after *that* then
-// divides among those weighted siblings exactly the way this used to
-// work before `fixed`/`minimized` existed -- proportional to weight/
-// (sum of weighted siblings' weights), with the *last* weighted child
-// (not necessarily the last child overall) absorbing the rounding
-// remainder so the weighted children's own total always adds up
-// exactly. With no `fixed`/`minimized` children at all (every existing
-// call site, before this pane type), `weighted_count == children.len()`
-// and this is byte-for-byte the original formula.
+// One Split's children as cell counts along its axis, from `usable`
+// (the area minus drawn dividers; see `dividers_after`). A minimized
+// child takes one cell first; then each `fixed` child its count,
+// clamped so no weighted sibling drops below one; the rest divides among
+// weighted children by weight, the last weighted child taking the
+// rounding remainder so the total is exact.
 fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
     let mut sizes = vec![0usize; children.len()];
     let mut budget = usable;
@@ -953,15 +777,11 @@ fn split_sizes(children: &[SplitChild], usable: usize) -> Vec<usize> {
     sizes
 }
 
-// Walks `layout`, splitting `area` among each Split's children (see
-// split_sizes, above, for how much each one gets) down to each Leaf's
-// own rectangle. `dividers` collects the reserved divider strips
-// separately (row=true for a horizontal divider line, running
-// left-right; false for a vertical one, running top-bottom) so the
-// caller can draw them after every pane's own content, rather than each
-// Split trying to draw into space a child might otherwise want --
-// skipped entirely between a minimized child and its neighbor (see
-// dividers_after).
+// Walks `layout`, dividing `area` among each Split's children (see
+// `split_sizes`) down to each Leaf's rectangle. Divider strips go into
+// `dividers` (`row` true for a horizontal line) to be drawn after the
+// panes; none between a minimized child and its neighbour (see
+// `dividers_after`).
 fn compute_regions(layout: &PaneLayout, area: Rect, focused: PaneId, budget: usize, out: &mut Vec<(PaneId, Rect)>, dividers: &mut Vec<Divider>) {
     compute_regions_at(layout, area, focused, budget, out, dividers, &mut Vec::new());
 }
@@ -985,15 +805,12 @@ fn leaves_of(layout: &PaneLayout, out: &mut Vec<PaneId>) {
     }
 }
 
-// compute_regions' own recursion, carrying the path from the layout root
-// down to whichever Split is being laid out right now -- each entry is
-// the child index taken at that level. A divider records that path plus
-// the index of the child it follows, which is the only way to name the
-// thing a drag has to resize: a `SplitChild` has no identity of its own,
-// and the pane ids underneath it belong to leaves that can be nested
-// arbitrarily deep. `split_axis` is the axis length that child's own size
-// is a share of, so a drag can turn a screen position straight into a
-// fraction without re-deriving the layout.
+// `compute_regions`' recursion, carrying the path of child indices from
+// the root to the Split being laid out. A divider records that path and
+// the child it follows, the only way to name what a drag resizes: a
+// `SplitChild` has no identity, and pane ids belong to leaves nested
+// anywhere. `split_axis`, the axis length the child's size shares,
+// lets a drag turn a position straight into a fraction.
 fn compute_regions_at(
     layout: &PaneLayout,
     area: Rect,
@@ -1012,28 +829,21 @@ fn compute_regions_at(
             }
             let draws_divider = dividers_after(children);
             let axis = if *horizontal { area.rows } else { area.cols };
-            // Folded when the dividers would otherwise take more of this
-            // split than they are allowed to. The runs are measured from
-            // whichever child holds the focus -- an unfocused split
-            // (the focus is in some other branch entirely) folds around
-            // its first child, which is as good an anchor as any when
-            // nothing here is being looked at.
+            // Folded when the dividers would take more than allowed. Runs
+            // are measured from the child holding the focus; a split
+            // without it folds around its first child.
             let folded = if dividers_overflow(draws_divider.iter().filter(|d| **d).count(), axis, budget) {
                 collapsed_runs(n, child_holding(children, focused).unwrap_or(0))
             } else {
                 Vec::new()
             };
             let hidden = |i: usize| folded.iter().any(|r| r.contains(&i));
-            // A folded run costs exactly one line, and the ordinary
-            // divider that would have followed the run's last child is
-            // the line it costs -- so it is drawn instead of, not as
-            // well as, that one.
+            // A folded run costs one line, which is the divider that would
+            // have followed its last child: drawn instead of that one.
             let divider_count = (0..n.saturating_sub(1)).filter(|i| draws_divider[*i] && !hidden(*i)).count() + folded.len();
-            // Only the children that are actually drawn are sized:
-            // handing `split_sizes` a zero-weight child would still
-            // spend whatever minimum it guarantees on something with no
-            // room on screen. `sizes` is indexed by *visible* position,
-            // which `visible_index` maps back from a child index.
+            // Only drawn children are sized: a zero-weight child would
+            // still get `split_sizes`' minimum. `sizes` is by visible
+            // position, mapped back through `visible_index`.
             let visible: Vec<SplitChild> = children
                 .iter()
                 .enumerate()
@@ -1042,16 +852,15 @@ fn compute_regions_at(
                 .collect();
             let visible_index = |upto: usize| (0..upto).filter(|i| !hidden(*i)).count();
             if *horizontal {
-                // Panes stacked top/bottom; the divider is the horizontal
-                // line between them.
+                // Panes stacked; the divider is the horizontal line between
+                // them.
                 let usable = area.rows.saturating_sub(divider_count);
                 let sizes = split_sizes(&visible, usable);
                 let mut row = area.row;
                 for (i, child) in children.iter().enumerate() {
-                    // A folded child gets no space, and its panes are
-                    // still reported -- at the fold's own row, with no
-                    // height -- so that focusing one still works and
-                    // brings it straight back (see focus_pane_direction).
+                    // A folded child gets no space but is still reported,
+                    // at the fold's row with no height, so focusing it
+                    // works and unfolds it (see `focus_pane_direction`).
                     let h = if hidden(i) { 0 } else { sizes[visible_index(i)] };
                     path.push(i);
                     compute_regions_at(&child.layout, Rect { row, col: area.col, rows: h, cols: area.cols }, focused, budget, out, dividers, path);
@@ -1124,30 +933,26 @@ fn compute_regions_at(
     }
 }
 
-// One divider strip, plus everything a drag needs to resize what it
-// separates -- see compute_regions_at.
+// One divider strip, and what a drag needs to resize what it separates;
+// see `compute_regions_at`.
 #[derive(Clone)]
 pub(crate) struct Divider {
     pub(crate) rect: Rect,
     pub(crate) horizontal: bool,
     pub(crate) path: Vec<usize>,
     pub(crate) child: usize,
-    // Where the owning Split's own area starts on the divider's axis, and
-    // how much of that axis its children actually divide up (the area
-    // minus the strips the dividers themselves occupy).
+    // Where the owning Split's area starts on the divider's axis, and how
+    // much of it the children divide (minus the divider strips).
     pub(crate) split_start: usize,
     pub(crate) split_axis: usize,
-    // How many panes this divider stands in for, when it is a folded
-    // run rather than an ordinary line between two neighbours (see
-    // collapsed_runs). `None` for every ordinary divider; a folded one
-    // draws a count into itself and is not draggable, since there is no
-    // single boundary for a drag to move.
+    // How many panes this divider stands for when it's a folded run (see
+    // `collapsed_runs`); `None` for an ordinary one. A folded divider shows
+    // a count and can't be dragged: there's no single boundary to move.
     pub(crate) folded: Option<usize>,
 }
 
-// The first pane hidden behind a folded divider -- what clicking one
-// focuses. `Divider::child` is the index of the run's last child, so the
-// run's own panes are the ones this walks back over.
+// The first pane hidden behind a folded divider, which a click on it
+// focuses. `Divider::child` is the run's last child, so this walks back.
 pub(crate) fn folded_divider_pane(window: &WindowEntry, divider: &Divider) -> Option<PaneId> {
     let folded = divider.folded?;
     let mut layout = &window.layout;
@@ -1164,37 +969,15 @@ pub(crate) fn folded_divider_pane(window: &WindowEntry, divider: &Divider) -> Op
     leaves.first().copied()
 }
 
-// (col_origin, width): the real terminal column the given window's
-// *focused* pane's own column 0 sits at, and how many columns of that
-// row belong to it -- see editor::read_line's own doc comment for why
-// both matter. (0, term_cols) -- the whole real terminal row --
-// whenever there's nothing to offset by: not yet promoted
-// (sinks_are_grid false -- read_line is drawing straight to the plain,
-// unpaned real terminal), or promoted but this window isn't split (a
-// single pane always owns the terminal's whole own row regardless of
-// the window's own position in a next/previous cycle, since only one
-// window is ever full-screen at a time).
-// `(prompt_row, pane_bottom_row)` for the completion menu's own
-// absolute-positioned path -- both real terminal rows, 0-indexed. The
-// menu draws one row below the prompt and is skipped when that would
-// fall past the pane (see redraw_with_completion_row).
+// `(prompt_row, pane_bottom_row)` for the completion menu, terminal rows,
+// 0-based. The menu draws one row below the prompt, skipped when that's
+// past the pane (see `redraw_with_completion_row`). `None` without a
+// grid (unpromoted), where the menu draws relative to the prompt with
+// `\n` and `\x1b[1A`, which scrolls the terminal and so is kept away
+// from panes.
 //
-// `None` only when there's no grid at all (an unpromoted terminal),
-// where the menu falls back to its relative `\n`/draw/`\x1b[1A` dance
-// instead. This used to return `None` for a *split* window too, on the
-// grounds that a split needs neighbour-pane clamping the absolute path
-// didn't have -- but it does: `pane_bottom_row` bounds it vertically and
-// `focused_col_origin`'s own `(col, cols)` bounds it horizontally, both
-// already the focused pane's rather than the terminal's. What genuinely
-// can't be let near a pane is the *relative* path, whose newline scrolls
-// the real terminal; that one is still reached only when there are no
-// panes to spill into.
-//
-// `cursor_row` is the session's own vt100::Screen cursor row, which
-// already tracks which row the upcoming prompt will occupy (it's fed a
-// trailing "\r\n" every time a line is submitted) with none of real-
-// terminal relative movement's scrolling ambiguity -- so no live query
-// is needed to learn it.
+// `cursor_row` is the session's grid cursor row, which tracks where the
+// next prompt goes without querying the terminal.
 pub(crate) fn completion_menu_rows(
     window: &WindowEntry,
     sinks_are_grid: bool,
@@ -1209,6 +992,9 @@ pub(crate) fn completion_menu_rows(
     Some((rect.row + cursor_row, rect.row + rect.rows - 1))
 }
 
+// `(col_origin, width)`: the terminal column the focused pane's column 0
+// is at, and how many columns of the row it owns (see `editor::read_line`).
+// `(0, term_cols)` when unpromoted or unsplit.
 pub(crate) fn focused_col_origin(window: &WindowEntry, sinks_are_grid: bool, term_rows: usize, term_cols: usize) -> (usize, usize) {
     if !sinks_are_grid || window.panes.len() <= 1 {
         return (0, term_cols);
@@ -1217,11 +1003,8 @@ pub(crate) fn focused_col_origin(window: &WindowEntry, sinks_are_grid: bool, ter
     (rect.col, rect.cols)
 }
 
-// The screen rectangle `pane_id` currently occupies within `window`,
-// resolved against the real terminal size -- the read-only half of
-// what snapshot_window computes, for callers (focused_col_origin, pane
-// focus-change handling) that only need one pane's geometry rather than
-// every pane's live screen reference too.
+// The rectangle `pane_id` occupies in `window` at this terminal size:
+// `snapshot_window`'s geometry for one pane, without the screens.
 pub(crate) fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize, term_cols: usize) -> Rect {
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
@@ -1230,32 +1013,19 @@ pub(crate) fn pane_rect(window: &WindowEntry, pane_id: PaneId, term_rows: usize,
     if let Some((_, rect)) = regions.iter().find(|(id, _)| *id == pane_id) {
         return *rect;
     }
-    // Hidden behind a zoom. Its rect is what the untouched layout tree
-    // still says it is -- see WindowEntry::zoomed for why a hidden pane
-    // must keep the geometry it had rather than be told it has none:
-    // this is what its own grid stays sized to, and resizing a grid
-    // reflows scrollback.
+    // Hidden behind a zoom: its rect is what the layout tree says, as its
+    // grid stays that size (see `WindowEntry::zoomed`).
     regions.clear();
     compute_regions(&window.layout, area, window.focused_pane, window.divider_budget, &mut regions, &mut dividers);
     regions.into_iter().find(|(id, _)| *id == pane_id).map(|(_, r)| r).expect("pane id always present in its own window's layout")
 }
 
-// How much one `window +`/`sizeup` or `-`/`sizedown` press changes the
-// focused pane's own weight -- see SplitChild's own doc comment for why
-// changing just one pane's weight (not its siblings') is enough to
-// resize the whole split: compute_regions always divides by weight
-// *share*, so growing one pane's weight relative to an unchanged total
-// for the others already shrinks them proportionally.
+// How much one `window +`/`-` press changes the focused pane's weight;
+// changing one weight resizes the split, as shares renormalise (see
+// `SplitChild`).
 pub(crate) const RESIZE_STEP: f64 = 0.2;
 
-// Finds the Split node that directly contains `target` as one of its
-// own children (not a further-nested grandchild), returning that
-// Split's own orientation, a mutable handle onto its children, and
-// target's index within them -- everything resize_focused_pane/
-// set_focused_pane_size need to read or adjust *only* the target's own
-// weight. None if the window isn't split at all (target is the whole
-// layout, a bare Leaf with no enclosing Split).
-// Walks `path` (see compute_regions_at) down to the Split it names.
+// Walks `path` (see `compute_regions_at`) down to the Split it names.
 fn split_children_at<'a>(layout: &'a mut PaneLayout, path: &[usize]) -> Option<&'a mut Vec<SplitChild>> {
     let mut node = layout;
     for step in path {
@@ -1270,13 +1040,9 @@ fn split_children_at<'a>(layout: &'a mut PaneLayout, path: &[usize]) -> Option<&
     }
 }
 
-// Gives `children[idx]` the share of its split's axis that `fraction`
-// names, by solving for the weight that produces it: split_sizes divides
-// the axis in proportion to weight/(sum of all siblings'), so a target
-// fraction f wants weight = f * sum_others / (1 - f). Clamped well short
-// of 0 and 1 so a drag to the very edge leaves both sides usable rather
-// than collapsing one -- compute_regions' own `.max(1)` would keep a pane
-// one cell tall, which is not a state anyone wants to drag back out of.
+// Gives `children[idx]` the share `fraction` of its split, solving
+// weight = f * sum_others / (1 - f). Clamped short of 0 and 1, so a drag
+// to the edge leaves both sides usable rather than a one-cell pane.
 pub(crate) fn set_child_weight_to_fraction(children: &mut [SplitChild], idx: usize, fraction: f64) {
     let old_weight = children[idx].weight.max(MIN_PANE_WEIGHT);
     let total_weight: f64 = children.iter().map(|c| c.weight.max(MIN_PANE_WEIGHT)).sum();
@@ -1285,15 +1051,10 @@ pub(crate) fn set_child_weight_to_fraction(children: &mut [SplitChild], idx: usi
     children[idx].weight = (fraction * sum_others / (1.0 - fraction)).max(MIN_PANE_WEIGHT);
 }
 
-// Drags `divider` to real terminal row/column `to` (whichever axis it
-// runs across), by resizing the child immediately before it. Returns
-// whether the layout actually changed, so a caller driving a stream of
-// motion events only repaints when something moved.
-//
-// A `fixed`-sized child (the diagnostics pane while expanded -- see
-// SplitChild's own doc comment) has its `fixed` set directly instead:
-// its weight is ignored while that's set, so solving for one would do
-// nothing at all.
+// Drags `divider` to terminal row or column `to`, resizing the child
+// before it. Returns whether the layout changed, so a stream of motion
+// events repaints only on change. A `fixed` child (the expanded
+// diagnostics pane) has `fixed` set directly, as its weight is ignored.
 pub(crate) fn resize_split_child_to(window: &mut WindowEntry, divider: &Divider, to: usize) -> bool {
     if divider.split_axis == 0 {
         return false;
@@ -1317,6 +1078,9 @@ pub(crate) fn resize_split_child_to(window: &mut WindowEntry, divider: &Divider,
     children[divider.child].weight != before
 }
 
+// The Split directly containing `target`: its orientation, its children,
+// and `target`'s index, for adjusting only `target`'s weight. `None` if
+// the window isn't split.
 pub(crate) fn find_parent_split_mut(layout: &mut PaneLayout, target: PaneId) -> Option<(bool, &mut Vec<SplitChild>, usize)> {
     match layout {
         PaneLayout::Leaf(_) => None,
@@ -1334,13 +1098,10 @@ pub(crate) fn find_parent_split_mut(layout: &mut PaneLayout, target: PaneId) -> 
     }
 }
 
-// `window +`/`sizeup` (delta > 0) and `-`/`sizedown` (delta < 0): grows
-// or shrinks the focused pane's own weight within its immediate parent
-// split by RESIZE_STEP, floored at MIN_PANE_WEIGHT so repeated presses
-// can never zero it out (compute_regions' own `.max(1)` on the
-// resulting *rendered* size is the other half of that guarantee -- a
-// pane can get very small, never invisible). A no-op if the window
-// isn't split.
+// `window +` (delta > 0) and `-` (delta < 0): changes the focused pane's
+// weight in its parent split by `RESIZE_STEP`, floored at
+// `MIN_PANE_WEIGHT`; with the rendered `.max(1)`, a pane gets small but
+// never invisible. A no-op if the window isn't split.
 pub(crate) fn resize_focused_pane(window: &mut WindowEntry, delta: f64) {
     let focused = window.focused_pane;
     if let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, focused) {
@@ -1356,9 +1117,8 @@ mod jump_list_tests {
         JumpEntry { path: PathBuf::from(path), row, col: 0 }
     }
 
-    // The property the whole feature exists for: one list spanning
-    // files, so `Ctrl-O` after a cross-file `gd` steps back over the
-    // file boundary and `Ctrl-I` steps forward over it again.
+    // One list across files: `Ctrl-O` after a cross-file `gd` steps back
+    // over the boundary and `Ctrl-I` forward again.
     #[test]
     fn back_and_forward_step_across_files_in_one_history() {
         let mut jumps = JumpList::default();
@@ -1367,7 +1127,7 @@ mod jump_list_tests {
         assert_eq!(jumps.back(at("b.rs", 5)), Some(at("a.rs", 30)));
         assert_eq!(jumps.back(at("a.rs", 30)), Some(at("a.rs", 1)));
         assert_eq!(jumps.back(at("a.rs", 1)), None, "nothing further back");
-        // ...and forward returns along the same path.
+        // ...and forward returns the same way.
         assert_eq!(jumps.forward(at("a.rs", 1)), Some(at("a.rs", 30)));
         assert_eq!(jumps.forward(at("a.rs", 30)), Some(at("b.rs", 5)));
         assert_eq!(jumps.forward(at("b.rs", 5)), None);
@@ -1379,22 +1139,19 @@ mod jump_list_tests {
         jumps.push(at("a.rs", 1));
         assert_eq!(jumps.back(at("a.rs", 9)), Some(at("a.rs", 1)));
         assert!(jumps.forward.len() == 1, "there is somewhere to go forward to");
-        // Taking a new branch discards it, as it does in a browser and
-        // as it does in vim.
+        // A new jump discards the forward history, as in vim.
         jumps.push(at("a.rs", 20));
         assert_eq!(jumps.forward(at("a.rs", 20)), None);
     }
 
-    // Vim collapses a repeat on the same line rather than stacking it,
-    // which is what stops `Ctrl-O` needing several presses to leave one
-    // spot.
+    // A repeat on the same line collapses, as in vim.
     #[test]
     fn repeated_jumps_from_one_line_leave_a_single_entry() {
         let mut jumps = JumpList::default();
         jumps.push(at("a.rs", 5));
         jumps.push(JumpEntry { path: PathBuf::from("a.rs"), row: 5, col: 40 });
         assert_eq!(jumps.back.len(), 1);
-        // The same line in a *different* file is a different place.
+        // The same line in another file is another place.
         jumps.push(at("b.rs", 5));
         assert_eq!(jumps.back.len(), 2);
     }
@@ -1451,15 +1208,14 @@ mod divider_drag_tests {
         assert_eq!(d[0].path, Vec::<usize>::new(), "the root split");
         assert_eq!(d[0].child, 0, "the divider follows the first child");
         assert!(!d[0].horizontal);
-        // 60 columns minus the one the divider itself occupies.
+        // 60 columns minus the divider's one.
         assert_eq!((d[0].split_start, d[0].split_axis), (0, 59));
     }
 
     #[test]
     fn a_nested_splits_divider_carries_the_path_to_reach_it() {
-        // Left half is itself split top/bottom -- its divider must name
-        // that inner split, not the outer one, or a drag would resize
-        // completely the wrong boundary.
+        // The left half is split top/bottom; its divider must name that inner
+        // split, or a drag would resize the wrong boundary.
         let inner = PaneLayout::Split { horizontal: true, children: vec![leaf(1, 1.0), leaf(2, 1.0)] };
         let layout = PaneLayout::Split {
             horizontal: false,
@@ -1510,9 +1266,8 @@ mod divider_drag_tests {
 
     #[test]
     fn a_fixed_size_child_is_resized_by_its_fixed_size_not_its_weight() {
-        // The diagnostics pane while expanded (see SplitChild) -- its
-        // weight is ignored entirely while `fixed` is set, so solving for
-        // one would move nothing at all.
+        // The expanded diagnostics pane (see `SplitChild`): its weight is
+        // ignored while `fixed` is set.
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![SplitChild { layout: PaneLayout::Leaf(0), weight: 1.0, fixed: Some(6), minimized: false }, leaf(1, 1.0)],
@@ -1535,7 +1290,7 @@ mod divider_drag_tests {
         let mut out = Vec::new();
         let mut dividers = Vec::new();
         compute_regions(&w.layout, AREA, w.focused_pane, w.divider_budget, &mut out, &mut dividers);
-        // Nothing overlaps: the divider column belongs to no pane rect.
+        // No overlap: the divider column is in no pane's rect.
         assert!(!out.iter().any(|(_, r)| d.rect.col >= r.col && d.rect.col < r.col + r.cols));
     }
 }
@@ -1564,17 +1319,16 @@ mod pane_layout_tests {
         let out = regions(&layout, area);
         let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
         let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
-        // 10 rows - 1 divider = 9 usable; the fixed child takes exactly
-        // 1, the lone weighted child absorbs the remaining 8.
+        // 10 rows less 1 divider is 9; the fixed child takes 1, the weighted
+        // child the other 8.
         assert_eq!(r1.rows, 1);
         assert_eq!(r0.rows, 8);
     }
 
     #[test]
     fn every_existing_split_still_divides_evenly_with_no_fixed_children() {
-        // Byte-for-byte the pre-`fixed`-field formula: three even
-        // weighted children in a 21-row area (20 usable after 2
-        // dividers) split 7/7/6, the last absorbing the remainder.
+        // Three even weighted children in 21 rows (20 after 2 dividers) split
+        // 7/7/6, the last taking the remainder.
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![
@@ -1599,8 +1353,8 @@ mod pane_layout_tests {
                 SplitChild { layout: PaneLayout::Leaf(1), weight: 1.0, fixed: Some(10), minimized: false },
             ],
         };
-        // 3 rows - 1 divider = 2 usable; a fixed request of 10 must be
-        // clamped so the weighted sibling isn't squeezed to 0.
+        // 3 rows less 1 divider is 2; a fixed request of 10 is clamped so the
+        // weighted sibling keeps a row.
         let area = Rect { row: 0, col: 0, rows: 3, cols: 20 };
         let out = regions(&layout, area);
         let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
@@ -1645,11 +1399,9 @@ mod pane_layout_tests {
         let (out, dividers) = regions_and_dividers(&layout, area);
         let r0 = out.iter().find(|(id, _)| *id == 0).unwrap().1;
         let r1 = out.iter().find(|(id, _)| *id == 1).unwrap().1;
-        // No divider at all between them: the minimized pane's own row
-        // is the whole boundary. 0's own 9 rows + 1's own 1 row fill
-        // the entire 10-row area exactly, unlike the ordinary
-        // fixed-child case (which still reserves 1 row for a real
-        // divider on top of the fixed child's own size).
+        // No divider: the minimized pane's row is the boundary, so 9 rows
+        // plus 1 fill the 10, unlike a fixed child, which still gets a
+        // divider.
         assert!(dividers.is_empty());
         assert_eq!(r1.rows, 1);
         assert_eq!(r0.rows, 9);
@@ -1674,9 +1426,8 @@ mod pane_layout_tests {
 
     #[test]
     fn a_normal_divider_still_separates_two_ordinary_siblings_next_to_a_minimized_one() {
-        // Three children: ordinary, ordinary, minimized -- the boundary
-        // between the first two still gets a real divider; only the one
-        // next to the minimized child is skipped.
+        // Ordinary, ordinary, minimized: the first two still get a divider;
+        // only the one beside the minimized child is skipped.
         let layout = PaneLayout::Split {
             horizontal: true,
             children: vec![
@@ -1690,8 +1441,8 @@ mod pane_layout_tests {
         assert_eq!(dividers.len(), 1);
         let r2 = out.iter().find(|(id, _)| *id == 2).unwrap().1;
         assert_eq!(r2.rows, 1);
-        // 11 rows - 1 real divider - 1 minimized row = 9 usable for the
-        // two ordinary weighted siblings, split evenly.
+        // 11 rows less 1 divider and 1 minimized row leaves 9 for the two
+        // weighted siblings, split evenly.
         let rows_of = |id: PaneId| out.iter().find(|(i, _)| *i == id).unwrap().1.rows;
         assert_eq!(rows_of(0) + rows_of(1), 9);
     }
@@ -1701,8 +1452,7 @@ mod pane_layout_tests {
 mod tab_fold_tests {
     use super::*;
 
-    // The worked examples from the feature's own description, with eight
-    // panes `a`..`h` and the focus moving right one at a time.
+    // Eight panes `a`..`h`, the focus moving right one at a time.
     #[test]
     fn folding_keeps_the_ends_the_focus_and_its_neighbours() {
         let show = |focused: usize| {
@@ -1731,21 +1481,18 @@ mod tab_fold_tests {
         assert_eq!(show(4), "a ... d [e] f g h");
     }
 
-    // The rule that keeps this from being merely mechanical: a folded
-    // run and an ordinary divider cost the same one line, so folding a
-    // lone child buys nothing and costs you a pane.
+    // A folded run costs a line, like a divider, so a lone child isn't
+    // folded.
     #[test]
     fn a_run_of_one_is_never_folded() {
-        // focus d (index 3) leaves exactly `b` between the first child
-        // and the focus's own neighbour -- kept.
+        // Focus d (index 3) leaves only `b` before the anchors: kept.
         assert_eq!(collapsed_runs(8, 3), vec![5..7]);
-        // ...and focus e leaves exactly `g` at the other end -- kept.
+        // ...and focus e leaves only `g` at the other end: kept.
         assert_eq!(collapsed_runs(8, 4), vec![1..3]);
     }
 
-    // Four panes can't fold from any focus: the ends, the focus and its
-    // two neighbours are already all of them, and whatever is left over
-    // is a run of one.
+    // Four panes never fold: the ends, the focus and its neighbours are all
+    // of them, and any leftover is a run of one.
     #[test]
     fn four_panes_or_fewer_never_fold() {
         for n in 0..=4 {
@@ -1755,8 +1502,8 @@ mod tab_fold_tests {
         }
     }
 
-    // Five is the first count that can, and only from an end -- from the
-    // middle every child is still an anchor or a lone leftover.
+    // Five is the first count that folds, and only from an end; from the
+    // middle every child is an anchor or a lone leftover.
     #[test]
     fn five_panes_fold_only_from_an_end() {
         assert_eq!(collapsed_runs(5, 0), vec![2..4], "[a] b ... e");
@@ -1785,19 +1532,17 @@ mod tab_fold_tests {
         // Seven dividers in forty rows is 17.5%.
         assert!(!dividers_overflow(7, 40, 25));
         assert!(dividers_overflow(7, 40, 10));
-        // 100 means never, whatever the numbers say.
+        // 100 means never.
         assert!(!dividers_overflow(39, 40, 100));
-        // ...and nothing divides by zero on a split with no room.
+        // ...and nothing divides by zero with no room.
         assert!(!dividers_overflow(7, 0, 25));
     }
 
-    // The layout half: folded children really do get no space, the
-    // dividers they would have needed are gone, and one divider stands
-    // in their place carrying the count.
+    // Folded children get no space, their dividers go, and one divider
+    // carrying the count takes their place.
     #[test]
     fn a_folded_run_gives_up_its_rows_to_the_panes_that_are_left() {
-        // Ten panes stacked in twenty rows: nine dividers is 45%, over
-        // the 25% budget.
+        // Ten panes in twenty rows: nine dividers is 45%, over 25%.
         let children: Vec<SplitChild> =
             (0..10).map(|i| SplitChild { layout: PaneLayout::Leaf(i), weight: 1.0, fixed: None, minimized: false }).collect();
         let layout = PaneLayout::Split { horizontal: true, children };
@@ -1806,8 +1551,7 @@ mod tab_fold_tests {
         let mut dividers = Vec::new();
         compute_regions(&layout, area, 1, 25, &mut regions, &mut dividers);
 
-        // Focused pane 1, so panes 0,1,2 and 9 keep their rows and
-        // 3..=8 fold.
+        // Focus on pane 1, so 0, 1, 2 and 9 keep rows and 3..=8 fold.
         let rows = |id: PaneId| regions.iter().find(|(p, _)| *p == id).unwrap().1.rows;
         for id in [0, 1, 2, 9] {
             assert!(rows(id) > 0, "pane {id} should still be drawn");
@@ -1815,8 +1559,7 @@ mod tab_fold_tests {
         for id in 3..=8 {
             assert_eq!(rows(id), 0, "pane {id} should be folded away");
         }
-        // Every pane is still reported, folded or not -- that is what
-        // keeps focusing one possible.
+        // Every pane is still reported, folded or not, so it can be focused.
         assert_eq!(regions.len(), 10);
         // Three ordinary dividers and one fold, not nine.
         assert_eq!(dividers.len(), 4);
@@ -1826,7 +1569,7 @@ mod tab_fold_tests {
         assert_eq!(used, area.rows);
     }
 
-    // Under the budget nothing folds, however many panes there are.
+    // Under the budget nothing folds, however many panes.
     #[test]
     fn a_generous_budget_folds_nothing() {
         let children: Vec<SplitChild> =
@@ -1840,8 +1583,8 @@ mod tab_fold_tests {
         assert!(regions.iter().all(|(_, r)| r.rows > 0));
     }
 
-    // Moving the focus is what unfolds: the same layout, a different
-    // pane in front, and a different set is hidden.
+    // Moving the focus unfolds: a different pane in front hides a
+    // different set.
     #[test]
     fn the_fold_follows_the_focus() {
         let hidden_for = |focused: PaneId| {
@@ -1857,7 +1600,7 @@ mod tab_fold_tests {
         };
         assert_eq!(hidden_for(1), vec![3, 4, 5, 6, 7, 8]);
         assert_eq!(hidden_for(5), vec![1, 2, 3, 7, 8]);
-        // Whatever is focused is never hidden, at any position.
+        // The focused pane is never hidden.
         for focused in 0..10 {
             assert!(!hidden_for(focused).contains(&focused));
         }
@@ -1897,7 +1640,7 @@ mod zoom_tests {
         assert_eq!(regions[0].1.rows, AREA.rows);
         assert_eq!(regions[0].1.cols, AREA.cols);
 
-        // And no dividers: there is nothing on screen to divide from.
+        // No dividers: nothing on screen to divide from.
         let (mut out, mut dividers) = (Vec::new(), Vec::new());
         w.regions(AREA, &mut out, &mut dividers);
         assert!(dividers.is_empty());
@@ -1906,9 +1649,8 @@ mod zoom_tests {
     #[test]
     fn unzooming_restores_the_layout_exactly() {
         let mut w = three_panes();
-        // Resize first, so "restored" means more than "three panes
-        // again" -- an unzoom that rebuilt the layout would even these
-        // back out.
+        // Resized first, so "restored" means the weights too; an unzoom that
+        // rebuilt the layout would even them out.
         resize_focused_pane(&mut w, RESIZE_STEP);
         let before: Vec<(PaneId, usize)> = regions_of(&w).into_iter().map(|(id, r)| (id, r.cols)).collect();
 
@@ -1921,9 +1663,8 @@ mod zoom_tests {
 
     #[test]
     fn a_hidden_pane_keeps_the_rectangle_it_had() {
-        // What its own grid stays sized to -- see WindowEntry::zoomed:
-        // resizing a grid reflows its scrollback, and a pane nobody can
-        // currently see is the last thing that should be reflowed.
+        // What its grid stays sized to (see `WindowEntry::zoomed`): resizing
+        // reflows scrollback, and an unseen pane shouldn't be reflowed.
         let mut w = three_panes();
         let hidden = w.panes.iter().map(|p| p.id).find(|id| *id != w.focused_pane).expect("three panes, one focused");
         let before = pane_rect(&w, hidden, 26, 80);
@@ -1942,8 +1683,8 @@ mod zoom_tests {
 
     #[test]
     fn closing_the_zoomed_pane_ends_the_zoom() {
-        // Otherwise `regions` would hand out a pane id nothing answers
-        // to, and every caller that looks it up would panic.
+        // Otherwise `regions` would hand out a dead pane id, and lookups
+        // would panic.
         let mut w = three_panes();
         w.toggle_zoom();
         let zoomed = w.focused_pane;
@@ -1965,8 +1706,8 @@ mod zoom_tests {
 
     #[test]
     fn adding_a_pane_puts_the_split_back() {
-        // A new pane under a zoom would be invisible, so `add_pane`
-        // unzooms -- which is why it is the only way in.
+        // A new pane under a zoom would be invisible, so `add_pane` unzooms;
+        // hence it's the only way in.
         let mut w = three_panes();
         w.toggle_zoom();
         w.add_pane(vec![Frame::Session(0)], true, false);
@@ -1989,7 +1730,7 @@ mod pane_move_tests {
         w
     }
 
-    // Which pane sits in which position, left to right.
+    // Which pane is in which position, left to right.
     fn order(w: &WindowEntry) -> Vec<PaneId> {
         let (mut out, mut dividers) = (Vec::new(), Vec::new());
         w.regions(AREA, &mut out, &mut dividers);
@@ -2010,8 +1751,7 @@ mod pane_move_tests {
         assert_eq!(after[0], before[1], "the two traded places");
         assert_eq!(after[1], before[0]);
         assert_eq!(after[2], before[2], "and nothing else moved");
-        // vim leaves the cursor in the window that moved, not in the
-        // position it left.
+        // Focus stays with the pane that moved, as in vim.
         assert_eq!(w.focused_pane, focused);
     }
 
@@ -2035,8 +1775,7 @@ mod pane_move_tests {
 
     #[test]
     fn pressing_swap_repeatedly_walks_the_pane_around_the_window() {
-        // Layout order wraps, so a held-down `<C-w>x` moves the pane on
-        // rather than oscillating between the same two positions.
+        // Layout order wraps, so repeated `<C-w>x` moves the pane on.
         let mut w = three();
         let moving = w.focused_pane;
         let mut visited = vec![order(&w).iter().position(|id| *id == moving).unwrap()];
@@ -2051,8 +1790,7 @@ mod pane_move_tests {
     #[test]
     fn breaking_a_pane_out_takes_its_whole_stack_with_it() {
         let mut w = three();
-        // A pane showing something on top of its session -- the frame
-        // stack has to survive the move, or the pane arrives blank.
+        // A frame on top of the session: the stack must survive the move.
         w.pane_mut(1).stack.push(Frame::Job(7));
         let taken = w.detach_pane(1).expect("three panes, so one can go");
 
@@ -2085,8 +1823,7 @@ mod pane_move_tests {
 
     #[test]
     fn a_joined_pane_gets_an_id_from_the_window_it_lands_in() {
-        // Ids are only unique within a window, so the one it arrived
-        // with means nothing here.
+        // Ids are unique only within a window, so the old one means nothing.
         let mut source = three();
         let taken = source.detach_pane(2).expect("three panes");
 
@@ -2119,9 +1856,9 @@ mod named_layout_tests {
         out
     }
 
-    // How many distinct rows and columns the panes start at -- enough
-    // to tell one row of four from a 2x2 grid without pinning exact
-    // arithmetic that divider budgets can legitimately change.
+    // How many distinct rows and columns panes start at: enough to tell one
+    // row of four from 2x2 without pinning arithmetic divider budgets
+    // change.
     fn shape(w: &WindowEntry) -> (usize, usize) {
         let r = rects(w);
         let mut rows: Vec<usize> = r.iter().map(|(_, rect)| rect.row).collect();
@@ -2143,9 +1880,8 @@ mod named_layout_tests {
         assert_eq!(shape(&w), (4, 1), "four panes, one column");
     }
 
-    // How many panes sit in each row, top to bottom -- the shape of a
-    // grid, without pinning column arithmetic that a short last row
-    // legitimately changes.
+    // How many panes are in each row, top to bottom: a grid's shape,
+    // without pinning column arithmetic.
     fn rows_of(w: &WindowEntry) -> Vec<usize> {
         let mut by_row: Vec<(usize, usize)> = Vec::new();
         for (_, rect) in rects(w) {
@@ -2164,8 +1900,7 @@ mod named_layout_tests {
         w.apply_layout(NamedLayout::Tiled);
         assert_eq!(rows_of(&w), vec![2, 2]);
 
-        // Rows fill left to right, so an odd count leaves the last row
-        // short rather than reshaping the ones above it.
+        // Rows fill left to right, so an odd count leaves the last row short.
         let mut w = window_of(5);
         w.apply_layout(NamedLayout::Tiled);
         assert_eq!(rows_of(&w), vec![3, 2]);
@@ -2204,9 +1939,8 @@ mod named_layout_tests {
 
     #[test]
     fn main_is_whichever_pane_has_focus() {
-        // The deviation from tmux, which always makes the first pane
-        // main: here the key that arranges the window is also the key
-        // that says what it is arranged around.
+        // The main pane is the focused one, so the key that arranges the
+        // window says what it's arranged around.
         let mut w = window_of(3);
         w.focused_pane = 2;
         w.apply_layout(NamedLayout::MainVertical);
@@ -2251,9 +1985,8 @@ mod named_layout_tests {
 
     #[test]
     fn every_layout_keeps_every_pane_exactly_once() {
-        // A rebuild that dropped or duplicated a leaf would leave a
-        // pane with no rectangle, which every geometry caller then
-        // panics on.
+        // A rebuild dropping or duplicating a leaf would leave a pane
+        // without a rectangle, which geometry callers panic on.
         for named in NamedLayout::ALL {
             for n in 2..7 {
                 let mut w = window_of(n);
@@ -2278,10 +2011,8 @@ mod named_layout_tests {
 mod layout_replay_tests {
     use super::*;
 
-    // Applies `rebuild_commands` to a fresh single-pane window, exactly
-    // the way the saved script does when it is sourced -- so what this
-    // checks is that the commands work, not that some parallel
-    // reimplementation of them agrees.
+    // Applies `rebuild_commands` to a fresh window as the saved script
+    // does when sourced, so this checks the commands themselves.
     fn replay(commands: &[String]) -> WindowEntry {
         let mut w = WindowEntry::single(0, Frame::Session(0));
         for command in commands {
@@ -2303,9 +2034,8 @@ mod layout_replay_tests {
         w
     }
 
-    // The shape of a tree, with pane ids replaced by their position in
-    // layout order -- two windows built by different routes are the
-    // same arrangement if these match.
+    // A tree's shape with pane ids replaced by layout position: windows
+    // built differently match if these do.
     fn shape(w: &WindowEntry) -> String {
         fn go(layout: &PaneLayout, order: &[PaneId], out: &mut String) {
             match layout {
@@ -2354,7 +2084,7 @@ mod layout_replay_tests {
 
     #[test]
     fn a_nested_split_replays_nested() {
-        // Split side by side, then stack the right-hand half.
+        // Split side by side, then stack the right half.
         let mut w = WindowEntry::single(0, Frame::Session(0));
         let right = w.add_pane(vec![Frame::Session(0)], false, false);
         w.focused_pane = right;
@@ -2365,8 +2095,7 @@ mod layout_replay_tests {
 
     #[test]
     fn every_named_layout_replays_exactly() {
-        // The arrangements anyone is most likely to have saved, and the
-        // ones with the deepest nesting.
+        // The arrangements most likely saved, and the most nested.
         for named in NamedLayout::ALL {
             for n in 2..7 {
                 let mut w = WindowEntry::single(0, Frame::Session(0));
@@ -2384,8 +2113,8 @@ mod layout_replay_tests {
 
     #[test]
     fn a_deep_alternating_tree_replays() {
-        // Split, focus the new half, split the other way, and again --
-        // the shape a few minutes of real work produces.
+        // Split, focus the new half, split the other way, again: what a few
+        // minutes of work produces.
         let mut w = WindowEntry::single(0, Frame::Session(0));
         for depth in 0..5 {
             let id = w.add_pane(vec![Frame::Session(0)], depth % 2 == 0, false);
