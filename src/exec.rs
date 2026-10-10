@@ -5657,6 +5657,23 @@ impl Shell {
                 s.push('\n');
             }
         }
+        // And `set -r` after even those, because it is the one option
+        // that makes the preamble itself illegal: `PATH` is readonly in
+        // a restricted shell, so a `set -r` written any earlier would
+        // make the child refuse the assignment that tells it where its
+        // commands are.
+        //
+        // It has no `-o` name in bash, so it is not in SET_O_OPTIONS,
+        // which is exactly how it came to be dropped: `( /bin/echo x )
+        // &`, a `coproc`, a compound forced to re-exec by a redirect --
+        // every construct that becomes a real process -- arrived
+        // unrestricted and ran whatever it liked. bash keeps restriction
+        // across all of them. The in-process children were never
+        // affected, since `new_virtual_child` copies the flag, which is
+        // why only the re-execing shapes leaked.
+        if self.opt_restricted {
+            s.push_str("set -r\n");
+        }
         s
     }
 
@@ -13032,6 +13049,14 @@ impl Shell {
     // response), not `<`/`>` on their own, which would each open an
     // independent, unrelated connection to the same address.
     fn open_in_out(&self, path: &str) -> Result<std::fs::File, String> {
+        // `<>` writes, so a restricted shell may not have it -- the same
+        // answer `open_out` gives, in the same words bash uses. It had
+        // been grouped with the reads, which are always allowed, so
+        // `exec 3<>file` was a way to create and write any file from a
+        // shell that had been told it could write none.
+        if self.opt_restricted {
+            return Err(format!("{}: restricted: cannot redirect output", path));
+        }
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
@@ -13071,6 +13096,25 @@ impl Shell {
     // bypass-spawn. Prints bash's own exact error text and returns true
     // when blocked, so a call site can just
     // `if self.check_restricted_command_name(name) { return ...; }`.
+    /// The same rule `check_restricted_command_name` enforces, for the
+    /// two places a program name reaches `Command::new` without going
+    /// through this shell's own dispatch at all: a language server
+    /// registered by `::bish lsp add`, and a debug adapter named by
+    /// `:dbg launch --adapter=`. Both are spawned later, from code with
+    /// no `Shell` in reach, so the name is checked where it is *given*.
+    ///
+    /// A bare name is still allowed, exactly as it is for a command --
+    /// restriction is about naming a path, not about refusing to run
+    /// anything. Blocking a path here is what stops a restricted shell
+    /// turning `--adapter=/tmp/mine` into arbitrary execution.
+    pub(crate) fn restricted_program_refused(&mut self, what: &str, name: &str) -> bool {
+        if self.opt_restricted && name.contains('/') {
+            sh_eprintln!(self, "bish: {}: {}: restricted: cannot specify `/' in command names", what, name);
+            return true;
+        }
+        false
+    }
+
     fn check_restricted_command_name(&mut self, name: &str) -> bool {
         if self.opt_restricted && name.contains('/') {
             sh_eprintln!(self, "bish: {}: restricted: cannot specify `/' in command names", name);
@@ -20355,6 +20399,53 @@ mod tests {
         shell.run_source_here("set -r", "<test>");
         let result = shell.run_source_here("cd /tmp", "<test>");
         assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    // A re-exec'd child is handed the shell's state as a script, and
+    // restriction has to be part of it -- it has no `-o` name, so the
+    // option replay never carried it and every backgrounded subshell
+    // arrived unrestricted. The corpus checks the behaviour against
+    // bash; this checks the one thing it cannot see, which is the
+    // *order*: `set -r` has to come after the assignments, because PATH
+    // is readonly once it is in force.
+    #[test]
+    fn the_preamble_restricts_a_child_only_after_telling_it_everything() {
+        let mut shell = Shell::new();
+        assert!(!shell.functions_preamble().contains("set -r"), "an unrestricted shell must not restrict its children");
+
+        shell.run_source_here("set -r", "<test>");
+        let preamble = shell.functions_preamble();
+        assert!(preamble.ends_with("set -r\n"), "restriction has to be the last thing said: {preamble:?}");
+        // And the assignments it would have made illegal are above it.
+        // `BASH_ENV` is one of the names restriction makes readonly, so
+        // a `set -r` written any earlier would have the child refuse the
+        // line that carries it.
+        let mut shell = Shell::new();
+        shell.run_source_here("BASH_ENV=/dev/null; set -r", "<test>");
+        let preamble = shell.functions_preamble();
+        let at = preamble.find("set -r").expect("restricted, so it is there");
+        assert!(preamble[..at].contains("BASH_ENV="), "a readonly-under-r name has to be assigned before: {preamble:?}");
+    }
+
+    // The two places a program name reaches `Command::new` without this
+    // shell's dispatch: a language server and a debug adapter. Both are
+    // started later, from code with no `Shell`, so the name is checked
+    // where it is given -- by the same rule a command name follows.
+    #[test]
+    fn a_restricted_shell_refuses_to_register_a_program_by_path() {
+        let mut shell = Shell::new();
+        assert!(!shell.restricted_program_refused("x", "/usr/bin/anything"), "nothing is refused when unrestricted");
+
+        shell.run_source_here("set -r", "<test>");
+        assert!(shell.restricted_program_refused("x", "/usr/bin/anything"));
+        assert!(shell.restricted_program_refused("x", "./relative"));
+        assert!(!shell.restricted_program_refused("x", "bare-name"), "a bare name is allowed, exactly as it is for a command");
+
+        // And through the builtin that registers one.
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=x", "/tmp/evil"])), 1);
+        assert!(shell.lsp_servers.is_empty(), "a refused registration must not leave a server behind");
+        assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--lang=x", "allowed-name"])), 0);
+        assert_eq!(shell.lsp_servers.len(), 1);
     }
 
     #[test]

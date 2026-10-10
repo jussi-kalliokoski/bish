@@ -1002,6 +1002,18 @@ b
         case("export-f", r#"f() { :; }; export -f f; echo $?; export -f nosuch_zz; echo $?"#),
         case("read-t0", r#"read -t 0 < /dev/null; echo $?"#),
         case("set-o", r#"set -C -o pipefail; set -o > oo; grep -E '^(noclobber|pipefail|xtrace) ' oo"#),
+        // `set -r` has to survive becoming a real process. Every one of
+        // these shapes re-execs, and every one of them used to arrive
+        // unrestricted and run whatever it was given -- the preamble
+        // replayed the `-o` options and restriction has no `-o` name.
+        case("restricted-keeps-a-backgrounded-subshell", r#"set -r; ( /bin/echo X ) & wait"#),
+        case("restricted-keeps-a-backgrounded-group", r#"set -r; { /bin/echo X; } & wait"#),
+        case("restricted-keeps-a-redirected-compound", r#"set -r; ( /bin/echo X ) <> /dev/null"#),
+        // `<>` writes, so a restricted shell may not have it either.
+        case("restricted-refuses-an-in-out-redirect", r#"set -r; exec 3<>/dev/null; echo "status=$?""#),
+        // ...and the things it may still do, so this is a fence and not
+        // a wall: a bare name is allowed, and a builtin always was.
+        case("restricted-still-runs-a-bare-name", r#"set -r; ( env true && echo ran ) & wait"#),
         // `set -n`: the one flag whose whole job is that what follows
         // does not happen. Every case here is about something *not*
         // appearing, which is why the first of them names what should.

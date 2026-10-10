@@ -419,6 +419,12 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
                 sh_eprintln!(sh, "bish: ::bish lsp: add: usage: ::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...");
                 return 2;
             }
+            // The server is started later, by code with no `Shell` to
+            // ask, so a restricted shell's one rule about program names
+            // is applied where the name is given instead.
+            if sh.restricted_program_refused("::bish lsp: add", &rest[0]) {
+                return 1;
+            }
             let id = sh.next_lsp_id;
             sh.next_lsp_id += 1;
             sh.lsp_servers.push(LspServer {

@@ -14112,6 +14112,29 @@ fn run_command_mode(
                                             continue;
                                         }
                                     };
+                                    // A named adapter is a program this
+                                    // shell is about to start, and
+                                    // `Session::start` has no `Shell` to
+                                    // ask -- so a restricted shell's
+                                    // rule about naming paths is applied
+                                    // here, where the name was given.
+                                    if let Some(named) = adapter.as_ref().and_then(|a: &Vec<String>| a.first()) {
+                                        let named = named.clone();
+                                        let sid = app.windows[app.current_window].owning_session();
+                                        let refused = app
+                                            .sessions
+                                            .get_mut(&sid)
+                                            .is_some_and(|state| state.shell.restricted_program_refused("dbg: --adapter", &named));
+                                        if refused {
+                                            show_command_mode_error(
+                                                &format!("bish: dbg: {named}: restricted: cannot specify `/' in command names"),
+                                                app.term_rows,
+                                                app.term_cols,
+                                            );
+                                            buffer.clear();
+                                            continue;
+                                        }
+                                    }
                                     let language = fileeditor::language_of(tb);
                                     let Some(adapter): Option<Vec<String>> = adapter.or_else(|| default_debug_adapter(&language)) else {
                                         show_command_mode_error(
