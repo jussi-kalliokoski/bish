@@ -1786,7 +1786,7 @@ pub fn read_line(
     // again on top of it -- without that, a background job's output
     // arriving mid-typing simply erased whatever had been typed until the
     // next keystroke happened to redraw it.
-    mut on_idle: impl FnMut() -> bool,
+    on_idle: &mut dyn FnMut() -> bool,
     // The `mouse` bishopt. Off means reporting is never turned on at
     // all, which is what hands the terminal's own selection back -- see
     // term::RawGuard::enable_maybe_mouse.
@@ -3087,7 +3087,7 @@ fn run_line_normal_mode(
 // the same reason `yank_motion` just below is -- shared by this file's
 // own run_line_normal_mode and by repl.rs's own ScreenBuffer-based Visual
 // mode.
-pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit::Buffer, m: motion::Motion, count: Option<usize>) {
+pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut dyn crate::bishedit::Buffer, m: motion::Motion, count: Option<usize>) {
     if let (true, motion::Motion::TextObject(kind, around)) = (vk.is_visual(), &m) {
         if let Some(range) = motion::text_object_range(buf, *kind, *around, count) {
             let (shape, _) = vk.visual_anchor().unwrap();
@@ -3121,7 +3121,7 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut impl crate::bishedit
 // ever have something real to put into -- see repl.rs's own doc comment on
 // why `KeyOutcome::Put` is a deliberate no-op there.
 pub fn yank_motion(
-    buf: &mut impl crate::bishedit::Buffer,
+    buf: &mut dyn crate::bishedit::Buffer,
     registers: &mut Registers,
     motion: motion::Motion,
     count: Option<usize>,
@@ -3135,7 +3135,7 @@ pub fn yank_motion(
     registers.record_yank(register, RegisterValue { text, shape });
 }
 
-pub fn yank_lines(buf: &impl crate::bishedit::Buffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
+pub fn yank_lines(buf: &dyn crate::bishedit::Buffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let text = motion::whole_lines(buf, count.unwrap_or(1).max(1));
     registers.record_yank(register, RegisterValue { text, shape: RegisterShape::Line });
 }

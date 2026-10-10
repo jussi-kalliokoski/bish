@@ -162,7 +162,7 @@ pub fn case_transform(c: char, kind: CaseKind) -> char {
     }
 }
 
-fn classify(buf: &impl Buffer, line: usize, col: usize, big: bool) -> Class {
+fn classify(buf: &dyn Buffer, line: usize, col: usize, big: bool) -> Class {
     let ch = match buf.char_at(line, col) {
         Some(c) => c,
         None => return Class::Blank,
@@ -187,7 +187,7 @@ fn classify(buf: &impl Buffer, line: usize, col: usize, big: bool) -> Class {
 // own last valid position is that cluster's *start*, not its last raw
 // char index -- landing on any char index past the start would put the
 // cursor visually inside the glyph.
-fn last_col(buf: &impl Buffer, line: usize) -> usize {
+fn last_col(buf: &dyn Buffer, line: usize) -> usize {
     let len = buf.line_len(line);
     if len == 0 {
         return 0;
@@ -196,7 +196,7 @@ fn last_col(buf: &impl Buffer, line: usize) -> usize {
     grapheme::prev_boundary(&chars, len)
 }
 
-pub fn first_non_blank(buf: &impl Buffer, line: usize) -> usize {
+pub fn first_non_blank(buf: &dyn Buffer, line: usize) -> usize {
     for col in 0..buf.line_len(line) {
         if let Some(c) = buf.char_at(line, col) {
             if !c.is_whitespace() {
@@ -207,7 +207,7 @@ pub fn first_non_blank(buf: &impl Buffer, line: usize) -> usize {
     0
 }
 
-fn last_non_blank(buf: &impl Buffer, line: usize) -> usize {
+fn last_non_blank(buf: &dyn Buffer, line: usize) -> usize {
     for col in (0..buf.line_len(line)).rev() {
         if let Some(c) = buf.char_at(line, col) {
             if !c.is_whitespace() {
@@ -222,7 +222,7 @@ fn last_non_blank(buf: &impl Buffer, line: usize) -> usize {
 /// always lands on the true end of the logical line, not wherever a
 /// column-width autowrap happened to cut it -- for every ordinary buffer
 /// (`line_wraps` always false) this is just `line` itself, unchanged.
-fn logical_line_end(buf: &impl Buffer, line: usize) -> usize {
+fn logical_line_end(buf: &dyn Buffer, line: usize) -> usize {
     let mut l = line;
     while buf.line_wraps(l) && l + 1 < buf.line_count() {
         l += 1;
@@ -234,7 +234,7 @@ fn logical_line_end(buf: &impl Buffer, line: usize) -> usize {
 /// last character" slot of a line -- that slot is skipped straight through
 /// to column 0 of the next line, since it isn't a real character and vim's
 /// word motions treat the line break itself as the boundary.
-fn step_forward(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
+fn step_forward(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     let len = buf.line_len(line);
     if col + 1 < len {
@@ -249,7 +249,7 @@ fn step_forward(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)
 /// Mirror of `step_forward`: stepping back from column 0 lands on the last
 /// real character of the previous line (or column 0 if that line is empty),
 /// never on a virtual past-the-end slot.
-fn step_backward(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
+fn step_backward(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     if col > 0 {
         Some((line, col - 1))
@@ -261,7 +261,7 @@ fn step_backward(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize
     }
 }
 
-fn word_forward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
+fn word_forward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let (line, col) = pos;
     if buf.line_len(line) == 0 {
         return step_forward(buf, pos).unwrap_or(pos);
@@ -300,7 +300,7 @@ fn word_forward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usiz
     }
 }
 
-fn word_backward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
+fn word_backward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let mut cur = match step_backward(buf, pos) {
         Some(p) => p,
         None => return pos,
@@ -335,7 +335,7 @@ fn word_backward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usi
     }
 }
 
-fn word_end_forward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
+fn word_end_forward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let mut cur = match step_forward(buf, pos) {
         Some(p) => p,
         None => return pos,
@@ -375,7 +375,7 @@ fn word_end_forward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (
 /// first word), this leaves the cursor unmoved rather than clamping to the
 /// farthest reachable position -- matching vim, which simply fails the
 /// motion in that case.
-fn word_end_backward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
+fn word_end_backward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let (oline, ocol) = pos;
     let orig_is_word = buf.line_len(oline) > 0 && classify(buf, oline, ocol, big) != Class::Blank;
     let orig_class = if orig_is_word { Some(classify(buf, oline, ocol, big)) } else { None };
@@ -405,11 +405,11 @@ fn word_end_backward_once(buf: &impl Buffer, pos: (usize, usize), big: bool) -> 
     }
 }
 
-fn find_char_forward_once(buf: &impl Buffer, line: usize, from_col: usize, ch: char) -> Option<usize> {
+fn find_char_forward_once(buf: &dyn Buffer, line: usize, from_col: usize, ch: char) -> Option<usize> {
     ((from_col + 1)..buf.line_len(line)).find(|&c| buf.char_at(line, c) == Some(ch))
 }
 
-fn find_char_backward_once(buf: &impl Buffer, line: usize, from_col: usize, ch: char) -> Option<usize> {
+fn find_char_backward_once(buf: &dyn Buffer, line: usize, from_col: usize, ch: char) -> Option<usize> {
     (0..from_col).rev().find(|&c| buf.char_at(line, c) == Some(ch))
 }
 
@@ -420,7 +420,7 @@ fn find_char_backward_once(buf: &impl Buffer, line: usize, from_col: usize, ch: 
 /// whether the find *succeeded*, which is not the same question as
 /// whether the cursor ended up somewhere new -- see its own note on
 /// `dt,`.
-fn find_char_landing(buf: &impl Buffer, line: usize, col: usize, ch: char, till: bool, forward: bool, n: usize) -> Option<usize> {
+fn find_char_landing(buf: &dyn Buffer, line: usize, col: usize, ch: char, till: bool, forward: bool, n: usize) -> Option<usize> {
     let mut c = col;
     for _ in 0..n {
         c = if forward { find_char_forward_once(buf, line, c, ch)? } else { find_char_backward_once(buf, line, c, ch)? };
@@ -436,7 +436,7 @@ fn is_closing_punct(c: char) -> bool {
     matches!(c, ')' | ']' | '"' | '\'')
 }
 
-fn is_blank_line(buf: &impl Buffer, line: usize) -> bool {
+fn is_blank_line(buf: &dyn Buffer, line: usize) -> bool {
     buf.line_len(line) == 0
 }
 
@@ -445,7 +445,7 @@ fn is_blank_line(buf: &impl Buffer, line: usize) -> bool {
 /// quotes/brackets, same line only) if that position is whitespace,
 /// end-of-line, or end-of-buffer -- i.e. if `pos` really does end a sentence
 /// -- or `None` if it doesn't (e.g. "3.14", where '.' isn't a sentence end).
-fn sentence_boundary_after(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
+fn sentence_boundary_after(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let mut cur = pos;
     loop {
         match step_forward(buf, cur) {
@@ -465,7 +465,7 @@ fn sentence_boundary_after(buf: &impl Buffer, pos: (usize, usize)) -> Option<(us
     }
 }
 
-fn skip_blank_forward(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usize) {
+fn skip_blank_forward(buf: &dyn Buffer, pos: (usize, usize)) -> (usize, usize) {
     let mut cur = pos;
     loop {
         if buf.line_len(cur.0) == 0 {
@@ -481,7 +481,7 @@ fn skip_blank_forward(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usize) 
     }
 }
 
-fn sentence_forward_once(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usize) {
+fn sentence_forward_once(buf: &dyn Buffer, pos: (usize, usize)) -> (usize, usize) {
     let mut cur = pos;
     loop {
         if buf.line_len(cur.0) == 0 {
@@ -523,7 +523,7 @@ fn sentence_forward_once(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usiz
 /// independent backward scan -- much easier to keep correct than
 /// hand-rolling a mirrored version of the forward algorithm's boundary
 /// detection.
-fn sentence_starts(buf: &impl Buffer) -> Vec<(usize, usize)> {
+fn sentence_starts(buf: &dyn Buffer) -> Vec<(usize, usize)> {
     let first = if buf.line_len(0) == 0 { (0, 0) } else { (0, first_non_blank(buf, 0)) };
     let mut starts = vec![first];
     let mut cur = first;
@@ -542,7 +542,7 @@ fn pos_lt(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.0 || (a.0 == b.0 && a.1 < b.1)
 }
 
-fn sentence_backward_once(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usize) {
+fn sentence_backward_once(buf: &dyn Buffer, pos: (usize, usize)) -> (usize, usize) {
     let starts = sentence_starts(buf);
     let mut result = starts[0];
     for s in starts {
@@ -555,7 +555,7 @@ fn sentence_backward_once(buf: &impl Buffer, pos: (usize, usize)) -> (usize, usi
     result
 }
 
-fn paragraph_forward_once(buf: &impl Buffer, line: usize) -> usize {
+fn paragraph_forward_once(buf: &dyn Buffer, line: usize) -> usize {
     let last = buf.line_count() - 1;
     let mut l = line;
     if !is_blank_line(buf, l) {
@@ -573,7 +573,7 @@ fn paragraph_forward_once(buf: &impl Buffer, line: usize) -> usize {
     if l < last { l + 1 } else { last }
 }
 
-fn paragraph_backward_once(buf: &impl Buffer, line: usize) -> usize {
+fn paragraph_backward_once(buf: &dyn Buffer, line: usize) -> usize {
     let mut l = line;
     if l == 0 {
         return 0;
@@ -593,7 +593,7 @@ fn paragraph_backward_once(buf: &impl Buffer, line: usize) -> usize {
     if l > 0 { l - 1 } else { 0 }
 }
 
-fn viewport_bottom(buf: &impl Buffer) -> usize {
+fn viewport_bottom(buf: &dyn Buffer) -> usize {
     (buf.viewport_top() + buf.viewport_height().saturating_sub(1)).min(buf.line_count() - 1)
 }
 
@@ -614,7 +614,7 @@ fn bracket_partner(c: char) -> Option<(char, bool)> {
 /// `%`: if the cursor isn't on a bracket, scans forward on the current line
 /// only (matching vim) for the first one, then walks forward or backward
 /// through the buffer tracking nesting depth to find its partner.
-fn match_pair_once(buf: &impl Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
+fn match_pair_once(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     let len = buf.line_len(line);
     let mut start = None;
@@ -639,7 +639,7 @@ const MATCH_LIMIT: usize = 20_000;
 // The bracket that closes the one at `start`, or opens it for a closing
 // one. `None` when nothing does -- and, given a `budget`, when nothing
 // does within that many characters.
-fn partner_of(buf: &impl Buffer, start: (usize, usize), budget: Option<usize>) -> Option<(usize, usize)> {
+fn partner_of(buf: &dyn Buffer, start: (usize, usize), budget: Option<usize>) -> Option<(usize, usize)> {
     let ch0 = buf.char_at(start.0, start.1)?;
     let (partner_char, is_opening) = bracket_partner(ch0)?;
     let mut depth = 1;
@@ -672,7 +672,7 @@ fn partner_of(buf: &impl Buffer, start: (usize, usize), budget: Option<usize>) -
 /// bracket on the line and jumps from there, where vim marks nothing at
 /// all unless the cursor is on a bracket itself. `None` for an unmatched
 /// bracket, and for one whose partner is further off than `MATCH_LIMIT`.
-pub fn bracket_pair_at(buf: &impl Buffer, pos: (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
+pub fn bracket_pair_at(buf: &dyn Buffer, pos: (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
     bracket_partner(buf.char_at(pos.0, pos.1)?)?;
     Some((pos, partner_of(buf, pos, Some(MATCH_LIMIT))?))
 }
@@ -687,7 +687,7 @@ pub fn bracket_pair_at(buf: &impl Buffer, pos: (usize, usize)) -> Option<((usize
 /// under the cursor *after* landing on a match is, by construction,
 /// textually identical to the word that was searched for -- so there's no
 /// need for `vimkeys.rs` to separately track and expose that text itself.
-pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<String> {
+pub fn word_under_cursor(buf: &dyn Buffer, pos: (usize, usize)) -> Option<String> {
     let mut p = pos;
     if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c, buf.word_chars())) {
         let next = word_forward_once(buf, p, false);
@@ -719,7 +719,7 @@ pub fn word_under_cursor(buf: &impl Buffer, pos: (usize, usize)) -> Option<Strin
 /// `iw`/`aw`/`iW`/`aW`: vim defines `[count]iw` as "the word (or
 /// punctuation-run, or blank-run -- whichever the cursor sits on) plus the
 /// next `count - 1` chunks of *any* class immediately following it".
-fn word_object_range(buf: &impl Buffer, pos: (usize, usize), big: bool, around: bool, count: Option<usize>) -> Option<MotionRange> {
+fn word_object_range(buf: &dyn Buffer, pos: (usize, usize), big: bool, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let (line, col) = pos;
     if buf.line_len(line) == 0 {
         return None;
@@ -766,7 +766,7 @@ fn word_object_range(buf: &impl Buffer, pos: (usize, usize), big: bool, around: 
 /// `surround_pair_positions`) can act on exactly the delimiter characters
 /// themselves, with none of `quote_object_range`'s own around-whitespace
 /// swallowing or inner-content trimming.
-fn quote_pair_positions(buf: &impl Buffer, pos: (usize, usize), quote: char) -> Option<((usize, usize), (usize, usize))> {
+fn quote_pair_positions(buf: &dyn Buffer, pos: (usize, usize), quote: char) -> Option<((usize, usize), (usize, usize))> {
     let (line, col) = pos;
     let len = buf.line_len(line);
     let positions: Vec<usize> = (0..len).filter(|&c| buf.char_at(line, c) == Some(quote)).collect();
@@ -787,7 +787,7 @@ fn quote_pair_positions(buf: &impl Buffer, pos: (usize, usize), quote: char) -> 
 /// and picks the first pair the cursor is at-or-before the close of --
 /// vim's own rule: inside a pair selects that pair, before all pairs
 /// selects the first, in the gap between two pairs selects the next one.
-fn quote_object_range(buf: &impl Buffer, pos: (usize, usize), quote: char, around: bool) -> Option<MotionRange> {
+fn quote_object_range(buf: &dyn Buffer, pos: (usize, usize), quote: char, around: bool) -> Option<MotionRange> {
     let (line, _) = pos;
     let len = buf.line_len(line);
     let ((_, a), (_, b)) = quote_pair_positions(buf, pos, quote)?;
@@ -816,7 +816,7 @@ fn quote_object_range(buf: &impl Buffer, pos: (usize, usize), quote: char, aroun
 
 /// Walks forward from just after `open_pos` (already known to hold `open`),
 /// tracking nesting depth, to `open_pos`'s matching `close`.
-fn scan_matching_forward(buf: &impl Buffer, open_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+fn scan_matching_forward(buf: &dyn Buffer, open_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 1;
     let mut cur = open_pos;
     loop {
@@ -836,7 +836,7 @@ fn scan_matching_forward(buf: &impl Buffer, open_pos: (usize, usize), open: char
 
 /// Mirror of `scan_matching_forward`: walks backward from just before
 /// `close_pos` to its matching `open`.
-fn scan_matching_backward(buf: &impl Buffer, close_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+fn scan_matching_backward(buf: &dyn Buffer, close_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 1;
     let mut cur = close_pos;
     loop {
@@ -857,7 +857,7 @@ fn scan_matching_backward(buf: &impl Buffer, close_pos: (usize, usize), open: ch
 /// Walks backward from `pos` (not itself on `open`/`close`) for the nearest
 /// `open` that isn't already balanced by a `close` seen along the way --
 /// i.e. the bracket that innermost-encloses `pos`.
-fn scan_unmatched_open_backward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+fn scan_unmatched_open_backward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 0;
     let mut cur = pos;
     loop {
@@ -878,7 +878,7 @@ fn scan_unmatched_open_backward(buf: &impl Buffer, pos: (usize, usize), open: ch
 /// The bracket pair that innermost-encloses `pos` -- `pos` sitting exactly
 /// on `open` or `close` counts as enclosed by that pair (matching vim: `%`
 /// on either paren already works the same way).
-fn find_enclosing_pair(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<((usize, usize), (usize, usize))> {
+fn find_enclosing_pair(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<((usize, usize), (usize, usize))> {
     if let Some(c) = buf.char_at(pos.0, pos.1) {
         if c == open {
             return scan_matching_forward(buf, pos, open, close).map(|close_pos| (pos, close_pos));
@@ -895,7 +895,7 @@ fn find_enclosing_pair(buf: &impl Buffer, pos: (usize, usize), open: char, close
 /// Mirror of `scan_unmatched_open_backward`: walks forward from `pos` for
 /// the nearest `close` that isn't already balanced by an `open` seen along
 /// the way -- `[(`/`[{`'s own forward-facing sibling, `])`/`]}`.
-fn scan_unmatched_close_forward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
+fn scan_unmatched_close_forward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 0;
     let mut cur = pos;
     loop {
@@ -917,7 +917,7 @@ fn scan_unmatched_close_forward(buf: &impl Buffer, pos: (usize, usize), open: ch
 /// Each repeat starts strictly before the previous find (`scan_unmatched_
 /// open_backward` never looks at `pos` itself, so re-feeding the same
 /// position back in naturally continues past it).
-fn unmatched_backward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
+fn unmatched_backward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
     let mut cur = pos;
     let mut found = None;
     for _ in 0..count.max(1) {
@@ -928,7 +928,7 @@ fn unmatched_backward(buf: &impl Buffer, pos: (usize, usize), open: char, close:
 }
 
 /// `])`/`]}`: `count` unmatched closing brackets forward from the cursor.
-fn unmatched_forward(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
+fn unmatched_forward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
     let mut cur = pos;
     let mut found = None;
     for _ in 0..count.max(1) {
@@ -942,14 +942,14 @@ fn unmatched_forward(buf: &impl Buffer, pos: (usize, usize), open: char, close: 
 /// agnostic) definition of a section boundary: `{` starts one, `}` ends
 /// one. No 'sections' option, no form-feed handling -- just the plain-text
 /// default.
-fn line_starts_with(buf: &impl Buffer, line: usize, ch: char) -> bool {
+fn line_starts_with(buf: &dyn Buffer, line: usize, ch: char) -> bool {
     buf.line_len(line) > 0 && buf.char_at(line, 0) == Some(ch)
 }
 
 /// `]]`/`][`: the next line (after the cursor's own) starting with `boundary`,
 /// clamped to the buffer's last line if there isn't one -- same clamp-at-
 /// the-edge convention `paragraph_forward_once` already uses.
-fn section_forward_once(buf: &impl Buffer, line: usize, boundary: char) -> usize {
+fn section_forward_once(buf: &dyn Buffer, line: usize, boundary: char) -> usize {
     let last = buf.line_count() - 1;
     let mut l = line;
     while l < last {
@@ -962,7 +962,7 @@ fn section_forward_once(buf: &impl Buffer, line: usize, boundary: char) -> usize
 }
 
 /// Mirror of `section_forward_once`, searching backward and clamping to 0.
-fn section_backward_once(buf: &impl Buffer, line: usize, boundary: char) -> usize {
+fn section_backward_once(buf: &dyn Buffer, line: usize, boundary: char) -> usize {
     let mut l = line;
     while l > 0 {
         l -= 1;
@@ -977,7 +977,7 @@ fn section_backward_once(buf: &impl Buffer, line: usize, boundary: char) -> usiz
 /// objects), tracking nesting via `find_enclosing_pair`. `count` widens
 /// outward one enclosing level per extra count, same as vim's `2i(` inside
 /// nested parens.
-fn pair_object_range(buf: &impl Buffer, pos: (usize, usize), open: char, close: char, around: bool, count: Option<usize>) -> Option<MotionRange> {
+fn pair_object_range(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let n = count.unwrap_or(1).max(1);
     let mut cur_pos = pos;
     let mut pair = None;
@@ -1010,7 +1010,7 @@ fn pair_object_range(buf: &impl Buffer, pos: (usize, usize), open: char, close: 
 /// there's none to swallow -- e.g. the buffer's last paragraph -- a leading
 /// one instead), matching vim's own "prefer trailing, fall back to
 /// leading" rule (same shape as `word_object_range`'s own `around` logic).
-fn paragraph_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
+fn paragraph_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
     let (line, _) = pos;
     let last = buf.line_count() - 1;
     let is_blank = is_blank_line(buf, line);
@@ -1053,7 +1053,7 @@ fn paragraph_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, 
 /// `around` includes the whitespace run up to the next sentence's start (or
 /// to the end of the buffer, for the last sentence); inner trims that back
 /// off, stopping at the last non-blank character.
-fn sentence_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
+fn sentence_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
     let starts = sentence_starts(buf);
     let mut idx = 0;
     for (i, s) in starts.iter().enumerate() {
@@ -1100,7 +1100,7 @@ fn sentence_object_range(buf: &impl Buffer, pos: (usize, usize), around: bool, c
 /// move anything itself; see `Motion::TextObject`'s own doc comment for why
 /// `motion_range` special-cases this variant instead of going through
 /// `apply_motion`.
-pub fn text_object_range(buf: &impl Buffer, kind: TextObjectKind, around: bool, count: Option<usize>) -> Option<MotionRange> {
+pub fn text_object_range(buf: &dyn Buffer, kind: TextObjectKind, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let pos = buf.cursor();
     match kind {
         TextObjectKind::Word => word_object_range(buf, pos, false, around, count),
@@ -1177,7 +1177,7 @@ pub fn surround_delims(ch: char) -> Option<(String, String)> {
 /// own doc comment on why those characters never resolve to a kind at
 /// all), but are listed explicitly rather than via a wildcard so this
 /// stays exhaustive if `TextObjectKind` ever grows a new pair-like kind.
-pub fn surround_pair_positions(buf: &impl Buffer, kind: TextObjectKind) -> Option<((usize, usize), (usize, usize))> {
+pub fn surround_pair_positions(buf: &dyn Buffer, kind: TextObjectKind) -> Option<((usize, usize), (usize, usize))> {
     let pos = buf.cursor();
     match kind {
         TextObjectKind::Paren => find_enclosing_pair(buf, pos, '(', ')'),
@@ -1203,7 +1203,7 @@ pub fn surround_pair_positions(buf: &impl Buffer, kind: TextObjectKind) -> Optio
 /// same position: the close side wins it, the open side falls back to
 /// just its own bracket.
 pub fn surround_delete_spans(
-    buf: &impl Buffer,
+    buf: &dyn Buffer,
     kind: TextObjectKind,
     open_pos: (usize, usize),
     close_pos: (usize, usize),
@@ -1242,7 +1242,7 @@ pub fn surround_delete_spans(
 /// `KeyOutcome::AddSurround`'s doc comment): first non-blank of the first
 /// line through the true end of the last line, ignoring leading
 /// indentation the way vim-surround's own linewise wrap does.
-pub fn surround_insert_points(buf: &impl Buffer, range: &MotionRange) -> ((usize, usize), (usize, usize)) {
+pub fn surround_insert_points(buf: &dyn Buffer, range: &MotionRange) -> ((usize, usize), (usize, usize)) {
     match range.shape {
         MotionShape::Linewise => {
             let open_at = (range.from.0, first_non_blank(buf, range.from.0));
@@ -1285,7 +1285,7 @@ pub struct NumberMatch {
 /// digit anywhere at or after `pos` on this line, or if the number
 /// somehow doesn't fit in an `i64` (astronomically unlikely for anything
 /// actually typed).
-pub fn find_number(buf: &impl Buffer, pos: (usize, usize)) -> Option<NumberMatch> {
+pub fn find_number(buf: &dyn Buffer, pos: (usize, usize)) -> Option<NumberMatch> {
     let (line, col) = pos;
     let len = buf.line_len(line);
     let mut start = (col..len).find(|&c| matches!(buf.char_at(line, c), Some(d) if d.is_ascii_digit()))?;
@@ -1322,7 +1322,7 @@ pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
 /// for the plain-text word searches (`*`/`#`/`g*`/`g#`) too, so there's
 /// only one matching engine for "search" in normal mode. Matches never
 /// span line breaks.
-fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, re: &Regex) -> Option<usize> {
+fn line_find(buf: &dyn Buffer, line: usize, lower_bound: usize, re: &Regex) -> Option<usize> {
     let chars = buf.line_chars(line);
     re.find_at(&chars, lower_bound).map(|(start, _end)| start)
 }
@@ -1333,7 +1333,7 @@ fn line_find(buf: &impl Buffer, line: usize, lower_bound: usize, re: &Regex) -> 
 /// cols 0 and 2, not 0/1/2). For search-match *highlighting* -- unrelated
 /// to, and doesn't share any state with, a live search's own cursor
 /// position via search_forward_once/search_backward_once above.
-pub fn find_matches_in_line(buf: &impl Buffer, line: usize, pattern: &str) -> Vec<(usize, usize)> {
+pub fn find_matches_in_line(buf: &dyn Buffer, line: usize, pattern: &str) -> Vec<(usize, usize)> {
     if pattern.is_empty() {
         return Vec::new();
     }
@@ -1348,7 +1348,7 @@ pub fn find_matches_in_line(buf: &impl Buffer, line: usize, pattern: &str) -> Ve
     matches
 }
 
-fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, re: &Regex) -> Option<usize> {
+fn line_rfind(buf: &dyn Buffer, line: usize, upper_bound: usize, re: &Regex) -> Option<usize> {
     let chars = buf.line_chars(line);
     let upper = upper_bound.min(chars.len());
     (0..upper).rev().find(|&start| re.match_at(&chars, start).is_some())
@@ -1357,7 +1357,7 @@ fn line_rfind(buf: &impl Buffer, line: usize, upper_bound: usize, re: &Regex) ->
 /// Wrapping forward search (matches vim's default 'wrapscan'): tries the
 /// rest of the current line, then every subsequent line, then wraps back
 /// around to the start of the original line.
-fn search_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
+fn search_forward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
     let total = buf.line_count();
     if let Some(c) = line_find(buf, pos.0, pos.1 + 1, re) {
         return Some((pos.0, c));
@@ -1371,7 +1371,7 @@ fn search_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> Op
     line_find(buf, pos.0, 0, re).map(|c| (pos.0, c))
 }
 
-fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
+fn search_backward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
     let total = buf.line_count();
     if let Some(c) = line_rfind(buf, pos.0, pos.1, re) {
         return Some((pos.0, c));
@@ -1385,7 +1385,7 @@ fn search_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex) -> O
     line_rfind(buf, pos.0, usize::MAX, re).map(|c| (pos.0, c))
 }
 
-fn is_word_boundary_at(buf: &impl Buffer, line: usize, col: usize) -> bool {
+fn is_word_boundary_at(buf: &dyn Buffer, line: usize, col: usize) -> bool {
     !matches!(buf.char_at(line, col), Some(c) if is_word_char(c, buf.word_chars()))
 }
 
@@ -1394,7 +1394,7 @@ fn is_word_boundary_at(buf: &impl Buffer, line: usize, col: usize) -> bool {
 /// *escaped* literal word (see the `Motion::SearchWordForward` arm below),
 /// so `word_len` (its char count) doubles as the matched text's length for
 /// the boundary check on either side.
-fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
+fn search_word_forward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
     let first = search_forward_once(buf, pos, re)?;
     let mut candidate = first;
     loop {
@@ -1412,7 +1412,7 @@ fn search_word_forward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex, 
     }
 }
 
-fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
+fn search_word_backward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
     let first = search_backward_once(buf, pos, re)?;
     let mut candidate = first;
     loop {
@@ -1432,7 +1432,7 @@ fn search_word_backward_once(buf: &impl Buffer, pos: (usize, usize), re: &Regex,
 
 /// The line `n` rows below `line`, a closed fold counting as one row --
 /// and never past the last line.
-pub fn rows_down(buf: &impl Buffer, line: usize, n: usize) -> usize {
+pub fn rows_down(buf: &dyn Buffer, line: usize, n: usize) -> usize {
     let last = buf.line_count().saturating_sub(1);
     let mut at = line;
     for _ in 0..n {
@@ -1446,7 +1446,7 @@ pub fn rows_down(buf: &impl Buffer, line: usize, n: usize) -> usize {
 }
 
 /// The line `n` rows above `line`, a closed fold counting as one row.
-pub fn rows_up(buf: &impl Buffer, line: usize, n: usize) -> usize {
+pub fn rows_up(buf: &dyn Buffer, line: usize, n: usize) -> usize {
     let mut at = buf.fold_span(line).0;
     for _ in 0..n {
         if at == 0 {
@@ -1460,7 +1460,7 @@ pub fn rows_up(buf: &impl Buffer, line: usize, n: usize) -> usize {
 /// The first and last line of the `count` rows starting at the cursor's:
 /// what `dd`, `yy`, `>>` and every other doubled operator act on. A
 /// closed fold is one row, and goes whole.
-pub fn line_span(buf: &impl Buffer, count: usize) -> (usize, usize) {
+pub fn line_span(buf: &dyn Buffer, count: usize) -> (usize, usize) {
     let (line, _) = buf.cursor();
     let last_line = buf.line_count().saturating_sub(1);
     let (first, mut last) = buf.fold_span(line);
@@ -1517,7 +1517,7 @@ fn opens_folds(m: &Motion) -> bool {
 /// the row that stands for it (see `opens_folds`). An operator's motion
 /// does neither -- `motion_range` takes a closed fold whole instead -- so
 /// it moves through `move_cursor` directly.
-pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) {
+pub fn apply_motion(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
     let opens = opens_folds(&motion);
     move_cursor(buf, motion, count);
     let (line, col) = buf.cursor();
@@ -1536,7 +1536,7 @@ pub fn apply_motion(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
     }
 }
 
-fn move_cursor(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) {
+fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
     let n = count.unwrap_or(1).max(1);
     match motion {
         // Steps by whole grapheme cluster, `n` times, rather than raw
@@ -2163,7 +2163,7 @@ pub struct MotionRange {
 /// or if it didn't actually move the cursor (a failed find/search, or a
 /// motion that's already at its clamped boundary) -- either way, there's
 /// nothing to yank and the cursor is restored to where it started.
-pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>) -> Option<MotionRange> {
+pub fn motion_range(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) -> Option<MotionRange> {
     // Text objects don't fit the "apply the motion, diff the cursor
     // before/after" trick below -- the cursor usually sits *inside* the
     // target range, not at one of its ends -- so they're resolved directly
@@ -2253,7 +2253,7 @@ pub fn motion_range(buf: &mut impl Buffer, motion: Motion, count: Option<usize>)
 /// use, inserting `\n` exactly when a step crosses a real line boundary
 /// (again, not a `line_wraps` one) -- `Exclusive` stops one character
 /// short of `to`, `Inclusive` includes it.
-pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
+pub fn extract_text(buf: &dyn Buffer, range: &MotionRange) -> String {
     // A block yanks as one line per row, each cut to the block's own
     // columns -- a short line contributing whatever of it falls inside,
     // which may be nothing at all.
@@ -2305,12 +2305,12 @@ pub fn extract_text(buf: &impl Buffer, range: &MotionRange) -> String {
 /// double-tap-the-operator shorthand, defined operationally as "this
 /// operator, this line" rather than as a real cursor motion (there's no
 /// `Motion` variant for it, and unlike every other yank the cursor doesn't
-/// move at all, so this takes `&impl Buffer` rather than `&mut impl
+/// move at all, so this takes `&dyn Buffer` rather than `&mut impl
 /// Buffer`). "This line" always means the *whole* line: if the cursor
 /// happens to sit on a `line_wraps` continuation row, the range is
 /// widened back to that run's first row first, so `yy` never yanks just a
 /// column-width fragment of whatever wrapped there.
-pub fn whole_lines(buf: &impl Buffer, count: usize) -> String {
+pub fn whole_lines(buf: &dyn Buffer, count: usize) -> String {
     let (cursor_line, _) = buf.cursor();
     let mut line = buf.fold_span(cursor_line).0;
     while line > 0 && buf.line_wraps(line - 1) {

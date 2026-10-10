@@ -862,7 +862,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     // back on top -- neither half can do the other's, which is
                     // why the signal is threaded through rather than either side
                     // just redrawing everything.
-                    || {
+                    &mut || {
                         let mut changed = service_background_jobs(app);
                         // A review a client is waiting on opens here, at an
                         // idle prompt -- see `pending_reviews`. Afterwards is
@@ -6180,7 +6180,7 @@ impl BisheditBuffer for NavBuffer {
 // `ReadOnly` `ScreenBuffer` (`Buffer::viewport_left`'s own doc comment
 // on why that one never actually scrolls), the real thing for `Editable`
 // (mirrors `fileeditor::scroll_to_show_cursor` exactly).
-pub(crate) fn scroll_to_show_cursor(buf: &mut impl BisheditBuffer, content_cols: usize) {
+pub(crate) fn scroll_to_show_cursor(buf: &mut dyn BisheditBuffer, content_cols: usize) {
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
     if line < buf.viewport_top() {
@@ -7067,7 +7067,7 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
 // vim's own rule, and the only place on screen it could be drawn. Motions
 // already see to this (motion::apply_motion); this is for everything else
 // that can put a cursor somewhere: `:N`, undo, a fold closing around it.
-fn rest_on_fold(buf: &mut impl BisheditBuffer) {
+fn rest_on_fold(buf: &mut dyn BisheditBuffer) {
     let (line, col) = buf.cursor();
     let (start, _) = buf.fold_span(line);
     if start != line {
@@ -8972,7 +8972,7 @@ fn run_normal_mode_navigation(
 // `extract_text`/rendering. `RegisterShape::Char` maps to
 // `MotionShape::Inclusive` (vim's own visual charwise is inclusive of
 // both ends, unlike most charwise motions), `::Line` to `::Linewise`.
-pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Option<motion::MotionRange> {
+pub(crate) fn active_visual_range(vk: &VimKeys, buf: &dyn BisheditBuffer) -> Option<motion::MotionRange> {
     let (shape, anchor) = vk.visual_anchor()?;
     let cursor = buf.cursor();
     let motion_shape = match shape {
@@ -9014,7 +9014,7 @@ pub(crate) fn active_visual_range(vk: &VimKeys, buf: &impl BisheditBuffer) -> Op
 // `impl BisheditBuffer` (not just `ScreenBuffer`) so `NavBuffer`'s own
 // `ReadOnly` case can call this directly, same as `motion::extract_text`
 // itself already is.
-fn yank_selections(buf: &impl BisheditBuffer, selections: &[motion::MotionRange], registers: &mut Registers, register: Option<char>) {
+fn yank_selections(buf: &dyn BisheditBuffer, selections: &[motion::MotionRange], registers: &mut Registers, register: Option<char>) {
     if selections.is_empty() {
         return;
     }
