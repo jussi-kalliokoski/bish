@@ -1,55 +1,39 @@
 //! The one place in bish that talks to the operating system.
 //!
 //! Every `extern "C"` declaration, every `#[repr(C)]` layout the kernel
-//! owns, and every constant whose value is the OS's rather than bish's
-//! belongs in this directory. `mod os_guard` below fails the build when
-//! one appears anywhere else, so the boundary is a test rather than a
-//! convention.
+//! owns, and every constant whose value is the OS's belongs in this
+//! directory; `mod os_guard` fails the build when one appears elsewhere.
 //!
-//! # Why a layer at all, rather than a `cfg` at each use
+//! # Why a layer, rather than a `cfg` at each use
 //!
-//! bish has no external crates, so every one of these is hand-written,
-//! and the OSes it runs on differ in two quite different ways.
-//!
-//! The first kind is loud: `inotify_add_watch` does not exist on macOS,
-//! and a build that calls it fails to link. That kind cannot be
-//! forgotten.
-//!
-//! The second kind is silent, and it is the reason for this directory.
-//! `TIOCGWINSZ` is `0x5413` on Linux and `0x40087468` on macOS; `VMIN`
-//! is index 6 in one `termios` and 16 in the other; `MAP_ANONYMOUS` is
-//! `0x20` against `0x1000`; `SC_CLK_TCK` is 2 against 3. Every one of
-//! them is an integer literal that compiles anywhere and is simply
-//! wrong on the other side -- raw mode that eats keystrokes, a window
-//! size of nonsense, CPU times off by a factor. Spelled out at the
-//! point of use, as bish spelled them out until now, there is nothing
-//! to review and no way to tell a ported value from an unported one.
-//! Collected in one table per OS, they can be read side by side.
+//! bish has no external crates, so all of this is hand-written, and the
+//! OSes differ in two ways. Loudly: `inotify_add_watch` doesn't exist on
+//! macOS, and the build fails to link. And silently: `TIOCGWINSZ` is
+//! `0x5413` on Linux and `0x40087468` on macOS, `VMIN` is index 6 in one
+//! `termios` and 16 in the other, `MAP_ANONYMOUS` is `0x20` against
+//! `0x1000`, `SC_CLK_TCK` 2 against 3. Each compiles anywhere and is wrong
+//! on the other side: raw mode eating keys, a nonsense window size, CPU
+//! times off by a factor. Collected in one table per OS, they can be read
+//! side by side.
 //!
 //! # The kinds of file
 //!
-//! - `unix.rs` -- how a capability is *done* on a POSIX system, written
-//!   once for every such OS. The great majority of bish's OS use is of
-//!   this kind: a pty, raw mode, a signal, a process group.
-//! - `linux.rs` / `darwin.rs` -- the capabilities where one body cannot
-//!   serve both, because the OSes do not offer the same call: `pipe2`
-//!   against `pipe` plus two `fcntl`s, `memfd_create` against a file
-//!   that is unlinked the moment it exists, inotify against kqueue. A
-//!   flag belonging to a call only one of them has stays private in that
-//!   file, rather than forcing an invented counterpart into the other's
-//!   table.
-//! - `sys_linux.rs` / `sys_darwin.rs` -- what that OS's own numbers and
-//!   structs *are*. Tables, not logic, and the second kind of
-//!   difference above lives here and nowhere else.
-//! - this file -- the capabilities themselves, which is all the rest of
-//!   bish may call. A new Unix is a new `sys_` table; a target that is
-//!   not a Unix at all (a browser, an embedded runtime) replaces
-//!   `unix.rs`, and this surface is the contract it has to satisfy.
+//! - `unix.rs`: how a capability is done on POSIX, written once. Most of
+//!   bish's OS use: a pty, raw mode, a signal, a process group.
+//! - `linux.rs` / `darwin.rs`: capabilities where the OSes offer different
+//!   calls: `pipe2` against `pipe` and two `fcntl`s, `memfd_create`
+//!   against an unlinked file, inotify against kqueue. A flag for a call
+//!   only one has stays private to that file.
+//! - `sys_linux.rs` / `sys_darwin.rs`: the OS's numbers and structs.
+//!   Tables, not logic; the silent differences live here only.
+//! - this file: the capabilities, all the rest of bish may call. A new
+//!   Unix is a new `sys_` table; a target that isn't a Unix (a browser, an
+//!   embedded runtime) replaces `unix.rs`, and this surface is its
+//!   contract.
 //!
 //! `mod sys_tables` pairs every `<name>_linux.rs` with its
-//! `<name>_darwin.rs` and fails the build when one of the two has a name
-//! the other does not, so a port cannot half-happen: a constant or a
-//! function added for Linux is a failure until macOS has one too.
+//! `<name>_darwin.rs` and fails the build when one has a name the other
+//! lacks, so a port can't half-happen.
 
 #[cfg(target_os = "linux")]
 #[path = "sys_linux.rs"]
@@ -59,10 +43,9 @@ mod sys;
 #[path = "sys_darwin.rs"]
 mod sys;
 
-// A target that is not a Unix at all -- WASI, and the browser builds
-// that run on top of it -- is the case the file comments above call out:
-// it replaces `unix.rs` with `web.rs` and brings its own `sys`/`os`/
-// `watch` arm, none of which talk to a kernel because there is none.
+// A target that isn't a Unix (WASI, and browser builds on it) replaces
+// `unix.rs` with `web.rs` and has its own `sys`, `os` and `watch`, none of
+// which talk to a kernel.
 #[cfg(target_family = "wasm")]
 #[path = "sys_wasm.rs"]
 mod sys;
@@ -107,23 +90,18 @@ mod unix;
 pub(crate) use os::*;
 pub(crate) use unix::*;
 pub(crate) use watch::DirWatch;
-// The signal numbers bish names. Facts about the OS, and two of them
-// differ: see either `sys_` table.
+// The signal numbers bish names; two differ between OSes (see the `sys_`
+// tables).
 pub(crate) use sys::{HIGHEST_SIGNAL, REALTIME_SIGNALS, SIGCONT, SIGHUP, SIGINT, SIGNAL_NAMES, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH};
 
-/// One watched directory, as the OS identifies it.
-///
-/// Opaque: inotify's own watch descriptor on Linux, a number this layer
-/// hands out on macOS. The one promise about it is the one both sides
-/// keep -- the same directory added twice gives the same id, which is
-/// what lets two watched files in one directory share a watch.
+/// One watched directory, as the OS identifies it: inotify's watch
+/// descriptor on Linux, a number this layer issues on macOS. Both promise
+/// that the same directory added twice gives the same id, so two watched
+/// files in a directory share a watch.
 pub(crate) type WatchId = i32;
 
-/// What the OS said happened, before any of bish's own filtering.
-///
-/// `watch.rs` turns these into the events the rest of bish sees: which
-/// names a caller actually asked about, what a change to one means, and
-/// one answer per path rather than five.
+/// What the OS said happened, before bish filters it: `watch.rs` turns
+/// these into events for the names asked about, one per path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawEvent {
     pub(crate) watch: WatchId,
@@ -133,26 +111,22 @@ pub(crate) struct RawEvent {
     pub(crate) change: RawChange,
 }
 
-// On a target whose directory watch reports nothing (`watch_wasm`),
-// none of these are ever constructed -- the type still has to exist, as
-// the shape a `RawEvent` carries.
+// Never constructed where the watch reports nothing (`watch_wasm`), but
+// the type must exist.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawChange {
-    /// It appeared, or it was written to, or it is not the file it was.
-    /// One answer, because every caller's next move is the same: look.
+    /// It appeared, was written, or is no longer the same file: one answer,
+    /// since every caller's next move is to look.
     Touched,
     /// It is not there under that name any more.
     Gone,
-    /// This watch is finished -- the directory it was on was deleted or
-    /// moved. The id is dead and the OS will say nothing more about it.
+    /// The watch is finished: its directory was deleted or moved, and the id
+    /// is dead.
     Dropped,
-    /// Events were lost, and nothing about *which* can be known.
-    ///
-    /// Linux's, and never reported on macOS: kqueue keeps one
-    /// registration per watched directory rather than a queue of
-    /// events, so there is nothing there to overflow. Hence the allow --
-    /// a variant only one OS ever constructs.
+    /// Events were lost, unknown which. Linux only: kqueue keeps one
+    /// registration per directory rather than a queue, so nothing overflows.
+    /// Hence the allow.
     #[allow(dead_code)]
     Overflowed,
 }
@@ -160,35 +134,20 @@ pub(crate) enum RawChange {
 #[cfg(test)]
 mod os_guard {
     /// `(file, how many C functions it declares, what they reach for)`.
-    ///
-    /// Empty, as of the commit that cleared the last of it: every call
-    /// into the operating system is now made from this directory. It was
-    /// a migration list -- 104 declarations across 18 files -- and the
-    /// counts were what kept it honest, a number that no longer matched
-    /// failing in both directions so the table could not drift from the
-    /// tree. It stays as the mechanism rather than the list: a new
-    /// declaration outside this directory has to be a deliberate act,
-    /// which means adding a line here and saying why.
+    /// Empty: every OS call is made from this directory. Kept as the
+    /// mechanism, so a declaration elsewhere needs a line here saying why.
     const NOT_MOVED_YET: &[(&str, usize, &str)] = &[];
 
-    /// `(file, how many, why it is not the operating system)`.
-    ///
-    /// A `extern "C"` block that is not a call into the OS at all, and so
-    /// has no business in this directory. There is exactly one: bish's own
-    /// context switch, which is defined a dozen lines above its
-    /// declaration by this crate's own `global_asm!` -- the C ABI is how
-    /// Rust is told how to call it, not a syscall.
+    /// `(file, how many, why it isn't the operating system)`: an
+    /// `extern "C"` block that isn't an OS call. One: bish's own context
+    /// switch, defined by this crate's `global_asm!`, where the C ABI only
+    /// tells Rust how to call it.
     const NOT_THE_OS: &[(&str, usize, &str)] = &[("src/coroutine.rs", 1, "`bish_switch_context`, hand-written assembly this crate defines itself")];
 
-    /// How many C functions a source file declares.
-    ///
-    /// Read line by line rather than parsed: a declaration block holds
-    /// one `fn` per line and no braces of its own, so tracking the
-    /// block's own braces and counting `fn` inside it is enough.
-    /// Comment lines are skipped so that prose about a `{` cannot be
-    /// mistaken for one, and `extern "C" fn` -- a Rust function the OS
-    /// calls back, which is a definition and not a declaration -- is
-    /// deliberately not counted.
+    /// How many C functions a source file declares, read line by line: a
+    /// declaration block holds one `fn` per line and no braces of its own.
+    /// Comment lines are skipped, so prose about `{` can't count, and
+    /// `extern "C" fn` (a Rust callback, a definition) isn't counted.
     fn c_declarations(source: &str) -> usize {
         let mut total = 0;
         let mut depth = 0usize;
@@ -228,7 +187,7 @@ mod os_guard {
                     continue;
                 }
                 let relative = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-                // This directory is where they are supposed to be.
+                // This directory is where they belong.
                 if relative.starts_with("src/platform/") {
                     continue;
                 }
@@ -268,13 +227,10 @@ mod os_guard {
 
 #[cfg(test)]
 mod sys_tables {
-    /// Every name a `sys_` table exposes.
-    ///
-    /// Read from the source text rather than from the compiled module,
-    /// because only one of the two is ever compiled: on Linux the
-    /// Darwin table is `cfg`'d out, so nothing but reading it as text
-    /// can notice that it is missing something. `cargo check --target
-    /// aarch64-apple-darwin` is what type-checks the other side.
+    /// Every name a `sys_` table exposes, read from the source text: only one
+    /// table is compiled, so only reading it as text sees what the other
+    /// lacks. `cargo check --target aarch64-apple-darwin` type-checks the
+    /// other side.
     fn exported_names(source: &str) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
         for line in source.lines() {
@@ -298,8 +254,7 @@ mod sys_tables {
         let mut problems: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&dir).expect("src/platform is readable").flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Every Linux-side file, by either spelling: `linux.rs`
-            // itself, or `<something>_linux.rs`.
+            // Every Linux-side file: `linux.rs` or `<something>_linux.rs`.
             let Some(stem) = name.strip_suffix("linux.rs") else { continue };
             let counterpart = format!("{stem}darwin.rs");
             let Ok(darwin_source) = std::fs::read_to_string(dir.join(&counterpart)) else {
