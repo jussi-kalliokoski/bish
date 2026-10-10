@@ -1,12 +1,11 @@
 // Folds: ranges of lines the editor shows as one row.
 //
-// vim's manual folds, which is what `vim -u NONE` has and so what the
-// editor corpus can hold this to. A fold is a range of lines, open or
-// closed. Folds nest, and a closed fold hides everything inside it --
-// folds of its own included -- behind the one row that stands for it.
+// vim's manual folds, which `vim -u NONE` has, so the editor corpus can
+// test them. A fold is open or closed, folds nest, and a closed fold hides
+// everything inside it, its own folds included, behind one row.
 //
-// Line-indexed state, so it has to move when lines do: see `remap`, and
-// `TextBuffer`'s content mutators, which are what call it.
+// The state is line-indexed, so it moves when lines do: see `remap`, which
+// `TextBuffer`'s content mutators call.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fold {
@@ -20,8 +19,7 @@ pub struct Folds {
     // Outermost first: by start, then the longer of two that start on
     // the same line. `containing` relies on that order.
     list: Vec<Fold>,
-    // `zi`. Off, every fold still exists and none of them hides
-    // anything, which is what makes it a toggle rather than a `zE`.
+    // `zi`. Off, the folds still exist but none hides anything.
     pub enabled: bool,
 }
 
@@ -45,8 +43,8 @@ impl Folds {
         self.list.dedup_by(|later, earlier| later.start == earlier.start && later.end == earlier.end);
     }
 
-    /// `zf`, `zF`, `:fold`: a fold over `start..=end`, closed -- which is
-    /// what a new fold is in vim with the default `foldlevel` of 0.
+    /// `zf`, `zF`, `:fold`: a closed fold over `start..=end`, as in vim
+    /// with the default `foldlevel` of 0.
     pub fn create(&mut self, start: usize, end: usize) {
         let (start, end) = (start.min(end), start.max(end));
         match self.list.iter_mut().find(|f| f.start == start && f.end == end) {
@@ -58,7 +56,6 @@ impl Folds {
         }
     }
 
-    // Outermost first, by the list's own order.
     fn containing(&self, line: usize) -> impl Iterator<Item = &Fold> {
         self.list.iter().filter(move |f| f.start <= line && line <= f.end)
     }
@@ -81,8 +78,8 @@ impl Folds {
         self.closed_at(line).unwrap_or((line, line))
     }
 
-    /// Whether anything is hidden at all -- the question that decides
-    /// whether counting rows can be done by subtracting line numbers.
+    /// Whether anything is hidden; if not, rows can be counted by
+    /// subtracting line numbers.
     pub fn any_closed(&self) -> bool {
         self.enabled && self.list.iter().any(|f| f.closed)
     }
@@ -140,9 +137,8 @@ impl Folds {
         if self.closed_at(line).is_some() { self.open_all(line) } else { self.close_all(line) }
     }
 
-    /// `:{range}foldopen`: one level of every fold the range reaches --
-    /// what `zo` would open on each of its lines, decided before any of
-    /// them opens, so a long range does not peel a nest several deep.
+    /// `:{range}foldopen`: one level of every fold the range reaches,
+    /// decided before any opens, so a long range doesn't peel a deep nest.
     /// `all` (the `!`) opens every fold the range touches.
     pub fn open_range(&mut self, first: usize, last: usize, all: bool) {
         let targets: Vec<usize> = if all {
@@ -155,9 +151,8 @@ impl Folds {
         }
     }
 
-    /// `:{range}foldclose`: what `zc` would close on each line of the
-    /// range, decided up front the same way; `all` closes every fold it
-    /// touches.
+    /// `:{range}foldclose`: what `zc` would close on each line, decided up
+    /// front the same way; `all` closes every fold it touches.
     pub fn close_range(&mut self, first: usize, last: usize, all: bool) {
         let targets: Vec<usize> = if all {
             (0..self.list.len()).filter(|&i| self.list[i].start <= last && first <= self.list[i].end).collect()
@@ -227,17 +222,17 @@ impl Folds {
     }
 
     /// `[z` (`end == false`) and `]z`: the start or end of the open fold
-    /// `line` is in -- or, already there, of the one around that.
+    /// `line` is in, or of the one around it when already there.
     pub fn edge(&self, line: usize, end: bool) -> Option<usize> {
         let mut chain: Vec<&Fold> = self.containing(line).filter(|f| !f.closed || !self.enabled).collect();
         chain.reverse();
         chain.into_iter().map(|f| if end { f.end } else { f.start }).find(|&at| at != line)
     }
 
-    /// Moves every fold the way its lines moved. `map` says where a line
-    /// of the old text is now, `None` for one that is gone. A fold keeps
-    /// whichever of its lines survived -- lines inserted between two of
-    /// them are inside it by the same token -- and goes when none did.
+    /// Moves every fold the way its lines moved. `map` gives a line's new
+    /// index, `None` if it's gone. A fold keeps whichever of its lines
+    /// survived (lines inserted between them join it) and goes when none
+    /// did.
     pub fn remap(&mut self, map: impl Fn(usize) -> Option<usize>) {
         self.list.retain_mut(|f| {
             let first = (f.start..=f.end).find_map(&map);
@@ -275,11 +270,10 @@ impl Folds {
         }
     }
 
-    /// The text changed some other way -- undo, redo, a reload -- with no
-    /// record of which lines moved, so the two versions are diffed to
-    /// find out. A line replaced rather than removed keeps its place,
-    /// which is what keeps an undone `x` on a fold's last line from
-    /// shrinking the fold.
+    /// The text changed with no record of which lines moved (undo, redo, a
+    /// reload), so the versions are diffed. A replaced line keeps its
+    /// place, so an undone `x` on a fold's last line doesn't shrink the
+    /// fold.
     pub fn text_replaced<T: PartialEq>(&mut self, old: &[T], new: &[T]) {
         if self.list.is_empty() {
             return;
