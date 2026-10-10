@@ -5309,16 +5309,14 @@ impl Shell {
             }
             self.pump_coroutines();
         }
-        // Whatever is still going is a producer with nobody listening.
+        // What's still running is a producer nobody is reading.
         if let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() {
             scheduler.cancel_running();
             scheduler.retire_finished();
         }
-        // And the ones that are real processes: a producer nobody is
-        // reading is stopped, a consumer is left alone and reaped when
-        // it finishes. Waiting for a consumer would make the shell
-        // block on something it deliberately started in the background,
-        // and bash does not.
+        // Real-process substitutions: a producer nobody reads is stopped; a
+        // consumer is left to finish and reaped later. Waiting for it would
+        // block on something deliberately backgrounded, which bash doesn't.
         let mut still_running = Vec::new();
         for (mut child, may_stop) in std::mem::take(&mut self.proc_sub_children) {
             match child.try_wait() {
@@ -5335,13 +5333,9 @@ impl Shell {
         self.proc_sub_children = still_running;
     }
 
-    /// `FUNCNEST`, if a script has set it to something meaningful.
-    ///
-    /// Deliberately not `lookup_var`: that ends in a `std::env::var`
-    /// fallback, i.e. a linear scan of `environ`, and this runs on every
-    /// single function call. A `FUNCNEST` inherited from the environment
-    /// is already in `globals` (seeded there at startup), so nothing is
-    /// lost by stopping short of the real environment.
+    /// `FUNCNEST`, if set to something meaningful. Not `lookup_var`, which
+    /// ends in a scan of `environ`, on every call; an inherited `FUNCNEST` is
+    /// already in `globals`.
     fn funcnest_limit(&self) -> Option<usize> {
         let raw = self
             .var_scopes
@@ -5356,28 +5350,18 @@ impl Shell {
         }
     }
 
-    /// Is this call to `name` provably a repeat of one already on the
-    /// stack, with nothing at all having happened in between?
+    /// Whether this call to `name` provably repeats one already on the
+    /// stack with nothing in between. `Shell::effects` counts every
+    /// command, assignment and volatile read, but not function calls, so a
+    /// frame of this function with the same `effects` means nothing
+    /// observable ran since, only frames were pushed. With the same
+    /// arguments too, the whole state is identical: a fixed point that
+    /// repeats forever.
     ///
-    /// Not a heuristic and not a depth guess. `Shell::effects` counts every
-    /// builtin, every external command, every assignment and every read of
-    /// a volatile variable, and is deliberately *not* bumped by a function
-    /// call itself. So if some frame for this same function recorded the
-    /// same `effects` value this call sees, then between that entry and
-    /// this one the interpreter executed nothing observable -- it only
-    /// pushed frames. If the positional parameters also match, the whole
-    /// reachable state is identical to what it was at that earlier entry,
-    /// and the program is at a fixed point: it will do this forever.
-    ///
-    /// O(1) in practice. The scan walks back from the innermost frame and
-    /// stops at the first frame whose `effects_at_entry` differs, which in
-    /// any program that does anything is the very first frame examined.
-    /// It only walks far in exactly the case it is looking for -- a run of
-    /// frames entered with no effect between them, i.e. the cycle itself,
-    /// which is why mutual recursion (`a() { b; }; b() { a; }`) is caught
-    /// too without the caller having to say how deep to look.
-    ///
-    /// Returns the number of frames in the cycle when it fires.
+    /// O(1) in practice: the scan stops at the first frame whose
+    /// `effects_at_entry` differs, the first one in any program doing work.
+    /// It walks far only along the cycle itself, which also catches mutual
+    /// recursion. Returns the cycle's length in frames.
     fn nonproductive_recursion_depth(&self, name: &str, args_hash: u64) -> Option<usize> {
         let here = self.effects;
         for (back, frame) in self.call_stack.iter().rev().enumerate() {
@@ -5391,37 +5375,24 @@ impl Shell {
         None
     }
 
-    /// `Some` when this call must not happen: either `FUNCNEST` says
-    /// so, or there is not enough stack left to survive it.
-    ///
-    /// bash only has the first of those, and dies on a signal without
-    /// it -- `bish -c 'f() { f; }; f'` used to abort and dump core, and
-    /// so does bash. The stack check is what makes the limit real when
-    /// nobody has set `FUNCNEST`, which is nearly always; see
-    /// stackguard's own doc comment for why it measures the stack
-    /// rather than counting frames.
-    ///
-    /// The message is bash's, including the line number and the
-    /// parenthesised limit. With no `FUNCNEST` set there is no
-    /// configured number to report, so it reports the depth actually
-    /// reached, which is the limit that applied.
+    /// `Some` when this call must not happen: `FUNCNEST` forbids it, or
+    /// there isn't stack enough to survive it. bash has only the first and
+    /// dies on a signal without it; the stack check makes a limit real when
+    /// `FUNCNEST` isn't set (see stackguard). The message is bash's, with
+    /// the line and the limit; without `FUNCNEST` it reports the depth
+    /// reached.
     fn refuse_deeper_nesting(&mut self, name: &str, args_hash: u64) -> Option<ExecResult> {
-        // Already unwinding out of a refusal further down: every call
-        // met on the way out is refused too, silently -- the message
-        // has been given once, which is what bash's jump to the top
-        // level amounts to.
+        // Already unwinding from a refusal below: every call on the way out
+        // is refused silently, the message given once, as bash's jump to
+        // the top level amounts to.
         if self.nesting_unwind {
             return Some(ExecResult::Status(1));
         }
-        // bash reads FUNCNEST as a number and treats anything else --
-        // unset, zero, negative, `abc` -- as "no limit".
-        //
-        // Checked ahead of the non-terminating-recursion proof below,
-        // even though the proof is the better diagnosis and fires
-        // immediately where this waits for a depth: a script that sets
-        // `FUNCNEST` is asking for bash's mechanism by name, and gets
-        // it, message and depth included. Every script that does not --
-        // which is nearly all of them -- gets the proof.
+        // bash reads FUNCNEST as a number, anything else (unset, zero,
+        // negative, `abc`) meaning no limit. Checked before the
+        // non-termination proof: a script that sets `FUNCNEST` asks for
+        // bash's mechanism, message and depth included; every other script
+        // gets the proof.
         let funcnest = self.funcnest_limit();
         let proven = funcnest.is_none().then(|| self.nonproductive_recursion_depth(name, args_hash)).flatten();
         let message = match (funcnest, proven) {
@@ -5436,11 +5407,9 @@ impl Shell {
                 "bish: line {}: {name}: re-entered through a cycle of {cycle} calls with no command run and no argument changed -- this cannot terminate\n",
                 self.current_line
             ),
-            // The backstop under both of the above, and the reason a
-            // `FUNCNEST` too large to ever be reached is not a way back
-            // to a core dump. Reports the depth actually reached, since
-            // the limit that applied here is the stack rather than a
-            // configured number.
+            // The backstop under both, so a `FUNCNEST` too large to reach
+            // can't lead to a crash. Reports the depth reached, since the
+            // stack was the limit.
             _ if crate::stackguard::nearly_exhausted() => {
                 format!("bish: line {}: {name}: maximum function nesting level exceeded ({})\n", self.current_line, self.function_depth)
             }
@@ -5448,11 +5417,9 @@ impl Shell {
         };
         self.sink_err(&message);
         self.nesting_unwind = true;
-        // bash stops the script outright -- nothing after the offending
-        // call runs, and the shell exits 1. It does not do that to a
-        // session someone is typing at, and neither does this: there
-        // the unwind flag alone gets back to the prompt. Same line the
-        // readonly-assignment error draws.
+        // bash stops the script and exits 1. Not in an interactive session,
+        // where the unwind flag returns to the prompt, as for readonly
+        // assignments.
         if !self.interactive {
             self.pending_exit = Some(1);
         }
@@ -5464,9 +5431,8 @@ impl Shell {
         if let Some(refused) = self.refuse_deeper_nesting(name, args_hash) {
             return refused;
         }
-        // Recorded before the body runs, so `current_line` is still the
-        // line of the call rather than of whatever the body reaches
-        // first.
+        // Before the body runs, while `current_line` is still the call's
+        // line.
         self.call_stack.push(CallFrame {
             called: name.to_string(),
             call_line: self.current_line,
@@ -5529,24 +5495,19 @@ impl Shell {
         self.arg_frames.pop();
         let returning_from = self.function_depth;
         self.function_depth -= 1;
-        // Back at the top: whatever was being unwound out of is fully
-        // unwound, and the shell can run commands again.
+        // Back at top level: the unwind is over.
         if self.function_depth == 0 {
             self.nesting_unwind = false;
         }
-        // RETURN, after the frame is gone so the trap runs in the
-        // caller's scope. It fires for the function that set it and for
-        // every one it returns *into* -- not for calls made from there,
-        // which is what "not inherited" means and what `functrace`
-        // turns off. Four cases pin the comparison down:
+        // RETURN, after the frame is gone, so the trap runs in the caller's
+        // scope. It fires for the function that set it and every one it
+        // returns into, not for calls made from there (which `functrace`
+        // would add):
         //
         //   trap RETURN; f() { :; }; f          set at 0, f returns at 1: no
         //   f() { trap RETURN; :; }; f          set at 1, f returns at 1: yes
         //   f() { trap RETURN; g; }; g          set at 1, g returns at 2: no
         //   g() { trap RETURN; :; }; f() { g; } set at 2, f returns at 1: yes
-        //
-        // This used to be gated on `functrace` alone, so the second --
-        // the ordinary way anyone writes a RETURN trap -- never ran.
         if self.opt_functrace || returning_from <= self.pseudo_trap_depth[PseudoTrap::Return as usize] {
             self.run_pseudo_trap(PseudoTrap::Return);
         }
@@ -5561,10 +5522,8 @@ impl Shell {
             self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
             self.suppress_errexit -= 1;
-            // A condition always has a branch waiting behind it, so a
-            // foreground pty job cannot escape from one -- see
-            // settle_fg. `if cp a b; then ...` ran the `cp` and then
-            // never looked at the branch.
+            // A branch always follows a condition, so a foreground pty job
+            // can't escape from one; see `settle_fg`.
             let cond_result = self.settle_fg(cond_result);
             if cond_result.is_signal() {
                 return cond_result;
@@ -5581,20 +5540,15 @@ impl Shell {
 
     fn run_while(&mut self, cond: &Program, body: &Program, until: bool) -> ExecResult {
         let mut ran_body = false;
-        // Tracked separately from self.last_status: evaluating `cond` runs
-        // a real command through run_program, which unconditionally
-        // overwrites self.last_status as a side effect (needed so `$?`
-        // reads right *during* that command) -- including on the final,
-        // loop-ending check. Without this, a loop's reported exit status
-        // would reflect that failing condition check instead of the body's
-        // last status, which is what bash actually reports.
+        // Separate from `last_status`, which the condition's own run
+        // overwrites, including the final failing check: a loop reports the
+        // body's last status, as bash does.
         let mut last_body_status = 0;
         loop {
             self.suppress_errexit += 1;
             let cond_result = self.run_program(cond);
             self.suppress_errexit -= 1;
-            // Same as `if`'s: the body, or the next test, always
-            // follows.
+            // As for `if`: the body or the next test follows.
             let cond_result = self.settle_fg(cond_result);
             if cond_result.is_signal() {
                 return cond_result;
@@ -5621,10 +5575,8 @@ impl Shell {
                     self.last_status = s;
                     last_body_status = s;
                 }
-                // A loop body always has the next iteration behind it
-                // -- `for f in a b c; do cp "$f" d/; done` copied only
-                // `a` before this, because the first `cp` escaped with
-                // the rest of the loop still to run. See settle_fg.
+                // The next iteration always follows, so a body's job can't
+                // escape; see `settle_fg`.
                 ExecResult::Fg => {
                     let status = self.drive_pending_fg_inline();
                     self.last_status = status;
@@ -5641,11 +5593,8 @@ impl Shell {
         }
     }
 
-    /// Names a compound's header and fires the DEBUG trap for it.
-    ///
-    /// The header is a command in its own right here, the same way a
-    /// simple command is, and it is named as written -- `for i in 1`,
-    /// not the list it expands to.
+    /// Names a compound's header and fires the DEBUG trap for it, as written:
+    /// `for i in 1`, not the expanded list.
     fn name_and_trace_header(&mut self, header: &str) {
         if self.debug_trap.is_none() || self.in_trap {
             return;
@@ -5659,14 +5608,9 @@ impl Shell {
             Some(words) => self.expand_words(words),
             None => self.arg_frames.last().cloned().unwrap_or_default(),
         };
-        // A loop header is a command as far as the DEBUG trap is
-        // concerned: bash fires it for `for` and `select` (and `case`),
-        // though not for `if` or `while`, whose conditions are
-        // themselves commands and fire on their own.
-        //
-        // Once per iteration, not once per loop -- `for i in a b c`
-        // traces its header three times -- and never at all when the
-        // list is empty, because then the loop is not entered.
+        // A `for`, `select` or `case` header is a command to the DEBUG trap
+        // (`if` and `while` conditions fire on their own). Once per
+        // iteration, and not at all for an empty list, as in bash.
         let header = loop_header("for", var, words);
         let mut ran_body = false;
         for val in values {
@@ -5701,17 +5645,12 @@ impl Shell {
         if ran_body { ExecResult::Status(self.last_status) } else { ExecResult::Status(0) }
     }
 
-    // `select var [in words]; do body; done`. Displays a numbered menu to
-    // stderr (never stdout, matching real bash) and reads a choice from
-    // stdin, looping until `break` or EOF. Real bash's exact behavior,
-    // confirmed empirically:
-    //  - the menu is (re)printed before the very first prompt, and again
-    //    after any BLANK line of input, but not otherwise
-    //  - a blank input line reprompts without running the body at all
-    //  - a non-blank but out-of-range/non-numeric choice still runs the
-    //    body, with `var` set to empty (REPLY still gets the raw text)
-    //  - EOF on stdin ends the loop entirely (like an implicit break),
-    //    without running the body, and the loop's status is 1
+    // `select var [in words]; do body; done`: a numbered menu on stderr, as
+    // bash does, and a choice read from stdin until `break` or end of input.
+    // As in bash: the menu prints before the first prompt and after any blank
+    // line; a blank line reprompts without running the body; an invalid
+    // choice runs the body with `var` empty (REPLY keeps the text); end of
+    // input ends the loop without the body, status 1.
     fn run_select(&mut self, var: &str, words: Option<&[Word]>, body: &Program) -> ExecResult {
         self.name_and_trace_header(&loop_header("select", var, words));
         let items: Vec<String> = match words {
@@ -5723,9 +5662,8 @@ impl Shell {
                 sh_eprintln!(this, "{}) {}", i + 1, item);
             }
         };
-        // Nothing to choose from is not a prompt with no options: bash
-        // does not print the menu, does not prompt, and leaves the loop
-        // at once with status 0.
+        // Nothing to choose from: bash prints no menu, doesn't prompt, and
+        // leaves at once with status 0.
         if items.is_empty() {
             return ExecResult::Status(0);
         }
@@ -5739,11 +5677,8 @@ impl Shell {
             let _ = std::io::Write::flush(&mut std::io::stderr());
             let mut line = String::new();
             match std::io::BufRead::read_line(&mut self.current_stdin_reader(), &mut line) {
-                // Confirmed against real bash: on EOF, `select` prints a
-                // bare newline to *stdout* (not stderr, where the menu/
-                // prompt otherwise live) before giving up -- reproducible
-                // even non-interactively, not just an interactive-terminal
-                // courtesy newline.
+                // At end of input bash prints a bare newline to stdout (not
+                // stderr, where the menu is), even non-interactively.
                 Ok(0) => {
                     sh_println!(self);
                     return ExecResult::Status(1);
@@ -5773,10 +5708,8 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                // A loop body always has the next iteration behind it
-                // -- `for f in a b c; do cp "$f" d/; done` copied only
-                // `a` before this, because the first `cp` escaped with
-                // the rest of the loop still to run. See settle_fg.
+                // The next iteration always follows, so a body's job can't
+                // escape; see `settle_fg`.
                 ExecResult::Fg => {
                     let status = self.drive_pending_fg_inline();
                     self.last_status = status;
@@ -5786,17 +5719,11 @@ impl Shell {
         }
     }
 
-    // `for ((init; cond; step)); do body; done`. Unlike run_for/run_while,
-    // `continue` must still run `step` before re-checking `cond` -- so the
-    // Continue arm falls through to the step evaluation below instead of
-    // looping straight back like a plain `while`'s `continue` does.
+    // `for ((init; cond; step))`: `continue` still runs `step` before the
+    // next test, so the Continue arm falls through to it.
     fn run_cfor(&mut self, init: &str, cond: &str, step: &str, body: &Program) -> ExecResult {
-        // Each of the three sections is its own command to a DEBUG
-        // trap, named `((expr))` -- so `for ((i=0;i<1;i++))` traces
-        // `((i=0))`, then `((i<1))` before every test and `((i++))`
-        // before every step.
-        // An omitted section is `1`, and bash names it that way rather
-        // than skipping it: `for ((;;))` traces `((1))`.
+        // Each section is its own command to the DEBUG trap, named
+        // `((expr))`; an omitted one is `((1))`, as bash names it.
         self.name_and_trace_header(&format!("(({}))", if init.is_empty() { "1" } else { init }));
         if !init.is_empty() {
             if let Err(e) = arith::eval(init, self) {
@@ -5835,10 +5762,7 @@ impl Shell {
                     }
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                // A loop body always has the next iteration behind it
-                // -- `for f in a b c; do cp "$f" d/; done` copied only
-                // `a` before this, because the first `cp` escaped with
-                // the rest of the loop still to run. See settle_fg.
+                // The next iteration always follows; see `settle_fg`.
                 ExecResult::Fg => {
                     let status = self.drive_pending_fg_inline();
                     self.last_status = status;
@@ -5857,30 +5781,23 @@ impl Shell {
     }
 
     fn run_case(&mut self, word: &Word, arms: &[(Vec<Word>, Program, parser::CaseTerm)]) -> ExecResult {
-        // Trailing space and all: bash writes this one as `case x in `.
+        // With the trailing space, as bash writes `case x in `.
         self.name_and_trace_header(&format!("case {} in ", crate::serialize::serialize_word(word)));
         let val = self.expand_word(word);
         let mut i = 0;
-        // Set by `;&`: run the next arm's body unconditionally, skipping
-        // its pattern test entirely (unlike `;;&`, which just resumes
-        // normal pattern testing at the next arm without forcing a run).
+        // Set by `;&`: run the next arm's body without testing its pattern
+        // (`;;&` instead resumes testing at the next arm).
         let mut force_run = false;
         let mut last_body_status = 0;
         while i < arms.len() {
             let (patterns, body, term) = &arms[i];
-            // `shopt -s nocasematch` covers `case` as well as
-            // `[[ =~ ]]` -- it was only wired into the latter.
+            // `shopt -s nocasematch` covers `case` too.
             let fold_case = self.shopt_is_on("nocasematch");
             let should_run = force_run
                 || patterns.iter().any(|p| {
-                    // A *quoted* part of a pattern is literal text, not
-                    // a pattern: `case abc in "$p")` with `p='*'` looks
-                    // for a literal asterisk, and so does `'*'`. The
-                    // whole pattern was expanded as plain text and then
-                    // matched as a glob, so both matched everything --
-                    // the same mistake `[[ =~ ]]` avoids by building
-                    // its operand chunk by chunk, which is what this
-                    // does now.
+                    // A quoted part of a pattern is literal:
+                    // `case abc in "$p")` with `p='*'` looks for an
+                    // asterisk. Built chunk by chunk, as `[[ =~ ]]` does.
                     let pat = self.expand_glob_pattern_operand(p);
                     glob::matches_with_case(&pat, &val, fold_case)
                 });
@@ -5946,9 +5863,8 @@ impl Shell {
                     word_atoms.push(w);
                     *pos += 1;
                 }
-                // `[[ a == b == c ]]` -- no form of `[[ ]]` takes four
-                // operands, and reading it as "non-empty, so true" is
-                // how a stray word passed silently.
+                // `[[ a == b == c ]]`: no form takes four operands, and
+                // reading it as "non-empty, so true" let a stray word pass.
                 if word_atoms.len() > 3 {
                     let text = word_atoms.iter().map(|w| self.expand_word(w)).collect::<Vec<_>>();
                     return Err(format!("syntax error in conditional expression: unexpected token `{}'", text[3]));
@@ -5959,24 +5875,17 @@ impl Shell {
                 }
                 Ok(self.eval_simple_test(&word_atoms))
             }
-            // Nothing where an expression should be. The one that
-            // reaches here is `[[ ]]` itself; anything else is a `]]`
-            // arriving before its expression did, which reads the same
-            // way to whoever typed it.
+            // Nothing where an expression should be: `[[ ]]`, or a `]]`
+            // before its expression.
             None => Err("syntax error near `]]'".to_string()),
-            // `&&`, `||` or `!` with no left-hand side -- `[[ && a ]]`.
-            // Named rather than `{:?}`-ed: a `Debug` rendering of an
-            // internal enum is not a sentence, and `syntax error near
-            // None` is what this used to say out loud.
+            // `&&`, `||` or `!` without a left side (`[[ && a ]]`), named,
+            // not `Debug`-printed.
             Some(atom) => Err(format!("unexpected token `{}' in conditional command", Self::test_atom_name(atom))),
         }
     }
 
-    // `[[ -v NAME ]]`, including `[[ -v arr[0] ]]`: is this name --
-    // scalar, array, or one element of one -- actually set, as opposed
-    // to reading back empty because it never was.
-    // What `[ -v NAME ]` and `[ -o OPTNAME ]` need answering, for the
-    // operands that actually appear -- see builtins::ShellFacts.
+    // What `[ -v NAME ]` and `[ -o OPTNAME ]` need answered, for the operands
+    // that appear; see `builtins::ShellFacts`.
     fn shell_test_answers(&mut self, args: &[String]) -> (HashMap<String, bool>, HashMap<String, bool>) {
         let mut vars = HashMap::new();
         let mut opts = HashMap::new();
@@ -5997,25 +5906,14 @@ impl Shell {
         (vars, opts)
     }
 
-    /// `${!name}`: the variable *named by* `name`'s value.
-    ///
-    /// bash refuses this three ways, each of them fatal the way
-    /// `${x:?}` is -- `name` unset, its value empty, and its value not
-    /// a parameter name. Expanding to nothing instead meant a typo in
-    /// the indirection quietly became an empty string, which is the
-    /// one thing an indirection cannot afford.
-    ///
-    /// The value may name an array element (`x=a[1]`), a positional
-    /// (`x=1`) or a special (`x=@`); bash follows all of them, and the
-    /// element form was reaching `lookup_var("a[1]")` and finding
-    /// nothing.
+    /// `${!name}`: the variable named by `name`'s value. bash makes it
+    /// fatal, like `${x:?}`, when `name` is unset, empty or not a parameter
+    /// name, so a typo doesn't silently become an empty string. The value
+    /// may name an element (`x=a[1]`), a positional (`x=1`) or a special
+    /// (`x=@`); bash follows them all.
     fn indirect_var(&mut self, name: &str) -> String {
-        // A nameref is the one case where `${!x}` is not an
-        // indirection at all: it gives the *name* the reference points
-        // at, following a chain of them to the end. `$r` is already the
-        // target's value, so reading `${!r}` as "indirect through that
-        // value" made it a second hop -- which lands on whatever the
-        // value happens to spell, and usually on nothing.
+        // For a nameref, `${!x}` gives the name it points at, following the
+        // chain, rather than indirecting through its value.
         if self.nameref_names.contains(name) {
             return self.resolve_nameref(name);
         }
@@ -6039,6 +5937,8 @@ impl Shell {
         }
     }
 
+    // `[[ -v NAME ]]`, `[[ -v arr[0] ]]` included: whether the name, array
+    // or element is set, not just empty.
     fn name_is_set(&mut self, name: &str) -> bool {
         match name.split_once('[').and_then(|(base, rest)| rest.strip_suffix(']').map(|index| (base, index))) {
             Some((base, index)) => self.array_element_is_set(base, index),
@@ -6046,21 +5946,17 @@ impl Shell {
         }
     }
 
-    /// What a `[[ ]]` says when its words do not make an expression.
-    ///
-    /// bash distinguishes three shapes and so does this, because the three
-    /// say genuinely different things about what the writer left out. Each
-    /// message and each case was read off `bash -c` rather than recalled --
-    /// `[[ -a -z ]]` in particular is *not* an error, it asks whether a file
-    /// named `-z` is there, which is why "the operand looks like an
-    /// operator" cannot be the test.
+    /// What a `[[ ]]` says when its words aren't an expression, in bash's
+    /// three shapes, read off `bash -c`. `[[ -a -z ]]` isn't an error (does a
+    /// file `-z` exist?), so an operand that looks like an operator can't be
+    /// the test.
     fn conditional_shape_error(text: &[String]) -> Option<String> {
         match text {
-            // `[[ -z ]]` -- a unary operator that never got its operand.
+            // `[[ -z ]]`: a unary operator without its operand.
             [op] if crate::builtins::is_unary_op(op) => Some("unexpected argument `]]' to conditional unary operator".to_string()),
-            // `[[ a -eq ]]` -- a binary operator that never got its right
-            // side. Checked on the second word rather than the first, which
-            // is what tells it from the case below.
+            // `[[ a -eq ]]`: a binary operator without its right side,
+            // checked on the second word, which tells it from the case
+            // below.
             [_, op] if crate::builtins::is_binary_op(op) => Some("unexpected argument `]]' to conditional binary operator".to_string()),
             // `[[ a b ]]`, `[[ = a ]]`, `[[ -eq a ]]` -- two words with
             // nothing between them that could join them. bash names the
@@ -6111,9 +6007,7 @@ impl Shell {
                 let a = self.expand_word(a);
                 if op == "=~" {
                     let pattern = self.expand_regex_operand(b);
-                    // `shopt -s nocasematch` -- registered since the
-                    // shopt namespace was, and until regex.rs could fold
-                    // case at all there was nothing for it to do.
+                    // `shopt -s nocasematch` applies to `=~` too.
                     match crate::regex::match_captures(&a, &pattern, self.shopt_is_on("nocasematch")) {
                         Some(groups) => {
                             let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(groups.into_iter().enumerate());
@@ -6126,9 +6020,9 @@ impl Shell {
                         }
                     }
                 } else {
-                    // `==`/`!=`/`=` take a *pattern* on the right, so
-                    // the quoted parts of it have to be escaped; every
-                    // other operator compares plain text.
+                    // `==`, `!=` and `=` take a pattern on the right, so
+                    // its quoted parts are escaped; other operators compare
+                    // plain text.
                     let b = match op.as_str() {
                         "=" | "==" | "!=" => self.expand_glob_pattern_operand(b),
                         _ => self.expand_word(b),
@@ -6137,21 +6031,15 @@ impl Shell {
                     builtins::binary_with_case(&a, &op, &b, true, fold_case)
                 }
             }
-            // Four or more is rejected by the caller before reaching
-            // here; this arm is unreachable in practice.
+            // Four or more words are rejected by the caller first.
             _ => !words.is_empty(),
         }
     }
 
-    // The RHS of `[[ str =~ pattern ]]`. Quoting (or backslash-escaping)
-    // any part of `pattern` in the source forces that part to match
-    // literally instead of as regex syntax -- real bash's documented
-    // behavior for `=~`. Mirrors expand_word's chunk loop, but escapes
-    // each chunk's own text for the regex engine when that chunk is
-    // individually quoted (Chunk::LiteralStr, or any other chunk's own
-    // `quoted` flag), leaving unquoted chunks as raw regex syntax -- so
-    // e.g. `^[0-9]+\.[0-9]+$` keeps `^`/`[0-9]`/`+`/`$` as regex metachars
-    // while the backslash-escaped `.` matches only a literal dot.
+    // The right side of `[[ str =~ pattern ]]`. A quoted or backslash-escaped
+    // part matches literally, as bash documents: each quoted chunk's text is
+    // escaped for the regex engine and unquoted chunks stay regex syntax, so
+    // in `^[0-9]+\.[0-9]+$` only the escaped `.` is literal.
     fn expand_regex_operand(&mut self, w: &Word) -> String {
         let mut out = String::new();
         for c in &w.chunks {
@@ -6179,8 +6067,8 @@ impl Shell {
                     }
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", raw, e);
-                        // Fatal, unlike the `(( ))` *command* -- see
-                        // expansion_failed.
+                        // Fatal, unlike the `(( ))` command; see
+                        // `expansion_failed`.
                         self.expansion_failed = true;
                     }
                 },
@@ -6245,11 +6133,8 @@ impl Shell {
         out
     }
 
-    // The same, for `[[ x == PATTERN ]]`. Quoting any part of the
-    // right-hand side makes that part a literal instead of pattern
-    // syntax -- `[[ abc == "a*" ]]` is false, and `[[ abc == a* ]]` is
-    // true. Expanding it as one plain word lost the distinction, so a
-    // quoted `*` still globbed.
+    // The same for `[[ x == PATTERN ]]`: a quoted part is literal, so
+    // `[[ abc == "a*" ]]` is false and `[[ abc == a* ]]` true.
     fn expand_glob_pattern_operand(&mut self, w: &Word) -> String {
         let mut out = String::new();
         for c in &w.chunks {
@@ -6277,8 +6162,8 @@ impl Shell {
                     }
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", raw, e);
-                        // Fatal, unlike the `(( ))` *command* -- see
-                        // expansion_failed.
+                        // Fatal, unlike the `(( ))` command; see
+                        // `expansion_failed`.
                         self.expansion_failed = true;
                     }
                 },
@@ -6345,12 +6230,10 @@ impl Shell {
 
     fn run_single(&mut self, cmd: &SimpleCommand, background: bool) -> ExecResult {
         if cmd.words.is_empty() {
-            // An assignment-only command is a command, and bash names
-            // it in `$BASH_COMMAND` like any other.
-            // Serialised, not expanded. The value has not been
-            // evaluated yet -- the DEBUG trap fires *before* the
-            // assignment -- and expanding it here to name it would run
-            // any `$( )` in it a second time.
+            // An assignment-only command is named in `$BASH_COMMAND` like
+            // any other. Serialized, not expanded: DEBUG fires before the
+            // assignment, and expanding here would run any `$( )` in it
+            // twice.
             let named: Vec<String> = cmd
                 .assigns
                 .iter()
@@ -6360,18 +6243,14 @@ impl Shell {
                 })
                 .collect();
             self.bash_command = Rc::from(named.join(" ").into_boxed_str());
-            // An assignment-only command has no last word, and bash
-            // duly empties `$_` rather than leaving the previous one:
+            // With no last word, `$_` becomes empty, as in bash:
             // `x=1; echo "$_"` prints nothing.
             self.underscore_pending.push(String::new());
-            // DEBUG, before the command rather than after: the whole
-            // use of it is to see what is about to run.
+            // DEBUG before the command: its use is seeing what's about to
+            // run.
             self.run_pseudo_trap(PseudoTrap::Debug);
-            // An assignment-only command is still a command, so `&`
-            // makes it a job -- one whose whole effect is discarded
-            // with the child, which is exactly what bash does with
-            // `x=1 &`. Left running here it set the variable in this
-            // shell and registered nothing.
+            // `&` makes an assignment-only command a job too, whose effect
+            // is lost with the child, as bash does with `x=1 &`.
             if background && cmd.array_assigns.is_empty() {
                 let mut script = String::new();
                 for (name, mode, val) in &cmd.assigns {
@@ -6382,16 +6261,14 @@ impl Shell {
                 let label = script.trim_end().to_string();
                 return ExecResult::Status(self.spawn_background_script(&script, label));
             }
-            // A refused write (readonly name) is the whole command's
-            // failure, not a silent no-op -- `set -e` and an explicit
-            // `|| exit` both depend on seeing it.
+            // A refused write (readonly) fails the command, for `set -e` and
+            // `|| exit` to see.
             let mut ok = true;
-            // Cleared before the expansions, so what is left afterwards
-            // is this command's own -- see last_subst_status.
+            // Cleared before the expansions, so what's left is this
+            // command's; see `last_subst_status`.
             self.last_subst_status = None;
-            // A bare assignment is a command, and bash traces it:
-            // `set -x; x=1` prints `+ x=1`, with the *expanded* value
-            // and quotes only where they are needed.
+            // Traced, as bash does: `set -x; x=1` prints `+ x=1` with the
+            // expanded value, quoted only where needed.
             let mut traced: Vec<String> = Vec::new();
             // An assignment-only command is an effect too.
             self.effects += 1;
@@ -6416,16 +6293,14 @@ impl Shell {
                 ok &= self.apply_array_literal(name, *mode, items);
             }
             for (name, index, mode, val) in &cmd.index_assigns {
-                // `a[]=1` names no element at all. bash calls that a
-                // bad subscript and stops; accepting it wrote to index
-                // 0, which is not what anyone typing it meant.
+                // `a[]=1` names no element: a bad subscript, as in bash,
+                // not index 0.
                 if index.trim().is_empty() {
                     sh_eprintln!(self, "bish: {}[]: bad array subscript", name);
                     ok = false;
                     continue;
                 }
-                // array_set_index prints the refusal itself; this only
-                // needs to know that one is coming.
+                // `array_set_index` prints the refusal itself.
                 ok &= !self.name_is_readonly(name);
                 let v = self.expand_word(val);
                 if self.opt_xtrace {
@@ -6434,8 +6309,7 @@ impl Shell {
                 }
                 let v = match mode {
                     AssignMode::Set => v,
-                    // `m[k]+=v` appends to whatever the element holds,
-                    // the same way `x+=v` does for a scalar.
+                    // `m[k]+=v` appends to the element, as `x+=v` does.
                     AssignMode::Append => self.array_element(name, index) + &v,
                 };
                 self.array_set_index(name, index, v);
@@ -6445,14 +6319,13 @@ impl Shell {
                 sh_eprintln!(self, "{}{}", ps4, traced.join(" "));
             }
             if !cmd.redirects.is_empty() {
-                // side effect only: create/truncate/append the target files
+                // For the side effect only: create, truncate or append the
+                // targets.
                 let _ = self.resolve_redirects(cmd);
             }
-            // bash treats a refused assignment as *fatal* in a
-            // non-interactive shell -- the script stops, which is the
-            // only thing that makes `readonly` worth writing. It does
-            // not do that to a session someone is typing at, and
-            // neither does this.
+            // A refused assignment is fatal in a script, as in bash, which
+            // is what makes `readonly` worth writing; not in an interactive
+            // session.
             if !ok && !self.interactive {
                 self.pending_exit = Some(1);
             }
@@ -6482,32 +6355,27 @@ impl Shell {
         if !self.in_trap {
             self.bash_command = crate::serialize::rendered_command(cmd);
         }
-        // And the DEBUG trap fires here for the same reason: bash runs
-        // it before the command's expansions, so a `$( )` in the
-        // command runs after the trap rather than before it.
+        // DEBUG fires here, before the expansions, so a `$( )` in the command
+        // runs after the trap, as in bash.
         self.run_pseudo_trap(PseudoTrap::Debug);
 
         let saved_stderr_target = self.current_stderr_target.take();
         self.current_stderr_target = self.peek_stderr_target(&cmd.redirects);
         let first_word_literal = match cmd.words[0].chunks.as_slice() {
-            // Quoting a builtin's own name doesn't stop bash from
-            // recognizing it (`"export" FOO=bar` still runs export), so
-            // this must match a fully-quoted name too, not just a bare one.
+            // A quoted builtin name is still recognized (`"export" FOO=bar`
+            // runs export), so a fully quoted name matches too.
             [Chunk::Str(s)] | [Chunk::LiteralStr(s, _)] => Some(s.as_str()),
             _ => None,
         };
-        // Only populated for the same assignment-builtin names as the argv
-        // branch just below (an ordinary command's cmd.array_word_assigns
-        // is always empty -- see parser.rs's is_declare_family_command).
-        // Position `p` here means "the array literal that would sit at
-        // argv[p]" -- run_declare/run_local's own arg loops splice it back
-        // in at that index instead of re-parsing a plain string there.
+        // Only for the assignment builtins (see parser.rs's
+        // `is_declare_family_command`). Position `p` is the array literal
+        // sitting at `argv[p]`, which `run_declare`/`run_local` splice back
+        // in rather than reparsing a string.
         let mut array_literal_args: Vec<(usize, String, AssignMode, Vec<ArrayLiteralItem>)> = Vec::new();
         let argv: Vec<String> = if matches!(first_word_literal, Some("local") | Some("export") | Some("declare") | Some("typeset") | Some("readonly"))
         {
-            // Assignment-builtins: `NAME=value` arguments must not be
-            // word-split on the expanded value (bash treats them like any
-            // other assignment), unlike a normal builtin's arguments.
+            // For the assignment builtins, a `NAME=value` argument isn't
+            // word-split, like any assignment.
             let mut v = vec![first_word_literal.unwrap().to_string()];
             let mut pending = cmd.array_word_assigns.iter().peekable();
             for (i, w) in cmd.words[1..].iter().enumerate() {
@@ -6541,15 +6409,10 @@ impl Shell {
         if let Some(exit) = self.take_pending_exit() {
             return exit;
         }
-        // Expanded once, here, and used everywhere the assignments are
-        // needed after this. They used to be expanded wherever each
-        // consumer happened to want them -- once to put them in the
-        // shell for a builtin to read, and again to build an external's
-        // environment -- so `x=$(echo a) /bin/echo hi` ran the
-        // substitution twice.
-        //
-        // After the words, because that is bash's order: `x=$(echo A
-        // >&2) cmd $(echo B >&2)` prints B before A.
+        // Expanded once, here, for every consumer, so
+        // `x=$(echo a) /bin/echo hi` runs the substitution once. After the
+        // words, as bash orders them: `x=$(echo A >&2) cmd $(echo B >&2)`
+        // prints B, then A.
         let prefix_values: Vec<(String, String)> = cmd
             .assigns
             .iter()
@@ -6562,53 +6425,37 @@ impl Shell {
                 (name.clone(), v)
             })
             .collect();
-        // What `$_` will be *after* this command, which is the last
-        // word of it as expanded -- or its own name when it has no
-        // arguments, which falls out of `last()` for free. Recorded
-        // rather than assigned: the command has not run yet, and
-        // everything inside it must still see the previous value.
+        // What `$_` becomes after this command: its last expanded word, or
+        // its name with no arguments. Recorded, not assigned: the command
+        // must still see the previous value.
         self.underscore_pending.push(argv.last().cloned().unwrap_or_default());
         if argv.is_empty() {
-            // Every word vanished (e.g. the command was just an unquoted
-            // empty/unset variable) -- matches bash: nothing runs.
+            // Every word vanished (an unquoted empty variable): nothing
+            // runs, as in bash.
             return ExecResult::Status(0);
         }
         if self.opt_xtrace {
             let ps4 = self.xtrace_prefix();
-            // Assignments first, which is where bash puts them -- and
-            // always with `=` and the value the command will actually
-            // see, so a prefix `p+=y` traces as `p=xy` where a
-            // standalone `p+=y` keeps its own operator.
+            // Assignments first, where bash puts them, always as `=` with
+            // the value the command sees, so a prefix `p+=y` traces as
+            // `p=xy`.
             for (name, value) in &prefix_values {
                 sh_eprintln!(self, "{}{}={}", ps4, name, xtrace_quote(value));
             }
-            // Each word quoted if it needs it, the same way an
-            // assignment's value already was: the trace is meant to be
-            // readable *as* the command that ran, and unquoted it is
-            // not. `echo "a b"` traced as `+ echo a b`, which reads as
-            // two arguments, and `[ x = x ]` as `+ [ x = x ]`, where
-            // bash writes `+ '[' x = x ']'`.
+            // Each word quoted if needed, so the trace reads as the command
+            // that ran: bash writes `+ echo 'a b'` and `+ '[' x = x ']'`.
             let words: Vec<String> = argv.iter().map(|w| xtrace_quote_word(w)).collect();
             sh_eprintln!(self, "{}{}", ps4, words.join(" "));
         }
         let name = argv[0].clone();
 
-        // `&` on a builtin or a function is a job, which means a child.
-        // Only an external took any notice of it here: everything else
-        // ran in this shell, synchronously, registering no job -- so
-        // `echo a &` left `$!` unset and `wait` with nothing to collect,
-        // and `f() { exit 5; }; f &` took the whole shell down with it.
-        //
-        // The child is handed the words this shell has *already
-        // expanded*, quoted, rather than the source text: the
-        // expansions have happened, and a `$( )` among them must not
-        // run a second time. Its redirects go as written, since nothing
-        // has expanded those yet.
-        //
-        // A `declare`-family array literal is the exception. Its display
-        // text is not the source it was parsed from, so there is
-        // nothing honest to hand a child -- and backgrounding a
-        // declaration has no observable effect anyway.
+        // `&` on a builtin or function makes a job, a child, so `echo a &`
+        // sets `$!` and `f() { exit 5; }; f &` can't end the shell. The
+        // child gets the already-expanded words, quoted, so a `$( )`
+        // doesn't run twice; its redirects go as written, not yet expanded.
+        // Not a `declare`-family array literal, whose display text isn't
+        // its source; backgrounding a declaration does nothing observable
+        // anyway.
         let runs_in_this_shell = self.is_active_builtin(&name) || (!self.restrict_to_builtins && self.functions.contains_key(&name));
         if background && runs_in_this_shell && cmd.array_assigns.is_empty() && cmd.array_word_assigns.is_empty() {
             let mut script = String::new();
@@ -6624,35 +6471,27 @@ impl Shell {
             return ExecResult::Status(self.spawn_background_script(&script, label));
         }
 
-        // Functions shadow builtins, matching real bash (confirmed: even
-        // POSIX "special" builtins like `export`/`return`/`break` are
-        // overridable by a same-named function there) -- `builtin NAME`
-        // (its own arm inside dispatch_builtin_or_external below) is the
-        // explicit bypass. `restrict_to_builtins` (command mode's
-        // colon-line) skips this entirely: its own contract is "only
-        // real builtins run here", not "functions still apply".
+        // Functions shadow builtins, as in bash, even `export`, `return` and
+        // `break`; `builtin NAME` bypasses that. Not on the colon line
+        // (`restrict_to_builtins`), which runs only real builtins.
         if !self.restrict_to_builtins
             && let Some(body) = self.functions.get(&name).cloned()
         {
-            // In scope for the body: `p=1 f` lets `f` read `p`, and
-            // bash puts the old value back afterwards. Nothing applied
-            // them here at all before, so the body saw whatever was
-            // there before the call.
+            // In scope for the body: `p=1 f` lets `f` read `p`, and the old
+            // value comes back after, as in bash.
             let restore = self.apply_prefix_assigns(&prefix_values);
-            // A redirect on the *call* applies to the whole body:
-            // `f > out` sends everything the function prints to the
-            // file, builtins and external commands alike. It used to be
-            // dropped entirely -- the file was never even created.
+            // A redirect on the call applies to the whole body: `f > out`
+            // sends everything the function prints, builtins and externals
+            // alike.
             if cmd.redirects.is_empty() {
                 let result = self.call_function(&name, &body, argv[1..].to_vec());
                 self.restore_prefix_assigns(restore);
                 return result;
             }
             if !Self::compound_redirects_are_simple(&cmd.redirects) {
-                // A numbered-fd redirect on a function call has no
-                // in-process model (see run_compound_redirected); run
-                // the body the way a redirected compound command is
-                // run, which does.
+                // A numbered-fd redirect on a call has no in-process model
+                // (see `run_compound_redirected`), so the body runs as a
+                // redirected compound.
                 let group = parser::Command::Group(
                     vec![ListItem {
                         and_or: AndOr { first: Pipeline { commands: vec![body.clone()], negate: false, timed: None }, rest: Vec::new() },
@@ -6683,47 +6522,32 @@ impl Shell {
             return result;
         }
         // A prefix assignment (`IFS=: read a b`) is in scope for the
-        // command it prefixes and gone afterwards. The external path
-        // already handled this by passing them as environment -- see
-        // run_external's own `command.env` loop -- but a builtin reads
-        // the *shell's* variables, so nothing reached it: `IFS=: read`
-        // split on the old IFS and `HISTTIMEFORMAT=x history` printed no
-        // times.
-        //
-        // Applied here, around the dispatch, rather than inside it: this
-        // is the one place that knows the command is about to run and
-        // that it is not a function call (bash lets an assignment
-        // outlive a function, which is its own rule and not this one).
-        // Every builtin and every external command is an effect. A shell
-        // *function* call is not -- it returned above, before this point.
+        // command and gone after. An external gets it as environment (see
+        // `run_external`), but a builtin reads the shell's variables, so
+        // it's applied around the dispatch here, where it's known not to be
+        // a function call (bash lets an assignment outlive a function call,
+        // a rule of its own). Every builtin and external is an effect;
+        // function calls returned above.
         self.effects += 1;
         let restore = self.apply_prefix_assigns(&prefix_values);
         let result = self.dispatch_builtin_or_external(&argv, name, cmd, background, false, &array_literal_args);
         self.restore_prefix_assigns(restore);
-        // Every simple command returns through here, which is the
-        // point: the drains inside the dispatch above are all on the
-        // *external* paths, so a `>( )` used by a builtin was queued and
-        // never run at all. `echo hi > >(cat)` produced nothing while
-        // `/bin/echo hi > >(cat)` worked. Cheap when nothing is queued,
-        // and a no-op when one of those inner drains has already run.
+        // Every simple command returns through here, so a `>( )` used by a
+        // builtin runs too, not only those on the external paths. A no-op
+        // when nothing is queued.
         self.drain_proc_subs();
         result
     }
 
-    // Applies `cmd`'s prefix assignments to the shell's own variables,
-    // handing back what was there before so it can be put back.
-    //
-    // `None` for a name that was unset, which has to be restored as
-    // *unset* rather than as empty -- `FOO=x cmd` must not leave `FOO`
-    // behind set to nothing, which `${FOO-default}` and `-u` both
-    // notice.
+    // Applies prefix assignments, returning the old values to restore. `None`
+    // for a name that was unset, restored as unset, not empty, which
+    // `${FOO-default}` and `-u` would notice.
     fn apply_prefix_assigns(&mut self, values: &[(String, String)]) -> Vec<(String, Option<String>)> {
         let mut saved = Vec::new();
         for (name, v) in values {
             let v = v.clone();
-            // Only what was actually written needs putting back -- a
-            // refused write (readonly name) left nothing to restore,
-            // and restoring it would print the same refusal twice.
+            // Only what was written needs restoring: a refused write left
+            // nothing, and restoring would print the refusal twice.
             let previous = self.var_is_set(name).then(|| self.lookup_var(name));
             if self.assign_var(name, v) {
                 saved.push((name.clone(), previous));
@@ -6738,25 +6562,18 @@ impl Shell {
                 Some(v) => {
                     self.assign_var(&name, v);
                 }
-                // Restored as *unset*, the same way `unset` does it:
-                // walk the local scopes first, then the real
-                // environment.
+                // Restored as unset, as `unset` does it.
                 None => self.remove_var(&name),
             }
         }
     }
 
-    // Thin wrapper around dispatch_builtin_or_external_impl (the actual
-    // dozens-of-arms match, below) that installs a per-command output-
-    // redirect override around the whole call -- see push_builtin_output_
-    // sink's own doc comment for exactly what it covers and why a single
-    // push/pop pair here (rather than threading a restore through every
-    // one of that match's many `return` points) is enough: every path
-    // through it either returns straight from the match (builtin output)
-    // or falls through into the external-spawn tail, whose own child
-    // process writes straight to real fds regardless of self.sink -- only
-    // the shell's *own* diagnostics along that tail (e.g. a failed spawn)
-    // are affected, which is exactly the intended, correct behavior.
+    // `dispatch_builtin_or_external_impl` with a per-command
+    // output-redirect sink pushed around it (see
+    // `push_builtin_output_sink`). One push and pop here covers every
+    // return path: builtins return from the match, and the external tail's
+    // child writes to real fds regardless, so only the shell's own
+    // diagnostics there are affected, as intended.
     fn dispatch_builtin_or_external(
         &mut self,
         argv: &[String],
@@ -6766,24 +6583,10 @@ impl Shell {
         builtin_only: bool,
         array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
     ) -> ExecResult {
-        // Only pop if this call's own push actually installed a new layer
-        // (`Ok(true)`) -- `self.sink` can legitimately already be
-        // `OutputSink::Builtin` when this command starts (e.g. this
-        // command runs inside a converted foreground subshell/command-
-        // substitution/proc-sub, whose own capture is exactly a Builtin
-        // sink left in place for its *whole* run, not just one command --
-        // see run_in_child_shell). Popping unconditionally would strip
-        // that unrelated, still-needed layer the moment a command with no
-        // redirect of its own (push returning `Ok(false)`, doing nothing)
-        // ran inside it.
-        // Only for a command that will run *in* this shell. An
-        // external's redirects are applied to the spawned process by
-        // `resolve_redirects` further down, and expanding them here as
-        // well expanded every redirect target twice: `/bin/echo x >
-        // $(echo side >&2; echo f)` ran that substitution twice, so the
-        // file it created and the file it wrote could be different
-        // ones. Invisible until `>( )` started a process per expansion
-        // and a second `wc -l` answered `0`.
+        // Only for a command that runs in this shell. An external's
+        // redirects are applied to the process by `resolve_redirects`
+        // later, and expanding them here too would expand each target
+        // twice, possibly naming two different files.
         let runs_here = self.is_active_builtin(&name) || self.functions.contains_key(&name);
         let pushed = if runs_here {
             match self.push_builtin_output_sink(&cmd.redirects, &name) {
@@ -6796,9 +6599,12 @@ impl Shell {
         } else {
             false
         };
-        // A builtin's own redirects are a scope `run_exit_trap` waits on
-        // too: `exit > f`, `eval exit > f` and `. file > f` all put the
-        // descriptor back before bash says goodbye.
+        // A builtin's own redirects are a scope `run_exit_trap` waits on:
+        // `exit > f`, `eval exit > f` and `. file > f` restore the
+        // descriptor before bash says goodbye. Popped only if this call
+        // pushed: the sink may already be a `Builtin` installed for a whole
+        // converted construct (see `run_in_child_shell`), which mustn't be
+        // stripped.
         if pushed {
             self.redirect_scopes += 1;
         }
@@ -6807,25 +6613,19 @@ impl Shell {
             self.pop_builtin_output_sink();
             self.leave_redirect_scope(&result);
         }
-        // With that command's own redirect sink off again, a bare `exec`
-        // can say where this shell's output goes from here.
+        // With the command's redirect sink gone, a bare `exec` can say
+        // where this shell's output goes from now on.
         if let Some(moved) = self.descriptors_to_follow.take() {
             self.follow_moved_descriptors(&moved);
         }
         result
     }
 
-    // Split out from run_single so `builtin NAME...` (its own arm below)
-    // can re-enter just the builtin-dispatch-and-external-spawn part,
-    // bypassing run_single's own function-shadowing check above -- that
-    // bypass is the entire point of `builtin`. `builtin_only` is true
-    // only for that recursive call: on no match, it reports "not a
-    // shell builtin" instead of falling through to
-    // restrict_to_builtins/external-spawn like the ordinary top-level
-    // path does. `array_literal_args` is the same side-channel argv's
-    // own doc comment above describes -- empty for the `builtin` arm's
-    // own recursive call (`builtin declare -A m=(...)` isn't supported,
-    // an accepted narrow gap given how rare combining the two is).
+    // Split from `run_single` so `builtin NAME...` can reach the builtin
+    // dispatch past `run_single`'s function shadowing. `builtin_only` is set
+    // for that call: no match means "not a shell builtin" instead of falling
+    // through to an external. `array_literal_args` is empty for it, so
+    // `builtin declare -A m=(...)` isn't supported.
     fn dispatch_builtin_or_external_impl(
         &mut self,
         argv: &[String],
@@ -6835,17 +6635,10 @@ impl Shell {
         builtin_only: bool,
         array_literal_args: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)],
     ) -> ExecResult {
-        // `enable -n NAME` takes a builtin out of service so the external
-        // of the same name runs instead. Done by handing the dispatch a
-        // name no arm can match, rather than by jumping past it: the
-        // external path is the code immediately after this match, and
-        // this is the one place that chooses between the two.
-        //
-        // `builtin NAME` does not get an exemption. It looks as though
-        // it should -- `builtin` is how you reach past a *function* of
-        // the same name -- but bash refuses a disabled builtin there
-        // too, with "not a shell builtin", which is exactly what
-        // falling through this match produces.
+        // `enable -n NAME` hands the dispatch a name no arm matches, so the
+        // external of that name runs: the external path follows the match. No
+        // exception for `builtin NAME`: bash refuses a disabled builtin there
+        // too, with "not a shell builtin", which falling through gives.
         let dispatch_name: &str = if self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
         match dispatch_name {
             // POSIX special builtin: does nothing, exits 0. Its arguments
@@ -6919,21 +6712,15 @@ impl Shell {
                 }
                 ext.args(&argv[i + 1..]);
                 ext.current_dir(&self.cwd);
-                // Without these, `command foo` would always inherit the
-                // real process's own stdio, invisible to a converted
-                // foreground subshell/command-substitution/proc-sub's own
-                // capture (see spawn_stdin_stdio/spawn_stdout_stdio's own
-                // doc comment) -- confirmed the hard way: `mise`'s own
-                // activation script shadows itself with a `mise()`
-                // function that calls `command "$__MISE_EXE" ...` to reach
-                // the real binary, so `$(mise hook-env ...)` from inside
-                // it went straight through this path, silently landing on
-                // the real terminal instead of being captured.
+                // The construct's stdio, so `command foo` inside a
+                // converted subshell or substitution is captured (mise's
+                // activation shadows itself with a function calling
+                // `command "$__MISE_EXE"`, inside `$( )`).
                 ext.stdin(self.spawn_stdin_stdio());
                 ext.stdout(self.spawn_stdout_stdio());
-                // See apply_fd_redirects' pre_exec comment: without this,
-                // `command foo` would inherit bish's own ignored SIGINT
-                // and never respond to Ctrl-C.
+                // See `apply_fd_redirects`' pre_exec: otherwise
+                // `command foo` inherits bish's ignored SIGINT and ignores
+                // Ctrl-C.
                 #[cfg(unix)]
                 unsafe {
                     ext.pre_exec(|| {
@@ -6945,9 +6732,8 @@ impl Shell {
                 return match ext.status() {
                     Ok(status) => ExecResult::Status(exit_code_from_status(status)),
                     Err(e) => {
-                        // Same three answers and two statuses as an
-                        // ordinary command word -- see the Err arm in
-                        // spawn_external.
+                        // The same answers and statuses as an ordinary
+                        // command word; see `spawn_external`'s Err arm.
                         let name = &argv[i];
                         let not_found = e.kind() == std::io::ErrorKind::NotFound;
                         let (text, status) = match (not_found, name.contains('/')) {
@@ -6961,14 +6747,10 @@ impl Shell {
                     }
                 };
             }
-            // builtin NAME [args...]: forces the real builtin even when a
-            // same-named function is defined -- the explicit bypass for
-            // the function-shadowing run_single now does by default (see
-            // its own doc comment). Unlike an ordinary command that falls
-            // back to spawning an external program when nothing matches,
-            // `builtin` never does that (builtin_only: true below) --
-            // matching bash's own "not a shell builtin" error instead.
-            // Bare `builtin` (no name) is a silent no-op, matching bash.
+            // `builtin NAME [args...]`: the real builtin even when a
+            // function shadows it, never an external ("not a shell builtin"
+            // instead, as in bash). Bare `builtin` does nothing, as in
+            // bash.
             "builtin" => {
                 if argv.len() < 2 {
                     return ExecResult::Status(0);
@@ -6977,12 +6759,9 @@ impl Shell {
                 return self.dispatch_builtin_or_external(&argv[1..], inner_name, cmd, background, true, &[]);
             }
             "type" => return ExecResult::Status(crate::builtins::shell::run_type(self, &argv[1..])),
-            // No command-path cache exists to manage -- every exec
-            // re-resolves PATH via Command::status() itself -- so this is
-            // a documented no-op rather than a real cache: `hash -r`
-            // (clear) and bare `hash cmd` (remember) both just succeed.
-            // Bare `hash` with no args normally lists the cache; ours is
-            // always empty, so that's the one output bash-compat requires.
+            // There's no command path cache (PATH is resolved at every
+            // spawn), so `hash -r` and `hash cmd` just succeed, and bare
+            // `hash` prints the empty cache as bash would.
             "hash" => {
                 if let Some(bad) = first_unknown_option(&argv[1..], "lrpdt") {
                     let usage = "hash [-lr] [-p pathname] [-dt] [name ...]";
@@ -6993,12 +6772,12 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            // Real builtins, as they are in bash: a `while true` loop
-            // should not spawn a process per iteration.
+            // Builtins, as in bash, so `while true` doesn't spawn per
+            // iteration.
             "true" => return ExecResult::Status(0),
             "false" => return ExecResult::Status(1),
-            // Job control belongs to the terminal, and a shell without
-            // it cannot hand itself back -- bash says exactly this.
+            // A shell without job control can't hand itself back, as bash
+            // says.
             "suspend" => {
                 if !self.opt_monitor {
                     sh_eprintln!(self, "bish: suspend: cannot suspend: no job control");
@@ -7008,15 +6787,13 @@ impl Shell {
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
-            // A builtin, as it is in bash, and not for tidiness: it has
-            // to report the *shell's* idea of where it is, it has to
-            // work when PATH is empty, and `type pwd` has to say so.
-            // Resolving to /usr/bin/pwd meant all three were wrong.
+            // A builtin, as in bash: it reports the shell's own idea of
+            // where it is, works with an empty PATH, and `type pwd` says
+            // so.
             "pwd" => {
-                // `-P` is the resolved path and `-L` the one the shell
-                // holds; they are the same here, because `cd` resolves
-                // symlinks as it goes (see the divergence recorded for
-                // that in bashdiff).
+                // `-P` is the resolved path and `-L` the shell's; the same
+                // here, since `cd` resolves symlinks as it goes (a
+                // divergence recorded in bashdiff).
                 let physical = argv[1..].iter().any(|a| a == "-P");
                 let here = match physical {
                     true => std::fs::canonicalize(&self.cwd).unwrap_or_else(|_| self.cwd.clone()),
@@ -7025,21 +6802,15 @@ impl Shell {
                 sh_println!(self, "{}", here.display());
                 return ExecResult::Status(0);
             }
-            // `e [ARG...]`: bubbles up via ExecResult::Edit -- see its
-            // own doc comment, and Fg's, for why this can't just be
-            // driven from here directly. The arguments are passed on
-            // unparsed for the same reason: deciding what they mean
-            // needs the editor, not the shell.
+            // `e [ARG...]` bubbles up as `ExecResult::Edit` (see it and
+            // `Fg`), its arguments unparsed: what they mean is the editor's
+            // to decide.
             "e" => {
                 self.pending_edit = Some(argv[1..].to_vec());
                 return ExecResult::Edit;
             }
-            // Real builtins (not just something the external /bin/echo,
-            // /bin/printf would cover) -- see run_echo/run_printf's own
-            // doc comments. Matters beyond ordinary interactive use:
-            // command mode (restrict_to_builtins, below) disallows
-            // externals outright, and echo/printf are two of the most
-            // reached-for commands for producing quick output there.
+            // Builtins (see `run_echo`, `run_printf`), which also matters
+            // on the colon line, where externals aren't allowed.
             "echo" => return ExecResult::Status(crate::builtins::io::run_echo(self, &argv[1..])),
             "printf" => return ExecResult::Status(crate::builtins::io::run_printf(self, &argv[1..])),
             "umask" => return ExecResult::Status(crate::builtins::limits::run_umask(self, &argv[1..])),
@@ -7048,14 +6819,11 @@ impl Shell {
             "help" => return ExecResult::Status(crate::builtins::shell::run_help(self, &argv[1..])),
             "caller" => return ExecResult::Status(crate::builtins::shell::run_caller(self, &argv[1..])),
             "ulimit" => return ExecResult::Status(crate::builtins::limits::run_ulimit(self, &argv[1..])),
-            // alias/unalias: store and query only, no expansion when a
-            // command runs -- see the comment on the `aliases` field for
-            // why.
+            // `alias`/`unalias`: the table; expansion happens when lines
+            // are read (see `expand_aliases`).
             "alias" => {
-                // `-p` prints them all, the same as no arguments --
-                // bash's flag for "give me something re-runnable", and
-                // it used to be read as an alias *name* and reported
-                // as not found.
+                // `-p` prints them all, like no arguments: bash's "give me
+                // something re-runnable".
                 if argv.len() == 1 || argv[1..].iter().all(|a| a == "-p") {
                     let mut sorted: Vec<&(String, String)> = self.aliases.iter().collect();
                     crate::sort::sort_by(&mut sorted, |a, b| a.0.cmp(&b.0));
@@ -7109,57 +6877,36 @@ impl Shell {
             "abbr" => return ExecResult::Status(crate::builtins::bish::run_abbr(self, &argv[1..])),
             "history" => return ExecResult::Status(crate::builtins::history::run_history(self, &argv[1..])),
             "fc" => return ExecResult::Status(crate::builtins::history::run_fc(self, &argv[1..])),
-            // `= EXPR`: evaluate and print. The other half of the inline
-            // calculator whose answer the prompt already shows as ghost
-            // text while it is being typed (bishedit::suggestion::
-            // ArithSuggestionProvider) -- pressing Enter runs this and
-            // makes the answer real output, so it can be piped, captured
-            // or scrolled back to.
+            // `= EXPR`: evaluate and print, the Enter half of the inline
+            // calculator whose answer shows as ghost text while typing
+            // (`ArithSuggestionProvider`), so it can be piped or captured.
             "=" => return ExecResult::Status(self.run_arith_print(&argv[1..])),
             "shopt" => return ExecResult::Status(crate::builtins::shell::run_shopt(self, &argv[1..])),
             "bishopt" => return ExecResult::Status(crate::builtins::bish::run_bishopt(self, &argv[1..], KNOWN_BISHOPTS)),
-            // `::bish SUBCOMMAND...`: a dedicated namespace for bish-
-            // specific commands that don't belong as an ordinary top-
-            // level builtin name (see run_bish's own doc comment for
-            // why) -- `theme` (begin/end a theme declaration) is the
-            // first subcommand.
+            // `::bish SUBCOMMAND...`: bish's own namespace (see `run_bish`).
             "::bish" => return crate::builtins::bish::run_bish(self, &argv[1..]),
             "compgen" => return ExecResult::Status(crate::builtins::completion::run_compgen(self, &argv[1..])),
             "complete" => return ExecResult::Status(crate::builtins::completion::run_complete(self, &argv[1..])),
             "compopt" => return ExecResult::Status(crate::builtins::completion::run_compopt(self, &argv[1..])),
-            // Available in command mode, and at any prompt a real window
-            // manager is behind. It used to be
-            // command-mode-exclusive and is again, but for a better
-            // reason than before: `::bish window` is the canonical
-            // spelling everywhere else. A top-level builtin called
-            // `window` shadows any real `window` on `$PATH` for every
-            // script run under bish, which is a lot to charge for a
-            // shorter name. The colon line is the one place the short
-            // form costs nothing -- it runs builtins exclusively, so
-            // there is no external there for it to shadow.
-            // "w" deliberately isn't an alias here (unlike "win") -- it's
-            // reserved for a future vim-style `:w` write command instead,
-            // matching bishedit's normal-mode Ctrl-W leader now covering
-            // window management directly (see vimkeys.rs's WindowCmd).
+            // On the colon line only, where builtins run exclusively, so
+            // there's no external for the short name to shadow; elsewhere
+            // it's `::bish window`. `w` isn't an alias: it's kept for a
+            // vim-style `:w`.
             "window" | "win" if self.restrict_to_builtins => {
                 return crate::builtins::bish::run_window(self, &argv[1..]);
             }
             "pushd" => return ExecResult::Status(crate::builtins::dirs::run_pushd(self, &argv[1..])),
             "popd" => return ExecResult::Status(crate::builtins::dirs::run_popd(self, &argv[1..])),
             "dirs" => return ExecResult::Status(crate::builtins::dirs::run_dirs(self, &argv[1..])),
-            // `export` is equivalent to `declare -x` (real bash documents
-            // it that way) -- routing through run_declare means it shares
-            // -x's local-variable-mirroring behavior instead of the
-            // simpler, env-only handling this had before.
+            // `export` is `declare -x`, as bash documents, sharing `-x`'s
+            // handling of locals.
             "export" => {
-                // `export -f NAME` marks a *function* for export.
-                // bash carries it to a child through the environment;
-                // bish's own children already inherit the function
-                // table wholesale (see `new_virtual_child`), so there
-                // is nothing to arrange -- but it has to be quiet and
-                // it has to notice a name that is not a function,
-                // rather than falling through to `declare -f`, which
-                // prints the body.
+                // `export -f NAME` marks a function for export. bash
+                // carries it through the environment; bish's children
+                // inherit the function table already (see
+                // `new_virtual_child`), so it only has to be quiet and
+                // reject a name that isn't a function, not fall through to
+                // `declare -f`, which prints it.
                 if argv.get(1).map(String::as_str) == Some("-f") {
                     let mut status = 0;
                     for name in &argv[2..] {
@@ -7170,10 +6917,9 @@ impl Shell {
                     }
                     return ExecResult::Status(status);
                 }
-                // `export -n NAME` takes the export attribute away and
-                // leaves the value. It cannot go through run_declare:
-                // `-n` there means *nameref*, so this used to turn the
-                // variable into one and lose its value entirely.
+                // `export -n NAME` removes the export attribute, keeping
+                // the value. Not through `run_declare`, where `-n` means
+                // nameref.
                 if argv.get(1).map(String::as_str) == Some("-n") {
                     for name in &argv[2..] {
                         Rc::make_mut(&mut self.exported_names).remove(name);
@@ -7182,28 +6928,20 @@ impl Shell {
                 }
                 let mut declare_args = vec!["-x".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
-                // Dropping argv[0] ("export") shifts every recorded
-                // position back by one; prepending "-x" here shifts them
-                // forward by one again -- net zero, so array_literal_args
-                // (itself indexed into the *original* argv) already lines
-                // up with declare_args unchanged.
+                // Dropping `export` and prepending `-x` cancel out, so
+                // `array_literal_args` (indexed into the original argv)
+                // still lines up with `declare_args`.
                 return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &declare_args, array_literal_args));
             }
             "let" => {
                 let mut last = 0i64;
                 for a in &argv[1..] {
-                    // `arith::eval` and not `eval_arith`: by the time an
-                    // argument reaches a builtin the word stage has
-                    // already expanded it once, and `eval_arith`'s own
-                    // pass -- which `$(( ))` needs, because the parser
-                    // hands it its interior raw -- would be a second
-                    // one. A second pass is how `x='$(touch M)'; let
-                    // "y=$x+1"` came to run the command: the first pass
-                    // turned `$x` into its value and the second ran what
-                    // was in it. bash expands `let`'s text not at all --
-                    // every `$` form reaching it errors, including a
-                    // single-quoted `$x` -- so this matches it and
-                    // closes that in one move.
+                    // `arith::eval`, not `eval_arith`: the argument is
+                    // already expanded, and `eval_arith`'s own pass (which
+                    // `$(( ))` needs, getting its interior raw) would be a
+                    // second one, running `$(touch M)` hidden in a
+                    // variable's value. bash doesn't expand `let`'s text at
+                    // all.
                     match arith::eval(a, self) {
                         Ok(v) => last = v,
                         Err(e) => {
@@ -7227,14 +6965,11 @@ impl Shell {
                     }
                 });
             }
-            // `[[` is a keyword (see lexer.rs/parser.rs Command::Test), not
-            // a plain command name, so it never reaches this dispatch --
-            // only bracket-style `[ ... ]` (the `test` alias) does.
+            // `[[` is a keyword (`Command::Test`) and never reaches this
+            // dispatch; only `[`, `test`'s other name, does.
             "[" => {
-                // The closing `]` is punctuation, not an operand, so it
-                // is dropped by not looking at it -- rather than by
-                // copying every argument into a vector of its own to
-                // pop one off the end.
+                // The closing `]` is punctuation, dropped by not looking at
+                // it.
                 let args = match argv[1..].split_last() {
                     Some((last, rest)) if last == "]" => rest,
                     _ => {
@@ -7254,11 +6989,8 @@ impl Shell {
             }
             "return" => {
                 let code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(self.last_status);
-                // A sourced file counts, and says so: bash's own
-                // wording names both places this is allowed. The status
-                // is 2 -- the usage error -- and not the argument,
-                // which `return 3` at top level was handing back as
-                // though it had worked.
+                // A sourced file is allowed too, and bash's message names
+                // both places. Status 2, the usage error, not the argument.
                 if self.var_scopes.is_empty() && self.source_depth == 0 {
                     sh_eprintln!(self, "bish: return: can only `return' from a function or sourced script");
                     return ExecResult::Status(2);
@@ -7329,11 +7061,8 @@ impl Shell {
                 // enumeration below.
                 let shifted_array_literals: Vec<_> =
                     array_literal_args.iter().filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone()))).collect();
-                // `-r` was not handled at all, and the letters did not
-                // cluster: `local -ir v=1` set neither attribute, so
-                // the readonly was silently not a readonly. Same shape
-                // as `declare`'s own list -- every flag here is a
-                // single letter with no argument of its own.
+                // `local`'s flags cluster, as `declare`'s do
+                // (`local -ir v=1`), each a single letter with no argument.
                 let mut readonly_flag = false;
                 for (i, a) in argv[1..].iter().enumerate() {
                     if a.len() > 1 && a.starts_with('-') && a != "--" {
@@ -7356,12 +7085,10 @@ impl Shell {
                     if a == "--" {
                         continue;
                     }
-                    // `local -A m=([a]=1 [b]=2)` -- this position is
-                    // actually an array literal (`a` here is just its
-                    // xtrace-only display text). The table-snapshot/
-                    // reset dance below is identical to the plain-name
-                    // array case; only the population step (via
-                    // apply_array_literal) is new.
+                    // `local -A m=([a]=1 [b]=2)`: an array literal at this
+                    // position (`a` is its xtrace text). Snapshotted and
+                    // reset as for a plain array name, then filled by
+                    // `apply_array_literal`.
                     if let Some((_, name, mode, items)) = shifted_array_literals.iter().find(|(pos, ..)| *pos == i) {
                         match array_mode {
                             Some(true) => {
@@ -7418,9 +7145,9 @@ impl Shell {
                         Rc::make_mut(&mut self.exported_names).insert(n.clone());
                     }
                     match array_mode {
-                        // The bare `local -a x` form declares without
-                        // assigning: the attribute is local, and there
-                        // is no value until something writes one.
+                        // `local -a x` declares without assigning: the
+                        // attribute is local, and there's no value until
+                        // one is written.
                         Some(true) => {
                             let prev = self.assoc_arrays.remove(&n);
                             let was = self.assoc_names.contains(&n);
@@ -7438,11 +7165,10 @@ impl Shell {
                                 self.assign_var_global(&n, v.unwrap_or_default());
                                 continue;
                             }
-                            // `local x` with no `=` declares the name
-                            // and leaves it *unset* -- see var_scopes.
-                            // Storing an empty string here is what made
-                            // `${x-default}` inside a function unable
-                            // to tell "my caller did not set this".
+                            // `local x` without `=` declares the name and
+                            // leaves it unset (see `var_scopes`), so
+                            // `${x-default}` can tell the caller didn't set
+                            // it.
                             let Some(v) = v else {
                                 self.var_scopes.last_mut().unwrap().insert(n, None);
                                 continue;
@@ -7468,9 +7194,8 @@ impl Shell {
                 }
                 return ExecResult::Status(0);
             }
-            // `logout` is `exit` for a login shell, and a refusal
-            // anywhere else -- including a `( )` or a pipeline stage of
-            // one, which bash does not count as the login shell either.
+            // `logout` is `exit` for a login shell and refused elsewhere,
+            // including a `( )` or pipeline stage of one, as in bash.
             "exit" | "logout" => {
                 let name = argv[0].as_str();
                 if name == "logout" && !self.login_shell {
@@ -7485,9 +7210,8 @@ impl Shell {
                     [] => self.last_status,
                     [a] => match a.parse::<i32>() {
                         Ok(n) => n,
-                        // Reported, and then *not* obeyed: bash 5.3
-                        // carries on with 2 rather than guessing what
-                        // was meant. Posix mode still leaves.
+                        // Reported and not obeyed: bash 5.3 carries on with
+                        // 2. Posix mode still leaves.
                         Err(_) => {
                             sh_eprintln!(self, "bish: {}: {}: numeric argument required", name, a);
                             if !self.opt_posix {
@@ -7498,16 +7222,14 @@ impl Shell {
                             return ExecResult::Exit(2);
                         }
                     },
-                    // An error that still leaves, with 1. It used to
-                    // leave with the first number, silently.
+                    // An error that still leaves, with 1.
                     _ => {
                         sh_eprintln!(self, "bish: {}: too many arguments", name);
                         1
                     }
                 };
-                // The trap sees the status being left with as `$?`:
-                // `trap 'echo $?' EXIT; exit 4` prints 4. It printed
-                // whatever the command before `exit` had left behind.
+                // The trap sees the exit status as `$?`:
+                // `trap 'echo $?' EXIT; exit 4` prints 4.
                 let code = exit_status_byte(code);
                 self.last_status = code;
                 self.run_exit_trap();
@@ -7520,25 +7242,16 @@ impl Shell {
                 let mut nchars: Option<usize> = None;
                 let mut delim: u8 = b'\n';
                 let mut read_u_flag: Option<&str> = None;
-                // -s (silent/no-echo): suppresses terminal echo for the
-                // duration of this one read, via term::NoEchoGuard (same
-                // hand-rolled-against-glibc termios layout RawGuard already
-                // uses, no libc crate). Only meaningful against a real,
-                // interactive terminal -- gated the same way `-p`'s own
-                // prompt already is below (is_real_stdin && stdin_is_tty()),
-                // and only when this read isn't actually coming from a
-                // coproc fd (-u) instead of the terminal.
+                // `-s`: no echo for this read (`term::NoEchoGuard`), only
+                // against an interactive terminal, gated like `-p`'s prompt
+                // below, and not when reading a coproc fd (`-u`).
                 let mut silent = false;
-                // Without `-r`, a backslash escapes the next character
-                // -- and the delimiter, which continues the line.
+                // Without `-r`, a backslash escapes the next character, the
+                // delimiter included, which continues the line.
                 let mut raw = false;
                 let mut timeout_arg: Option<&str> = None;
-                // Short options cluster, the way every other shell
-                // builtin's do: `-ra arr` is `-r -a arr`, and `-rn2` is
-                // `-r -n 2`. Matching whole argument strings meant
-                // `read -ra p` took `-ra` for a *variable name*, so the
-                // commonest spelling of the commonest idiom silently
-                // read into nothing.
+                // Short options cluster: `-ra arr` is `-r -a arr`, `-rn2`
+                // is `-r -n 2`.
                 let mut i = 1;
                 'args: while i < argv.len() {
                     let a = argv[i].as_str();
@@ -7559,9 +7272,8 @@ impl Shell {
                     let mut ci = 1;
                     while ci < bytes.len() {
                         let c = bytes[ci] as char;
-                        // The options that take a value take the rest of
-                        // the cluster if there is one, and the next
-                        // argument otherwise.
+                        // An option taking a value takes the rest of the
+                        // cluster, or the next argument.
                         if matches!(c, 'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u') {
                             let value: Option<&str> = if ci + 1 < bytes.len() {
                                 Some(&a[ci + 1..])
@@ -7573,19 +7285,18 @@ impl Shell {
                                 'a' => array_name = value,
                                 'p' => prompt = value,
                                 'n' | 'N' => nchars = value.and_then(|v| v.parse::<usize>().ok()),
-                                // `-d ''` is bash's spelling of "delimit
-                                // on NUL", which is what `find -print0`
-                                // and `git ls-files -z` produce -- the
-                                // empty string has no first byte, so it
-                                // cannot simply fall back to a newline.
+                                // `-d ''` delimits on NUL, as
+                                // `find -print0` and `git ls-files -z`
+                                // produce; the empty string has no first
+                                // byte to use.
                                 'd' => delim = value.map(|v| v.bytes().next().unwrap_or(0)).unwrap_or(b'\n'),
-                                // Enforced below, and only against real
-                                // stdin (see is_real_stdin).
+                                // Enforced below, only against real stdin
+                                // (see `is_real_stdin`).
                                 't' => timeout_arg = value,
                                 'u' => read_u_flag = value,
-                                // `-i text` seeds the line editor, which
-                                // this read has none of: accepted and
-                                // ignored, like bash does with no tty.
+                                // `-i text` seeds a line editor this read
+                                // doesn't have: ignored, as bash does
+                                // without a tty.
                                 _ => {}
                             }
                             break;
@@ -7593,8 +7304,8 @@ impl Shell {
                         match c {
                             'r' => raw = true,
                             's' => silent = true,
-                            // `-e`/`-E`: read through the line editor.
-                            // Accepted; there is nothing to edit with.
+                            // `-e`/`-E`: the line editor; accepted, with
+                            // nothing to edit with.
                             'e' | 'E' => {}
                             _ => {
                                 let usage = "read [-Eers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]";
@@ -7616,13 +7327,11 @@ impl Shell {
                     }
                 }
                 if let Some(secs) = timeout_secs {
-                    // `-t 0` is a question, not a read: has the source
-                    // got something to give right now? It consumes
-                    // nothing and assigns nothing, which is what makes
-                    // it useful as a "would this block?" test.
+                    // `-t 0` asks whether the source has something now,
+                    // reading and assigning nothing: a "would this block?"
+                    // test.
                     if secs == 0.0 {
-                        // A file, here-doc or here-string is always
-                        // ready -- there is nothing to wait for.
+                        // A file, heredoc or here-string is always ready.
                         let ready = !is_real_stdin || stdin_ready(0);
                         return ExecResult::Status(i32::from(!ready));
                     }
@@ -7632,16 +7341,14 @@ impl Shell {
                             return ExecResult::Status(1);
                         }
                     }
-                    // A non-stdin source (file/heredoc/here-string redirect)
-                    // has no pollable fd for a meaningful timeout check, so
-                    // -t against those is treated as immediately ready.
+                    // A redirected source has no fd to poll, so `-t` treats
+                    // it as ready.
                 }
 
-                // `-u FD` reads from a fd this shell already has open (most
-                // commonly a coproc's read end, coproc_fds[NAME[0]]) instead
-                // of the command's own stdin/redirect -- borrowed tightly in
-                // its own block so the borrow of self.coproc_fds ends before
-                // the assign_var calls below need `&mut self` again.
+                // `-u FD` reads a descriptor this shell holds (usually a
+                // coproc's read end) instead of stdin, in its own block so
+                // the `coproc_fds` borrow ends before the assignments
+                // below.
                 let ufd = read_u_flag.and_then(|s| s.parse::<i32>().ok());
                 let _silent_guard =
                     if silent && ufd.is_none() && is_real_stdin && stdin_is_tty() { crate::term::NoEchoGuard::enable(0).ok() } else { None };
@@ -7652,10 +7359,9 @@ impl Shell {
                             sh_eprintln!(self, "bish: read: {}: invalid file descriptor", fd);
                             return ExecResult::Status(1);
                         }
-                        // Not a coproc's end: an ordinary descriptor
-                        // this shell holds open, `exec 3<file`'s being
-                        // the usual one. Unbuffered for the same reason
-                        // stdin is -- see UnbufferedFd.
+                        // Not a coproc's end: a descriptor this shell
+                        // holds, such as from `exec 3<file`. Unbuffered, as
+                        // stdin is (see UnbufferedFd).
                         None if !UnbufferedFd::is_open(fd) => {
                             sh_eprintln!(self, "bish: read: {}: invalid file descriptor: Bad file descriptor", fd);
                             return ExecResult::Status(1);
@@ -7674,9 +7380,9 @@ impl Shell {
                     None => ExecResult::Status(1),
                     Some(line) => {
                         let ifs = self.get_ifs();
-                        // Without `-r` the escapes come off, and what
-                        // they protected is remembered so a separator
-                        // one of them covered stays part of its field.
+                        // Without `-r` the escapes come off, and what they
+                        // protected is remembered, so an escaped separator
+                        // stays in its field.
                         let (line, mask) = if raw { (line, Vec::new()) } else { unescape_read_line(&line) };
                         let chars: Vec<char> = line.chars().collect();
                         let mask = if raw { vec![false; chars.len()] } else { mask };
@@ -7720,32 +7426,21 @@ impl Shell {
                     }
                 };
             }
-            // mapfile/readarray [-t] [name]. Reads lines from stdin (or
-            // this command's own `<` redirect, via the same
-            // read_input_source machinery `read` uses) into an indexed
-            // array, one element per line -- default array name MAPFILE.
-            // Only `-t` (strip trailing newlines) is recognized; other
-            // real bash flags (-n/-O/-s/-C/-c/-u/-d) are accepted and
-            // ignored rather than erroring, a scoped subset covering the
-            // overwhelmingly common `mapfile -t arr < file` usage.
+            // `mapfile`/`readarray [options] [name]`: reads lines from
+            // stdin (or the command's `<`, through `read_input_source`)
+            // into an indexed array, MAPFILE by default.
             "mapfile" | "readarray" => {
                 let mut strip_newline = false;
                 let mut array_name = "MAPFILE".to_string();
-                // The counted options, each acted on now rather than
-                // only validated: `-n` how many lines to keep, `-s` how
-                // many to skip first, `-O` the index to start writing
-                // at, `-u` the descriptor to read instead of stdin.
-                // (`-c`/`-C` are the progress callback, still accepted
-                // and ignored -- there is nothing to call back into.)
+                // `-n` lines to keep, `-s` to skip first, `-O` the start
+                // index, `-u` a descriptor instead of stdin. `-c`/`-C`, the
+                // progress callback, are accepted and ignored.
                 let mut max_lines = 0u64;
                 let mut skip = 0u64;
                 let mut origin = 0u64;
                 let mut from_fd: Option<i32> = None;
                 let mut bad_count: Option<(String, String)> = None;
-                // What separates one element from the next. `-d` was
-                // parsed and then thrown away, so `mapfile -d, arr`
-                // read *lines* -- and the option did not cluster
-                // either, so `-d,` was rejected outright as `-,`.
+                // What separates elements; `-d` clusters (`-d,`).
                 let mut delim = b'\n';
                 let usage = format!("{} [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", name);
                 let mut i = 1;
@@ -7779,8 +7474,7 @@ impl Shell {
                                 return ExecResult::Status(2);
                             };
                             match c {
-                                // An empty `-d ''` delimits on NUL, as
-                                // it does for `read`.
+                                // `-d ''` delimits on NUL, as for `read`.
                                 'd' => delim = value.bytes().next().unwrap_or(0),
                                 'n' | 's' | 'O' | 'u' => match value.parse::<u64>() {
                                     Ok(v) => match c {
@@ -7798,9 +7492,8 @@ impl Shell {
                                         bad_count = Some((value.to_string(), what.to_string()));
                                     }
                                 },
-                                // `-C callback` and `-c quantum`: the
-                                // progress hook, accepted and ignored --
-                                // there is nothing to call back into.
+                                // `-C callback` and `-c quantum`: ignored,
+                                // nothing to call back into.
                                 _ => {}
                             }
                             break;
@@ -7840,10 +7533,9 @@ impl Shell {
                             if seen <= skip {
                                 continue;
                             }
-                            // `-t` takes off the delimiter, whatever it
-                            // is -- not "trailing whitespace". With
-                            // `-d,` on `a,b,c` bash keeps the `\n` that
-                            // ends the last field.
+                            // `-t` removes the delimiter, whatever it is:
+                            // with `-d,` on `a,b,c` bash keeps the `\n`
+                            // ending the last field.
                             if strip_newline && raw.last() == Some(&delim) {
                                 line.pop();
                             }
@@ -7857,21 +7549,12 @@ impl Shell {
                 self.arrays.insert(array_name, map);
                 return ExecResult::Status(0);
             }
-            // `json [-r] [PATH] [FILE]` -- a `jq`-lite convenience
-            // builtin (bash has nothing like this at all): parse JSON,
-            // optionally navigate a dotted-path query (`.foo.bar[2]`,
-            // default `.` -- identity), pretty-print the result. `-r`
-            // prints a string result raw/unquoted (everything else
-            // still pretty-printed) -- the common case for pulling one
-            // value straight into a shell variable (`name=$(json -r
-            // .name config.json)`), matching real jq's own `-r` flag.
-            // `PATH` mirrors jq's own convention exactly, including its
-            // own well-known gotcha: with exactly one positional
-            // argument, that argument is *always* the path, never a
-            // filename (`json file.json` tries to query a path literally
-            // named "file.json", it does not read that file) -- `json .
-            // file.json` is what reads a file with the identity query.
-            // See src/json.rs for the actual parser/query engine.
+            // `json [-r] [PATH] [FILE]`: parse JSON, apply a dotted path
+            // query (`.foo.bar[2]`, default `.`) and pretty-print the
+            // result, like a small jq. `-r` prints a string unquoted, as
+            // jq's does (`name=$(json -r .name config.json)`). As in jq, a
+            // single argument is always the path, so `json . file.json`
+            // reads a file. See json.rs.
             "json" => {
                 let mut raw = false;
                 let mut positional: Vec<&str> = Vec::new();
@@ -7936,12 +7619,9 @@ impl Shell {
                     sh_eprintln!(self, "bish: {}: {}: restricted", name, path);
                     return ExecResult::Status(1);
                 }
-                // `. /dev/stdin <<< "..."` names *this command's* stdin,
-                // which is not the process's whenever a redirect or an
-                // enclosing construct supplies it -- opening the path
-                // read the real fd 0 instead, a terminal or nothing, and
-                // sourced nothing without a word. So stdin, by any of
-                // its names, is read the way `read` reads it.
+                // `. /dev/stdin` names this command's stdin, which a
+                // redirect or enclosing construct may supply, so it's read
+                // as `read` reads it rather than by opening the real fd 0.
                 let names_stdin = matches!(path.as_str(), "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0");
                 let stdin_redirected = cmd.redirects.iter().any(|r| {
                     matches!(
@@ -7961,17 +7641,14 @@ impl Shell {
                 };
                 match text {
                     Ok(src) => {
-                        // For the duration, this file *is* the script:
-                        // a function defined here records it, and a
-                        // frame made here names it. Restored afterwards,
-                        // since `$0` and every later frame belong to the
-                        // outer script again.
+                        // Meanwhile this file is the script: functions
+                        // defined and frames made here name it. Restored
+                        // after.
                         let outer_script = std::mem::replace(&mut self.script_name, path.clone());
-                        // `. file arg...` gives the sourced file its own
-                        // positional parameters, and puts the caller's
-                        // back afterwards. With none given it keeps the
-                        // caller's, which is what makes `. lib.sh`
-                        // inside a function still see `$1`.
+                        // `. file arg...` gives the file its own positional
+                        // parameters, restoring the caller's after. Without
+                        // arguments it keeps the caller's, so `. lib.sh` in
+                        // a function still sees `$1`.
                         let outer_args = match argv.len() > 2 {
                             true => Some(std::mem::replace(self.arg_frames.last_mut().expect("a positional frame"), argv[2..].to_vec())),
                             false => None,
@@ -7979,10 +7656,9 @@ impl Shell {
                         self.source_depth += 1;
                         let result = self.run_source_here(&src, &path);
                         self.source_depth -= 1;
-                        // `return` inside the file ends the file, and
-                        // its code is what the `.` reports. A `return`
-                        // inside a *function* defined here never gets
-                        // this far -- call_function catches its own.
+                        // `return` in the file ends the file, and `.`
+                        // reports its code. A `return` in a function
+                        // defined here is caught by `call_function`.
                         let result = match result {
                             ExecResult::Return(code) => ExecResult::Status(code),
                             other => other,
@@ -7993,18 +7669,15 @@ impl Shell {
                             *frame = args;
                         }
                         self.script_name = outer_script;
-                        // A sourced script fires RETURN when it
-                        // finishes, `functrace` or not -- unlike a
-                        // function, and unlike `eval`, which is why this
-                        // is here rather than inside `run_source_here`.
+                        // A sourced script fires RETURN when it finishes,
+                        // `functrace` or not, unlike a function or `eval`.
                         self.run_pseudo_trap(PseudoTrap::Return);
                         return result;
                     }
                     Err(e) => {
-                        // A directory gets the builtin's own name in
-                        // front of it and bash's lowercase wording;
-                        // everything else is the bare path and the
-                        // system's message. Checked against bash 5.3.
+                        // A directory gets the builtin's name and bash's
+                        // lowercase wording; anything else the bare path
+                        // and the system's message, as in bash 5.3.
                         if std::path::Path::new(&path).is_dir() {
                             sh_eprintln!(self, "bish: {}: {}: is a directory", name, path);
                         } else {
@@ -8019,22 +7692,16 @@ impl Shell {
                     let usage = "trap [-Plp] [[action] signal_spec ...]";
                     return ExecResult::Status(bad_option_status(self, "trap", &bad, usage));
                 }
-                // `--` ends the options, and this is not a nicety: it is
-                // the form `trap -p` itself prints, so without it the
-                // builtin could not read its own output back. `trap --
-                // 'echo t' USR1` set a trap whose action was `--` and
-                // then rejected `echo t` as a signal name.
+                // `--` ends the options, which `trap -p` prints, so `trap`
+                // can read its own output back.
                 let argv: Vec<String> = match argv.iter().position(|a| a == "--") {
                     Some(at) => argv[..at].iter().chain(argv[at + 1..].iter()).cloned().collect(),
                     None => argv.to_vec(),
                 };
                 if argv.len() == 1 || argv.get(1).map(|s| s == "-p").unwrap_or(false) {
-                    // `trap -p NAME...` reports only those. Without
-                    // names every trap is reported, in bash's order:
-                    // EXIT, then the signals by number, then the three
-                    // pseudo-signals. Those three were missing from the
-                    // listing entirely, so a script could set a DEBUG
-                    // or RETURN trap and then not find it.
+                    // `trap -p NAME...` reports only those; without names
+                    // every trap, in bash's order: EXIT, signals by number,
+                    // then the pseudo-signals.
                     let wanted: Vec<String> = argv[2.min(argv.len())..].to_vec();
                     let mut bad = 0;
                     for w in &wanted {
@@ -8078,8 +7745,7 @@ impl Shell {
                     return ExecResult::Status(0);
                 }
                 let cmd_str = argv[1].clone();
-                // A signal this shell cannot name is the command
-                // failing, not a line of output to scroll past.
+                // A signal this shell can't name fails the command.
                 let mut status = 0;
                 for sig in &argv[2..] {
                     if sig == "EXIT" || sig == "0" {
@@ -8087,9 +7753,8 @@ impl Shell {
                         self.exit_trap_depth = self.subshell_depth;
                         continue;
                     }
-                    // The pseudo-signals: not signals, fired by the
-                    // interpreter itself. `-` clears one, same as for a
-                    // real signal.
+                    // The pseudo-signals, fired by the interpreter. `-`
+                    // clears one, as for a real signal.
                     if let Some(which) = match sig.as_str() {
                         "DEBUG" => Some(PseudoTrap::Debug),
                         "ERR" => Some(PseudoTrap::Err),
