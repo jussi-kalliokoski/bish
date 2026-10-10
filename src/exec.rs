@@ -13457,11 +13457,8 @@ fn ifs_tokenize(v: &str, ifs: &str) -> (Vec<String>, bool, bool) {
             }
         }
         if i >= n {
-            // A delimiter at the very end of the string is dropped
-            // without producing a trailing empty field -- unlike an
-            // *embedded* separator (e.g. "a::b" is still "a","","b"),
-            // confirmed against real bash: "a:" with IFS=":" splits to
-            // exactly one field, "a", not ["a", ""].
+            // A trailing delimiter makes no empty field, unlike an embedded
+            // one: `a:` with `IFS=:` is just `a`.
             trailing_sep = true;
             break;
         }
@@ -13469,15 +13466,9 @@ fn ifs_tokenize(v: &str, ifs: &str) -> (Vec<String>, bool, bool) {
     (parts, leading_sep, trailing_sep)
 }
 
-// Finds the next IFS-delimited field in `s` (which is assumed to already
-// have any leading separator trimmed), returning (field, remainder-with-
-// its-own-leading-separator-trimmed). None if `s` contains no further
-// delimiter at all. Used by `read NAME1 NAME2 ...`, which needs the
-// untouched remainder text for its last variable rather than a fully
-// re-tokenized-and-rejoined value.
-// ifs_next_field over a line `read` has already unescaped, starting at
-// `from`. A character `escaped` marks is not a separator, whatever it
-// is. Returns the field and where the remainder starts.
+// The next IFS field of a line `read` has unescaped, from `from`;
+// characters marked `escaped` never separate. The field and where the
+// rest starts, which `read`'s last variable takes as it is.
 fn ifs_next_field_masked(chars: &[char], escaped: &[bool], ifs: &str, from: usize) -> Option<(String, usize)> {
     let is_sep = |i: usize| !escaped[i] && ifs.contains(chars[i]);
     let is_ws = |i: usize| !escaped[i] && chars[i].is_whitespace() && ifs.contains(chars[i]);
@@ -13524,35 +13515,24 @@ fn ifs_tokenize_masked(chars: &[char], escaped: &[bool], ifs: &str) -> Vec<Strin
     fields
 }
 
-/// One field of a split word, and the pattern it globs as.
-///
-/// The two differ only where the word was quoted, since quoting is what
-/// makes a `*` text rather than syntax. So `pattern` is `None` for a
-/// field with no quoted part in it -- which is nearly all of them -- and
-/// the field's own text is its pattern.
-///
-/// Kept together rather than as two vectors built side by side. The
-/// pairing was positional, held by four out-parameters threaded through
-/// every append in lockstep, and the second string was built in full
-/// even when it could only ever equal the first.
+/// One field of a split word, and the pattern it globs as. They differ
+/// only where the word was quoted, so `pattern` is `None` for a field
+/// with nothing quoted, which is most of them.
 struct Field {
     text: String,
     pattern: Option<String>,
 }
 
 impl Field {
-    /// What to glob this field as. Its own text, unless quoting made
-    /// part of it inert.
+    /// What to glob this field as: its own text, unless quoting made part
+    /// of it inert.
     fn pattern(&self) -> &str {
         self.pattern.as_deref().unwrap_or(&self.text)
     }
 }
 
-/// A field still being built up, chunk by chunk.
-///
-/// The pattern copy is started only at the moment something diverges --
-/// the first quoted piece -- and begins as whatever the field already
-/// held, which up to that point was its own pattern.
+/// A field being built. The pattern copy starts at the first quoted
+/// piece, from the text so far.
 #[derive(Default)]
 struct FieldBuilder {
     text: String,
@@ -13560,7 +13540,7 @@ struct FieldBuilder {
 }
 
 impl FieldBuilder {
-    /// Text that means what it says: it is its own pattern.
+    /// Text that is its own pattern.
     fn push(&mut self, t: &str) {
         self.text.push_str(t);
         if let Some(p) = &mut self.pattern {
@@ -13568,9 +13548,8 @@ impl FieldBuilder {
         }
     }
 
-    /// Text that must not act as a pattern -- a quoted or backslashed
-    /// piece, or an expanded `~`, whose `*` is a character and not a
-    /// wildcard.
+    /// Text that mustn't act as a pattern: quoted or backslashed, or an
+    /// expanded `~`.
     fn push_inert(&mut self, t: &str) {
         if self.pattern.is_none() {
             self.pattern = Some(self.text.clone());
@@ -13593,8 +13572,7 @@ fn close_field(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>) {
     }
 }
 
-/// Ends it whether or not there is one -- an empty field is still a
-/// field once a separator has said so.
+/// Ends it even when empty: a separator made it a field.
 fn close_field_even_if_empty(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>) {
     fields.push(current.take().unwrap_or_default().finish());
 }
@@ -13605,8 +13583,7 @@ fn close_field_even_if_empty(fields: &mut Vec<Field>, current: &mut Option<Field
 // `y`), and a value that is all separators adds nothing.
 fn append_splittable(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>, v: &str, quoted: bool, ifs: &str) {
     if quoted {
-        // One field, and never a pattern: quoting is exactly the thing
-        // that makes its characters text.
+        // One field, never a pattern.
         current.get_or_insert_with(FieldBuilder::default).push_inert(v);
         return;
     }
@@ -13614,7 +13591,7 @@ fn append_splittable(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>
         return;
     }
     if ifs.is_empty() {
-        // IFS set to the empty string: no splitting at all.
+        // `IFS` empty: no splitting.
         current.get_or_insert_with(FieldBuilder::default).push(v);
         return;
     }
@@ -13637,10 +13614,8 @@ fn append_splittable(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>
     }
 }
 
-// Like append_splittable, but for "$@": the parts are already well-defined
-// (one per positional parameter, never re-split even if a param contains
-// whitespace) rather than derived by splitting a joined string. They
-// arrive already-quoted, so none of them is glob-eligible.
+// `append_splittable` for `"$@"`: one part per positional parameter,
+// never re-split, and none glob-eligible.
 fn append_parts(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>, parts: &[String]) {
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
@@ -13675,10 +13650,9 @@ fn strip_suffix_glob(s: &str, pattern: &str, longest: bool) -> String {
     s.to_string()
 }
 
-// `${V^pattern}` family. An empty pattern (the common `${V^^}` shape with
-// nothing after it) matches every character; otherwise each candidate
-// character is matched against the pattern with the same glob matcher
-// `case` patterns use. `all` picks every matching char vs just the first.
+// `${V^pattern}` and friends. An empty pattern (`${V^^}`) matches every
+// character; otherwise each is matched as a `case` pattern. `all` picks
+// every match rather than the first.
 fn apply_case_convert(cur: &str, pattern: &str, upper: bool, all: bool) -> String {
     let mut result = String::with_capacity(cur.len());
     let mut first = true;
@@ -13698,11 +13672,9 @@ fn apply_case_convert(cur: &str, pattern: &str, upper: bool, all: bool) -> Strin
     result
 }
 
-// `${V:offset}` / `${V:offset:length}`. Character-indexed (not byte), same
-// as everywhere else length/indexing happens in this shell. Negative
-// offset counts back from the end; negative length is an end position
-// counted from the end too (bash: "an offset from the end of the string"),
-// not an error.
+// `${V:offset}` and `${V:offset:length}`, by character. A negative
+// offset counts from the end, and so does a negative length (an end
+// position), as in bash.
 fn substring_expand(s: &str, offset: i64, length: Option<i64>) -> String {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
@@ -13718,23 +13690,10 @@ fn substring_expand(s: &str, offset: i64, length: Option<i64>) -> String {
     chars[start as usize..end as usize].iter().collect()
 }
 
-// Finds the leftmost-longest glob match of `pattern` in `chars` at or
-// after `start_from`, honoring `anchor` (Start/End restrict the search to
-// that specific boundary, matching how `#`/`%` pattern-stripping anchors
-// its own search). Returns the matched (start, end) character range.
-/// Where in `text` the pattern matches, in *character* indices -- which
-/// is what the caller splices by, even though the matching itself is
-/// done on the string.
-///
-/// `bounds` is the byte offset of each character, one longer than the
-/// character count so the end of the string has an entry too. It exists
-/// so a candidate substring is a *slice* of `text` rather than a
-/// freshly built `String`: this walks O(n^2) candidates, and collecting
-/// each one made the loop copy O(n^3) bytes. A profile of
-/// `${s//a/b}` on a 256-character string put 71% of all cycles in the
-/// one `String::extend` that did it, with another tenth in the
-/// allocator underneath -- and made a 1024-character string take longer
-/// than anyone would wait for. Slicing costs nothing at all.
+/// The leftmost-longest match of `pattern` in `text` at or after
+/// `start_from`, in character indices; `anchor` restricts it to the start
+/// or end. `bounds` (see `char_bounds`) makes each candidate a slice, not
+/// a new `String`: there are O(n^2) of them.
 fn find_glob_match(text: &str, bounds: &[usize], start_from: usize, pattern: &str, anchor: ReplaceAnchor) -> Option<(usize, usize)> {
     let n = bounds.len() - 1;
     let slice = |a: usize, b: usize| &text[bounds[a]..bounds[b]];
@@ -13747,18 +13706,11 @@ fn find_glob_match(text: &str, bounds: &[usize], start_from: usize, pattern: &st
         }
         ReplaceAnchor::End => (start_from..=n).find_map(|s| glob::matches(pattern, slice(s, n)).then_some((s, n))),
         ReplaceAnchor::None => {
-            // A pattern with no `*` matches a known number of
-            // characters, so there is exactly one end worth trying at
-            // each start rather than every one to the end of the
-            // string. That is the difference between linear and
-            // quadratic, and it is the shape almost every real
-            // replacement has: `${s//a/b}`, `${path//\//_}`.
+            // A pattern without `*` has a fixed width, so there's one end
+            // to try per start: linear instead of quadratic, for the shape
+            // most replacements have (`${s//a/b}`).
             if let Some(width) = glob::fixed_width(pattern) {
-                // Wider than the whole string: nothing to try. The
-                // saturating subtraction this replaces still yielded the
-                // range `0..=0`, and slicing `width` characters out of a
-                // shorter string panicked -- `${s//abc/Z}` on "ab" was
-                // enough to do it.
+                // Wider than the whole string: nothing to try.
                 if width > n {
                     return None;
                 }
@@ -13774,38 +13726,25 @@ fn find_glob_match(text: &str, bounds: &[usize], start_from: usize, pattern: &st
     }
 }
 
-/// The byte offset of every character in `s`, plus one past the last --
-/// so `bounds[i]..bounds[j]` is the substring from character `i` to
-/// character `j`. Built once per replacement rather than per candidate.
+/// The byte offset of each character in `s` and one past the last, so
+/// `bounds[i]..bounds[j]` is characters `i` to `j`.
 fn char_bounds(s: &str) -> Vec<usize> {
     let mut bounds: Vec<usize> = s.char_indices().map(|(at, _)| at).collect();
     bounds.push(s.len());
     bounds
 }
 
-// `${V/pat/repl}` (first match), `${V//pat/repl}` (all matches),
-// `${V/#pat/repl}` / `${V/%pat/repl}` (anchored -- always a single check,
-// `global` doesn't apply to them since an anchored match can only occur
-// once).
-/// The replacement text for one match, with `&` standing for whatever
-/// was matched and `\&` for a literal ampersand -- `sed`'s convention,
-/// which bash follows here.
-///
-/// Done on the *expanded* replacement, so `r='&'; ${s//X/$r}` puts the
-/// match in as well. That is bash's behaviour, checked rather than
-/// assumed, and it is why this cannot be folded into the earlier
-/// quote-removal pass: by then there would be nothing left to tell an
-/// escaped ampersand from a bare one.
+/// The replacement for one match: `&` is the match, `\&` a literal `&`,
+/// as in sed and bash. Done on the expanded replacement, so
+/// `r='&'; ${s//X/$r}` inserts the match too, as in bash.
 fn expand_replacement(repl: &str, matched: &str) -> String {
     let mut out = String::new();
     let mut chars = repl.chars();
     while let Some(c) = chars.next() {
         match c {
             '&' => out.push_str(matched),
-            // The two escapes `expand_replacement_operand` writes,
-            // undone here: a literal `&`, and a literal backslash.
-            // Any other backslash arrived from an expansion rather
-            // than from the source, and is ordinary text.
+            // The two escapes `expand_replacement_operand` writes; any other
+            // backslash came from an expansion and is text.
             '\\' => match chars.next() {
                 Some('&') => out.push('&'),
                 Some('\\') => out.push('\\'),
@@ -13821,26 +13760,17 @@ fn expand_replacement(repl: &str, matched: &str) -> String {
     out
 }
 
-/// Whether a `${...}` operand can expand to anything but itself.
-///
-/// Very often it cannot. The operands scripts actually write are a
-/// literal character or two -- `${p//\//_}`, `${s#a}`, `${line%%:*}` --
-/// and lexing one into chunks only to walk them back into a `String`
-/// spends its time arriving at the text it started from. Twice per
-/// substitution, because the replacement half is expanded the same way,
-/// and again on every turn of a loop containing it.
-///
-/// Only a byte that can begin an expansion, quote something or escape
-/// something can make the answer differ from the input. The list is
-/// deliberately over-broad: a byte named here that would in fact have
-/// expanded to itself costs nothing but the slow path, while one missing
-/// from it would be a wrong answer. What keeps that honest is
-/// `the_shortcut_agrees_with_the_lexer`, which runs both paths over
-/// every operand shape it can think of and compares them.
+/// Whether a `${...}` operand can only expand to itself, as most do
+/// (`${p//\//_}`, `${s#a}`), skipping the lexer. The byte list is
+/// deliberately broad: an extra byte costs the slow path, a missing one
+/// a wrong answer. `the_shortcut_agrees_with_the_lexer` compares both
+/// paths.
 fn expands_to_itself(raw: &str) -> bool {
     !raw.bytes().any(|b| matches!(b, b'$' | b'`' | b'\'' | b'"' | b'\\' | b'~'))
 }
 
+// `${V/pat/repl}` (first match), `${V//pat/repl}` (all), and the anchored
+// `${V/#pat/repl}` and `${V/%pat/repl}`, which can only match once.
 fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: ReplaceAnchor) -> String {
     let chars: Vec<char> = s.chars().collect();
     let bounds = char_bounds(s);
@@ -13855,19 +13785,11 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
             None => s.to_string(),
         };
     }
-    // An *empty* pattern matches nothing when unanchored -- bash's
-    // pat_subst returns the string untouched rather than splicing the
-    // replacement between every character, so `${s//""/Z}` is a no-op.
-    // A pattern that merely *can* match empty, like `@()`, is not this
-    // case and does splice; only the empty string itself bails, and the
-    // anchored `${s/#}`/`${s/%}` handled above still fire.
-    //
-    // bash draws one further line this does not: on an *empty* string it
-    // replaces for `*`, `**` and `*()` but not for `@()`, `?()` or
-    // `@(*)`, though its own matcher says all six match the empty string
-    // (`[[ "" == @() ]]` is true). Nothing in its documentation accounts
-    // for the split, so bish replaces whenever the pattern matches --
-    // a rule that can at least be written down.
+    // An empty pattern, unanchored, matches nothing: `${s//""/Z}` is a
+    // no-op, as in bash. A pattern that can match empty, like `@()`, does
+    // splice. bash also refuses `@()`, `?()` and `@(*)` on an empty string
+    // while replacing for `*`; it doesn't document why, so bish replaces
+    // whenever the pattern matches.
     if pattern.is_empty() {
         return s.to_string();
     }
@@ -13881,20 +13803,17 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
                 pos = if e0 > s0 {
                     e0
                 } else {
-                    // An empty match -- `@()` and `?()` both match
-                    // nothing -- must still advance, or this loops
-                    // forever. The character it steps over is copied
-                    // through rather than eaten: `${s//@()/Z}` on "abc"
-                    // is `ZaZbZc`.
+                    // An empty match must still advance, copying the
+                    // character it steps over: `${s//@()/Z}` on `abc` is
+                    // `ZaZbZc`.
                     if e0 < chars.len() {
                         out.push(chars[e0]);
                     }
                     e0 + 1
                 };
-                // Reaching the end ends the walk -- bash's own loop is
-                // `while (*s)`. Without this, `${s//*/Z}` matched all of
-                // "abc", then matched empty at the end and replaced
-                // twice, giving `ZZ` where bash gives `Z`.
+                // The end ends the walk, as bash's `while (*s)`: otherwise
+                // `${s//*/Z}` would also match empty at the end and give
+                // `ZZ`.
                 if !global || pos >= chars.len() {
                     if pos <= chars.len() {
                         out.extend(&chars[pos..]);
@@ -13911,11 +13830,8 @@ fn glob_replace(s: &str, pattern: &str, repl: &str, global: bool, anchor: Replac
     out
 }
 
-// `declare -p`'s own value quoting: double-quoted with backslash-escaped
-// '"'/'\'/'$'/'`' (matching real bash's own `declare -p` output), not
-// serialize::quote_literal's single-quote style -- the two aren't
-// interchangeable, this one specifically matches what `declare -p`
-// itself prints.
+// `declare -p`'s quoting: double quotes, with `"`, `\`, `$` and a
+// backtick escaped, as bash prints it.
 fn declare_p_quote(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
@@ -13928,11 +13844,8 @@ fn declare_p_quote(value: &str) -> String {
     out
 }
 
-// Only the four pure string-transform operators -- @A/@a/@K/@P all need
-// context (name/attributes, or live shell state) this function doesn't
-// have, so every call site handles those itself (see eval_var_op/
-// eval_array_var_op's own Transform arms) and never reaches here with
-// them.
+// The pure string transforms. `@A`, `@a`, `@K` and `@P` need shell
+// state, and their callers handle them.
 fn apply_transform(cur: &str, kind: TransformKind) -> String {
     match kind {
         TransformKind::Quote => crate::serialize::quote_literal(cur),
@@ -13952,9 +13865,8 @@ fn apply_transform(cur: &str, kind: TransformKind) -> String {
     }
 }
 
-// Same escape table as the lexer's own $'...' reader (read_ansi_c_string)
-// -- an unrecognized backslash sequence passes through literally rather
-// than dropping the backslash, matching bash's own $'...' behavior.
+// The `$'...'` escapes (`read_ansi_c_string`). An unknown sequence keeps
+// its backslash, as in bash.
 fn expand_backslash_escapes(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -13986,16 +13898,8 @@ fn expand_backslash_escapes(s: &str) -> String {
     out
 }
 
-// One line per builtin, for `help`. Kept beside KNOWN_BUILTINS because
-// the two have to agree: a test asserts every name in that list has a
-// line here and vice versa, so adding a builtin without describing it
-// fails the build rather than silently listing a blank.
-//
-// Deliberately one line each, not bash's paragraphs. bash's `help` is a
-// manual; this is an index -- enough to tell you which builtin you
-// want, after which `::bish <thing> help` or the real manual has the
-// detail. A line that has to wrap is a line nobody reads in a list of
-// sixty.
+// One line per builtin, for `help`: an index, not bash's manual pages.
+// A test checks it against `KNOWN_BUILTINS` both ways.
 pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     (":", "Do nothing, successfully. Arguments are still expanded."),
     ("true", "Do nothing, successfully."),
@@ -14068,11 +13972,9 @@ pub(crate) const BUILTIN_HELP: &[(&str, &str)] = &[
     ("window", "Manage windows and panes."),
 ];
 
-// Kept in sync with run_single's builtin dispatch match by hand -- used
-// only by `command -v`/`type` to classify a name, not to actually run
-// anything, so a name missing from this list just means those two
-// diagnostic builtins under-report it as an external/not-found rather
-// than anything actually breaking.
+// Every builtin, for `type`, `command -v`, `enable`, completion, and
+// `is_active_builtin`, which decides how a pipeline stage runs. See
+// `every_dispatched_builtin_is_known`.
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":",
     "true",
@@ -14082,13 +13984,6 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "caller",
     "enable",
     "help",
-    // Every name `dispatch_builtin_or_external_impl` handles has to be
-    // here, not just for completion: `run_multi` uses this list to
-    // decide whether a pipeline stage needs the self-exec that lets a
-    // builtin run as one. A builtin missing from it is spawned as an
-    // external program and fails with ENOENT -- which is exactly what
-    // `echo hi | json .` did until `json` was added. See
-    // `every_dispatched_builtin_is_known`.
     "json",
     "cd",
     "pwd",
@@ -14152,16 +14047,10 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "printf",
 ];
 
-// The names `shopt` itself recognizes, each with its own default on/off
-// state absent an explicit `-s`/`-u` override -- mirrors bash 5.x's own
-// `shopt` output for an ordinary interactive shell (`bash -c shopt`).
-// Needed for run_shopt to enumerate anything at all (bare `shopt`/`shopt
-// -s`/`shopt -u` have nothing to list without a registry), and to reject
-// a genuinely unknown name the way real bash does, rather than silently
-// treating every unrecognized string as "off". As with shopt_options
-// itself, most of these have no actual effect on bish's behavior beyond
-// being trackable -- extglob is the one name overridden elsewhere (see
-// Shell::shopt_is_on) since bish's extglob support is unconditional.
+// The options `shopt` knows, with bash 5's defaults for an ordinary
+// shell, so `shopt` can list them and reject unknown names. Most have
+// no effect beyond being tracked; `extglob` is always on (see
+// `Shell::shopt_is_on`).
 pub(crate) const KNOWN_SHOPT_OPTIONS: &[(&str, bool)] = &[
     ("array_expand_once", false),
     ("assoc_expand_once", false),
@@ -14228,50 +14117,29 @@ pub(crate) fn shopt_default_on(name: &str) -> Option<bool> {
     KNOWN_SHOPT_OPTIONS.iter().find(|(n, _)| *n == name).map(|(_, on)| *on)
 }
 
-// `compgen -A setopt`/`complete -A setopt`: valid `set -o NAME` names.
-// Kept as its own list (rather than bash's full ~29-entry set) in sync
-// with apply_shell_option's own match arms above -- only names that
-// actually gate real bish behavior, same "don't advertise a name that
-// does nothing" principle KNOWN_BISHOPTS follows for its own registry.
+// `compgen -A setopt`: the `set -o` names `apply_shell_option` acts on,
+// not all of bash's.
 pub(crate) const SET_O_OPTIONS: &[&str] =
     &["errexit", "errtrace", "functrace", "monitor", "noclobber", "noexec", "noglob", "nounset", "pipefail", "posix", "xtrace"];
 
-// A bishopt option's type, plus its own default value -- for Str and
-// Color that's the literal default text (parsed the same way a `--set`
-// value would be, see `bishopt_value`); Bool has no stored default of
-// its own, see `run_bishopt`'s own doc comment on why "unset" and
-// "false" are the same state for a boolean option.
-// #[allow(dead_code)]: no Bool entry has landed in KNOWN_BISHOPTS yet
-// (Color, for the ui_col_* chrome colours, and Str, for "theme" -- see KNOWN_BISHOPTS'
-// own doc comments -- both have real entries), so only Bool isn't
-// actually constructed by production code, only by run_bishopt's tests
-// (which build their own small registry covering all three). Drop this
-// once a real Bool entry exists.
-// Not `Copy`: an Int option carries the range it accepts, and a range
-// isn't. Cloned at the two places that need an owned default instead.
+// A bishopt option's type and default. For Str and Color the default is
+// text, parsed as a `--set` value would be (`bishopt_value`). Not `Copy`:
+// an Int carries a range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BishOptDefault {
     Bool(bool),
-    // Whole numbers, with the range they accept -- a column count or a
-    // scroll margin is meaningless outside one, and catching that at
-    // `--set` beats discovering it as a rendering bug.
+    // Whole numbers in a range, so a bad column count fails at `--set`, not
+    // as a rendering bug.
     Int(i64, std::ops::RangeInclusive<i64>),
     Str(&'static str),
     Color(&'static str),
 }
 
-// A bishopt option's actual current value -- what `Shell::bishopts` maps
-// names to once they've been explicitly `--set`. Color keeps the
-// original source text alongside the parsed candidate list -- `bishopt
-// get` prints that text back verbatim (see run_bishopt's own doc
-// comment), not a re-serialization, so `--set accent cornflowerblue`
-// reads back as "cornflowerblue" rather than "#6495ed". The list is
-// CSS font-family-style fallback (csscolor::parse_terminal_list/pick):
-// almost always exactly one candidate, but "#ff0000, -bish-ansi(1),
-// -bish-red" is equally valid, with which one actually applies decided
-// at render time by the terminal's own detected color support (see
-// Shell::bishopt_color) -- not baked in here, since that support could
-// in principle differ from whatever it was when `--set` ran.
+// A bishopt option's value once `--set`. Color keeps the source text,
+// which `bishopt get` prints back (`cornflowerblue`, not `#6495ed`),
+// beside the parsed fallback list (`#ff0000, -bish-ansi(1)`); which
+// candidate applies is decided at render time from the terminal's
+// color support (`Shell::bishopt_color`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BishOptValue {
     Bool(bool),
@@ -14280,55 +14148,29 @@ pub(crate) enum BishOptValue {
     Color(String, Vec<crate::csscolor::TermColor>),
 }
 
-// bishopt's own known-option registry -- deliberately separate from (and
-// deliberately *not* merged into) KNOWN_SHOPT_OPTIONS above: shopt exists
-// solely so a real bash script's own defensive `shopt -s foo` preambles
-// don't fail, and its namespace is bash's own to define, not bish's --
-// mixing bish-specific settings into it risks a script written against
-// real bash silently colliding with (or being silently ignored by) a
-// bish-only setting sharing the same name.
-//
-// The `ui_col_*` entries are the first real, behavior-gating ones (no
-// more dead-stub problem, unlike shopt_options' own history): each is
-// one of bishedit::highlight's own HL_NAMES names, read every
-// prompt redraw (see repl.rs's own construction of `highlight_ctx`) to
-// build that redraw's ColorOverrides. Their default text is a `-bish-*`
-// vendor color (csscolor::parse_terminal) naming the exact ANSI slot
-// that HighlightKind's own hardcoded Indexed color (bishedit::highlight::
-// default_style) already used -- so a fresh install renders identically
-// to before this option existed, still resolved by the *user's own*
-// terminal palette rather than some fixed guess at what "yellow" ought
-// to look like. `--set`-ing an ordinary CSS color (or color-mix, hsl(),
-// ...) is what actually pins it to a real, terminal-independent color.
-// Shell::change_directory's own "refused by `set -r`" answer -- matched
-// by the `cd` builtin so it can keep printing the message it always has.
+// `Shell::change_directory`'s refusal under `set -r`, which the `cd`
+// builtin matches to print its message.
 pub(crate) const RESTRICTED: &str = "restricted";
 
-/// The bash release bish answers `$BASH_VERSION` with, and reports
-/// itself compatible with in `--version`. `BASH_VERSINFO` is this same
-/// version taken apart, since scripts branch on `${BASH_VERSINFO[0]}`
-/// far more often than they parse the string.
+/// The bash release `$BASH_VERSION` reports, and `--version` claims
+/// compatibility with. `BASH_VERSINFO` is it taken apart.
 pub const BASH_VERSION: &str = "5.2.21(1)-release";
 pub(crate) const BASH_VERSINFO: &[&str] = &["5", "2", "21", "1", "release", "x86_64-pc-linux-gnu"];
 
+// bishopt's registry, separate from `KNOWN_SHOPT_OPTIONS`: shopt's names
+// are bash's to define, and a bish setting there could collide with a
+// bash script's `shopt -s`. The `ui_col_*` defaults are `-bish-*` colors
+// naming the ANSI slots `default_style` uses, so they follow the
+// terminal's palette until `--set` pins a real color.
 const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
-    // Which `::bish theme`-declared theme (if any) is currently active --
-    // an ordinary Str option, set/unset/read the normal way (`bishopt
-    // --set theme NAME`/`--unset theme`/`bishopt theme`), *outside* any
-    // `::bish theme begin`/`end` declaration (setting it *inside* one
-    // instead names the theme being declared -- see run_bish_theme_end's
-    // own doc comment). Empty default = no active theme, same as every
-    // other Str option's "never set" state. bishopt_value special-cases
-    // this exact name to never additionally consult `self.themes` the
-    // way every other option does -- a theme naming itself would be
-    // circular and meaningless.
+    // The active `::bish theme`, empty for none. Setting it inside a
+    // `::bish theme begin`/`end` names the theme being declared instead
+    // (`run_bish_theme_end`). `bishopt_value` doesn't look this one up in
+    // `self.themes`, which would be circular.
     ("theme", BishOptDefault::Str("")),
-    // ...and the same for bish's own chrome rather than for the text it
-    // shows: the browser's entry types, rendered markdown, diagnostics.
-    // Identical machinery (see theme.rs, which mirrors
-    // bishedit::highlight's) so `ui_col_directory` behaves exactly as
-    // `::bish hl`'s own names do, and both land in a `::bish theme`
-    // declaration without either knowing about themes.
+    // The same for bish's own UI: the browser's entry types, rendered
+    // markdown, diagnostics. Same machinery as `::bish hl` (theme.rs
+    // mirrors bishedit::highlight), so both work in a theme.
     ("ui_col_directory", BishOptDefault::Color("-bish-blue")),
     ("ui_col_symlink", BishOptDefault::Color("-bish-cyan")),
     ("ui_col_archive", BishOptDefault::Color("-bish-magenta")),
@@ -14341,222 +14183,121 @@ const KNOWN_BISHOPTS: &[(&str, BishOptDefault)] = &[
     ("ui_col_warning", BishOptDefault::Color("-bish-yellow")),
     ("ui_col_info", BishOptDefault::Color("-bish-blue")),
     ("ui_col_hint", BishOptDefault::Color("-bish-cyan")),
-    // How the file editor handles a line wider than the pane. `wrap`
-    // off is the current behaviour and vim's `nowrap`: the line scrolls
-    // sideways. On, it is broken across as many rows as it needs.
-    //
-    // The three that shape a wrapped line default *on* where vim
-    // defaults them off, which is a deliberate divergence: vim's
-    // defaults are a 1991 artifact that essentially every vimrc
-    // overrides, and breaking mid-word with no indent and no marker is
-    // not something anyone chooses. They do nothing at all while `wrap`
-    // is off.
+    // How the file editor handles a line wider than the pane: off scrolls
+    // sideways (vim's `nowrap`), on breaks it across rows. The three that
+    // shape a wrapped line default on, unlike vim, since nearly every vimrc
+    // turns them on; they do nothing while `wrap` is off.
     ("wrap", BishOptDefault::Bool(false)),
     ("linebreak", BishOptDefault::Bool(true)),
     ("breakindent", BishOptDefault::Bool(true)),
-    // What a continued row opens with. Empty for none.
+    // What a continued row starts with; empty for nothing.
     ("showbreak", BishOptDefault::Str("\u{21B3} ")),
-    // Wrap at this column rather than at the pane's edge -- VS Code's
-    // own `wordWrapColumn`. 0 means the pane's width; anything else is
-    // capped by it, so a narrow pane still wraps at the pane.
+    // Wrap at this column instead of the pane's edge. 0 is the pane width,
+    // which also caps it.
     ("wrap_column", BishOptDefault::Int(0, 0..=1000)),
-    // vim's own: keep this many lines visible above and below the
-    // cursor rather than letting it sit against the top or bottom of
-    // the pane. Applies with or without wrapping, unlike its horizontal
-    // counterpart just below. Capped at half the pane, since a margin
-    // wider than that has no middle left to keep the cursor in.
+    // vim's: keep this many lines visible above and below the cursor.
+    // Capped at half the pane.
     ("scrolloff", BishOptDefault::Int(0, 0..=200)),
-    // No zero, deliberately: bash's HISTFILESIZE=0 truncates the file to
-    // nothing, which is a footgun for anyone who reads 0 as "unlimited".
-    // The top of the range is the unlimited-in-practice answer instead.
+    // No zero: bash's `HISTFILESIZE=0` empties the file, a trap for anyone
+    // reading 0 as unlimited.
     ("history_size", BishOptDefault::Int(10_000, 100..=1_000_000)),
-    // The extra characters -- beyond letters and digits, which are
-    // always word characters in any script -- that `w`/`b`/`e`, `iw`,
-    // `*` and `Ctrl-W` treat as part of a word. `_` is what every
-    // motion has always assumed; `-` suits kebab-case, `$` shell
+    // Characters besides letters and digits that `w`/`b`/`e`, `iw`, `*` and
+    // Ctrl-W treat as part of a word: `-` suits kebab-case, `$` shell
     // variables.
     ("iskeyword", BishOptDefault::Str("_")),
-    // ...and the two that matter while `wrap` is *off*. `sidescrolloff`
-    // is vim's own: keep this many columns visible either side of the
-    // cursor rather than letting it sit against the edge.
+    // For `wrap` off. `sidescrolloff` is vim's: keep this many columns
+    // visible either side of the cursor.
     ("sidescrolloff", BishOptDefault::Int(0, 0..=200)),
-    // vim's `listchars` `extends`/`precedes`: shown in the last/first
-    // column when a line continues off that edge. Empty by default, so
-    // rendering is unchanged until asked for.
+    // vim's `listchars` `extends`/`precedes`: shown in the last/first column
+    // when a line continues past that edge. Empty by default.
     ("extends", BishOptDefault::Str("")),
     ("precedes", BishOptDefault::Str("")),
-    // Which languages get a tabular display -- columns lined up on
-    // screen without a character of the file changing. A language glob,
-    // the same shape and the same matcher `abbr --lang` uses, so
-    // `!(csv)` turns it off for CSV and leaves it on elsewhere.
-    //
-    // `*` by default, and that is not the same as "on for everything":
-    // a language with no tabular form of its own is simply left alone
-    // (bishedit::tabular::style says which have one), so matching
-    // everything means "wherever this is implemented, use it".
+    // Languages shown tabular: columns aligned on screen, file unchanged.
+    // A language glob, matched as `abbr --lang` does (`!(csv)` turns off
+    // CSV only). `*` means wherever a language has a tabular form
+    // (`bishedit::tabular::style`).
     ("tabular", BishOptDefault::Str("*")),
-    // Where Ctrl+T's opener puts what you pick, and which of those
-    // answers it will offer. `opener_target` is where it starts;
-    // `opener_targets` is a glob over the same four names, as `tabular`
-    // just above globs over languages, and it decides what Ctrl+T
-    // cycles through inside the dialog.
-    //
-    // Four names: `tab` (a window of its own), `here` (the pane you are
-    // in), `vsplit` (a new pane below it, as `::bish window vsplit`) and
-    // `hsplit` (beside it, as `::bish window split`). Both split names
-    // follow bish's own: they describe how the panes end up arranged,
-    // so `vsplit` stacks them vertically. A name neither
-    // option recognises falls back rather than erroring, because the
-    // dialog shows which destination is live in its own border -- a
-    // wrong value is visible the first time you press the key, which is
-    // a better diagnosis than a message at startup nobody reads.
-    //
-    // `tab` by default, which is what the opener did before it could be
-    // asked, and `*` so the key cycles all four until somebody says
-    // otherwise.
-    // Capabilities a directory you own is trusted for without a
-    // `::bish trust` entry -- a glob over the same capability names, as
-    // `opener_targets` is over destinations. Empty by default, which
-    // trusts nothing: owning a directory is a weaker signal than
-    // vouching for it (you own a tarball the moment you extract it), so
-    // the safe default is that ownership grants nothing and every
-    // directory is untrusted until `::bish trust` says otherwise. Set it
-    // to `git`, or `*`, to opt into "trust what I own" for those
-    // capabilities -- a deliberate loosening, not the default.
+    // Directory capabilities granted by owning the directory, without a
+    // `::bish trust` entry: a glob over capability names. Empty by default:
+    // you own a tarball as soon as you extract it, so ownership alone
+    // grants nothing. `git` or `*` opts in.
     ("trust_owned", BishOptDefault::Str("")),
+    // Where Ctrl+T's opener puts what you pick: `tab`, `here` (this pane),
+    // `vsplit` (a pane below) or `hsplit` (beside), named for how the
+    // panes end up. `opener_targets` is a glob over those for what Ctrl+T
+    // cycles through. An unknown name falls back rather than erroring:
+    // the dialog's border shows which is live.
     ("opener_target", BishOptDefault::Str("tab")),
     ("opener_targets", BishOptDefault::Str("*")),
-    // The other place columns have to line up, and the one where the
-    // text is bish's rather than the file's: a table in a rendered
-    // markdown document (`:preview`, `:help`). On, a table too wide for
-    // the pane is fitted to it -- the columns give up width in
-    // proportion to what they asked for and the cells wrap inside them,
-    // so the whole table is on screen at the cost of taller rows. Off,
-    // every column keeps the width its widest cell wants and the table
-    // runs off the side, to be read by scrolling the pager sideways --
-    // which is what a table of numbers usually wants, since a wrapped
-    // cell is harder to compare down a column than an off-screen one is
-    // to scroll to.
+    // A table in rendered markdown (`:preview`, `:help`). On, a table too
+    // wide for the pane is fitted to it, its cells wrapping. Off, columns
+    // keep their widths and the pager scrolls sideways, which suits tables
+    // of numbers.
     ("table_wrap", BishOptDefault::Bool(true)),
-    // Whether bish pays attention to `.gitignore` at all. On, the file
-    // browser leaves ignored files out of its listing until `i` asks
-    // for them; off, there is no such thing as an ignored file anywhere
-    // and every listing is what is actually on disk.
-    //
-    // Named for the file rather than for the browser (`browser_
-    // gitignore`, say) on purpose: the question it answers is "does
-    // bish honour .gitignore", which is the thing a person goes looking
-    // for, and the answer should stay one option as more of bish comes
-    // to ask it -- the fuzzy finder next.
+    // Whether bish honours `.gitignore`: on, the file browser hides ignored
+    // files until `i`. Named for the file, not the browser, since more of
+    // bish will ask the same question.
     ("gitignore", BishOptDefault::Bool(true)),
     ("lsp", BishOptDefault::Bool(true)),
     ("lsp_timeout_ms", BishOptDefault::Int(1000, 0..=10000)),
-    // Whether a URL, a markdown link's destination or a path that
-    // resolves is drawn as a real OSC 8 terminal hyperlink -- clickable
-    // where the terminal supports it. On: a terminal that doesn't know
-    // OSC 8 skips the sequence and shows the text exactly as before, so
-    // there is nothing to detect and nothing to degrade. Off is for
-    // wanting the text and only the text.
+    // URLs, link destinations and existing paths as OSC 8 hyperlinks.
+    // Terminals without OSC 8 skip the sequence.
     ("hyperlinks", BishOptDefault::Bool(true)),
-    // How much of a split's own space its pane dividers may take before
-    // the panes furthest from the focus fold away behind a single
-    // divider that stands for all of them (see repl.rs's
-    // collapsed_runs). A percentage; 100 turns folding off entirely and
-    // lets the dividers have the whole split if that is what the pane
-    // count comes to.
+    // How much of a split, as a percentage, its dividers may take before
+    // the panes furthest from focus fold behind one divider (repl.rs's
+    // `collapsed_runs`). 100 never folds.
     ("divider_budget", BishOptDefault::Int(25, 0..=100)),
-    // What each of the default prompt's three components may take of the
-    // line, as a percentage. Independent maxima rather than a partition:
-    // a component only gives anything up when it is itself long, so these
-    // do not have to sum to a hundred. `0` is no limit, as `wrap_column`
-    // spells off. The path gets the largest share because it is the part
-    // that is different every time; `user@host` the smallest because it
-    // is the part that never changes.
+    // How much of the line each default-prompt component may take, as a
+    // percentage; `0` is no limit. Independent maxima, so they needn't sum
+    // to 100. The path gets the most, `user@host` the least.
     ("prompt_host_budget", BishOptDefault::Int(25, 0..=100)),
     ("prompt_cwd_budget", BishOptDefault::Int(40, 0..=100)),
     ("prompt_git_budget", BishOptDefault::Int(25, 0..=100)),
-    // vim's own `relativenumber`: number each line by its distance from
-    // the cursor's, which is what makes `12j` or `d8k` something you
-    // read off the screen instead of counting.
-    //
-    // The cursor's own line keeps its absolute number -- vim gets that
-    // by setting `number` *and* `relativenumber` together, and bish has
-    // no `number` to turn off (the gutter always numbers), so this is
-    // the only reading of it that leaves the option meaningful.
+    // vim's `relativenumber`: lines numbered by distance from the cursor,
+    // so `12j` can be read off the screen. The cursor's line keeps its
+    // absolute number, as vim shows with `number` also set; bish's gutter
+    // always numbers.
     ("relativenumber", BishOptDefault::Bool(false)),
     ("ignorecase", BishOptDefault::Bool(false)),
     ("inlayhints", BishOptDefault::Bool(true)),
-    // On, as vim's own matchparen is: a bracket saying where its pair
-    // is, is what makes nested ones readable without counting.
     ("matchbrackets", BishOptDefault::Bool(true)),
     ("smartcase", BishOptDefault::Bool(false)),
-    // Whether a project's own `.editorconfig` wins over the settings
-    // just below. On, it does -- a project's conventions are the point
-    // of the file, and the settings here are your own preference for
-    // everywhere *else*. Off ignores `.editorconfig` entirely, which is
-    // how you override one from the colon line without editing it:
-    // `:bishopt --set editorconfig off` and your own settings take the
-    // buffer back on the next redraw.
+    // Whether a project's `.editorconfig` overrides the settings below.
+    // Off ignores it, overriding one without editing it.
     ("editorconfig", BishOptDefault::Bool(true)),
-    // Whether bish asks the terminal to report mouse events at all.
-    // On, clicking places the cursor and dragging selects. Off is not
-    // just "ignore the mouse": reporting is never turned on, which is
-    // what gives the *terminal's own* selection back -- with reporting
-    // on, dragging is bish's gesture and there is no way to sweep a
-    // region for the system clipboard.
+    // Whether bish asks for mouse reports: clicking places the cursor and
+    // dragging selects. Off leaves selection to the terminal, for copying
+    // to the system clipboard.
     ("mouse", BishOptDefault::Bool(true)),
-    // Whether resting the pointer on a word in the editor shows what
-    // `K` would say about it, without pressing anything.
-    //
-    // On, and separate from `mouse` rather than folded into it, because
-    // it costs something the rest of the mouse does not: the terminal
-    // reports every cell the pointer crosses (DECSET 1003), where
-    // clicking and dragging need no traffic at all until a button goes
-    // down. Somebody on a slow link, or who simply does not want a
-    // popup arriving unasked, turns this off and keeps the mouse.
-    //
-    // `mouse` off turns this off with it -- there are no reports to
-    // read.
+    // Hovering a word in the editor shows what `K` would. Separate from
+    // `mouse` because it makes the terminal report every pointer move
+    // (DECSET 1003). Off with `mouse`.
     ("mouse_hover", BishOptDefault::Bool(true)),
-    // Whether the terminal's cursor changes shape to show the mode: a
-    // block in Normal and Visual, a bar in Insert, an underline in
-    // Replace. Off leaves the cursor however the terminal draws it, for
-    // a terminal that renders one of the shapes badly or not at all.
+    // The cursor's shape follows the mode: a block in Normal and Visual, a
+    // bar in Insert, an underline in Replace.
     ("cursorshape", BishOptDefault::Bool(true)),
-    // vim's names for the four things `.editorconfig` calls
-    // `indent_style`, `indent_size`, `tab_width` and
-    // `insert_final_newline`. `trim_trailing_whitespace` keeps
-    // EditorConfig's own name, since vim has nothing to borrow.
+    // vim's names for `.editorconfig`'s `indent_style`, `indent_size`,
+    // `tab_width` and `insert_final_newline`; vim has no
+    // `trim_trailing_whitespace`.
     ("expandtab", BishOptDefault::Bool(true)),
     ("shiftwidth", BishOptDefault::Int(4, 1..=64)),
     ("tabstop", BishOptDefault::Int(4, 1..=64)),
     ("fixendofline", BishOptDefault::Bool(true)),
     ("trim_trailing_whitespace", BishOptDefault::Bool(false)),
-    // vim's `fileformat`, and the one option here whose default is
-    // *nothing*: an empty value means "whatever this file already had",
-    // which is the only answer that doesn't rewrite every line of a
-    // CRLF file the first time you save it.
+    // vim's `fileformat`. Empty keeps whatever the file has, so saving a
+    // CRLF file doesn't rewrite every line.
     ("fileformat", BishOptDefault::Str("")),
 ];
 
-// Every bishopt option name, in registry order -- the source of truth
-// for Tab completion (bishedit::completion::bishopt_candidates).
-//
-// Deliberately *not* hand-duplicated into bishedit the way KNOWN_BUILTINS
-// is. That duplication exists to keep the editor's syntax *analysis*
-// independent of the execution engine, and a name drifting out of sync
-// there costs one word's colour. Here the whole feature is "tell me which
-// options exist", so a list that can drift from the registry would
-// advertise options that aren't real and hide ones that are -- worse than
-// having no completion at all.
+// Every bishopt name, in registry order, for completion
+// (`bishedit::completion::bishopt_candidates`). Read from the registry,
+// unlike `KNOWN_BUILTINS`' copy in bishedit, so it can't drift.
 pub fn bishopt_names() -> Vec<&'static str> {
     KNOWN_BISHOPTS.iter().map(|(name, _)| *name).collect()
 }
 
-// The values `bishopt --set NAME` accepts, when they are a fixed set.
-// Only a boolean has one; a string, colour or number is free text, and
-// offering a guess at it would be inventing options rather than
-// reporting them.
+// The values `bishopt --set NAME` accepts when they're a fixed set: only
+// a boolean's.
 pub fn bishopt_values(name: &str) -> &'static [&'static str] {
     match KNOWN_BISHOPTS.iter().find(|(n, _)| *n == name) {
         Some((_, BishOptDefault::Bool(_))) => &["on", "off"],
