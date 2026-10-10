@@ -1,67 +1,33 @@
-// Editor-side git integration (`:git ...` in bishedit command mode -- see
-// repl.rs's own run_command_mode `"git"` arm). Bish has zero external
-// dependencies and no git object-database implementation of its own, so
-// every one of these shells out to the user's real `git` executable --
-// exactly the "let a real external tool do the heavy lifting" choice this
-// project already makes elsewhere (e.g. `mise`/`nvm`-style shell
-// activation scripts), just invoked directly by the editor here instead of
-// something the user's own shell config chooses to run. `available()` is
-// what makes every other function in here optional rather than a hard
-// dependency: a missing `git` on $PATH just means these features quietly
-// don't work, not a broken build/editor.
+// Editor-side git integration (`:git ...` in command mode; see repl.rs's
+// `run_command_mode`). Every call runs the user's `git`; `available()`
+// makes all of it optional, so without git these features just don't
+// work.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-// Every `git` this module runs, built in one place so that what it
-// prints is decided here and not by the machine bish happens to be on.
+// Every `git` this module runs, built here so its output doesn't depend
+// on the machine's configuration. bish parses that output, and settings
+// change it: `log.showSignature` puts gpg lines before a commit,
+// `color.ui = always` adds escapes, `log.date` re-renders `%ad`,
+// `core.quotepath` escapes non-ASCII paths. `GIT_DIR`, `GIT_WORK_TREE`
+// and `GIT_INDEX_FILE` are cleared, since a git hook's children inherit
+// them and would answer about another repository. Aliases, `includeIf`,
+// `safe.directory` and mailmaps are left to the repository.
 //
-// bish parses this output -- a `--format` with 0x1f separators, a
-// porcelain status, a line-porcelain blame -- and a developer's own
-// configuration can change all of it. `log.showSignature = true`, which
-// anyone who signs their commits may well have, puts gpg's verification
-// lines in front of the commit `log` was asked to print, straight into
-// the first field bish splits out. `color.ui = always` writes escape
-// codes through output meant for a machine. `log.date` re-renders the
-// `%ad` the `:git show` header asks for. `core.quotepath` decides
-// whether a non-ASCII path arrives escaped.
+// The config keys whose values are commands are overridden: bish runs
+// git on its own (every prompt, Ctrl+T, the blame gutter), so a
+// repository's config would be code execution on `cd`.
+// `core.fsmonitor = "touch /tmp/x; false"` ran on entering a directory.
+// `safe.directory` doesn't cover it: it refuses repositories owned by
+// other users, and this arrives as an archive you extracted.
 //
-// Three environment variables go the other way: `GIT_DIR`,
-// `GIT_WORK_TREE` and `GIT_INDEX_FILE` override the directory the
-// command runs in, and every process a git hook starts inherits them --
-// so a prompt drawn from a shell inside a hook, or `:git log` in an
-// editor opened from one, would answer about that repository instead of
-// the one on screen.
-//
-// What is *not* overridden is the rest: an alias, an `includeIf`, a
-// `safe.directory`, a mailmap are all the repository's own business and
-// bish asks git the same questions a terminal would.
-//
-// Except for the config keys whose values are *commands*. bish runs git
-// by itself -- on every prompt, when Ctrl+T opens, when a buffer wants a
-// blame gutter -- so a repository's own config becomes code execution on
-// nothing more than `cd`, which is the bug fish shipped as
-// CVE-2022-20001 and powerlevel10k shipped twice. Demonstrated here
-// before this list existed: `core.fsmonitor = "touch /tmp/x; false"` in
-// a repository's `.git/config` ran on entering the directory, and again
-// from the opener, and again from the blame gutter.
-//
-// `safe.directory` is git's own answer and does not cover this: it
-// refuses a repository owned by *another* user, and the way this arrives
-// is an archive you extracted yourself. A person typing `git status`
-// chose to run git there; a prompt did not.
-//
-// So every key below is one git would hand to a shell, and `-c` beats
-// the repository's config file. What this cannot reach is a driver the
-// repository *names* itself -- `filter.<whatever>.clean` selected by a
-// tracked `.gitattributes`, and `diff.<whatever>.textconv` the same way.
-// Config subsections do not glob, so there is no `-c` to write in
-// advance, and the one blunt instrument that works -- pointing
-// `GIT_ATTR_SOURCE` at an empty tree, which was measured to stop it --
-// also throws away `text=auto` and every other eol rule, so a clean
-// repository would start reporting itself dirty. That half is still
-// open and is written down here rather than left to be rediscovered.
+// Still open: drivers the repository names itself
+// (`filter.<name>.clean` via `.gitattributes`, `diff.<name>.textconv`).
+// Subsections don't glob, so there's no `-c` for them, and pointing
+// `GIT_ATTR_SOURCE` at an empty tree stops them but also drops
+// `text=auto` and the eol rules, making clean repositories look dirty.
 fn command(dir: &Path) -> Command {
     let mut git = Command::new("git");
     git.current_dir(dir)
@@ -83,9 +49,8 @@ fn command(dir: &Path) -> Command {
             "log.date=default",
             "-c",
             "core.quotepath=false",
-            // Every one of these is a command git would run. None of
-            // them is wanted by anything bish asks for: it reads, it
-            // never fetches, and it never pages.
+            // Each of these is a command git would run; bish only reads,
+            // never fetches or pages.
             "-c",
             "core.fsmonitor=",
             "-c",
@@ -106,45 +71,28 @@ fn command(dir: &Path) -> Command {
     git
 }
 
-// Checked fresh on every `:git` invocation rather than cached once at
-// startup -- a subprocess spawn is cheap and this only runs when a user
-// actually types a `:git` command, not on every keystroke -- so installing
-// or removing `git` mid-session is picked up immediately.
+// Checked on every `:git` command, not cached: a spawn is cheap here, and
+// installing git mid-session is picked up.
 pub fn available() -> bool {
     command(Path::new(".")).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
-// One command prompt's worth of "where does this repo's HEAD point, and
-// is the working tree dirty" (prompt.rs's own git segment). `branch` is
-// the checked-out branch name, or (rare -- detached HEAD) the short
-// commit hash instead, matching what a human glancing at `git status`
-// would call it either way. `dirty` is true iff there's anything beyond
-// a clean `git status` (staged, unstaged, or untracked).
+// The prompt's git segment: the checked-out branch, or the short hash
+// when detached, and whether `git status` shows anything.
 pub struct HeadStatus {
     pub branch: String,
     pub dirty: bool,
 }
 
-// One `git status --porcelain=v2 --branch` call covers both branch name
-// (the `# branch.head` line) and dirty (whether any non-`#` line
-// follows it) at once, rather than two separate git invocations per
-// prompt render -- still a real subprocess spawn on every new prompt
-// line though (prompt::render's own call site), same accepted cost
-// real bash-prompt git plugins (starship, oh-my-zsh's git-prompt, ...)
-// all have; a config knob to disable it, or caching against some
-// "did HEAD/the index change" signal, is a reasonable follow-up if it
-// ever shows up as noticeable latency in practice, not attempted here.
-// `None` covers "git not installed" and "not inside a repo" alike --
-// prompt.rs's own caller treats both the same (no segment shown), so
-// there's no need to tell them apart.
+// One `git status --porcelain=v2 --branch` gives both the branch
+// (`# branch.head`) and dirtiness (any other line), one spawn per
+// prompt. `None` when git is missing or this isn't a repository; the
+// prompt treats both alike.
 pub fn head_status(dir: &Path, trusted: bool) -> Option<HeadStatus> {
-    // In a directory you have not vouched for, bish runs no git in the
-    // working tree at all -- not even to ask whether it is dirty.
-    // Deciding dirtiness is what runs a repository's `clean` filter (see
-    // `command`), so the branch is read out of `.git/HEAD` directly
-    // instead, with no subprocess for any repo-configured driver to hook.
-    // The cost is honest and visible: an untrusted repo shows its branch
-    // and no dirty marker, until `::bish trust` says more is wanted.
+    // In a directory you haven't vouched for, no git runs in the working
+    // tree: deciding dirtiness runs the repository's `clean` filter (see
+    // `command`). The branch is read from `.git/HEAD`, with no dirty marker
+    // until `::bish trust`.
     if !trusted {
         return branch_from_head(dir).map(|branch| HeadStatus { branch, dirty: false });
     }
@@ -157,9 +105,7 @@ pub fn head_status(dir: &Path, trusted: bool) -> Option<HeadStatus> {
     let mut dirty = false;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# branch.head ") {
-            // "(detached)" while HEAD isn't on any branch -- fall back to
-            // the short commit hash below instead, same as `git status`
-            // itself would tell a human ("HEAD detached at <sha>").
+            // Detached: the short hash below, as `git status` would say.
             if rest != "(detached)" {
                 branch = Some(rest.to_string());
             }
@@ -182,39 +128,27 @@ fn short_head(dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// The branch name from `.git/HEAD`, read as a plain file rather than
-/// asked of git -- the untrusted `head_status` path, where the point is
-/// that no git process touches the working tree.
-///
-/// `None` when `dir` is not in a repository, so the prompt shows no git
-/// segment there, exactly as it does when `git status` returns nothing.
-/// A detached HEAD comes back as the short hash, matching what the
-/// trusted path's `short_head` would have shown.
-///
-/// It reimplements only the two steps git would take to answer this one
-/// question: find the git directory, read HEAD. HEAD is always a loose
-/// file (git never packs it), so there is no ref database to consult --
-/// a `ref: refs/heads/NAME` line or a bare object id, and nothing else.
+/// The branch from `.git/HEAD`, read as a file, for untrusted
+/// `head_status`. `None` outside a repository; a detached HEAD gives the
+/// short hash. HEAD is always a loose file (git never packs it): a
+/// `ref: refs/heads/NAME` line or a bare object id.
 fn branch_from_head(dir: &Path) -> Option<String> {
     let git_dir = find_git_dir(dir)?;
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     match head.strip_prefix("ref: ") {
-        // `ref: refs/heads/main` -> `main`; any other ref target shows
-        // its last component, which is what a human reads off it too.
+        // `ref: refs/heads/main` gives `main`; other refs show their last
+        // component.
         Some(target) => target.rsplit('/').next().map(str::to_string).filter(|s| !s.is_empty()),
-        // Detached: a bare object id. Abbreviated to git's own default
-        // length, so it reads the same as the trusted path's answer.
+        // Detached: a bare object id, abbreviated as the trusted path does.
         None if head.chars().all(|c| c.is_ascii_hexdigit()) && head.len() >= 7 => Some(head[..head.len().min(8)].to_string()),
         None => None,
     }
 }
 
-/// The repository's git directory for `dir`, by walking up and looking
-/// for `.git` -- the same search git does, reduced to what reading HEAD
-/// needs. `.git` is usually a directory; in a linked worktree or a
-/// submodule it is a file holding `gitdir: <path>`, which may be
-/// relative to the `.git` file's own directory.
+/// The git directory for `dir`, walking up for `.git`. Usually a
+/// directory; in a linked worktree or submodule a file holding
+/// `gitdir: <path>`, possibly relative to that file.
 fn find_git_dir(dir: &Path) -> Option<PathBuf> {
     let start = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     for ancestor in start.ancestors() {
@@ -236,15 +170,10 @@ fn find_git_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-// One buffer line's worth of `git blame` info -- deliberately minimal
-// (just enough for a gutter cell, not every field real `git blame`
-// reports): `short_commit` is the first 8 hex digits (matching `git`'s own
-// default abbreviation length), `date` is the commit's author-time
-// formatted as `YYYY-MM-DD` (see format_unix_date below for why no
-// external date/time crate is needed for this). An uncommitted working-
-// tree line comes back with `short_commit` "00000000" and author "Not
-// Committed Yet" -- real `git blame --line-porcelain`'s own convention for
-// that case, not something this parses specially.
+// One line's blame, as much as a gutter cell needs: the 8-digit commit
+// (git's default abbreviation) and the author date as `YYYY-MM-DD`. An
+// uncommitted line has `00000000` and "Not Committed Yet", git's own
+// convention.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlameLine {
     pub short_commit: String,
@@ -252,20 +181,12 @@ pub struct BlameLine {
     pub date: String,
 }
 
-// Runs `git blame --line-porcelain` against `path`, one BlameLine per line
-// of the file in order. Always run from `path`'s own parent directory
-// with just its filename as the argument (rather than passing `path`
-// itself, possibly relative to bish's own cwd, straight through) -- keeps
-// this correct regardless of where bish's own process cwd happens to be
-// relative to the repo, the same way a real terminal `git blame` run from
-// that file's own directory would resolve. `Err` covers both "git itself
-// failed" (not a repo, file not tracked, path doesn't exist, ...) and a
-// malformed/unexpected porcelain response.
+// `git blame --line-porcelain` on `path`, one `BlameLine` per line. Run
+// from the file's directory with just its name, so bish's cwd doesn't
+// matter. `Err` for git failing or unexpected output.
 pub fn blame(path: &Path, rev: Option<&str>, trusted: bool) -> Result<Vec<BlameLine>, String> {
-    // `git blame` runs the repository's `clean` filter on the working
-    // copy and its `textconv` on blobs (both measured), so it is gated
-    // on the same `git` capability the prompt is: in an untrusted
-    // directory there is no blame gutter until `::bish trust` grants it.
+    // Blame runs the `clean` filter and `textconv`, so it's gated on the
+    // `git` capability, as the prompt is.
     if !trusted {
         return Err("blame: this directory is not trusted (`::bish trust` to allow)".to_string());
     }
@@ -274,26 +195,17 @@ pub fn blame(path: &Path, rev: Option<&str>, trusted: bool) -> Result<Vec<BlameL
     let mut blame = command(dir);
     blame.arg("blame").arg("--line-porcelain");
     if let Some(rev) = rev {
-        // Refused here rather than fenced off with
-        // `--end-of-options`, which is how `log` and `show` do it and
-        // does not work for this command: `git blame
-        // --end-of-options <rev> -- <path>` stops treating the `--` as
-        // the revision/path separator, so the path is read as a second
-        // revision and the whole call fails with "bad revision". Tried,
-        // measured, and the separator is the more important of the two
-        // -- a branch and a file can share a name, which is what the
-        // comment below is about.
-        //
-        // A revision is a word somebody typed at `:blame`, so the only
-        // thing that needed closing is one shaped like an option.
+        // A revision shaped like an option is refused here:
+        // `--end-of-options` (as `log` and `show` use) breaks blame's `--`
+        // separator, reading the path as a second revision. The separator
+        // matters more, since a branch and a file can share a name.
         if rev.starts_with('-') {
             return Err(format!("bad revision '{rev}'"));
         }
         blame.arg(rev);
     }
-    // `--` before the path, always: without it a revision and a filename
-    // are told apart by guesswork, and a branch and a file can share a
-    // name.
+    // `--` before the path, so a branch and a file of the same name aren't
+    // confused.
     let output = blame.arg("--").arg(filename).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
         return Err(first_stderr_line(&output.stderr, "git blame failed"));
@@ -301,27 +213,13 @@ pub fn blame(path: &Path, rev: Option<&str>, trusted: bool) -> Result<Vec<BlameL
     parse_line_porcelain(&String::from_utf8_lossy(&output.stdout))
 }
 
-// The committed content of `path` at `rev` -- the *other* half of what
-// blame and diff need, and the reason both work against a modified
-// buffer at all: knowing what the file looked like there is what lets
-// bish line those results up with what's actually on screen (see
-// `align_to`), rather than assuming the buffer still matches whatever
-// git was asked about.
-//
-// `rev` of `None` means the index -- `git show :path` is git's own
-// spelling for it, and the right default because a plain `git diff`
-// compares the worktree against the index too, not against HEAD.
-//
-// `Ok(None)` when the file simply isn't there at that revision (not yet
-// added, or deleted since): a real answer, not a failure -- every line is
-// then new, which is exactly what the caller should show.
-//
-// The two genuine failures -- no repository at all, and a revision that
-// doesn't resolve -- are each checked with their own small `git` call
-// first, rather than sorting them out of `git show`'s own error message
-// afterwards. `git show` reports all three cases as one indistinguishable
-// "fatal: ambiguous argument", so a typo'd revision would otherwise read
-// as "the file isn't in it" and quietly show every line as new.
+// `path`'s content at `rev`, or in the index for `None` (as a plain
+// `git diff` compares against), so blame and diff can be aligned with a
+// modified buffer (`align_to`). `Ok(None)` when the file isn't there at
+// that revision: every line is then new. No repository and an unknown
+// revision are checked first with their own calls, since `git show`
+// reports all three as "ambiguous argument", which would make a typo'd
+// revision look like an absent file.
 pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, String> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
@@ -339,28 +237,25 @@ pub fn file_at_rev(path: &Path, rev: Option<&str>) -> Result<Option<String>, Str
             .status()
             .map_err(|e| format!("git: {e}"))?;
         if !resolved.success() {
-            // --quiet means git printed nothing of its own to relay.
+            // `--quiet`: git printed nothing to relay.
             return Err(format!("unknown revision '{rev}'"));
         }
     }
 
-    // `./` makes the path cwd-relative rather than repo-root-relative,
-    // which is what lets this run from the file's own directory like
-    // every other call here.
+    // `./` makes the path cwd-relative, not repo-root-relative.
     let mut spec = std::ffi::OsString::from(rev.unwrap_or(""));
     spec.push(":./");
     spec.push(filename);
     let output = command(dir).arg("show").arg(&spec).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
-        // Both real failures are already ruled out above, so what's left
-        // is "that path isn't in there".
+        // The real failures are ruled out, so the path isn't there.
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
-// One `git` call from `dir`, its stdout on success and the first line of
-// what it said on failure.
+// One `git` call from `dir`: stdout on success, the first line of its
+// complaint on failure.
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = command(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
     if !output.status.success() {
@@ -394,13 +289,10 @@ pub struct Commit {
     pub files: Vec<ChangedFile>,
 }
 
-/// What `rev` is, from anywhere inside the repository at `dir`: its
-/// header, its parent, and the files it changed against that parent.
-///
-/// A merge is shown against its first parent -- one diff rather than
-/// git's combined one, which has no single "before" to put beside
-/// "after" -- and `merge` says so. Renames are followed (`-M`), so a
-/// moved file is one entry rather than a deletion and an addition.
+/// What `rev` is, from inside the repository at `dir`: its header,
+/// parent and the files it changed. A merge is shown against its first
+/// parent (`merge` says so), not git's combined diff. Renames are followed
+/// (`-M`).
 pub fn show(dir: &Path, rev: &str) -> Result<Commit, String> {
     let root = std::path::PathBuf::from(String::from_utf8_lossy(&git(dir, &["rev-parse", "--show-toplevel"])?).trim());
     let hash = git(&root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")])
@@ -430,27 +322,17 @@ pub struct LogEntry {
     pub subject: String,
 }
 
-/// Every file git tracks at or below `dir`, as paths relative to `dir`.
-///
-/// Relative to `dir` rather than to the top level because this is a list
-/// to put in front of somebody: a path they can read, and the one they
-/// would have typed from where they are. `git ls-files` already answers
-/// that way when run from a subdirectory.
-///
-/// Nothing here consults `.gitignore`: an ignored file is by definition
-/// not tracked, so the question never comes up.
+/// Every tracked file at or below `dir`, relative to `dir` as
+/// `git ls-files` gives them from a subdirectory: the paths someone there
+/// would type. `.gitignore` doesn't come into it.
 pub fn tracked_files(dir: &Path) -> Result<Vec<String>, String> {
-    // -z because a tracked filename may contain a newline, and git's
-    // default quoting of one would hand back a path that no longer opens.
+    // `-z`: a filename may contain a newline, and git's quoting would
+    // break the path.
     Ok(git(dir, &["ls-files", "-z"])?.split(|b| *b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect())
 }
 
-/// The directories those files are in, nearest the top first.
-///
-/// Derived from the file list rather than asked for, because git does not
-/// track directories at all -- a directory exists exactly as long as
-/// something in it does, which makes the parents of the tracked files the
-/// honest answer to "which directories does git know about".
+/// The directories holding those files, nearest the top first. Derived
+/// from the files, since git doesn't track directories.
 pub fn tracked_directories(files: &[String]) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     for file in files {
@@ -474,9 +356,7 @@ pub fn log(dir: &Path, path: Option<&Path>, rev: Option<&str>) -> Result<Vec<Log
     let rev = rev.unwrap_or("HEAD");
     git(&root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")])
         .map_err(|_| format!("unknown revision '{rev}'"))?;
-    // Absolute, so it names the same file from the top level as from
-    // wherever the buffer is; git takes a path inside the work tree
-    // either way.
+    // Absolute, so it names the same file from the top level.
     let file = path.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned());
     let mut args = vec!["log", "--date=short", "--format=%H%x1f%ad%x1f%an%x1f%s%x1e"];
     if file.is_some() {
@@ -489,9 +369,8 @@ pub fn log(dir: &Path, path: Option<&Path>, rev: Option<&str>) -> Result<Vec<Log
     Ok(parse_log(&git(&root, &args)?))
 }
 
-// `git log` in the format `log` asks for: each commit ended by 0x1e, its
-// fields split by 0x1f -- two bytes no hash, date, name or subject has
-// any use for, which a tab or a newline could not promise.
+// Parses `log`'s format: commits ended by 0x1e, fields split by 0x1f,
+// bytes no field uses, unlike tab or newline.
 pub(crate) fn parse_log(bytes: &[u8]) -> Vec<LogEntry> {
     String::from_utf8_lossy(bytes)
         .split('\u{1e}')
@@ -512,9 +391,9 @@ pub fn blob(root: &Path, rev: &str, path: &str) -> Result<Vec<u8>, String> {
     git(root, &["cat-file", "blob", &format!("{rev}:{path}")])
 }
 
-// `git diff-tree --name-status -z`: a status, then one path, or two for a
-// rename or copy, every field ended by a NUL. The NULs are what let a
-// path hold a tab or a newline without being misread.
+// `git diff-tree --name-status -z`: a status, then one path (two for a
+// rename or copy), each ended by NUL, so paths may hold tabs or
+// newlines.
 pub(crate) fn parse_name_status_z(bytes: &[u8]) -> Vec<ChangedFile> {
     let fields: Vec<String> = bytes.split(|b| *b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect();
     let mut out = Vec::new();
@@ -537,17 +416,10 @@ pub(crate) fn parse_name_status_z(bytes: &[u8]) -> Vec<ChangedFile> {
     out
 }
 
-// Lines up per-line results computed against `old` with the buffer's own
-// `new` lines, by diffing the two: entry `i` of the result is whatever
-// `old`-side line buffer line `i` came from, or `None` for a line that
-// isn't in `old` at all.
-//
-// This is what makes `:git blame` work on a modified buffer and against
-// an arbitrary revision at once -- the two are the same problem. Blame
-// describes some committed version of the file; the buffer on screen is
-// something else (edited since, or simply a later revision), and without
-// this the two are lined up by line number, which is wrong the moment
-// anything above shifted.
+// Lines up per-line results computed against `old` with the buffer's
+// `new` lines by diffing them: entry `i` is the `old` line buffer line
+// `i` came from, or `None`. Blame describes a committed version, and
+// matching by line number breaks as soon as anything above shifts.
 pub(crate) fn align_to(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
     let mut out = vec![None; new.len()];
     for op in crate::diff::diff(old, new) {
@@ -562,14 +434,10 @@ pub(crate) fn align_to(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
     out
 }
 
-// `--line-porcelain` repeats every commit's full metadata for every line
-// it covers (unlike plain `--porcelain`, which omits it for a repeat
-// commit already shown) -- picked specifically so this parse never needs
-// to carry state forward from an earlier record, just read one self-
-// contained group at a time: a header line (`<sha> <orig-line>
-// <final-line> [<count>]`), then `key value...` lines until the literal
-// file content line (always exactly one tab followed by that line's
-// text, even when the line itself is empty), which ends the group.
+// Parses `--line-porcelain`, which repeats a commit's metadata for every
+// line, so each group stands alone: a header (`<sha> <orig-line>
+// <final-line> [<count>]`), `key value` lines, then the content line,
+// a tab and the text, which ends the group.
 fn parse_line_porcelain(text: &str) -> Result<Vec<BlameLine>, String> {
     let mut result = Vec::new();
     let mut lines = text.lines();
@@ -586,22 +454,16 @@ fn parse_line_porcelain(text: &str) -> Result<Vec<BlameLine>, String> {
             } else if let Some(rest) = line.strip_prefix("author-time ") {
                 author_time = rest.trim().parse().unwrap_or(0);
             }
-            // Every other key (author-mail/committer*/summary/previous/
-            // filename/boundary) is real git blame output too, just not
-            // needed for this gutter's own minimal display -- skipped.
+            // Other keys are skipped.
         }
         result.push(BlameLine { short_commit: sha.chars().take(8).collect(), author, date: format_unix_date(author_time) });
     }
     Ok(result)
 }
 
-// `:git diff`'s own per-line marker -- which kind of change (relative to
-// this file's tracked state) a given 0-indexed buffer line falls under.
-// `Removed` doesn't mark a line that itself changed (there isn't one --
-// the old lines are just gone) but the single nearest surviving line the
-// deletion sits next to, matching real diff-gutter plugins' own
-// convention (see `diff`'s own doc comment for exactly which line that
-// is and why).
+// `:git diff`'s marker for a buffer line. `Removed` marks the nearest
+// surviving line beside a deletion (see `diff`), since the removed lines
+// are gone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiffMark {
     Added,
@@ -609,25 +471,16 @@ pub enum DiffMark {
     Removed,
 }
 
-// Every diff gutter in the editor, computed here rather than by parsing
-// `git diff`'s own text output: a DiffMark keyed by 0-indexed *new*-side
-// line, built from `crate::diff::diff`'s own edit script. Both callers
-// (`fileeditor::toggle_buffer_diff`'s "buffer vs. what's on disk" and
-// `toggle_git_diff`'s "buffer vs. some revision") hand it two plain
-// slices of lines, which is why neither needs a git repository for the
-// diffing itself and why an unsaved buffer diffs correctly -- the old
-// side is just whatever the caller fetched, and the new side is the
-// buffer as it stands.
+// Every diff gutter's marks, from `crate::diff::diff` rather than
+// parsing `git diff`: a `DiffMark` per new-side line. Callers pass two
+// slices of lines (the buffer and the disk, or the buffer and a
+// revision), so the diffing needs no repository and an unsaved buffer
+// diffs correctly.
 //
-// A Delete immediately followed by an Insert (no Equal between them --
-// `crate::diff::diff`'s own coalescing already merges any run of same-
-// kind steps, so this is the only way to see both back to back) is one
-// "changed" hunk, same as a unified diff's own old_count>0/new_count>0
-// hunk; an unpaired Delete marks the single nearest surviving new-side
-// line (wherever the very next op's own `b` picks back up, or the very
-// end of the file if this Delete is the last op) as Removed -- the same
-// attachment line real `git diff -U0` picks, verified against it in
-// marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does.
+// A Delete directly followed by an Insert is one changed hunk; an
+// unpaired Delete marks the nearest surviving line (where the next op
+// resumes, or the last line) as Removed, the line `git diff -U0` picks
+// (see `marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does`).
 pub(crate) fn marks_from_diff(old: &[&str], new: &[&str]) -> HashMap<usize, DiffMark> {
     let ops = crate::diff::diff(old, new);
     let mut marks = HashMap::new();
@@ -667,12 +520,7 @@ fn first_stderr_line(stderr: &[u8], fallback: &str) -> String {
     text.lines().next().unwrap_or(fallback).trim().to_string()
 }
 
-// git blame's author-time, as a plain date. This used to carry its own
-// copy of `struct tm` and its own `localtime_r` declaration, with a
-// comment explaining that one small FFI need did not justify a
-// cross-module dependency. That was true while the only other copy was
-// a private function sixteen thousand lines into exec.rs; `time.rs`
-// exists now, so it isn't.
+// git blame's author time as a plain date.
 fn format_unix_date(epoch_secs: i64) -> String {
     crate::time::strftime("%F", &crate::time::local_time_at(epoch_secs))
 }
@@ -724,10 +572,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // The prompt runs git in whatever directory you entered, so a
-    // repository's own config must not be able to run a command. This is
-    // the vector fish shipped as CVE-2022-20001; it was live here until
-    // `command` started overriding the keys whose values git executes.
+    // The prompt runs git wherever you `cd`, so a repository's config must
+    // not run a command.
     #[test]
     fn a_repositorys_own_config_cannot_run_a_command_when_bish_asks_about_it() {
         if !available() {
@@ -742,12 +588,11 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
-        // `false` afterwards so git falls back to its ordinary scan: the
-        // point is whether the command ran at all, not what it answered.
+        // `false` afterwards so git falls back to its normal scan: what
+        // matters is whether the command ran.
         run(&["config", "core.fsmonitor", &format!("touch {}; false", marker.display())]);
 
-        // Every automatic query, not just the prompt's: the opener asks
-        // for the file list and a buffer asks for blame.
+        // Every automatic query: the prompt, the opener's file list, blame.
         let status = head_status(&dir, true);
         let files = tracked_files(&dir);
         let blamed = blame(&dir.join("a.txt"), None, true);
@@ -755,24 +600,15 @@ mod tests {
         let ran = marker.exists();
         std::fs::remove_dir_all(&dir).ok();
         assert!(!ran, "a repository's `core.fsmonitor` was executed by bish asking about it");
-        // ...and the answers still arrived, which is the half that makes
-        // this a fix rather than a removal.
+        // And the answers still arrived.
         assert_eq!(status.map(|s| s.branch), Some("main".to_string()));
         assert_eq!(files.unwrap(), ["a.txt"]);
         assert_eq!(blamed.unwrap().len(), 1);
     }
 
-    // `:blame <rev>` passes a typed word to `git blame`, where one
-    // beginning with a dash would be an option rather than a revision.
-    // `--end-of-options` is how the other commands here fence that off
-    // and cannot be used for this one: it makes `blame` stop treating
-    // `--` as the revision/path separator, so the path becomes a second
-    // revision and the call fails outright.
-    // The trust gate: in an untrusted directory bish runs no git in the
-    // working tree, so a repository's own `clean` filter never executes
-    // on a prompt draw. The branch still comes back -- read out of
-    // .git/HEAD -- and `dirty` is always false, because deciding
-    // dirtiness is the part that would have run the filter.
+    // Untrusted: no git runs in the working tree, so a `clean` filter never
+    // executes on a prompt draw. The branch comes from `.git/HEAD`, and
+    // `dirty` is false, since deciding it would run the filter.
     #[test]
     fn untrusted_head_status_reads_the_branch_without_running_git() {
         if !available() {
@@ -789,8 +625,8 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
         run(&["config", "filter.x.clean", &format!("touch {}; cat", marker.display())]);
-        // Dirty the tree so a trusted status would have something to
-        // filter, and bust the stat cache the same way.
+        // Dirty the tree and bust the stat cache, so a trusted status would
+        // filter.
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
 
         let status = head_status(&dir, false).expect("branch comes from HEAD");
@@ -798,7 +634,7 @@ mod tests {
         assert!(!status.dirty, "an untrusted repo reports no dirtiness");
         let ran = marker.exists();
 
-        // Blame is gated too: no gutter in an untrusted repo.
+        // Blame is gated too.
         let blamed = blame(&dir.join("a.txt"), None, false);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -806,8 +642,6 @@ mod tests {
         assert!(blamed.is_err(), "blame must refuse an untrusted directory");
     }
 
-    // The HEAD reader behind the untrusted path, on the forms it has to
-    // read without git's help.
     #[test]
     fn branch_from_head_reads_a_ref_and_a_detached_head() {
         if !available() {
@@ -822,13 +656,11 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
 
-        // On a branch, read from a subdirectory: finds the git dir by
-        // walking up.
+        // From a subdirectory, walking up to the git dir.
         assert_eq!(branch_from_head(&dir.join("sub")).as_deref(), Some("main"));
-        // Not a repository at all: nothing, so the prompt shows no
-        // git segment.
+        // Not a repository: nothing.
         assert_eq!(branch_from_head(std::path::Path::new("/")), None);
-        // Detached: the short hash, as the trusted path would show.
+        // Detached: the short hash.
         run(&["checkout", "-q", "--detach"]);
         let detached = branch_from_head(&dir).expect("detached still has a HEAD");
         assert_eq!(detached.len(), 8);
@@ -836,6 +668,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `--end-of-options` can't fence off a dash revision for `blame`: it
+    // breaks the `--` separator. See `blame`.
     #[test]
     fn blame_refuses_a_revision_shaped_like_an_option() {
         if !available() {
@@ -852,8 +686,7 @@ mod tests {
         run(&["commit", "-q", "-m", "initial"]);
 
         assert_eq!(blame(&file, Some("-L1,1"), true).unwrap_err(), "bad revision '-L1,1'");
-        // And the ordinary pair still work, which is what the refusal
-        // must not cost: a named revision, and none at all.
+        // A named revision and none still work.
         assert_eq!(blame(&file, Some("HEAD"), true).unwrap().len(), 1);
         assert_eq!(blame(&file, None, true).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -872,7 +705,7 @@ mod tests {
         for path in ["README.md", "src/repl.rs", "src/platform/unix.rs"] {
             std::fs::write(dir.join(path), "x\n").unwrap();
         }
-        // Not added, so not tracked, and nothing to do with .gitignore.
+        // Not added, so not tracked.
         std::fs::write(dir.join("src/scratch.rs"), "x\n").unwrap();
         run(&["add", "README.md", "src/repl.rs", "src/platform/unix.rs"]);
         run(&["commit", "-q", "-m", "initial"]);
@@ -880,8 +713,7 @@ mod tests {
         let files = tracked_files(&dir).unwrap();
         assert_eq!(files, ["README.md", "src/platform/unix.rs", "src/repl.rs"]);
         assert_eq!(tracked_directories(&files), ["src", "src/platform"], "every parent, and the top level is not one of them");
-        // From a subdirectory: the paths somebody standing there would
-        // type, and only what is at or below them.
+        // From a subdirectory: paths as typed from there, at or below it.
         assert_eq!(tracked_files(&dir.join("src")).unwrap(), ["platform/unix.rs", "repl.rs"]);
         assert!(tracked_directories(&["README.md".to_string()]).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -957,9 +789,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // bish parses what git prints, and a repository carries
-    // configuration of its own that changes it. `-c` on the command line
-    // outranks every config file, which is what `command` relies on.
+    // A repository's config changes git's output; `command`'s `-c` outranks
+    // it.
     #[test]
     fn a_repositorys_own_config_cannot_reshape_what_is_parsed() {
         if !available() {
@@ -971,9 +802,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         crate::gittest::run(dir, &["add", "."]);
         crate::gittest::run(dir, &["commit", "-q", "-m", "only commit"]);
-        // Each of these is a real setting someone has: a date format
-        // that rewrites the `%ad` the header asks for, colour in output
-        // meant for a machine, and signature lines in front of a commit.
+        // Real settings: a date format, colour, and signature lines.
         crate::gittest::run(dir, &["config", "log.date", "raw"]);
         crate::gittest::run(dir, &["config", "color.ui", "always"]);
         crate::gittest::run(dir, &["config", "log.showSignature", "true"]);
@@ -985,20 +814,16 @@ mod tests {
 
         let commit = show(dir, "HEAD").unwrap();
         let date = commit.header.iter().find(|l| l.starts_with("Date:")).expect("a Date line").clone();
-        // `log.date = raw` renders the date as seconds-since-the-epoch
-        // and an offset, so a letter in the rendered part -- past the
-        // "Date:" label, which has letters of its own -- is proof the
-        // default format survived.
+        // `log.date = raw` renders seconds and an offset, so a letter after
+        // "Date:" shows the default format survived.
         let rendered = date.trim_start_matches("Date:").trim().to_string();
         assert!(rendered.chars().any(|c| c.is_ascii_alphabetic()), "the header date is still git's default format: {rendered:?}");
         assert!(!commit.header.iter().any(|l| l.contains('\u{1b}')), "no escape codes anywhere in it: {:?}", commit.header);
     }
 
-    // A git hook exports `GIT_DIR`, and every process started from one
-    // inherits it -- a shell, an editor opened from that shell, a prompt
-    // drawn in it. It overrides the directory a `git` command runs in, so
-    // without `command` dropping it, `:git log` in an editor opened from
-    // a hook would list the hook's repository.
+    // A git hook exports `GIT_DIR`, inherited by everything it starts; left
+    // in place, `:git log` in an editor opened from a hook would list the
+    // hook's repository.
     #[test]
     fn a_git_dir_in_the_environment_does_not_decide_which_repository() {
         if !available() {
@@ -1011,10 +836,9 @@ mod tests {
         crate::gittest::run(dir, &["add", "."]);
         crate::gittest::run(dir, &["commit", "-q", "-m", "the one bish was asked about"]);
 
-        // SAFETY: every `git` this suite runs -- bish's own `command`
-        // here and `gittest`'s fixtures -- drops these three, which is
-        // the thing being tested, so no concurrent test can be derailed
-        // by them. Restored immediately either way.
+        // SAFETY: every `git` this suite runs drops these three, which is
+        // what's being tested, so no concurrent test is affected. Restored
+        // either way.
         let restore = |name: &str, had: Option<String>| match had {
             Some(value) => unsafe { std::env::set_var(name, value) },
             None => unsafe { std::env::remove_var(name) },
@@ -1034,21 +858,16 @@ mod tests {
         assert_eq!(head.expect("a prompt still has a branch to show").branch, "main");
     }
 
-    // The three deletion-attachment points (start/middle/end of file),
-    // each checked against a real `git diff --no-color -U0` run first
-    // rather than assumed -- this is the only part of a diff gutter
-    // where "which line does a *removal* belong to" has a non-obvious
-    // answer, and matching git's own choice is what makes the markers
-    // read the way anyone used to a diff gutter expects.
+    // Where a deletion is attached at the start, middle and end of a file,
+    // each checked against `git diff --no-color -U0`.
     #[test]
     fn marks_from_diff_places_a_deletion_at_the_same_line_git_itself_does() {
-        // Middle: [a,b,c,d] -> [a,d] -- real `git diff -U0` attaches
-        // this to new-side line 0 ("a"), the line right before the gap.
+        // Middle: `[a,b,c,d]` to `[a,d]` attaches to line 0 (`a`), before the
+        // gap.
         assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["a", "d"]), HashMap::from([(0, DiffMark::Removed)]));
-        // End: [a,b,c,d] -> [a,b,c] -- attaches to the new last line.
+        // End: attaches to the new last line.
         assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["a", "b", "c"]), HashMap::from([(2, DiffMark::Removed)]));
-        // Start: [a,b,c,d] -> [b,c,d] -- no line precedes the gap, so
-        // this attaches to the new first line instead.
+        // Start: nothing precedes the gap, so the new first line.
         assert_eq!(marks_from_diff(&["a", "b", "c", "d"], &["b", "c", "d"]), HashMap::from([(0, DiffMark::Removed)]));
     }
 
@@ -1115,19 +934,12 @@ filename src/main.rs
 
     #[test]
     fn format_unix_date_matches_a_known_utc_instant() {
-        // format_unix_date reads the process's own local timezone via
-        // localtime_r, so this pins TZ to UTC first (and calls tzset() so
-        // glibc actually notices the change) rather than depending on
-        // whatever the test-running machine happens to be configured
-        // with -- same reasoning this project's own verification always
-        // runs the full suite with --test-threads=1 (a process-wide env
-        // var like TZ isn't safe to mutate from a test that might run
-        // concurrently with another one reading it).
+        // `format_unix_date` uses the local timezone, so TZ is pinned to UTC
+        // (with `tzset()` so glibc notices).
         unsafe { std::env::set_var("TZ", "UTC") };
         crate::platform::reload_timezone();
         assert_eq!(format_unix_date(0), "1970-01-01");
-        // 1700000000 is a widely-cited round Unix timestamp: 2023-11-14
-        // 22:13:20 UTC.
+        // 1700000000 is 2023-11-14 22:13:20 UTC.
         assert_eq!(format_unix_date(1_700_000_000), "2023-11-14");
     }
 }
