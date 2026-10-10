@@ -1,18 +1,14 @@
-// `declare`, `readonly`, `unset`: the builtins that make, mark and
+// `declare`, `readonly` and `unset`: the builtins that make, mark and
 // unmake variables.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
 
 use crate::arith;
 use crate::exec::{Shell, sh_eprintln, write_diagnostic};
 use crate::parser::ArrayLiteralItem;
 use crate::parser::AssignMode;
 
-// unset [-f|-v] NAME... Also accepts `arr[i]` to remove one element
-// without touching the rest of the array. `stderr_target` mirrors real
-// bash routing this error through the command's own `2>` (confirmed via
-// a clean bash probe) -- unlike nounset/plain-assignment errors, which
-// always go to real stderr since they happen before any redirect setup.
+// `unset [-f|-v] NAME...`, and `arr[i]` to remove one element. Errors go
+// through the command's own `2>` (`stderr_target`), as in bash, unlike
+// nounset and assignment errors, which come before redirects are set up.
 pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<String>) -> i32 {
     let mut only_funcs = false;
     let mut only_vars = false;
@@ -68,18 +64,9 @@ pub(crate) fn run_unset(sh: &mut Shell, args: &[String], stderr_target: &Option<
     status
 }
 
-// declare/typeset [-A|-a|-i|-r|-g] [NAME|NAME=value]... `-x` isn't
-// tracked separately since every variable already lives in the
-// process env here; other real bash flags (-u/-l/-n/...) are
-// accepted but not enforced. `-p`/`-f`/`-F` are a different mode
-// entirely (print instead of declare, see print_declared/
-// print_functions) -- checked first, same as bash effectively
-// treating them as a separate subcommand.
-// What `declare`/`export`/`readonly` will accept as a name: an
-// identifier, optionally with a `[subscript]` after it. Everything
-// else is what bash calls "not a valid identifier" -- and what this
-// used to accept and then quietly write into the environment under a
-// name nothing could ever expand.
+// What `declare`, `export` and `readonly` accept as a name: an identifier,
+// optionally with a `[subscript]`. Anything else is "not a valid
+// identifier", as in bash.
 fn is_valid_declare_target(word: &str) -> bool {
     let name = word.split_once('=').map(|(n, _)| n).unwrap_or(word);
     let name = match name.split_once('[') {
@@ -95,13 +82,10 @@ fn is_valid_declare_target(word: &str) -> bool {
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-// The flag letters in one argument, if it is one. `declare -ir n=1`
-// carries two; matching whole strings saw neither, so the attributes
-// were silently dropped and `declare -p` reported a plain variable.
-// Every flag this family takes is a single letter with no argument of
-// its own, which is what makes the whole argument readable at once.
-//
-// `--` ends the options and is not one; a lone `-` is an operand.
+// The flag letters in one argument, if it's one: `declare -ir n=1`
+// carries two. Every flag here is a single letter without an argument of
+// its own, so the whole argument can be read at once. `--` ends the
+// options; a lone `-` is an operand.
 fn flag_letters(arg: &str) -> Option<impl Iterator<Item = char> + '_> {
     match arg.len() > 1 && arg.starts_with('-') && arg != "--" {
         true => Some(arg.chars().skip(1)),
@@ -113,6 +97,10 @@ fn has_flag(args: &[String], want: char) -> bool {
     args.iter().take_while(|a| *a != "--").filter_map(|a| flag_letters(a)).any(|mut cs| cs.any(|c| c == want))
 }
 
+// `declare`/`typeset`, `export` and `readonly` (`who`), with the flags
+// `-A -a -i -r -g -x`; bash's other letters are accepted and ignored.
+// `-p`, `-f` and `-F` print rather than declare (see `print_declared`,
+// `print_functions`) and are checked first.
 pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_literals: &[(usize, String, AssignMode, Vec<ArrayLiteralItem>)]) -> i32 {
     if has_flag(args, 'f') || has_flag(args, 'F') {
         let names_only = has_flag(args, 'F');
@@ -123,23 +111,13 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
         let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
         return sh.print_declared(&names);
     }
-    // `-g`: force the write to the true global scope even when
-    // called from inside a function -- without it, a plain
-    // declare/typeset inside a function auto-localizes exactly like
-    // `local` does (see the scalar assignment branch below), matching
-    // real bash (confirmed: `f() { declare z=5; }; f; echo "$z"`
-    // prints nothing in bash, but bish used to leak z to the global
-    // scope here before this fix).
+    // `-g` writes to the global scope even inside a function; without it,
+    // `declare`/`typeset` in a function makes a local, like `local` (see the
+    // scalar branch below), as in bash: `f() { declare z=5; }; f; echo "$z"`
+    // prints nothing.
     //
-    // `export` is always global, which is the one place `who` matters
-    // here. bash auto-localizes `declare`/`typeset` inside a function
-    // but not `export`: `f() { export E=v; }; f` leaves `E` set and
-    // exported in the *caller*, where `f() { declare E=v; }; f` leaves
-    // nothing. bish stored it as a local either way, and it appeared to
-    // work only because `lookup_var` fell back to reading the real
-    // process environment, which `export_to_environment` had written --
-    // so the value lived nowhere but the environment, and a child built
-    // from the shell's own variables could not see it at all.
+    // `export` is always global: in bash `f() { export E=v; }; f` leaves `E`
+    // set and exported in the caller.
     let mut global_flag = who == "export";
     let mut array_mode: Option<bool> = None; // Some(true)=-A, Some(false)=-a
     let mut readonly_flag = false;
@@ -149,9 +127,8 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
     let mut lower_flag = false;
     let mut export_flag = false;
     let mut status = 0;
-    // After `--` a word is an operand however it starts, which is the
-    // only way to reach the "not a valid identifier" path with a
-    // leading dash (`declare -x -- -bad=1`).
+    // After `--` a word is an operand however it starts, so
+    // `declare -x -- -bad=1` reaches "not a valid identifier".
     let mut after_dashdash = false;
     for (i, a) in args.iter().enumerate() {
         if a == "--" {
@@ -170,22 +147,17 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                     'l' => lower_flag = true,
                     'x' => export_flag = true,
                     'g' => global_flag = true,
-                    // Every other letter is accepted and does nothing,
-                    // as it was before this read them one at a time.
+                    // Every other letter is accepted and does nothing.
                     _ => {}
                 }
             }
             continue;
         }
-        // `declare -A m=([a]=1 [b]=2)` -- this position is actually
-        // an array literal, not a plain `NAME`/`NAME=value` string
-        // (`a` here is just its xtrace-only display text, see
-        // array_literal_display's own doc comment). `-A`/`-a` seen
-        // so far decides which table it's declared into, matching
-        // the plain-name case just below; no flag at all falls back
-        // to whatever `name` already is (bash's own behavior:
-        // without `-A`, a bracketed key is just an arithmetic index
-        // into a plain indexed array).
+        // `declare -A m=([a]=1 [b]=2)`: an array literal at this position
+        // (`a` is only its xtrace text; see `array_literal_display`). `-A`
+        // or `-a` picks the table, as for a plain name; without either, the
+        // name's current kind decides, as in bash, where a bracketed key
+        // without `-A` is an arithmetic index.
         if let Some((_, name, mode, items)) = array_literals.iter().find(|(pos, ..)| *pos == i) {
             match array_mode {
                 Some(true) => {
@@ -197,9 +169,8 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                 None => {}
             }
             sh.apply_array_literal(name, *mode, items);
-            // The other attributes apply to an array too:
-            // `declare -ax a=(1)` is exported as well as indexed, and
-            // only `-r` was being recorded here.
+            // The other attributes apply to arrays too: `declare -ax a=(1)`
+            // is exported as well as indexed.
             if integer_flag {
                 sh.integer_names.insert(name.clone());
             }
@@ -229,9 +200,7 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
             Some(eq) => (a[..eq].to_string(), Some(a[eq + 1..].to_string())),
             None => (a.clone(), None),
         };
-        // `declare 'a[0]=5'` names an *element*, not a variable called
-        // "a[0]" -- which is what this used to create, under a name
-        // nothing could then expand.
+        // `declare 'a[0]=5'` names an element.
         if let Some((base, rest)) = name.split_once('[') {
             let index = rest.trim_end_matches(']').to_string();
             let base = base.to_string();
@@ -273,40 +242,25 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                 sh.array_names.insert(name.clone());
             }
             None => {
-                // Auto-localize, matching `local`: a plain (non-`-g`)
-                // declare/typeset inside a function creates a new
-                // local shadow rather than falling through to the
-                // global env. Pre-inserting an (empty, for now) entry
-                // into the current scope makes assign_var's own
-                // existing "write into whichever scope already
-                // shadows this name" logic (raw_var_write) do the
-                // right thing without needing a separate write path.
+                // Make a local, as `local` does: an empty entry in the
+                // current scope makes `assign_var` (via `raw_var_write`)
+                // write into it.
                 if !global_flag && !sh.var_scopes.is_empty() {
                     sh.var_scopes.last_mut().unwrap().entry(name.clone()).or_default();
                 }
                 if let Some(v) = val {
                     // A readonly name refuses the write, and `declare`
-                    // owes the shell that failure -- same as a bare
-                    // `x=2` command does.
+                    // fails, as `x=2` would.
                     if !if global_flag { sh.assign_var_global(&name, v) } else { sh.assign_var(&name, v) } {
                         status = 1;
                     }
                 } else if export_flag {
-                    // Bare `declare -x NAME`/`export NAME` on an
-                    // already-set variable (commonly a local: `local
-                    // Z=inner; export Z`) -- re-assign its current
-                    // value through assign_var so exported_names'
-                    // mirror-to-env logic fires immediately, instead
-                    // of only on the variable's *next* write. The
-                    // empty-fallback branch below wouldn't reach this
-                    // case since it only fires for a name with no
-                    // value at all yet.
-                    // Only when there is a value to re-assign.
-                    // `lookup_var` answers "" for a name that is not
-                    // set at all, and writing that back *created* it:
-                    // `export E` on an unset `E` put an empty `E` in
-                    // every child's environment, where bash marks the
-                    // attribute and exports nothing.
+                    // `declare -x NAME`/`export NAME` on a set variable
+                    // (often a local: `local Z=inner; export Z`) reassigns
+                    // its value so it's exported now, not on its next
+                    // write. Only when set: `lookup_var` gives "" for an
+                    // unset name, and writing that back would create it,
+                    // where bash marks the attribute and exports nothing.
                     if sh.var_is_set(&name) {
                         let cur = sh.lookup_var(&name);
                         if global_flag {
@@ -316,11 +270,9 @@ pub(crate) fn run_declare(sh: &mut Shell, who: &str, args: &[String], array_lite
                         };
                     }
                 }
-                // No `else`: `declare x` with no value records the
-                // name's attributes and leaves it *unset*, at either
-                // scope. Assigning an empty string here is exactly the
-                // distinction being kept (see Shell::var_scopes) --
-                // `declare z; echo "${z-unset}"` says `unset` in bash.
+                // No `else`: `declare x` without a value records attributes
+                // and leaves the name unset, as bash's
+                // `declare z; echo "${z-unset}"` shows.
             }
         }
         if readonly_flag {
