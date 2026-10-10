@@ -218,7 +218,7 @@ pub enum ApplyEdits {
     Scoped,
     /// Refuse always.
     Never,
-    /// Accept whenever asked, as VS Code does.
+    /// Accept whenever asked.
     Always,
 }
 
