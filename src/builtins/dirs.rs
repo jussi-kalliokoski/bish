@@ -8,9 +8,9 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
     let physical = args.iter().rposition(|a| a == "-P" || a == "-L").is_some_and(|i| args[i] == "-P");
     let operands: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "-L" | "-P" | "-@" | "-e")).collect();
     if operands.len() > 1 {
-        // bash's status for a usage error.
+        const USAGE_ERROR: i32 = 2;
         sh_eprintln!(sh, "bish: cd: too many arguments");
-        return 2;
+        return USAGE_ERROR;
     }
     let old = sh.cwd.to_string_lossy().into_owned();
     let target = if let Some(dir) = operands.first() {
