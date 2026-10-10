@@ -1,38 +1,19 @@
-// Detachable `bish session` support -- the client/server split described
-// in ../bish-detachable-sessions.md and the approved implementation plan
-// (~/.claude/plans/melodic-sauteeing-boot.md). This module owns
-// everything specific to that split: where a session's socket/pidfile
-// live, the framed wire protocol spoken over that socket, verifying a
-// connecting peer's real UID before trusting anything it sends, the
-// daemon bootstrap (SessionBridge, run_daemon), and the client loop
-// (run_client). `main.rs`'s actual `bish session <subcommand>` argv
-// dispatch lands in a follow-up commit -- everything here is already
-// directly callable, just not yet wired to a CLI entry point.
+// Detachable `bish session` support: where a session's socket and
+// pidfile live, the framed protocol over that socket, checking a peer's
+// UID before trusting it, the daemon (`SessionBridge`, `run_daemon`) and
+// the client (`run_client`).
 //
-// The daemon side deliberately does *not* require any changes to
-// repl::run or anything under it: run_daemon gives the daemon its own
-// local pty pair (pty::attach_self_to_pty) and attaches the daemon's
-// own fd 0/1/2 to the slave side, so every existing termios/ioctl/read/
-// write call in this codebase keeps working completely unmodified --
-// as far as repl::run is concerned, it has a real terminal, because it
-// does. SessionBridge is the one new piece: a stateless byte relay
-// between that pty's *master* side (which the daemon keeps) and
-// whichever client socket is currently attached, if any -- no access
-// to Shell/SessionState/any Rc<RefCell> state at all, so it's safe to
-// service from inside the single-threaded on_idle mechanism every
-// blocking loop in repl.rs already calls (service_background_jobs) via
-// service_current_bridge below, without threading a new parameter
-// through the half-dozen-plus functions between here and there. Same
-// "this process is single-threaded, so plain global state describing
-// what the whole process is doing right now is fine" reasoning
-// exec.rs's own bare `static WINCH_FLAG` already relies on.
+// The daemon needs nothing from `repl::run`: `run_daemon` gives itself
+// a pty pair (`pty::attach_self_to_pty`) with fd 0/1/2 on the slave, so
+// every termios, ioctl, read and write works unchanged; as far as the
+// repl knows, it has a real terminal. `SessionBridge` relays bytes
+// between that pty's master and the attached client, if any. It touches
+// no shell state, so it can be serviced from the idle hook every
+// blocking loop already calls (`service_background_jobs`, via
+// `service_current_bridge`) through a global, without new parameters;
+// the process is single-threaded, as with exec.rs's `WINCH_FLAG`.
 //
-// Same zero-external-dependency, hand-roll-it philosophy as the rest of
-// this project: `std::os::unix::net::{UnixListener, UnixStream}` is
-// already in the standard library, so the only real FFI this needs is
-// `SO_PEERCRED` (Linux-only -- this codebase's pty.rs/term.rs are
-// already explicitly scoped to Linux x86_64, same stance here, not a
-// new boundary).
+// `is_attached`, `has_rpc_peers` and `Peer::fd` are used only by tests.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -45,14 +26,10 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(unix))]
 use wasm_socket::{UnixListener, UnixStream};
 
-// On a target without UNIX-domain sockets, detachable sessions cannot
-// work: there is no socket to bind, connect or accept on. These stubs
-// stand in for `std::os::unix::net`'s two types so the whole session
-// module still compiles -- every operation returns "unsupported", and
-// the callers (all behind a `bish session ...` subcommand or the
-// interactive bridge) surface that rather than a link failure. The one
-// user of a target like this is the browser build, which has no second
-// process to detach from in the first place.
+// Without UNIX-domain sockets sessions can't work: these stand in for
+// `std::os::unix::net`'s two types so the module compiles, with every
+// operation returning "unsupported". The browser build is the one such
+// target, and it has no second process to detach from.
 #[cfg(not(unix))]
 mod wasm_socket {
     use std::io;
@@ -108,8 +85,8 @@ mod wasm_socket {
         }
     }
 
-    // The protocol writes through a shared reference too (`(&*stream)`),
-    // so the borrowed form needs the same two traits.
+    // The protocol also writes through a shared reference (`(&*stream)`),
+    // so the borrowed form needs both traits.
     impl io::Read for &UnixStream {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
             unsupported()
@@ -132,8 +109,8 @@ mod wasm_socket {
             unsupported()
         }
 
-        /// Matches `std::os::unix::net::UnixListener::accept`'s shape --
-        /// the second element is the peer address, which callers ignore.
+        /// As `UnixListener::accept`; the second element, the peer address,
+        /// is ignored.
         pub fn accept(&self) -> io::Result<(UnixStream, ())> {
             unsupported()
         }
@@ -150,17 +127,14 @@ mod wasm_socket {
     }
 }
 
-// SIGTERM is 15 on every Unix bish targets, unlike the job-control
-// numbers; it is here rather than in the layer's tables for that reason.
+// SIGTERM is 15 on every Unix, unlike the job-control signals, so it's
+// here rather than in the platform tables.
 const SIGTERM: i32 = 15;
 
-// The connecting peer's real UID for an already-`accept`ed UNIX-domain
-// stream socket -- checked once per new connection, before trusting any
-// byte it sends. Defense in depth on top of the socket directory's own
-// `0700` permissions (see `socket_dir`), not a replacement for them: a
-// misconfigured or shared runtime directory could otherwise let another
-// local user's process connect at all; this is what actually refuses to
-// speak to it once it has.
+// The connecting peer's real UID, checked once per connection before
+// trusting a byte. On top of the socket directory's `0700` (see
+// `socket_dir`): if the directory were shared or misconfigured, this
+// still refuses another user.
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     crate::platform::peer_user(stream.as_raw_fd())
 }
@@ -169,13 +143,9 @@ fn current_uid() -> u32 {
     crate::platform::real_user()
 }
 
-// Where every session's socket/pidfile lives: `$XDG_RUNTIME_DIR/bish`
-// when set (the modern, tmpfs-backed, per-user-isolated convention --
-// cleared automatically on logout, never accumulates stale files across
-// reboots the way a `/tmp`-based one can), falling back to
-// `/tmp/bish-<uid>` otherwise. The directory itself is created mode
-// `0700` by `ensure_socket_dir` -- this function alone just computes the
-// path, so it stays testable without touching the filesystem.
+// Where sessions' sockets and pidfiles live: `$XDG_RUNTIME_DIR/bish`
+// (per-user, cleared on logout), else `/tmp/bish-<uid>`.
+// `ensure_socket_dir` creates it `0700`; this only computes the path.
 pub fn socket_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("bish");
@@ -183,15 +153,11 @@ pub fn socket_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/bish-{}", current_uid()))
 }
 
-// A session name becomes a filename inside the 0700 socket directory,
-// so it has to be one component and nothing else. `bish session new
-// ../../tmp/x` would otherwise write outside that directory, and `bish
-// session attach ../../...` would connect to an arbitrary socket path.
-//
-// The user supplies their own argv today, so this is not a privilege
-// boundary yet -- it becomes one the moment a name can come from
-// anywhere else (a config file, a hook, `$BISH_SESSION`), and the
-// cheapest time to draw the line is before that happens.
+// A session name becomes a filename in the socket directory, so it must
+// be one path component: `bish session new ../../tmp/x` would write
+// outside it. Not a privilege boundary while names come from the user's
+// own argv, but it would be once one could come from a config, a hook
+// or `$BISH_SESSION`.
 pub fn check_name(name: &str) -> io::Result<()> {
     let ok = !name.is_empty() && name != "." && name != ".." && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
     match ok {
@@ -208,20 +174,12 @@ pub fn pidfile_path(name: &str) -> PathBuf {
     socket_dir().join(format!("{}.pid", name))
 }
 
-// Opens (creating if needed) `name`'s pidfile, writes this process's own
-// PID into it, and takes an exclusive, non-blocking `flock` on it. The
-// returned File must simply stay alive for the rest of this process's
-// life -- dropping it releases the lock, which is exactly what tells
-// `is_daemon_alive` this daemon is gone. This is what actually lets
-// `ls`/`kill` tell a live daemon apart from a stale leftover file: the
-// file's own *content* (a PID number) can't do that on its own, since a
-// PID can be reused by an unrelated process after a crash -- see GNU
-// screen's own CVE-2023-24626 history (../bish-detachable-sessions.md's
-// research) for exactly the class of bug that comes from trusting a raw
-// PID number alone. Also doubles as the guard against two concurrent
-// `bish session new` calls for the same name racing each other: the
-// second one's own `flock` attempt fails here, before it ever touches
-// the socket file.
+// Opens (creating) `name`'s pidfile, writes this PID and takes an
+// exclusive non-blocking `flock`. Keep the file alive for the process's
+// life: dropping it releases the lock, which is how `is_daemon_alive`
+// tells a live daemon from a stale file. The PID alone can't, as it
+// may be reused after a crash. Also stops two `bish session new` for the
+// same name: the second's `flock` fails before it touches the socket.
 fn acquire_pidfile_lock(name: &str) -> io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(pidfile_path(name))?;
     crate::platform::lock_exclusive(file.as_raw_fd())?;
@@ -231,22 +189,16 @@ fn acquire_pidfile_lock(name: &str) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-// True if `name`'s pidfile exists and is currently locked by a live
-// daemon -- probes with its own non-blocking exclusive-lock attempt
-// (immediately released either way, win or lose) rather than trusting
-// the file's content, for the same PID-reuse reason
-// acquire_pidfile_lock's own doc comment gives. A missing pidfile
-// (never created, or already cleaned up) is simply "not alive," not an
-// error.
+// Whether `name`'s pidfile is locked by a live daemon, probed with a
+// non-blocking lock released straight away (see
+// `acquire_pidfile_lock`). A missing pidfile is "not alive".
 fn is_daemon_alive(name: &str) -> bool {
     let file = match std::fs::File::open(pidfile_path(name)) {
         Ok(f) => f,
         Err(_) => return false,
     };
     if crate::platform::lock_exclusive(file.as_raw_fd()).is_ok() {
-        // Nobody else was holding it -- stale. Release our own probe
-        // lock immediately; this function only ever answers a question,
-        // it doesn't hold anything.
+        // Nobody held it: stale. Release the probe lock.
         crate::platform::unlock(file.as_raw_fd());
         false
     } else {
@@ -255,31 +207,23 @@ fn is_daemon_alive(name: &str) -> bool {
 }
 
 fn read_pid(name: &str) -> Option<i32> {
-    // First line only: the daemon keeps a status line underneath it
-    // (see write_status), and a pid is still the first thing anyone
-    // reading this file wants.
+    // First line only: the daemon writes a status line under it (see
+    // `write_status`).
     std::fs::read_to_string(pidfile_path(name)).ok()?.lines().next()?.trim().parse().ok()
 }
 
-/// How many clients are attached to `name` right now, as its daemon
-/// last reported.
-///
-/// The daemon is the only thing that can know this, so it writes it
-/// down: `ls` runs in a different process entirely and has no way to
-/// ask. Rewritten only when the number actually changes, so an idle
-/// session touches nothing. `None` means the daemon predates the status
-/// line or has not written one yet, which reads as "unknown" rather
-/// than "nobody".
+/// How many clients are attached to `name`, as its daemon last wrote.
+/// Only the daemon knows, and `ls` runs in another process. Rewritten
+/// only on change. `None` (not yet written) reads as unknown, not
+/// nobody.
 fn read_attached(name: &str) -> Option<usize> {
     let text = std::fs::read_to_string(pidfile_path(name)).ok()?;
     text.lines().nth(1)?.strip_prefix("attached ")?.trim().parse().ok()
 }
 
-/// Rewrites `pidfile` as the pid line plus the current attached count.
-///
-/// Through the open descriptor rather than the path, which is what
-/// makes `session rename` safe: the file can be renamed out from under
-/// a running daemon and this keeps writing to the same inode.
+/// Rewrites `pidfile` as the pid line plus the attached count, through
+/// the open descriptor, so `session rename` can rename the file under a
+/// running daemon.
 fn write_status(pidfile: &mut std::fs::File, attached: usize) {
     use std::io::{Seek, SeekFrom};
     let text = format!("{}\nattached {}\n", crate::platform::process_id(), attached);
@@ -289,19 +233,15 @@ fn write_status(pidfile: &mut std::fs::File, attached: usize) {
     let _ = pidfile.flush();
 }
 
-/// When this session was created, from the socket file's own mtime.
-///
-/// The socket is written once, at bind, and never again -- unlike the
-/// pidfile, which the status line rewrites. So it is the one thing in
-/// the runtime directory that still remembers when the session started.
+/// When the session was created, from the socket's mtime: it's written
+/// once at bind, unlike the pidfile.
 fn session_age(name: &str) -> Option<std::time::Duration> {
     let created = std::fs::metadata(socket_path(name)).ok()?.modified().ok()?;
     std::time::SystemTime::now().duration_since(created).ok()
 }
 
-/// A duration as a person would say it: the largest unit that is not
-/// zero, and nothing after it. "3h" is more useful in a list than
-/// "3h07m12s".
+/// A duration as a person says it: the largest nonzero unit only. "3h"
+/// reads better in a list than "3h07m12s".
 fn short_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     match secs {
@@ -312,25 +252,15 @@ fn short_duration(d: std::time::Duration) -> String {
     }
 }
 
-/// The directory a session is in, read out of `/proc`.
-///
-/// The daemon *is* the shell process, so its own cwd is the session's
-/// -- a `cd` in the session moves it. Linux-only, like the rest of this
-/// module's syscalls (see the file header); `None` wherever /proc is
-/// not there or the link cannot be read.
+/// The session's directory, from `/proc`: the daemon is the shell, so a
+/// `cd` moves its cwd. `None` without `/proc` (macOS) or if unreadable.
 fn session_cwd(pid: i32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-// Creates `socket_dir()` (and any missing parent, e.g. a not-yet-existing
-// `$XDG_RUNTIME_DIR/bish`) mode `0700` if it doesn't already exist --
-// `mkdir`'s own `-p`-style idempotence (EEXIST on an existing directory
-// is success, not an error) via `std::fs::create_dir_all`'s directory
-// walk, but the final component's own permissions are set explicitly via
-// a raw `mkdir(2)` call rather than trusted to the umask `create_dir_all`
-// would otherwise apply -- this directory holds a socket only this user
-// should ever be able to connect to, so its mode must never depend on
-// whatever umask happened to be active.
+// Creates `socket_dir()` and any missing parents. The final directory's
+// `0700` is set explicitly rather than left to the umask: it holds a
+// socket only this user should reach.
 pub fn ensure_socket_dir() -> io::Result<PathBuf> {
     let dir = socket_dir();
     if let Some(parent) = dir.parent() {
@@ -340,16 +270,11 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
         if err.kind() != io::ErrorKind::AlreadyExists {
             return Err(err);
         }
-        // EEXIST is not the same as "the directory I meant is already
-        // there". On the `/tmp` fallback path anyone can pre-create
-        // `/tmp/bish-<uid>` -- including as a symlink into a directory
-        // they own -- and mkdir would report exactly this. The
-        // set_permissions below follows symlinks, so accepting EEXIST
-        // blindly means chmod'ing a stranger's directory 0700 and then
-        // putting this session's socket and pidfile inside it.
-        //
-        // symlink_metadata does not follow, so this sees the entry
-        // itself: it must be a real directory, and it must be ours.
+        // EEXIST doesn't mean the directory is ours: on the `/tmp` fallback
+        // anyone can pre-create `/tmp/bish-<uid>`, even as a symlink to
+        // their own directory, and `set_permissions` below follows
+        // symlinks. `symlink_metadata` doesn't, so this checks the entry
+        // itself is a real directory owned by us.
         let meta = std::fs::symlink_metadata(&dir)?;
         if !meta.is_dir() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists and is not a directory", dir.display())));
@@ -359,32 +284,17 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by uid {}, not by you", dir.display(), owner)));
         }
     }
-    // Belt-and-suspenders: force the mode even if the directory already
-    // existed with something looser (e.g. left over from before this
-    // function existed, or a stale `/tmp` fallback from a previous OS
-    // install) -- cheap, and closes exactly the class of gap GNU
-    // screen's own socket-directory CVE history warns against (see
-    // ../bish-detachable-sessions.md's tmux/screen research).
+    // Force the mode even if it existed looser (an old `/tmp` fallback, say).
     crate::platform::set_file_mode(&dir, 0o700)?;
     Ok(dir)
 }
 
-// The framed wire protocol spoken over a session socket. Kept
-// deliberately minimal -- a type byte plus a big-endian u32 length
-// prefix plus payload, no JSON/external framing crate, matching this
-// project's own `json.rs`/`diff.rs` precedent of "small hand-rolled
-// format, tested directly" -- four kinds, covering everything the
-// client/server split (bish-detachable-sessions.md §5) actually needs:
-// raw terminal I/O bytes in either direction (the hot path -- client
-// keystrokes one way, the server's already-rendered ANSI frames the
-// other, both just opaque bytes at this layer), the attach handshake a
-// client sends once right after connecting, a resize notification a
-// client sends whenever its own real terminal resizes, and an OSC-52-
-// style passthrough message the server sends when something running in
-// a pane wants the attached client's *real* terminal to see an escape
-// sequence directly (clipboard writes today, see registers.rs's
-// write_osc52 and bish-detachable-sessions.md §4 -- this module doesn't
-// interpret the payload, just carries it).
+// The framed protocol over a session socket: a type byte, a big-endian
+// u32 length, the payload. Raw terminal bytes both ways (keystrokes in,
+// rendered frames out), the handshake a client sends on connecting, a
+// resize when the client's terminal resizes, and a passthrough for an
+// escape sequence the client's real terminal must see (OSC 52 clipboard
+// writes; see `registers::write_osc52`), carried uninterpreted.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Bytes(Vec<u8>),
@@ -399,26 +309,18 @@ pub enum Message {
         cols: u16,
     },
     Passthrough(Vec<u8>),
-    /// `bish session capture <name>`: send me what the focused pane
-    /// currently shows. Client -> server.
+    /// `bish session capture <name>`: what the focused pane shows. Client to
+    /// server.
     CaptureRequest,
-    /// The answer, as plain text with a newline between rows. Server ->
-    /// client, and the only message a client both waits for and then
-    /// exits on.
+    /// The answer, plain text with a newline between rows. Server to client;
+    /// the one message a client waits for and then exits on.
     CaptureReply(Vec<u8>),
-    /// One JSON-RPC message for whatever is asking about this session
-    /// from outside -- `bish tool mcp-server` today. Client -> server.
-    ///
-    /// Opaque here on purpose: this layer carries bytes and counts them,
-    /// and every question about what they mean belongs to whoever
-    /// answers them. Same stance `Passthrough` already takes.
+    /// One JSON-RPC message from something asking about this session from
+    /// outside (`bish tool mcp-server`). Client to server. Opaque here, like
+    /// `Passthrough`: this layer only carries bytes.
     Rpc(Vec<u8>),
-    /// The answer, and also the unsolicited notifications that go the
-    /// same way. Server -> client.
-    ///
-    /// One kind for both because a JSON-RPC notification has no `id` and
-    /// so already says which it is; a second message kind would only be
-    /// restating that in a second place.
+    /// The answer, and unsolicited notifications too. Server to client. One
+    /// kind for both: a notification has no `id`, which already says so.
     RpcReply(Vec<u8>),
 }
 
@@ -432,10 +334,8 @@ const KIND_RPC: u8 = 6;
 const KIND_RPC_REPLY: u8 = 7;
 
 impl Message {
-    // Header (5 bytes: 1 kind + 4 big-endian length) followed by that
-    // many payload bytes -- big-endian purely by convention (this
-    // protocol has no other endianness-sensitive consumer to match), not
-    // because anything here is genuinely cross-architecture-sensitive.
+    // A 5-byte header (kind, big-endian length), then that many payload
+    // bytes.
     pub fn encode(&self) -> Vec<u8> {
         let (kind, payload) = match self {
             Message::Bytes(b) => (KIND_BYTES, b.clone()),
@@ -467,10 +367,8 @@ impl Message {
     }
 }
 
-// A `String` field inside a Handshake payload: one length byte (every
-// real $TERM/$COLORTERM value is a handful of ASCII bytes -- 255 is
-// generous headroom, not a real constraint) followed by that many UTF-8
-// bytes.
+// A `String` in a Handshake: one length byte, then that many UTF-8 bytes.
+// `$TERM`/`$COLORTERM` are a handful of bytes.
 fn encode_short_string(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     let len = bytes.len().min(255) as u8;
@@ -486,29 +384,17 @@ fn decode_short_string(buf: &[u8], pos: &mut usize) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-// Accumulates bytes arriving from a stream socket (which, unlike a
-// single `read()` off a pty, offers no guarantee a whole Message arrives
-// in one chunk -- a large paste or a big rendered frame can easily
-// straddle two `read()`s) and yields complete Messages as enough bytes
-// have accumulated for one. Mirrors this codebase's other incremental
-// byte-stream consumers in shape (vt100.rs's own parser survives a
-// control sequence split across two `feed()` calls the same way) --
-// `feed` never blocks or does I/O itself, just appends; `next_message`
-// is what actually tries to parse.
-// The largest frame this protocol will accept. `try_accept` already
-// drops any connection whose peer uid is not ours, so the peer is the
-// same user -- but a session socket outlives the process that made it,
-// and same-uid is not same-trust. A length prefix is a promise about
-// bytes that have not arrived yet: without a ceiling a peer can declare
-// 4 GiB, dribble, and `feed` grows the buffer forever.
-//
-// 16 MiB is far past any real frame (a full repaint of a large terminal
-// is tens of kilobytes) and far below anything that matters. Same
-// reasoning as framing.rs's MAX_CONTENT_LENGTH, which this protocol should
-// have had from the start.
+// The largest frame accepted. `try_accept` refuses other users, but the
+// same user isn't the same trust, and a socket outlives its creator:
+// without a ceiling a peer could declare 4 GiB, dribble, and grow the
+// buffer forever. A full repaint is tens of kilobytes. As framing.rs's
+// `MAX_CONTENT_LENGTH`.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
+// Collects bytes from a stream socket, which may split a message across
+// reads (a paste, a big frame), and yields whole messages. `feed` only
+// appends; `next_message` parses.
 pub struct Decoder {
     buf: Vec<u8>,
 }
@@ -522,22 +408,17 @@ impl Decoder {
         self.buf.extend_from_slice(bytes);
     }
 
-    // `Ok(None)` means "not enough bytes yet for a whole message" (call
-    // `feed` again and retry) -- not an error. `Err` is a genuinely
-    // malformed stream (an unrecognized kind byte, or a Handshake
-    // payload too short for its own declared string lengths) -- this
-    // should never happen against this module's own `encode`, so in
-    // practice only means "the peer on the other end isn't speaking this
-    // protocol," worth closing the connection over, not retrying.
+    // `Ok(None)`: not enough bytes for a whole message yet; feed more. `Err`:
+    // a malformed stream (unknown kind, a handshake shorter than its own
+    // lengths), meaning the peer isn't speaking this protocol; close it.
     pub fn next_message(&mut self) -> Result<Option<Message>, String> {
         if self.buf.len() < 5 {
             return Ok(None);
         }
         let kind = self.buf[0];
         let len = u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-        // Checked before the "not enough bytes yet" return, so an
-        // oversized declaration is refused on the first five bytes
-        // rather than after the peer has had a chance to send them.
+        // Before the not-enough-bytes return, so an oversized declaration is
+        // refused on its first five bytes.
         if len > MAX_FRAME {
             return Err(format!("frame of {len} bytes exceeds the {MAX_FRAME}-byte limit"));
         }
@@ -576,182 +457,110 @@ impl Decoder {
     }
 }
 
-// The byte relay between a daemon's own pty master and whichever client
-// socket is currently attached, if any.
-//
-// The pty-master-*reading* half runs on its own dedicated background
-// thread (drain_pty_master_thread below), not through the on_idle
-// mechanism every other part of this bridge uses -- found necessary the
-// hard way, via an actual reproducible hang, not assumed upfront. The
-// problem: `editor::read_line`/`vk.next_key`'s own on_idle callback
-// (`read_key_idle`, editor.rs) only runs while genuinely *waiting* for
-// the next byte -- once bytes are already sitting in the pty's read
-// queue (a paste, or any input arriving faster than one keystroke at a
-// time, which a client relaying a whole burst from its own socket read
-// absolutely can produce), every one of them gets consumed and
-// redrawn in a tight loop with no on_idle call in between. If the
-// *cumulative* redraw output from that burst exceeds the pty's own
-// kernel output-queue capacity, the shell's own next `io::stdout()`
-// write blocks -- and since nothing else was draining the master side
-// (on_idle never got a turn to), it stays blocked forever. Reproduced
-// directly: a short command (`echo hi`) never triggered this, but a
-// single `e <long path>\n` reliably hung the whole daemon. A dedicated
-// thread that does nothing but block-read the master and forward
-// whatever arrives keeps that queue draining continuously regardless
-// of what the main, single-threaded, on_idle-driven side is doing --
-// this closes the deadlock at its actual root rather than trying to
-// make every possible burst-producing code path yield more often.
-// Never touches Shell/SessionState/any Rc<RefCell> state (just raw
-// fds), so this doesn't reopen the single-threaded-by-design question
-// for anything else in this codebase -- see this module's own top doc
-// comment on why bish stays single-threaded everywhere else.
-//
-// The client-*input* direction (drain_client below) stays on the main,
-// on_idle-driven thread: writing a client's own input into the pty
-// master is comparatively small and immediately consumed by the
-// already-continuously-reading shell process on the other end, so it
-// doesn't have the same unbounded-accumulation shape -- and keeping it
-// on the main thread is what lets accept/attach/detach state
-// (`client_read`, `just_attached`) stay a single, non-atomic
-// `Option`/`bool` with no synchronization needed.
 // The size a session shared by these clients runs at: the smallest in
-// each direction, taken independently, so a tall narrow terminal beside
-// a short wide one leaves both able to see the whole screen.
-//
-// A client that has not sent its Handshake yet reports (0, 0) and is
-// skipped -- it must not shrink the session to nothing for everybody
-// else while its first message is still in flight. `None` (nobody
-// attached, or nobody who has said anything yet) means leave the pty at
-// whatever size it already has.
+// each direction independently, so a tall narrow terminal and a short
+// wide one both see the whole screen. A client yet to send its
+// handshake reports (0, 0) and is skipped. `None`, with nobody sized,
+// leaves the pty as it is.
 fn smallest_size(sizes: &[(u16, u16)]) -> Option<(u16, u16)> {
     let rows = sizes.iter().map(|(r, _)| *r).filter(|r| *r > 0).min()?;
     let cols = sizes.iter().map(|(_, c)| *c).filter(|c| *c > 0).min()?;
     Some((rows, cols))
 }
 
-// Names one attached client for as long as it is attached. Never
-// reused, so the write half the drain thread holds and the read half
-// the main thread holds can always be matched back up -- pairing them
-// by position in two separate lists would go wrong the first time a
-// client in the middle detached.
+// Names an attached client while attached, never reused, so the drain
+// thread's write half and the main thread's read half match up; pairing
+// by position would break when a middle client left.
 type ClientId = u64;
 
 // One attached client, from the main thread's side.
 struct Client {
     id: ClientId,
-    // Read from directly by drain_one_client; the matching write half
-    // lives in `writes`, where the drain thread can reach it.
+    // Read by `drain_one_client`; the write half is in `writes`, for the
+    // drain thread.
     read: UnixStream,
-    // Per client, because two clients' byte streams have nothing to do
-    // with each other: one decoder shared between them would splice
-    // half of one client's frame onto half of another's.
+    // Per client: one shared decoder would splice half of one client's frame
+    // onto another's.
     decoder: Decoder,
-    // The last size this client reported -- its Handshake, then every
-    // Resize. The pty gets the *smallest* of these, which is what makes
-    // a session shared by two differently-sized terminals legible in
-    // both. tmux's own rule.
+    // The last size this client reported (handshake, then each resize).
+    // The pty gets the smallest, so a session shared by two different
+    // terminals fits both.
     size: (u16, u16),
 }
 
-// How many clients one session will hold at once. No real workflow
-// wants more than a couple; the cap is here so a runaway attach loop
-// cannot walk the daemon out of file descriptors.
+// How many clients a session holds at once; a cap so a runaway attach
+// loop can't exhaust the daemon's descriptors.
 const MAX_CLIENTS: usize = 16;
 
+// The relay between a daemon's pty master and its attached clients.
+//
+// Reading the master runs on its own thread (`drain_pty_master_thread`).
+// The idle hook runs only while a loop waits for a key; a burst of input
+// (a paste, a client relaying a whole read) is consumed and redrawn with
+// no idle call between. If that output overfills the pty's queue, the
+// shell's next write blocks, and with nothing draining the master it
+// blocks forever (`e <long path>` hung the daemon). A thread that only
+// reads the master and forwards keeps the queue moving. It touches raw
+// fds only, no shell state.
+//
+// Client input (`drain_client`) stays on the main thread: it's small and
+// consumed at once by the shell, and that keeps attach state a plain
+// `Option`/`bool` with no locking.
 pub struct SessionBridge {
     listener: UnixListener,
-    // The main thread's own handles, one per attached client.
+    // The main thread's handle for each attached client.
     clients: Vec<Client>,
-    // Shared with the background pty-master-draining thread -- the only
-    // thing that thread ever touches. Every attached client's write
-    // half, each tagged with its own id so the main thread can take one
-    // away without disturbing the others. Kept in step with `clients`
-    // by attach/detach, the only two places either is ever changed.
+    // Shared with the pty-draining thread, the only thing it touches: each
+    // client's write half, tagged with its id. Changed only by attach and
+    // detach, in step with `clients`.
     //
-    // The flag is whether the client is watching the screen. Every one
-    // is until it asks a question: a peer that speaks RPC reads replies
-    // and notifications, and was being sent every byte a busy session
-    // drew only to throw each one away.
+    // The flag is whether the client is watching the screen: true until it
+    // asks a question. An RPC peer reads replies and notifications, and has
+    // no use for every byte a busy session draws.
     writes: Arc<Mutex<Vec<(ClientId, UnixStream, bool)>>>,
     next_client_id: ClientId,
-    // The daemon's own pidfile, held open for its lock and written
-    // through for the status line -- see write_status. `None` outside a
-    // real daemon (a test bridge has no pidfile to keep current).
+    // The daemon's pidfile, held for its lock and written for the status
+    // line (see `write_status`). `None` outside a daemon.
     pidfile: Option<std::fs::File>,
-    // What the status line currently says, so an idle session rewrites
-    // nothing.
+    // What the status line says, so an idle session rewrites nothing.
     reported_attached: usize,
-    // Clients that have asked what the screen currently shows and are
-    // waiting for the answer. Only recorded here: this module has no
-    // access to any session's grid, and deliberately keeps none (see
-    // the module doc comment). repl.rs, which does, answers them --
-    // see `answer_capture_requests`.
+    // Clients waiting for what the screen shows. Only recorded here: this
+    // module has no session grid; repl.rs answers
+    // (`answer_capture_requests`).
     capture_requests: Vec<ClientId>,
-    // JSON-RPC messages that have arrived and not been answered yet,
-    // each tagged with who asked. Recorded rather than answered for
-    // exactly the reason `capture_requests` is -- see
-    // `answer_rpc_requests`.
+    // JSON-RPC messages not answered yet, with who asked, recorded for the
+    // same reason (see `answer_rpc_requests`).
     pending_rpc: Vec<(ClientId, Vec<u8>)>,
-    // Every client that has ever sent one. A peer that asks questions is
-    // also a peer that wants to be told when something changes, so this
-    // doubles as the subscriber list for `push_rpc_notification`; there
-    // is no separate subscribe message to get wrong.
+    // Every client that has sent one. A peer asking questions also wants to
+    // hear of changes, so this is the subscriber list for
+    // `push_rpc_notification`.
     rpc_clients: Vec<ClientId>,
-    // The main thread's own pty-master handle -- writes only (client
-    // input, `Pty::set_size`); the background thread owns the read side
-    // via its own separate fd (see SessionBridge::new). `None` for a
-    // plain bish's bridge (see `listen_here`), which has no terminal of
-    // its own to share: its peers ask questions and never type.
+    // The main thread's pty master, for writes (client input,
+    // `Pty::set_size`); the drain thread reads its own fd. `None` for a plain
+    // bish's bridge (`listen_here`): no terminal, and its peers only ask.
     pty_master: Option<std::fs::File>,
-    // Set true the moment a connection is accepted (a first attach *or*
-    // a reattach after a prior client detached); consumed once by
-    // take_just_attached below. repl.rs's on_idle hook uses this to
-    // trigger one explicit full repaint (compositor_redraw) right when
-    // a client connects -- repl::run's own compositor otherwise only
-    // ever sends *incremental* diffs (see compositor_diff_tests), which
-    // would leave a freshly-attached client's own blank real terminal
-    // stuck showing nothing until unrelated activity happened to redraw
-    // it. Not needed for the very first attach performed by `session
-    // new` (that one already gets a full paint for free from
-    // start_promoted's own one-time compositor_redraw at startup,
-    // before any client exists to miss it) but harmless to also fire
-    // there -- one extra repaint into a pty nothing was reading from
-    // yet.
+    // Set when a connection is accepted; taken by `take_just_attached`.
+    // repl.rs then repaints fully once, as the compositor otherwise only
+    // sends changes and a new client's blank terminal would show nothing.
     just_attached: bool,
-    // The most recently received Handshake's own term/colorterm,
-    // consumed once by take_pending_capability below. Deliberately
-    // *not* applied directly here via `std::env::set_var` -- this
-    // bridge has no access to (and shouldn't reach into) any `Shell`'s
-    // own state, and a raw env var write would be silently undone the
-    // next time any session runs a command anyway (see exec.rs's
-    // `sync_real_state_in`/`set_terminal_capability_env`'s own doc
-    // comments for why). repl.rs's on_idle hook is what actually
-    // applies this, to every session's own remembered environment, at
-    // the same moment it notices `just_attached`.
+    // The last handshake's TERM and COLORTERM, taken by
+    // `take_pending_capability`. Not `set_var`'d here: the bridge doesn't
+    // touch shell state, and the next command would undo it (see
+    // `set_terminal_capability_env`). repl.rs applies it to every session
+    // when it sees `just_attached`.
     pending_capability: Option<(String, String)>,
 }
 
-// Bounds how many chunks get drained per tick before returning control
-// -- same reasoning drive_fg_job's own MAX_READS_PER_TICK already
-// documents: a firehose producer (a job printing in a tight loop) could
-// otherwise keep this side of the bridge busy indefinitely, starving
-// every other on_idle responsibility (job draining, WINCH, the next
-// keystroke) that also needs a turn. Only bounds drain_client now --
-// the pty-master-reading side runs unbounded on its own thread, where
-// starving anything else isn't a concern at all.
+// Chunks drained per tick before returning, as in `drive_fg_job`: a
+// client firehosing input would otherwise starve job draining, resizes
+// and keys. Bounds `drain_client` only; the pty side has its own thread.
 const MAX_READS_PER_TICK: u32 = 16;
 
-// The background thread's whole job: block-read `pty_master_read`
-// forever, forwarding whatever arrives to `client_write` if anyone's
-// there, discarding otherwise (see this struct's own doc comment for
-// why discarding, not buffering, and why this must never stop reading
-// regardless). A write failure (the client went away) is treated the
-// same as "no client" -- this thread never clears `client_write`
-// itself, that's the main thread's job (via drain_client's own EOF
-// detection on `client_read`); this just silently drops that one
-// forward attempt and keeps reading. Returns (ending the thread) only
-// when the pty master itself is gone, which in practice means the
-// whole daemon process is exiting.
+// The drain thread: block-reads the pty master forever, forwarding what
+// arrives to attached clients and discarding it when there are none,
+// so the pty never fills. A failed write is ignored; the main thread
+// decides when a client is gone. Ends when the pty master does, as the
+// daemon exits.
 fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex<Vec<(ClientId, UnixStream, bool)>>>) {
     let mut buf = [0u8; 4096];
     loop {
@@ -759,14 +568,10 @@ fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex
             Ok(0) => break,
             Ok(n) => {
                 let encoded = Message::Bytes(buf[..n].to_vec()).encode();
-                // Every attached client gets the same bytes: they are
-                // watching the same screen, which is the whole point of
-                // letting more than one attach. A write that fails is
-                // dropped and forgotten rather than acted on -- this
-                // thread has never been the one to decide a client is
-                // gone (the main thread's own EOF detection is), and
-                // racing it for that decision is the one way the two
-                // halves could come to disagree about who is here.
+                // Every client gets the same bytes: they watch the same
+                // screen. A failed write is dropped; deciding a client left
+                // is the main thread's job, and racing it would let the two
+                // disagree.
                 if let Ok(guard) = writes.lock() {
                     for (_, stream, _) in guard.iter().filter(|(_, _, watching)| *watching) {
                         let _ = (&*stream).write_all(&encoded);
@@ -780,12 +585,9 @@ fn drain_pty_master_thread(mut pty_master_read: std::fs::File, writes: Arc<Mutex
 }
 
 impl SessionBridge {
-    // `listener` is set non-blocking here (the main thread's own
-    // accept/drain_client loop is never allowed to block); `pty_master`
-    // is *not* -- the main thread only ever writes to it now, and the
-    // background thread's own clone (opened here, moved into the
-    // spawned thread) stays in ordinary blocking mode on purpose, since
-    // that thread has nothing else to do while waiting anyway.
+    // `listener` is made non-blocking, as the main thread must never block;
+    // the drain thread's clone of `pty_master` stays blocking, as that
+    // thread has nothing else to do.
     pub fn new(pty_master: std::fs::File, listener: UnixListener) -> io::Result<SessionBridge> {
         listener.set_nonblocking(true)?;
         let pty_master_read = pty_master.try_clone()?;
@@ -808,11 +610,10 @@ impl SessionBridge {
         })
     }
 
-    /// A bridge with no terminal behind it: what a plain interactive bish
-    /// listens with, so the programs in its panes can ask it what they
-    /// would ask a named session. Questions and captures are answered as
-    /// there; keys, sizes and terminal capabilities have nowhere to go
-    /// and are ignored.
+    /// A bridge with no terminal: what a plain interactive bish listens
+    /// with, so programs in its panes can ask what they'd ask a named
+    /// session. Questions and captures are answered; keys, sizes and
+    /// terminal capabilities are ignored.
     pub fn without_terminal(listener: UnixListener) -> io::Result<SessionBridge> {
         listener.set_nonblocking(true)?;
         Ok(SessionBridge {
@@ -835,21 +636,19 @@ impl SessionBridge {
         !self.clients.is_empty()
     }
 
-    /// Hands the daemon's own pidfile to the bridge, so the attached
-    /// count in it can be kept current. Called once, by run_daemon.
+    /// Hands the daemon's pidfile to the bridge to keep the attached count
+    /// current. Called once, by `run_daemon`.
     pub fn watch_pidfile(&mut self, mut pidfile: std::fs::File) {
-        // Written straight out rather than through publish_attached,
-        // which only writes on a *change*: the first status line is
-        // exactly the one that has nothing to differ from, and without
-        // it a session nobody has attached to yet would read as
-        // "unknown" for its whole life instead of "detached".
+        // Written directly, not through `publish_attached`, which writes only
+        // on change; without it an unattached session would read "unknown"
+        // rather than "detached".
         self.reported_attached = self.clients.len();
         write_status(&mut pidfile, self.reported_attached);
         self.pidfile = Some(pidfile);
     }
 
-    // Writes the attached count into the pidfile, but only when it has
-    // actually changed -- this runs on every idle tick.
+    // Writes the attached count into the pidfile only when it changed; this
+    // runs every tick.
     fn publish_attached(&mut self) {
         let attached = self.clients.len();
         if attached == self.reported_attached {
@@ -869,24 +668,18 @@ impl SessionBridge {
         self.pending_capability.take()
     }
 
-    // Called once per on_idle tick (see service_current_bridge below).
-    // Never blocks -- the pty-master-draining half no longer lives
-    // here at all (see drain_pty_master_thread).
+    // Called each idle tick (`service_current_bridge`). Never blocks.
     pub fn service(&mut self) {
-        // Tried every tick, not only while nobody is attached: another
-        // terminal joining a session someone is already using is an
-        // ordinary thing to do now, not an error.
+        // Every tick, not only with nobody attached: joining a session
+        // someone is using is ordinary.
         self.try_accept();
         self.drain_clients();
         self.publish_attached();
     }
 
-    // The pty is sized to the smallest attached client, so nothing any
-    // of them can see sits off the edge of what another one has. Called
-    // after every change to the set of clients and after every size any
-    // one of them reports. A client that has not said how big it is yet
-    // reports (0, 0) and is skipped -- it must not shrink the session
-    // to nothing for everybody else while its handshake is in flight.
+    // Sizes the pty to the smallest attached client, so nothing one sees is
+    // past another's edge. Called after the set of clients or any size
+    // changes. A client yet to handshake reports (0, 0) and is skipped.
     fn resize_to_smallest_client(&mut self) {
         let sizes: Vec<(u16, u16)> = self.clients.iter().map(|c| c.size).collect();
         if let (Some((rows, cols)), Some(master)) = (smallest_size(&sizes), self.pty_master.as_ref()) {
@@ -897,13 +690,9 @@ impl SessionBridge {
     fn try_accept(&mut self) {
         match self.listener.accept() {
             Ok((stream, _addr)) => {
-                // Verified once, at connect time -- see peer_uid's own
-                // doc comment on why this is defense in depth on top of
-                // the socket directory's own 0700 permissions, not a
-                // replacement for them. A mismatched UID (only reachable
-                // at all under a misconfigured/shared runtime directory)
-                // just drops the connection rather than accepting an
-                // unauthenticated bridge target.
+                // Checked once on connect (see `peer_uid`). A mismatched
+                // UID, possible only with a shared or misconfigured runtime
+                // directory, drops the connection.
                 match peer_uid(&stream) {
                     Ok(uid) if uid == current_uid() => self.attach(stream),
                     _ => { /* wrong UID or the check itself failed -- drop `stream` */ }
@@ -914,13 +703,12 @@ impl SessionBridge {
         }
     }
 
-    // Adds an accepted connection to the set of attached clients: the
-    // one place `clients` and `writes` both grow, which is what keeps
-    // them agreeing about who is here.
+    // Adds an accepted connection: the one place `clients` and `writes`
+    // grow, keeping them in agreement.
     fn attach(&mut self, stream: UnixStream) {
         if self.clients.len() >= MAX_CLIENTS {
-            // Dropped, so the far end sees EOF and exits, rather than
-            // sitting connected to a session that will never answer it.
+            // Dropped, so the far end sees EOF and exits rather than
+            // waiting on a session that won't answer.
             return;
         }
         let Ok(write_half) = stream.try_clone() else { return };
@@ -932,17 +720,15 @@ impl SessionBridge {
             Err(_) => return,
         }
         self.clients.push(Client { id, read: stream, decoder: Decoder::new(), size: (0, 0) });
-        // A repaint is for a terminal that has just started watching. A
-        // plain bish's peers watch nothing, and repainting the real
-        // screen every time an agent connects would only flicker it.
+        // A repaint is for a terminal that just started watching; a plain
+        // bish's peers watch nothing, and repainting for each agent would
+        // flicker the screen.
         self.just_attached = self.pty_master.is_some();
     }
 
-    // Drops one client from both `clients` (this struct's own handles)
-    // and `writes` (the background thread's shared ones) together --
-    // the one place either shrinks, so the two never disagree about who
-    // is attached. The pty resizes afterwards: with the smallest client
-    // gone, everyone left can have the room it was holding them to.
+    // Drops one client from `clients` and `writes` together, the one place
+    // either shrinks. The pty then resizes: with the smallest client gone,
+    // the rest may have more room.
     fn detach(&mut self, id: ClientId) {
         self.rpc_clients.retain(|other| *other != id);
         self.pending_rpc.retain(|(other, _)| *other != id);
@@ -951,9 +737,8 @@ impl SessionBridge {
         self.resize_to_smallest_client();
     }
 
-    // Every attached client's input, in turn. Each is drained and
-    // decoded on its own: one client's malformed frame or sudden
-    // departure has nothing to do with the others.
+    // Every client's input in turn, each drained and decoded alone: one's
+    // malformed frame or departure doesn't affect the others.
     fn drain_clients(&mut self) {
         let ids: Vec<ClientId> = self.clients.iter().map(|c| c.id).collect();
         for id in ids {
@@ -963,17 +748,14 @@ impl SessionBridge {
         }
     }
 
-    // Reads and acts on whatever `id` has sent. `false` means that
-    // client is gone -- EOF, a read error, or a frame this protocol
-    // cannot make sense of -- and should be detached.
+    // Reads and acts on what `id` sent. `false`: the client is gone (EOF, a
+    // read error, an unparseable frame) and should be detached.
     fn drain_one_client(&mut self, id: ClientId) -> bool {
         let Some(at) = self.clients.iter().position(|c| c.id == id) else { return true };
         let mut buf = [0u8; 4096];
-        // Noted rather than returned on immediately: whatever arrived in
-        // the same breath as the EOF is still in the decoder and still
-        // meant something. `bish session send` is exactly that shape --
-        // connect, write, close -- so returning early here would drop
-        // the keys it came to deliver.
+        // Noted, not returned on at once: what arrived with the EOF is
+        // still in the decoder. `bish session send` connects, writes and
+        // closes, and returning early would drop its keys.
         let mut ended = false;
         for _ in 0..MAX_READS_PER_TICK {
             match self.clients[at].read.read(&mut buf) {
@@ -995,35 +777,20 @@ impl SessionBridge {
         loop {
             match self.clients[at].decoder.next_message() {
                 Ok(Some(Message::Bytes(payload))) => {
-                    // A write to the pty master's own kernel buffer --
-                    // bounded by that buffer's size, same as any other
-                    // pty write in this codebase (e.g. drive_fg_job
-                    // forwarding a real paste/mouse sequence into a
-                    // job's own pty); not a new risk category (see this
-                    // struct's own doc comment for why the *other*
-                    // direction was the one that could actually
-                    // deadlock, and why this one doesn't the same way).
-                    //
-                    // Every client types into the same shell. That is
-                    // what sharing a session means.
+                    // Into the pty master's buffer, bounded like any pty
+                    // write here (see `SessionBridge` for why the other
+                    // direction was the risky one). Every client types into
+                    // the same shell: that's what sharing means.
                     if let Some(master) = self.pty_master.as_mut() {
                         let _ = master.write_all(&payload);
                     }
                 }
                 Ok(Some(Message::Resize { rows, cols })) => {
-                    // Recorded against this client and then resolved
-                    // against all of them, rather than applied straight
-                    // to the pty: a second, larger terminal must not
-                    // stretch the session out from under a smaller one
-                    // that can then only see part of it.
-                    //
-                    // Resizing via the master fd is what delivers a real
-                    // SIGWINCH to the slave's controlling-terminal
-                    // holder (this same daemon process, via
-                    // attach_self_to_pty), so the existing
-                    // install_winch_handler/take_winch/
-                    // poll_and_apply_resize machinery in exec.rs and
-                    // repl.rs picks it up with no new code.
+                    // Recorded per client and resolved over all, so a
+                    // larger terminal doesn't stretch the session past a
+                    // smaller one. Resizing the master sends SIGWINCH to
+                    // this daemon (the slave's controlling process), and
+                    // the existing resize handling picks it up.
                     self.clients[at].size = (rows, cols);
                     self.resize_to_smallest_client();
                 }
@@ -1031,32 +798,25 @@ impl SessionBridge {
                     self.clients[at].size = (rows, cols);
                     self.resize_to_smallest_client();
                     // Stashed for repl.rs to apply to every session's
-                    // own remembered environment (Shell::
-                    // set_terminal_capability_env) -- not set directly
-                    // here. See this struct's own `pending_capability`
-                    // field doc comment for why a raw `std::env::
-                    // set_var` from inside this bridge doesn't actually
-                    // stick (confirmed the hard way: it worked for
-                    // exactly one moment, then exec.rs's own
-                    // sync_real_state_in silently undid it the next
-                    // time any session ran a command).
+                    // remembered environment
+                    // (`Shell::set_terminal_capability_env`); see
+                    // `pending_capability`.
                     if self.pty_master.is_some() {
                         self.pending_capability = Some((term, colorterm));
                     }
                 }
                 Ok(Some(Message::CaptureRequest)) => {
-                    // Recorded, not answered: the answer lives in a
-                    // session's grid, which this module cannot reach.
+                    // Recorded, not answered: the answer is in a session's
+                    // grid, out of reach here.
                     self.capture_requests.push(id);
                 }
                 Ok(Some(Message::Rpc(payload))) => {
-                    // Recorded, not answered -- same reason as a capture
-                    // request just above, and answered from the same
-                    // place (`answer_rpc_requests`).
+                    // Recorded, like a capture, and answered by
+                    // `answer_rpc_requests`.
                     if !self.rpc_clients.contains(&id) {
                         self.rpc_clients.push(id);
-                        // Asking, not watching: it is sent answers from
-                        // here on, and no more of the screen.
+                        // Asking, not watching: from now on it gets
+                        // answers, not the screen.
                         if let Ok(mut guard) = self.writes.lock() {
                             for entry in guard.iter_mut().filter(|(other, _, _)| *other == id) {
                                 entry.2 = false;
@@ -1066,10 +826,8 @@ impl SessionBridge {
                     self.pending_rpc.push((id, payload));
                 }
                 Ok(Some(Message::Passthrough(_) | Message::CaptureReply(_) | Message::RpcReply(_))) => {
-                    // Server -> client messages (see Message's own doc
-                    // comments). A client never sends these; tolerated
-                    // as a no-op rather than treated as malformed, in
-                    // case that ever changes.
+                    // Server-to-client messages a client never sends;
+                    // ignored rather than treated as malformed.
                 }
                 Ok(None) => break,
                 Err(_) => return false,
@@ -1088,9 +846,9 @@ impl SessionBridge {
         !self.pending_rpc.is_empty()
     }
 
-    // An unsolicited message to every RPC peer. Nothing is queued for a
-    // peer that is not there: a notification describes a moment, and a
-    // client that connects later wants the state it finds, not a replay.
+    // An unsolicited message to every RPC peer. Nothing is queued for
+    // absent peers: a notification is about a moment, and a later client
+    // wants the state it finds.
     fn notify_rpc(&mut self, payload: &[u8]) {
         let encoded = Message::RpcReply(payload.to_vec()).encode();
         for id in self.rpc_clients.clone() {
@@ -1098,7 +856,7 @@ impl SessionBridge {
         }
     }
 
-    // One already-encoded message to one client, if it is still there.
+    // One encoded message to one client, if it's still there.
     fn send_to(&mut self, id: ClientId, encoded: &[u8]) {
         if let Ok(guard) = self.writes.lock()
             && let Some((_, stream, _)) = guard.iter().find(|(other, _, _)| *other == id)
@@ -1107,8 +865,8 @@ impl SessionBridge {
         }
     }
 
-    // Sends `text` to every client waiting for a capture, and closes
-    // each of them out: a capture client asks one question and leaves.
+    // Sends `text` to every client waiting for a capture and closes each:
+    // a capture client asks once and leaves.
     fn answer_captures(&mut self, text: &str) {
         let encoded = Message::CaptureReply(text.as_bytes().to_vec()).encode();
         for id in std::mem::take(&mut self.capture_requests) {
@@ -1125,15 +883,14 @@ thread_local! {
     static ACTIVE_BRIDGE: RefCell<Option<SessionBridge>> = const { RefCell::new(None) };
 }
 
-// Installs `bridge` as this process's current session bridge -- called
-// once by run_daemon, before repl::run starts.
+// Installs this process's session bridge; `run_daemon` calls it before
+// `repl::run`.
 pub fn install_bridge(bridge: SessionBridge) {
     ACTIVE_BRIDGE.with(|b| *b.borrow_mut() = Some(bridge));
 }
 
-// The one call service_background_jobs (repl.rs) needs -- a plain no-op
-// when this process isn't running as a session daemon, which is every
-// process except one that reached here via run_daemon below.
+// What `service_background_jobs` calls; a no-op unless this process is a
+// session daemon.
 pub fn service_current_bridge() {
     ACTIVE_BRIDGE.with(|b| {
         if let Some(bridge) = b.borrow_mut().as_mut() {
@@ -1142,15 +899,10 @@ pub fn service_current_bridge() {
     });
 }
 
-/// Answers any pending `bish session capture` with the text `screen`
-/// produces, and says whether there was one.
-///
-/// `screen` is only called when somebody is actually waiting, so the
-/// caller can render as expensively as it likes here. It is a closure
-/// rather than anything this module holds because what the screen
-/// currently shows lives in repl.rs's own session state, which this
-/// module has no access to and keeps none of -- the same shape as the
-/// `on_idle` callback every blocking loop in repl.rs already passes.
+/// Answers pending `bish session capture` requests with what `screen`
+/// returns, and says whether there were any. `screen` runs only when
+/// someone is waiting, and is a closure because the screen lives in
+/// repl.rs's state, which this module can't see.
 pub fn answer_capture_requests(screen: impl FnOnce() -> String) -> bool {
     ACTIVE_BRIDGE.with(|b| {
         let mut guard = b.borrow_mut();
@@ -1164,18 +916,14 @@ pub fn answer_capture_requests(screen: impl FnOnce() -> String) -> bool {
     })
 }
 
-/// Who asked a question, kept by whoever cannot answer it yet.
-///
-/// Most questions are answered inside the tick that received them, and
-/// never need this. One that waits on a person deciding something is
-/// answered minutes later, from somewhere else entirely -- and has to
-/// reach the one client that asked, not every client listening.
+/// Who asked a question, kept by whoever can't answer it yet. Most are
+/// answered in the tick they arrive; one waiting on a person's decision
+/// is answered much later, and must reach only the client that asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caller(ClientId);
 
-/// `answer_rpc_requests`, with each question's `Caller` handed over
-/// alongside it, for a handler that means to answer some of them later
-/// with `reply_to`. `None` sends nothing now, exactly as there.
+/// `answer_rpc_requests`, passing each question's `Caller` for a handler
+/// that answers some later with `reply_to`. `None` sends nothing now.
 pub fn answer_rpc_requests_with(mut handle: impl FnMut(&[u8], Caller) -> Option<Vec<u8>>) -> bool {
     ACTIVE_BRIDGE.with(|b| {
         let mut guard = b.borrow_mut();
@@ -1191,8 +939,8 @@ pub fn answer_rpc_requests_with(mut handle: impl FnMut(&[u8], Caller) -> Option<
     })
 }
 
-/// The answer to a question put earlier, to the client that put it. A
-/// client that has gone since gets nothing, which is all there is to do.
+/// The answer to an earlier question, to the client that asked; one that
+/// left gets nothing.
 pub fn reply_to(caller: Caller, payload: &[u8]) {
     ACTIVE_BRIDGE.with(|b| {
         if let Some(bridge) = b.borrow_mut().as_mut() {
@@ -1201,8 +949,8 @@ pub fn reply_to(caller: Caller, payload: &[u8]) {
     });
 }
 
-/// Sends one unsolicited JSON-RPC message to every peer that has spoken
-/// to us. A no-op when there are none, which is the ordinary case.
+/// Sends one unsolicited JSON-RPC message to every peer that has spoken;
+/// usually there are none.
 pub fn push_rpc_notification(payload: &[u8]) {
     ACTIVE_BRIDGE.with(|b| {
         if let Some(bridge) = b.borrow_mut().as_mut() {
@@ -1211,42 +959,39 @@ pub fn push_rpc_notification(payload: &[u8]) {
     });
 }
 
-/// Whether anything is listening for notifications -- so a caller can
-/// skip building one nobody will read.
+/// Whether anything listens for notifications, so a caller can skip
+/// building one.
 pub fn has_rpc_peers() -> bool {
     ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| !bridge.rpc_clients.is_empty()))
 }
 
-/// Whether this process has a socket to answer on -- a session daemon's,
-/// or a plain interactive bish's (see `listen_here`).
+/// Whether this process has a socket to answer on: a session daemon's, or
+/// a plain bish's (see `listen_here`).
 pub fn is_listening() -> bool {
     ACTIVE_BRIDGE.with(|b| b.try_borrow().map_or(true, |bridge| bridge.is_some()))
 }
 
-// A question answered without the idle loop -- see `answer_while_busy`.
+// A question answered outside the idle loop; see `answer_while_busy`.
 type BusyAnswer = Box<dyn Fn(&[u8]) -> Option<Vec<u8>>>;
 
 thread_local! {
     static BUSY_ANSWER: RefCell<Option<BusyAnswer>> = const { RefCell::new(None) };
 }
 
-/// What `service_while_busy` may answer, and with what, while a command
-/// holds the idle loop; `None` once it no longer does. repl.rs sets it
-/// just before a line runs, from the editor's state as it is then --
-/// which is how it stays, since nothing drives the editor until the line
-/// is done.
+/// What `service_while_busy` may answer while a command holds the idle
+/// loop, `None` once it doesn't. repl.rs sets it before a line runs,
+/// from the editor's state then, which holds until the line is done.
 pub fn answer_while_busy(answer: Option<BusyAnswer>) {
     BUSY_ANSWER.with(|a| *a.borrow_mut() = answer);
 }
 
-/// The socket, serviced from inside a wait that is not the idle loop:
-/// a command running partway through a list, or at a prompt with no
-/// panes, where nothing else would answer before a peer gave up.
+/// Services the socket from a wait outside the idle loop: a command
+/// partway through a list, or at a prompt with no panes, where a peer
+/// would otherwise give up.
 ///
-/// Answers only what `answer_while_busy` covers. Everything else -- a
-/// review, a capture, a question it has no answer for -- stays queued, in
-/// the order it came, for the idle loop once the command is done. Does
-/// nothing inside a coroutine, or while the bridge is already in use
+/// Answers only what `answer_while_busy` covers; anything else (a review,
+/// a capture, an unknown question) stays queued in order for the idle
+/// loop. Does nothing inside a coroutine, or while the bridge is in use
 /// further up this thread.
 pub fn service_while_busy() {
     if crate::coroutine::in_coroutine() {
@@ -1271,54 +1016,41 @@ pub fn service_while_busy() {
     });
 }
 
-// True at most once per attach (a first attach or a reattach) -- lets
-// repl.rs's own on_idle hook trigger one explicit full repaint right
-// when a client connects. See SessionBridge::just_attached's own doc
-// comment for why an incremental-diff-only compositor otherwise leaves
-// a freshly (re)attached client's blank real terminal stuck empty.
+// True once per attach, for repl.rs's one full repaint (see
+// `SessionBridge::just_attached`).
 pub fn take_bridge_just_attached() -> bool {
     ACTIVE_BRIDGE.with(|b| b.borrow_mut().as_mut().is_some_and(|bridge| bridge.take_just_attached()))
 }
 
-// The most recently attached client's own (term, colorterm), if any
-// arrived and hasn't been consumed yet -- see SessionBridge's own
-// `pending_capability` field doc comment for why applying this is
-// repl.rs's job, not this bridge's.
+// The last attached client's (term, colorterm), if not yet taken; see
+// `SessionBridge::pending_capability`.
 pub fn take_pending_capability() -> Option<(String, String)> {
     ACTIVE_BRIDGE.with(|b| b.borrow_mut().as_mut().and_then(|bridge| bridge.take_pending_capability()))
 }
 
-// Ignores SIGHUP so a detached daemon survives whatever terminal/ssh
-// connection launched `bish session new` going away. setsid() itself
-// already happens inside pty::attach_self_to_pty (a precondition for
-// TIOCSCTTY, not something worth a second, separate call here) --
-// installing this too is cheap, standard defense-in-depth for any
-// window where the daemon is still reachable by a HUP before that takes
-// effect, the same belt-and-suspenders `nohup` itself relies on.
+// Ignores SIGHUP so a detached daemon survives the terminal or ssh
+// session that launched it. `setsid` happens in
+// `pty::attach_self_to_pty`; this covers the window before.
 fn daemonize() {
     term::ignore_sighup();
 }
 
 use crate::term;
 
-// The daemon bootstrap: binds the session's socket, gives this process
-// its own local pty (see this module's own top doc comment for why),
-// installs the bridge, and hands off into the ordinary, completely
-// unmodified repl::run. Only returns on a genuine startup failure --
-// repl::run itself runs until the interactive shell actually exits.
+// The daemon: binds the session's socket, gives this process its own
+// pty (see the module doc), installs the bridge, and runs `repl::run`.
+// Returns only on a startup failure; otherwise the shell runs until it
+// exits.
 pub fn run_daemon(name: &str) -> io::Result<i32> {
     check_name(name)?;
     ensure_socket_dir()?;
-    // Acquired first, before touching the socket at all: fails fast
-    // (AddrInUse-shaped, but really "a live daemon already owns this
-    // name") if another live daemon -- or a concurrently-racing `bish
-    // session new` for the same name -- already holds it, rather than
-    // silently stomping on a still-running session's own socket file.
+    // First, before the socket: fails fast if a live daemon (or a racing
+    // `bish session new`) holds this name, instead of clobbering its socket.
     let pidfile_lock = acquire_pidfile_lock(name)?;
 
     let sock_path = socket_path(name);
-    // Now safe to remove unconditionally: holding the pidfile's own
-    // exclusive lock proves nothing live could still be bound here.
+    // Safe to remove: holding the pidfile's lock proves nothing live is
+    // bound here.
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)?;
 
@@ -1329,46 +1061,38 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
     daemonize();
     crate::pty::attach_self_to_pty(&slave_path)?;
 
-    // The bridge keeps the attached count in here current, which is the
-    // only way `ls` -- a different process entirely -- can know it.
-    // The lock lives on in the bridge's own copy for the rest of this
-    // process's life, exactly as it did when run_daemon held it alone.
+    // The bridge keeps the attached count in the pidfile, which is how `ls`
+    // knows it, and holds the lock for the process's life.
     let mut bridge = bridge;
     bridge.watch_pidfile(pidfile_lock);
     install_bridge(bridge);
 
     let mut shell = crate::exec::Shell::new();
-    // How a program in one of its panes finds this session without being
-    // told its name -- `bish tool mcp-server` does. See `listen_here`.
+    // How a program in a pane finds this session without its name (`bish
+    // tool mcp-server` does); see `listen_here`.
     shell.export_var("BISH_SOCKET", sock_path.to_string_lossy().into_owned());
-    // `true`: a session daemon is an interactive shell like any other,
-    // and reads the user's config like one. It did not, for as long as
-    // loading that config was the *caller's* job -- which is exactly
-    // why it is `repl::run`'s now.
+    // `true`: a session daemon reads the user's config like any interactive
+    // shell.
     crate::repl::run(shell, true, true);
     Ok(0)
 }
 
-/// Makes this interactive bish reachable the way a named session is, and
-/// returns where: the path its panes are given as `BISH_SOCKET`, so a
-/// program running inside it -- an agent's MCP server -- can ask it what
-/// is open and what is wrong with it without anyone naming anything.
+/// Makes this interactive bish reachable as a named session is, and
+/// returns the path its panes get as `BISH_SOCKET`, so a program inside
+/// it (an agent's MCP server) can ask what's open and what's wrong.
 ///
-/// The socket sits in the same 0700 directory as every session's, and
-/// the bridge checks each peer's uid as it does there. Named
-/// `<pid>.ide` rather than `.sock`, so `session ls` and `attach` never
-/// mistake it for a session: there is no terminal here to attach to.
+/// In the same 0700 directory, with peer uids checked. Named `<pid>.ide`,
+/// not `.sock`, so `session ls` and `attach` skip it: there's no terminal
+/// to attach to.
 ///
-/// Questions are answered from the idle loop, as a session's are, so an
-/// agent gets its answers while it runs as a command of its own in a
-/// pane. They wait while a command runs at a prompt with no panes, or
-/// partway through a list (`cd proj && claude`, driven by
-/// `drive_pending_fg_inline`): nothing services the socket until that
-/// command is done.
+/// Answered from the idle loop, so an agent running as a command in a
+/// pane gets answers. Not while a command runs at a prompt with no panes
+/// or partway through a list (`cd proj && claude`, in
+/// `drive_pending_fg_inline`).
 ///
-/// A bish that dies without `stop_listening` leaves its socket behind.
-/// Nothing answers on it, so the next one to start sweeps it up -- asked
-/// by connecting rather than by pid, which the kernel reuses.
+/// A bish that dies without `stop_listening` leaves its socket; the next
+/// to start finds nothing answering on it and removes it, testing by
+/// connecting, since pids are reused.
 pub fn listen_here() -> io::Result<PathBuf> {
     if !cfg!(feature = "sessions") {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "detachable sessions are not part of this build"));
@@ -1382,13 +1106,13 @@ pub fn listen_here() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Where a plain bish with this pid listens -- see `listen_here`.
+/// Where a plain bish with this pid listens; see `listen_here`.
 pub fn ide_socket_path(pid: u32) -> PathBuf {
     socket_dir().join(format!("{pid}.ide"))
 }
 
-/// Takes this bish's own socket away as it exits. A no-op for a session
-/// daemon, whose socket and pidfile are looked after as a pair.
+/// Removes this bish's socket as it exits. A no-op for a session daemon,
+/// whose socket and pidfile are handled together.
 pub fn stop_listening() {
     let plain = ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| bridge.pty_master.is_none()));
     if plain {
@@ -1408,10 +1132,8 @@ fn remove_unanswered_ide_sockets(dir: &std::path::Path) {
     }
 }
 
-// `bish session ls`: every name in the socket directory whose pidfile
-// is currently locked by a live daemon (see is_daemon_alive) -- a
-// leftover socket/pidfile pair from a daemon that already exited is
-// silently skipped, not listed as if it still existed.
+// `bish session ls`: every name in the socket directory whose pidfile a
+// live daemon holds (see `is_daemon_alive`); stale pairs are skipped.
 pub fn run_ls() -> io::Result<i32> {
     let entries = match std::fs::read_dir(socket_dir()) {
         Ok(e) => e,
@@ -1426,15 +1148,14 @@ pub fn run_ls() -> io::Result<i32> {
         println!("no sessions");
         return Ok(0);
     }
-    // Names are the column anyone scans down, so they line up.
+    // Names line up, as the column people scan.
     let width = live.iter().map(String::len).max().unwrap_or(0);
     for name in live {
         let attached = match read_attached(&name) {
             Some(0) => "detached".to_string(),
             Some(1) => "1 client".to_string(),
             Some(n) => format!("{n} clients"),
-            // A daemon from before the status line existed, or one that
-            // has not written its first one yet.
+            // A daemon that hasn't written its status line yet.
             None => "?".to_string(),
         };
         let age = session_age(&name).map(short_duration).unwrap_or_else(|| "?".to_string());
@@ -1444,22 +1165,17 @@ pub fn run_ls() -> io::Result<i32> {
     Ok(0)
 }
 
-/// A live question-and-answer connection to a running session, for a
-/// process that needs more than one answer.
-///
-/// `run_capture` asks once and exits, so it can afford to be a function.
-/// This is what a peer that stays -- `bish tool mcp-server` -- holds:
-/// the same socket, the same framing, but with the connection kept open
-/// so the daemon can also push notifications back down it.
+/// A connection to a running session kept open for many answers, for a
+/// peer that stays (`bish tool mcp-server`); the daemon can push
+/// notifications down it. `run_capture` asks once and exits.
 pub struct Peer {
     stream: UnixStream,
     decoder: Decoder,
 }
 
 impl Peer {
-    /// Connects to `name`, or says why it could not in words that name
-    /// the likely cause: a session that was never started looks exactly
-    /// like a typo, and the message has to serve both.
+    /// Connects to `name`, or says why not, naming the likely cause: a
+    /// session never started looks just like a typo.
     pub fn connect(name: &str) -> io::Result<Peer> {
         check_name(name)?;
         let path = socket_path(name);
@@ -1472,8 +1188,8 @@ impl Peer {
         Ok(Peer { stream, decoder: Decoder::default() })
     }
 
-    /// Connects to the bish listening at `path` -- the one a program is
-    /// running inside, named by its `BISH_SOCKET` (see `listen_here`).
+    /// Connects to the bish listening at `path`, the one a program runs
+    /// inside, from its `BISH_SOCKET` (see `listen_here`).
     pub fn connect_path(path: &std::path::Path) -> io::Result<Peer> {
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
@@ -1484,31 +1200,24 @@ impl Peer {
         Ok(Peer { stream, decoder: Decoder::default() })
     }
 
-    /// A peer over an already-connected socket, for tests: the daemon
-    /// this talks to needs a controlling terminal, and a socketpair
-    /// exercises every byte of the protocol without one.
+    /// A peer over a connected socket, for tests: a daemon needs a
+    /// controlling terminal, and a socketpair exercises the protocol
+    /// without one.
     #[cfg(test)]
     pub fn over(stream: UnixStream) -> Peer {
         Peer { stream, decoder: Decoder::default() }
     }
 
-    /// Says something with no answer expected.
-    ///
-    /// What a peer announcing itself uses: the daemon only knows a peer
-    /// exists once one has spoken, and some of what it will be asked
-    /// about is only kept current while somebody is listening.
+    /// Says something with no answer expected: how a peer announces itself,
+    /// as the daemon only knows of a peer once it has spoken.
     pub fn tell(&mut self, payload: &[u8]) -> io::Result<()> {
         self.stream.write_all(&Message::Rpc(payload.to_vec()).encode())?;
         self.stream.flush()
     }
 
-    /// Asks one question and waits for its answer, up to `timeout`.
-    ///
-    /// The daemon answers from its own idle tick (see
-    /// `answer_rpc_requests`), so an answer takes as long as whatever it
-    /// is currently doing -- a foreground command holds the loop, and
-    /// waiting forever behind one would wedge the caller with no way to
-    /// say why. The timeout is what turns that into an error message.
+    /// Asks one question and waits up to `timeout`. The daemon answers from
+    /// its idle tick, which a foreground command holds; the timeout turns
+    /// that wait into an error message.
     pub fn ask(&mut self, payload: &[u8], timeout: std::time::Duration) -> io::Result<Vec<u8>> {
         self.stream.write_all(&Message::Rpc(payload.to_vec()).encode())?;
         self.stream.flush()?;
@@ -1532,17 +1241,15 @@ impl Peer {
         }
     }
 
-    /// This connection's own descriptor, for a caller that has to wait
-    /// on it alongside something else -- which anything reading
-    /// notifications does, since they arrive unasked.
+    /// This connection's descriptor, for waiting on it with something else,
+    /// as anything reading notifications must.
     pub fn fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self.stream.as_raw_fd()
     }
 
-    /// Reads whatever has arrived without waiting, and returns every
-    /// complete message in it. This is how a notification is collected:
-    /// nobody asked for it, so nobody is waiting on it.
+    /// Reads what has arrived without waiting and returns each complete
+    /// message: how notifications, which nobody waits on, are collected.
     pub fn poll(&mut self) -> io::Result<Vec<Vec<u8>>> {
         self.stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
         let mut buf = [0u8; 8192];
@@ -1559,13 +1266,10 @@ impl Peer {
         Ok(out)
     }
 
-    /// Waits for the one reply `wanted` picks out, for as long as that
-    /// takes, and hands back everything else that arrived meanwhile -- so
-    /// a notification is not lost to a wait that was not about it.
-    ///
-    /// No timeout, unlike `ask`. What this waits for is somebody making up
-    /// their mind about something, which takes as long as it takes; the
-    /// session going away is what ends it otherwise.
+    /// Waits for the reply `wanted` picks out, however long, returning what
+    /// else arrived meanwhile so notifications aren't lost. No timeout: it
+    /// waits on a person deciding, and the session ending stops it
+    /// otherwise.
     pub fn wait_for(&mut self, wanted: impl Fn(&[u8]) -> bool) -> io::Result<(Vec<u8>, Vec<Vec<u8>>)> {
         let mut others = Vec::new();
         self.stream.set_read_timeout(None)?;
@@ -1586,10 +1290,8 @@ impl Peer {
         }
     }
 
-    /// The next already-arrived reply, if there is one. Everything else
-    /// this connection carries -- the session's own screen bytes, which
-    /// arrive here because any connected client gets them -- is dropped:
-    /// a peer asking questions is not a terminal.
+    /// The next reply already arrived, if any. The session's screen bytes,
+    /// which every client gets, are dropped: a peer asking isn't a terminal.
     fn next_reply(&mut self) -> io::Result<Option<Vec<u8>>> {
         loop {
             match self.decoder.next_message() {
@@ -1602,13 +1304,9 @@ impl Peer {
     }
 }
 
-/// The bytes a `bish session send` argument stands for.
-///
-/// An argument that names a key is that key; anything else is its own
-/// literal text. tmux's `send-keys` does exactly this, and for the same
-/// reason: `send-keys make Enter` reads better than any escaping scheme
-/// anyone has come up with, and a literal word that happens to be
-/// spelled "Enter" is rare enough to be worth the ambiguity.
+/// The bytes a `bish session send` argument stands for: a key name is
+/// that key, anything else its literal text. `send make Enter` reads
+/// better than any escaping; a literal word spelled "Enter" is rare.
 fn key_bytes(arg: &str) -> Vec<u8> {
     let named: &[u8] = match arg {
         "Enter" | "C-m" => b"\r",
@@ -1622,8 +1320,8 @@ fn key_bytes(arg: &str) -> Vec<u8> {
         "Left" => b"\x1b[D",
         "Home" => b"\x1b[H",
         "End" => b"\x1b[F",
-        // `C-a` through `C-z`, plus the handful above them that a
-        // terminal spells the same way.
+        // `C-a` to `C-z`, and the few above them a terminal spells the same
+        // way.
         _ => {
             if let Some(rest) = arg.strip_prefix("C-")
                 && rest.chars().count() == 1
@@ -1632,8 +1330,8 @@ fn key_bytes(arg: &str) -> Vec<u8> {
                 if c.is_ascii_alphabetic() {
                     return vec![(c.to_ascii_lowercase() as u8) - b'a' + 1];
                 }
-                // C-Space is NUL, which bish still accepts as its detach
-                // key (Ctrl+G is the one it asks for).
+                // C-Space is NUL, still accepted as the detach key (Ctrl+G
+                // is the advertised one).
                 if c == '@' {
                     return vec![0];
                 }
@@ -1644,13 +1342,10 @@ fn key_bytes(arg: &str) -> Vec<u8> {
     named.to_vec()
 }
 
-/// `bish session send <name> <arg>...`: types into a running session
-/// from outside it, tmux's `send-keys`.
-///
-/// Connects, writes, and closes -- no handshake, so it never counts
-/// towards the session's size and never becomes something the session
-/// has to redraw for. The daemon takes what arrived with the EOF (see
-/// drain_one_client), so there is nothing to wait for here.
+/// `bish session send <name> <arg>...`: types into a running session.
+/// Connects, writes and closes, with no handshake, so it never affects
+/// the session's size or causes a redraw. The daemon takes what arrived
+/// with the EOF (see `drain_one_client`).
 pub fn run_send(name: &str, args: &[String]) -> io::Result<i32> {
     check_name(name)?;
     if !is_daemon_alive(name) {
@@ -1670,13 +1365,10 @@ pub fn run_send(name: &str, args: &[String]) -> io::Result<i32> {
     Ok(0)
 }
 
-/// `bish session capture <name>`: prints what that session's focused
-/// pane currently shows, tmux's `capture-pane -p`.
-///
-/// Asks and waits. The answer has to come from the daemon's own idle
-/// tick (see answer_capture_requests), so this blocks on the reply with
-/// a bound on how long it will wait -- a daemon wedged inside something
-/// that never yields should end as a message, not a hang.
+/// `bish session capture <name>`: prints what the session's focused pane
+/// shows. The daemon answers from its idle tick (see
+/// `answer_capture_requests`), so the wait is bounded: a wedged daemon
+/// ends in a message, not a hang.
 pub fn run_capture(name: &str) -> io::Result<i32> {
     check_name(name)?;
     if !is_daemon_alive(name) {
@@ -1704,10 +1396,8 @@ pub fn run_capture(name: &str) -> io::Result<i32> {
                     print!("{}", String::from_utf8_lossy(&text));
                     return Ok(0);
                 }
-                // Ordinary screen traffic: this connection is an
-                // attached client like any other for as long as it is
-                // open, so the daemon fans output to it too. Ignored --
-                // this one came to ask a question.
+                // Screen traffic: while connected this is a client like any
+                // other. Ignored; it came to ask.
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) => {
@@ -1721,13 +1411,10 @@ pub fn run_capture(name: &str) -> io::Result<i32> {
     Ok(1)
 }
 
-/// `bish session rename <old> <new>`.
-///
-/// Renames the socket and the pidfile, which is all a session's name
-/// is. The daemon keeps both open by descriptor -- its listener is
-/// bound to the socket's inode, and its pidfile lock and status writes
-/// go through the fd it already holds -- so it carries on through the
-/// rename without noticing, and clients connecting afterwards find it
+/// `bish session rename <old> <new>`: renames the socket and the
+/// pidfile, which is all a name is. The daemon holds both by descriptor
+/// (the listener on the socket's inode, the pidfile's lock and status
+/// writes through its fd), so it carries on, and new clients find it
 /// under the new name.
 pub fn run_rename(from: &str, to: &str) -> io::Result<i32> {
     check_name(from)?;
@@ -1743,13 +1430,12 @@ pub fn run_rename(from: &str, to: &str) -> io::Result<i32> {
         eprintln!("bish: session '{to}' already exists");
         return Ok(1);
     }
-    // A dead name can still have files sitting on it (a daemon killed
-    // between the SIGTERM and the sweep, say). They are nobody's, and
-    // the rename below would fail on them.
+    // A dead name may still have files (a daemon killed between the
+    // SIGTERM and the sweep); they're nobody's, and would fail the rename.
     let _ = std::fs::remove_file(socket_path(to));
     let _ = std::fs::remove_file(pidfile_path(to));
-    // The socket first: it is what a client connects to, so the window
-    // in which neither name works is as short as it can be.
+    // The socket first: it's what clients connect to, so the window where
+    // neither name works is shortest.
     std::fs::rename(socket_path(from), socket_path(to))?;
     std::fs::rename(pidfile_path(from), pidfile_path(to))?;
     Ok(0)
@@ -1771,22 +1457,16 @@ pub fn run_kill(name: &str) -> io::Result<i32> {
     if !crate::platform::send_signal(pid, SIGTERM) {
         return Err(io::Error::last_os_error());
     }
-    // A daemon killed by a signal runs no cleanup of its own, so its
-    // socket and pidfile outlive it. `ls` already ignores them (it
-    // tests the pidfile lock, not the file's existence), but leaving a
-    // pile of dead sockets in the runtime directory is nobody's idea of
-    // tidy, and a name cannot be reasoned about while its corpse is
-    // still lying there.
+    // A daemon killed by a signal leaves its socket and pidfile. `ls`
+    // ignores them (it tests the lock), but they'd pile up in the runtime
+    // directory.
     remove_dead_session_files(name, std::time::Duration::from_secs(2));
     Ok(0)
 }
 
-/// Removes a session's socket and pidfile once nothing is holding them.
-///
-/// Waits up to `grace` for the daemon to actually be gone, then checks
-/// once more immediately before unlinking: a new daemon can legitimately
-/// have claimed the same name in between, and its files are not ours to
-/// delete.
+/// Removes a session's socket and pidfile once nothing holds them. Waits
+/// up to `grace` for the daemon to go, then checks again just before
+/// unlinking: a new daemon may have claimed the name meanwhile.
 fn remove_dead_session_files(name: &str, grace: std::time::Duration) {
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline && is_daemon_alive(name) {
@@ -1799,13 +1479,10 @@ fn remove_dead_session_files(name: &str, grace: std::time::Duration) {
     let _ = std::fs::remove_file(pidfile_path(name));
 }
 
-// The client loop: connects to `name`'s socket, puts the *local* real
-// terminal into raw mode, sends the attach handshake, then relays bytes
-// in both directions until the connection ends or the user detaches.
-// Unlike the daemon side, this has no on_idle-style other work to
-// interleave, so it blocks genuinely indefinitely in PollSet::wait
-// rather than polling on an interval -- there is nothing else for a
-// client to usefully do while idle.
+// The client: connects to `name`'s socket, puts the local terminal in
+// raw mode, sends the handshake, and relays both ways until the
+// connection ends or the user detaches. With nothing else to do, it
+// blocks in `PollSet::wait` rather than polling.
 pub fn run_client(name: &str) -> io::Result<i32> {
     check_name(name)?;
     let sock_path = socket_path(name);
@@ -1819,14 +1496,9 @@ pub fn run_client(name: &str) -> io::Result<i32> {
 
     let _raw_guard = term::RawGuard::enable(0).ok();
 
-    // The client's own *local* terminal can be resized at any time
-    // (dragging the window, an ssh client reconnecting at a different
-    // size) -- unlike the daemon side, this process has no other
-    // on_idle-style periodic check to notice it between poll() calls
-    // (it blocks genuinely indefinitely below, on purpose: there is
-    // nothing else for a client to usefully do while idle), so SIGWINCH
-    // needs to wake this loop directly via the self-pipe trick rather
-    // than being polled.
+    // The local terminal can resize any time (a window drag, an ssh
+    // reconnect), and this blocks in poll with nothing periodic, so
+    // SIGWINCH wakes the loop through a self-pipe.
     let winch_pipe = crate::poll::SelfPipe::new()?;
     crate::poll::install_sigwinch_wake(winch_pipe.write_fd());
 
@@ -1853,16 +1525,9 @@ pub fn run_client(name: &str) -> io::Result<i32> {
                 if n == 0 {
                     break 'relay;
                 }
-                // Ctrl+G (0x07), or the NUL that Ctrl+Space sends where
-                // a terminal still sends it, unaccompanied by anything
-                // else in this same read -- consistent with bish's own
-                // in-process detach binding (see Frame's own doc comment
-                // in repl.rs), reused here for the same underlying
-                // concept rather than inventing a second one. A real
-                // multi-byte paste that happens to start with either is
-                // vanishingly unlikely and not specially guarded against
-                // here, same tradeoff editor.rs's own single-byte
-                // control-key decoding already accepts elsewhere.
+                // Ctrl+G (0x07), or Ctrl+Space's NUL, alone in a read: the
+                // detach key, as in-process (see `Frame` in repl.rs). A
+                // paste starting with either isn't guarded against.
                 if n == 1 && matches!(buf[0], 0x07 | 0x00) {
                     break 'relay;
                 }
@@ -1912,21 +1577,14 @@ pub fn run_client(name: &str) -> io::Result<i32> {
     Ok(0)
 }
 
-// `bish session new <name>`: spawns the daemon (a detached child
-// re-exec'ing this same binary in `--daemon` mode) and, once its socket
-// is up, attaches to it as the first client -- both in one command,
-// matching plain `tmux`'s own UX (see the implementation plan's
-// decision 1) rather than tmux's `-d`.
-/// `bish session new <name>`, and `new -A <name>`.
+/// `bish session new <name>`, and `new -A <name>`: spawns the daemon (a
+/// detached child re-exec'ing this binary with `--daemon`) and attaches
+/// to it once its socket is up.
 ///
-/// `attach_if_running` is `-A`: attach to the session if it is already
-/// there, create it if it is not. Without it a name already taken is an
-/// error, which it has to be -- spawning a second daemon for a live
-/// name loses the pidfile lock and dies, and the connect below then
-/// lands on the *existing* session. That looked like "new" quietly
-/// working, while actually attaching -- and since an attach replaces
-/// whoever was there, it also threw whoever was using that session off
-/// it, with no message anywhere.
+/// `attach_if_running` is `-A`: attach if the session exists, else create
+/// it. Without it a taken name is an error: a second daemon would lose
+/// the pidfile lock and die, and the connect below would silently attach
+/// to the existing session instead.
 pub fn run_new(name: &str, attach_if_running: bool) -> io::Result<i32> {
     check_name(name)?;
     if is_daemon_alive(name) {
@@ -1960,9 +1618,8 @@ pub fn run_new(name: &str, attach_if_running: bool) -> io::Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    // A declared length is a promise about bytes that have not arrived.
-    // Believing a 4 GiB one means `feed` grows the buffer forever while
-    // the peer dribbles.
+    // A declared length promises bytes not yet arrived; believing 4 GiB,
+    // `feed` grows forever while the peer dribbles.
     #[test]
     fn an_oversized_frame_is_refused_on_its_header() {
         let mut d = super::Decoder::new();
@@ -1972,11 +1629,10 @@ mod tests {
         let err = d.next_message().unwrap_err();
         assert!(err.contains("exceeds"), "{err}");
 
-        // Refused on the five header bytes alone -- the payload never
-        // has to arrive, which is the whole point.
+        // Refused on the five header bytes; the payload never has to arrive.
         assert_eq!(header.len(), 5);
 
-        // And the largest legal frame still decodes.
+        // The largest legal frame still decodes.
         let big = super::Message::Bytes(vec![b'x'; 4096]).encode();
         let mut d = super::Decoder::new();
         d.feed(&big);
@@ -1997,27 +1653,14 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
 
-    // `XDG_RUNTIME_DIR` is process-wide mutable state, and `cargo test`
-    // runs tests in parallel by default -- every test below that reads
-    // `socket_dir()` (directly, or via any function built on it) needs
-    // to run with *this* env var pinned to a value only it controls for
-    // the duration, or two such tests racing each other will
-    // occasionally observe (and act on) each other's value. Confirmed
-    // this was a real, live flake, not just a hypothetical one, while
-    // adding the pidfile-lock tests below (a fresh `cargo test session::`
-    // run failed exactly this way on the first try). A single shared
-    // mutex, held for the whole body, is the standard fix -- serializes
-    // only these tests relative to each other, the rest of the suite
-    // stays fully parallel.
+    // `XDG_RUNTIME_DIR` is process-wide and tests run in parallel, so every
+    // test reading `socket_dir()` holds this lock while it pins the
+    // variable, or they see each other's values.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // Runs `body` with `XDG_RUNTIME_DIR` set to `dir` (a fresh, isolated
-    // temp path, unique per call via `tag`) for its duration, holding
-    // `ENV_LOCK` throughout and restoring the env var afterward
-    // regardless of how `body` returns. `.unwrap_or_else(|p| p.into_inner())`
-    // recovers from a poisoned lock (an earlier panicking test having
-    // held it) rather than cascading that failure into every later test
-    // that also needs this same lock.
+    // Runs `body` with `XDG_RUNTIME_DIR` set to a fresh temp dir unique per
+    // `tag`, holding `ENV_LOCK` and restoring the variable after. A poisoned
+    // lock is recovered rather than failing every later test.
     fn with_isolated_runtime_dir(tag: &str, body: impl FnOnce(&std::path::Path)) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("bish-session-test-{}-{}", std::process::id(), tag));
@@ -2031,9 +1674,9 @@ mod tests {
         }
     }
 
-    // A busy session's screen is bytes nobody asking questions reads. The
-    // drain thread is fed through a socket pair standing in for the pty
-    // master, so what each client is sent can be read back.
+    // A busy session's screen isn't sent to a peer asking questions. A
+    // socket pair stands in for the pty master so what each client gets can
+    // be read back.
     #[test]
     fn the_screen_goes_to_whoever_watches_it_and_not_to_a_peer_asking_questions() {
         let (master, master_far_end) = UnixStream::pair().unwrap();
@@ -2058,8 +1701,8 @@ mod tests {
             }
         };
         assert!(matches!(&got, Message::Bytes(bytes) if bytes == b"hello"));
-        // Written in the same pass as the watcher's, so had it been sent,
-        // it would be there by now.
+        // Written in the same pass as the watcher's, so it would be there by
+        // now.
         asker.set_nonblocking(true).unwrap();
         assert_eq!(asker.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock, "nothing for the peer asking questions");
     }
@@ -2080,9 +1723,9 @@ mod tests {
         });
     }
 
-    // A command holding the idle loop: the question a stored answer covers
-    // is answered from the wait itself, and one it does not cover stays
-    // queued, in order, for the loop once the command is done.
+    // While a command holds the idle loop, a question the stored answer
+    // covers is answered from the wait, and one it doesn't stays queued in
+    // order for the loop.
     #[test]
     fn a_busy_wait_answers_what_it_can_and_leaves_the_rest_queued() {
         with_isolated_runtime_dir("busy", |_| {
@@ -2110,10 +1753,9 @@ mod tests {
         });
     }
 
-    // A plain bish's socket, end to end over a real bound one: a question
-    // put through `Peer::connect_path` comes back answered, a peer
-    // arriving does not repaint anything, and a socket left by a bish
-    // that died is gone once the next one listens.
+    // A plain bish's socket end to end: a question through
+    // `Peer::connect_path` is answered, a peer arriving repaints nothing,
+    // and a dead bish's socket goes when the next one listens.
     #[test]
     fn a_plain_bish_answers_on_its_own_socket_and_sweeps_up_a_dead_ones() {
         with_isolated_runtime_dir("listen-here", |_| {
@@ -2168,11 +1810,8 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
             None => {}
         }
-        // `Path::starts_with` compares whole path *components*, not
-        // string prefixes -- "/tmp/bish-1000" doesn't component-wise
-        // start with "/tmp/bish-" (its last component is "bish-1000",
-        // not "bish-"), so this deliberately checks the rendered string
-        // instead.
+        // `Path::starts_with` compares whole components, and `bish-1000`
+        // isn't `bish-`, so this checks the string.
         assert!(dir.to_string_lossy().starts_with("/tmp/bish-"), "expected a /tmp/bish-<uid> fallback, got {:?}", dir);
     }
 
@@ -2225,10 +1864,10 @@ mod tests {
         assert_eq!(key_bytes("Tab"), b"\t");
         assert_eq!(key_bytes("Escape"), b"\x1b");
         assert_eq!(key_bytes("Up"), b"\x1b[A");
-        // A word that is not a key name is the word.
+        // A word that isn't a key name is the word.
         assert_eq!(key_bytes("make"), b"make");
         assert_eq!(key_bytes("echo hello"), b"echo hello");
-        // Including one that only looks like a key name.
+        // Including one that only looks like one.
         assert_eq!(key_bytes("C-"), b"C-");
         assert_eq!(key_bytes("C-hello"), b"C-hello");
     }
@@ -2239,11 +1878,11 @@ mod tests {
         assert_eq!(key_bytes("C-d"), vec![4]);
         assert_eq!(key_bytes("C-a"), vec![1]);
         assert_eq!(key_bytes("C-z"), vec![26]);
-        // Case makes no difference to which code it is.
+        // Case doesn't matter.
         assert_eq!(key_bytes("C-C"), vec![3]);
-        // C-Space, which is also bish's own detach key.
+        // C-Space, also the detach key.
         assert_eq!(key_bytes("C-@"), vec![0]);
-        // The two spellings a terminal genuinely shares.
+        // The two spellings a terminal shares.
         assert_eq!(key_bytes("C-m"), key_bytes("Enter"));
         assert_eq!(key_bytes("C-i"), key_bytes("Tab"));
     }
@@ -2271,8 +1910,7 @@ mod tests {
         assert_eq!(short_duration(Duration::from_secs(3600)), "1h");
         assert_eq!(short_duration(Duration::from_secs(86399)), "23h");
         assert_eq!(short_duration(Duration::from_secs(86400)), "1d");
-        // Nothing after the first unit: "3h" belongs in a list,
-        // "3h07m12s" does not.
+        // Only the first unit: "3h", not "3h07m12s".
         assert_eq!(short_duration(Duration::from_secs(3 * 3600 + 432)), "3h");
     }
 
@@ -2286,8 +1924,7 @@ mod tests {
             assert_eq!(read_pid("s"), Some(std::process::id() as i32), "the pid is still the first line");
             assert_eq!(read_attached("s"), Some(2));
 
-            // Rewritten in place, shorter -- the old line must not show
-            // through underneath the new one.
+            // Rewritten in place, shorter; the old line mustn't show through.
             write_status(&mut file, 0);
             assert_eq!(read_attached("s"), Some(0));
             assert_eq!(read_pid("s"), Some(std::process::id() as i32));
@@ -2296,8 +1933,7 @@ mod tests {
 
     #[test]
     fn a_pidfile_with_no_status_line_reads_as_unknown_not_as_nobody() {
-        // What a daemon from before the status line existed leaves.
-        // "?" in the listing is honest; "detached" would not be.
+        // A pidfile with no status line: "?" in the listing, not "detached".
         with_isolated_runtime_dir("old-pidfile", |_dir| {
             ensure_socket_dir().expect("ensure_socket_dir");
             std::fs::write(pidfile_path("old"), b"4242\n").expect("pidfile");
@@ -2308,8 +1944,7 @@ mod tests {
 
     #[test]
     fn a_shared_session_runs_at_the_smallest_attached_size() {
-        // Each direction independently, so a tall narrow terminal beside
-        // a short wide one leaves both able to see the whole screen.
+        // Each direction independently.
         assert_eq!(smallest_size(&[(40, 100), (24, 80)]), Some((24, 80)));
         assert_eq!(smallest_size(&[(24, 200), (60, 80)]), Some((24, 80)));
         assert_eq!(smallest_size(&[(30, 90)]), Some((30, 90)));
@@ -2317,9 +1952,8 @@ mod tests {
 
     #[test]
     fn a_client_that_has_not_said_its_size_yet_does_not_shrink_the_session() {
-        // (0, 0) is what a just-accepted client reports until its
-        // Handshake arrives. Taking it literally would collapse the pty
-        // to nothing for everyone already attached.
+        // A client reports (0, 0) until its handshake arrives; taken
+        // literally it would collapse the pty for everyone.
         assert_eq!(smallest_size(&[(40, 100), (0, 0)]), Some((40, 100)));
         assert_eq!(smallest_size(&[(0, 0)]), None, "and with nobody sized yet, leave the pty alone");
         assert_eq!(smallest_size(&[]), None, "same when nobody is attached at all");
@@ -2329,8 +1963,7 @@ mod tests {
     fn dead_session_files_are_removed_once_nothing_holds_them() {
         with_isolated_runtime_dir("dead-files", |_dir| {
             ensure_socket_dir().expect("ensure_socket_dir");
-            // What a daemon killed by a signal leaves behind: it runs no
-            // cleanup of its own, so both files outlive it.
+            // What a killed daemon leaves: both files outlive it.
             std::fs::write(socket_path("gone"), b"").expect("socket stand-in");
             std::fs::write(pidfile_path("gone"), b"12345\n").expect("pidfile stand-in");
 
@@ -2346,10 +1979,9 @@ mod tests {
         with_isolated_runtime_dir("live-files", |_dir| {
             ensure_socket_dir().expect("ensure_socket_dir");
             std::fs::write(socket_path("live"), b"").expect("socket stand-in");
-            // Holding the lock is exactly what "a daemon is alive here"
-            // means (see acquire_pidfile_lock), so this stands in for
-            // one -- including the case that matters most: a *new*
-            // daemon claiming the name between the kill and the sweep.
+            // Holding the lock is what a live daemon means (see
+            // `acquire_pidfile_lock`), so this stands in for a new daemon
+            // claiming the name between the kill and the sweep.
             let _held = acquire_pidfile_lock("live").expect("acquire");
 
             remove_dead_session_files("live", std::time::Duration::from_millis(0));
@@ -2364,12 +1996,9 @@ mod tests {
         with_isolated_runtime_dir("double-acquire", |_dir| {
             ensure_socket_dir().expect("ensure_socket_dir");
             let _first = acquire_pidfile_lock("work").expect("first acquire");
-            // flock is associated with the open file *description*, not
-            // the process -- a second, independent open+lock attempt
-            // against the same path genuinely conflicts even though
-            // it's the same process making both calls, which is exactly
-            // what lets this simulate "a second `bish session new work`
-            // while the first is still running" faithfully.
+            // `flock` belongs to the open file description, not the
+            // process, so a second open and lock conflicts even in the same
+            // process, standing in for a second `bish session new work`.
             let second = acquire_pidfile_lock("work");
             assert!(second.is_err(), "a second lock attempt should fail while the first is still held");
         });
@@ -2397,8 +2026,7 @@ mod tests {
 
     #[test]
     fn the_rpc_messages_round_trip() {
-        // A JSON-RPC body is just bytes here, and deliberately so -- the
-        // point of these two cases is that the framing does not care.
+        // A JSON-RPC body is just bytes here; the framing doesn't care.
         let request = Message::Rpc(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec());
         let mut dec = Decoder::new();
         dec.feed(&request.encode());
@@ -2409,17 +2037,15 @@ mod tests {
         dec.feed(&reply.encode());
         assert_eq!(dec.next_message().unwrap(), Some(reply));
 
-        // Including a body that is not text at all: this layer counts
-        // bytes and never looks inside them.
+        // Even one that isn't text: this layer counts bytes.
         let raw = Message::Rpc(vec![0x00, 0xff, 0xfe, b'\n']);
         let mut dec = Decoder::new();
         dec.feed(&raw.encode());
         assert_eq!(dec.next_message().unwrap(), Some(raw));
     }
 
-    // Two messages of the new kinds arriving glued together, byte by
-    // byte -- the case a stream socket actually produces, and the one a
-    // length prefix exists for.
+    // Two messages glued together and fed byte by byte, as a stream socket
+    // delivers them.
     #[test]
     fn rpc_messages_survive_arriving_in_pieces() {
         let one = Message::Rpc(b"{\"id\":1}".to_vec());
@@ -2433,8 +2059,7 @@ mod tests {
         for (at, byte) in wire.iter().enumerate() {
             dec.feed(&[*byte]);
             while let Some(msg) = dec.next_message().unwrap() {
-                // Each one appears on the byte that completes it, and
-                // not one byte earlier.
+                // Each appears on the byte that completes it, not before.
                 assert!(at + 1 == first || at + 1 == wire.len(), "a message surfaced at byte {}", at + 1);
                 seen.push(msg);
             }
@@ -2442,8 +2067,7 @@ mod tests {
         assert_eq!(seen, vec![one, two]);
     }
 
-    // The same header check every other kind gets: refused on the five
-    // header bytes, before the peer has sent a single byte of body.
+    // Refused on the five header bytes, before any body.
     #[test]
     fn an_oversized_rpc_frame_is_refused_on_its_header() {
         let mut dec = Decoder::new();
