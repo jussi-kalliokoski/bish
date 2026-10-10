@@ -1,37 +1,24 @@
-// roff, hand-rolled: the typesetting language every man page on this
-// machine is actually written in. No `man` subprocess, no groff, no
-// external crate -- the same stance as every other parser here.
+// roff, the typesetting language man pages are written in, parsed here
+// without `man`, groff or a crate.
 //
-// Three things use it. `bishedit::manpages` mines flags and descriptions
-// out of real pages (it used to shell out to `man` and scan the
-// *rendered* text, which cost ~250ms per lookup and meant guessing
-// structure back out of indentation). The editor highlights `.1`/`.3`
-// files. And `:preview` renders one, which is what makes a man page
-// readable without leaving the editor.
+// Three users: `bishedit::manpages` mines flags and descriptions from
+// pages, the editor highlights `.1`/`.3` files, and `:preview` renders
+// one.
 //
-// **Two layers, because two consumers want different things.** `lexer`
-// is a lexical pass -- where the control lines, requests, escapes and
-// comments *are* in the source -- and drives highlighting, which must
-// never interpret. `interp` is a real roff interpreter -- registers,
-// strings, user-defined macros, conditionals -- and `man` is the man(7)
-// macro package on top of it, producing the document model below. That
-// split is the same one bash already has here: the highlighter reads the
-// lexer, execution reads the parser.
+// Two layers for two consumers. `lexer` finds where control lines,
+// requests, escapes and comments are, for highlighting, which must never
+// interpret. `interp` is a roff interpreter (registers, strings, macros,
+// conditionals), and `man` is the man(7) package on it, producing the
+// document model below. The same split as bash's highlighter and parser.
 //
-// **What "hand-rolled roff" honestly means.** roff is a
-// Turing-complete typesetting language with diversions, traps, and
-// arbitrary page geometry. This implements the part man pages use:
-// requests for macro definition and conditional expansion, number
-// registers and strings with arithmetic, the escape vocabulary, and the
-// man(7) macros. It does not implement page layout, traps, diversions,
-// tbl/eqn/pic preprocessors, or `.so` inclusion. Those absences are
-// reported rather than silently mis-rendered -- see `Document::notes`.
+// What's implemented is what man pages use: macro definition,
+// conditionals, registers and strings with arithmetic, the escapes, and
+// the man(7) macros. Not page layout, traps, diversions, tbl/eqn/pic or
+// `.so`; those are reported (see `Document::notes`), not mis-rendered.
 
-// A parser exposes the model the format has, and this codebase's callers
-// use a subset -- the highlighter reads spans, the miner reads structure,
-// the preview reads both. Kept whole rather than trimmed to today's
-// callers, the same reasoning (and the same allow) as html/mod.rs and
-// markdown/mod.rs.
+// The model is kept whole though callers use parts of it (spans for the
+// highlighter, structure for the miner, both for the preview), as in
+// html/mod.rs and markdown/mod.rs.
 #![allow(dead_code)]
 
 pub mod interp;
@@ -51,14 +38,13 @@ pub struct Header {
     pub manual: String,
 }
 
-// roff's font model is a *mode*, not a nesting: `\fB` switches to bold
-// until something switches away. So a style rides on each run of text
-// rather than wrapping it.
+// roff's font is a mode, not a nesting: `\fB` is bold until something
+// switches away. So each run carries a style rather than being wrapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
-    // Constant-width (`\f(CW`, `.EX`) -- what a page uses for code.
+    // Constant-width (`\f(CW`, `.EX`), what pages use for code.
     pub mono: bool,
 }
 
@@ -77,9 +63,7 @@ pub enum Block {
     Heading { level: u8, content: Vec<Inline>, span: Range<usize> },
     Paragraph { content: Vec<Inline>, span: Range<usize> },
     // `.TP` and `.IP`: a tag (the flag, the term) and the indented body
-    // that documents it. The single most useful structure in a man page,
-    // and the reason mining one is worth doing structurally rather than
-    // by measuring indentation in rendered output.
+    // documenting it, the most useful structure in a man page.
     Tagged { tag: Vec<Inline>, blocks: Vec<Block>, span: Range<usize> },
     // `.RS`/`.RE`.
     Indented { blocks: Vec<Block>, span: Range<usize> },
@@ -106,8 +90,8 @@ impl Inline {
         }
     }
 
-    // Every character this stands for with the styling dropped -- what a
-    // flag name or a section title is, as text.
+    // The characters with styling dropped: a flag name or section title as
+    // text.
     pub fn text_content(&self) -> String {
         match self {
             Inline::Text { text, .. } => text.clone(),
@@ -125,17 +109,15 @@ pub fn text_of(inlines: &[Inline]) -> String {
 pub struct Document {
     pub header: Option<Header>,
     pub blocks: Vec<Block>,
-    // What this parse met and could not honour -- an unimplemented
-    // request, a preprocessor block, a `.so` inclusion. Collected rather
-    // than acted on, so a caller can say "this page uses tbl" instead of
-    // rendering a table as garbage and leaving the reader to guess.
+    // What this parse met and couldn't honour: an unimplemented request, a
+    // preprocessor block, a `.so`. Collected so a caller can say "this page
+    // uses tbl" rather than render a table as garbage.
     pub notes: Vec<String>,
 }
 
 impl Document {
-    // The first section whose heading matches, case-insensitively --
-    // `NAME`, `OPTIONS`, `DESCRIPTION`. Returns the blocks between that
-    // heading and the next one at the same level.
+    // The blocks under the first heading matching `name` case-insensitively
+    // (`NAME`, `OPTIONS`), up to the next heading at its level.
     pub fn section(&self, name: &str) -> Vec<&Block> {
         let mut out = Vec::new();
         let mut inside = false;
@@ -161,9 +143,8 @@ pub fn parse(source: &str) -> Document {
 mod tests {
     use super::*;
 
-    // A compact view of the block tree, so an expectation reads as the
-    // page it describes. Fonts are shown as sigils: *bold*, _italic_,
-    // `mono`.
+    // A compact view of the block tree, so an expectation reads like the
+    // page. Fonts as sigils: *bold*, _italic_, `mono`.
     fn tree(source: &str) -> String {
         let doc = parse(source);
         let mut out = String::new();
@@ -248,8 +229,7 @@ mod tests {
         );
     }
 
-    // A tagged paragraph pairs the flag with its own prose, which is the
-    // structure that makes mining a page reliable.
+    // A tagged paragraph pairs the flag with its prose.
     #[test]
     fn a_tagged_paragraph_pairs_its_tag_with_its_body() {
         assert_tree(
@@ -263,8 +243,7 @@ mod tests {
         );
     }
 
-    // Consecutive input lines are one paragraph -- roff fills text, so a
-    // page's own line breaks are not the reader's.
+    // Consecutive input lines are one paragraph: roff fills text.
     #[test]
     fn text_lines_are_filled_into_one_paragraph() {
         assert_tree(
@@ -276,9 +255,7 @@ mod tests {
         );
     }
 
-    // `.BR ls (1)` is a cross reference: bold then roman, with no space
-    // between them. That is the entire reason the alternating-font
-    // macros exist.
+    // `.BR ls (1)` is a cross reference: bold then roman, no space between.
     #[test]
     fn alternating_font_macros_join_their_arguments_without_spaces() {
         assert_tree(".BR ls (1)\n", "p: *ls*(1)\n");
@@ -286,9 +263,8 @@ mod tests {
         assert_tree(".IR a b c\n", "p: _a_b_c_\n");
     }
 
-    // Regression: a request line ending in `\r\n` split its arguments
-    // forever, one empty argument at a time, until the machine ran out of
-    // memory. macOS ships a page written that way.
+    // A request line ending in `\r\n` must split its arguments and stop;
+    // macOS ships a page written that way.
     #[test]
     fn a_request_line_with_crlf_line_endings_parses() {
         let doc = parse(".Sh NAME\r\n.Nm foo\r\n");
@@ -305,8 +281,8 @@ mod tests {
         );
     }
 
-    // The scaffolding a generated page opens with: a macro defined then
-    // invoked, with its argument substituted.
+    // The scaffolding a generated page opens with: a macro defined, invoked,
+    // its argument substituted.
     #[test]
     fn a_user_defined_macro_is_expanded_with_its_arguments() {
         assert_tree(
@@ -327,19 +303,16 @@ mod tests {
         );
     }
 
-    // Rendering to a terminal is nroff, so the `n` branch is the one a
-    // page's conditionals should take.
+    // A terminal is nroff, so conditionals take the `n` branch.
     #[test]
     fn conditionals_take_the_nroff_branch() {
         assert_tree(".ie n .SH TERMINAL\n.el .SH TYPESET\n", "h1: TERMINAL\n");
         assert_tree(".if t .SH NEVER\n.if n .SH ALWAYS\n", "h1: ALWAYS\n");
     }
 
-    // A `\{` block runs to its matching `\}`, however many lines
-    // later. Note that `.\}` is not a break request, so the line after
-    // the block fills into the same paragraph as the line inside it --
-    // which is what groff does too, and worth pinning so it isn't
-    // "fixed" later.
+    // A `\{` block runs to its matching `\}`. `.\}` isn't a break, so the
+    // line after the block fills into the paragraph inside it, as groff
+    // does.
     #[test]
     fn a_braced_conditional_block_spans_lines() {
         assert_tree(
@@ -350,8 +323,7 @@ mod tests {
             p: after
             "#,
         );
-        // ...and an untaken block contributes nothing at all, including
-        // its headings.
+        // ...and an untaken block contributes nothing, headings included.
         assert_tree(
             ".if t \\{\\\n.SH SKIPPED\nnot this either\n.\\}\n.PP\nafter\n",
             r#"
@@ -416,9 +388,8 @@ mod tests {
         assert_tree("\\-\\-flag \\(bu \\(em \\(aq \\e\n", "p: --flag \u{2022} \u{2014} ' \\\n");
     }
 
-    // groff writes terminal hyperlinks as `\X'tty: link ...'` around
-    // every option name in a coreutils page. They are device control
-    // strings, not text.
+    // groff wraps every option name in a coreutils page in
+    // `\X'tty: link ...'`; device control strings, not text.
     #[test]
     fn device_control_escapes_contribute_nothing() {
         assert_tree("\\X'tty: link https://example.com'\\fB\\-a\\fP\\X'tty: link'\n", "p: *-a*\n");
@@ -441,8 +412,7 @@ mod tests {
         assert_eq!(parse(".\n.\n").blocks.len(), 0);
     }
 
-    // A page is untrusted input: roff is Turing-complete and this must
-    // terminate on anything.
+    // A page is untrusted input; this must terminate on anything.
     #[test]
     fn pathological_input_terminates() {
         // A macro that invokes itself.
@@ -472,10 +442,8 @@ mod tests {
 mod real_world_tests {
     use super::*;
 
-    // Every man page this machine has, parsed. Real pages written by
-    // real tools -- help2man, pod2man, asciidoctor, and by hand -- which
-    // is what catches a parser that only works on the examples it was
-    // written against. Skipped where there are no pages.
+    // Every man page on this machine, parsed: real pages from help2man,
+    // pod2man, asciidoctor and by hand. Skipped where there are none.
     #[test]
     fn parses_every_man_page_on_this_machine() {
         let mut checked = 0;
@@ -494,8 +462,7 @@ mod real_world_tests {
                 for block in &doc.blocks {
                     check_spans(block, len, &path);
                 }
-                // A rendered page must not be empty for a page that had
-                // any content at all.
+                // A page with any content mustn't render empty.
                 if text.contains(".SH") {
                     assert!(!doc.blocks.is_empty(), "{} rendered to nothing", path.display());
                 }
@@ -508,13 +475,12 @@ mod real_world_tests {
         if checked == 0 {
             return;
         }
-        // The overwhelming majority of real pages have a NAME section;
-        // this is a floor, not a target, and exists to catch a parse
-        // that silently stops finding structure.
+        // Nearly all real pages have a NAME section; a floor that catches a
+        // parse silently losing structure.
         assert!(with_name * 10 >= checked * 8, "only {with_name} of {checked} pages had a NAME section -- structure is being lost");
     }
 
-    // Man pages are gzipped, which bish can now undo itself.
+    // Man pages are gzipped.
     fn read_page(path: &std::path::Path) -> Option<String> {
         if path.extension().is_some_and(|e| e == "gz") {
             let (_, bytes) = crate::archive::gunzip(path).ok()?;
