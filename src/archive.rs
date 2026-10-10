@@ -1,37 +1,24 @@
-// zip and gzip, hand-rolled on top of inflate.rs -- reading only. What
-// this is for: `e some.zip` browses the archive like a directory, and
-// `e some.txt.gz` opens the decompressed text as a read-only buffer, so
-// looking inside a compressed thing doesn't mean leaving the editor to
-// unpack it first.
+// Read-only zip, gzip and tar, on top of inflate.rs, so the editor can
+// browse an archive like a directory (`e some.zip`) and open a gzipped
+// file as a read-only buffer.
 //
-// Read-only is not a limitation waiting to be lifted, it's the design.
-// Writing into either format means *compressing*, which is a much larger
-// problem than inflate.rs solves (see its own module comment), and
-// rewriting a zip in place means rebuilding its central directory around
-// an edit. Both buffers this feeds are opened readonly for that reason,
-// not as a placeholder.
-//
-// Deliberately out of scope, each reported as a plain error rather than
-// half-handled: zip64 (archives past 4GiB or 65535 members), encrypted
-// entries, and compression methods other than store/deflate. tar --
-// which is what a `.tar.gz` actually contains once gunzipped -- is a
-// separate container this doesn't parse yet; see plan.md.
+// Writing would mean compressing, and rebuilding a zip's central
+// directory around an edit, so all of it is read-only. Not supported,
+// each reported as an error: zip64 (over 4 GiB or 65535 members),
+// encrypted entries, and compression methods other than store and deflate.
 
 use std::path::{Path, PathBuf};
 
 use crate::inflate;
 
-// What `!` separates in a virtual path: the archive on disk from the
-// member inside it, `/a/b.zip!/dir/file.txt`, with `/a/b.zip!` naming
-// the archive's own root. Same spelling Java uses for a jar URL, and
-// picked over inventing a scheme prefix because a virtual path has to
-// survive being passed around as an ordinary string -- through
-// EditTarget::path, browser::Entry::path and the editor's own status
-// line -- with no type to carry the distinction.
+// Separates the archive from the member in a virtual path:
+// `/a/b.zip!/dir/file.txt`, with `/a/b.zip!` naming the archive's root. A
+// virtual path travels as a plain string (`EditTarget::path`,
+// `browser::Entry::path`, the status line), so the distinction has to be
+// in the spelling.
 //
-// A literal `!` in a real filename can't be mistaken for this: `split`
-// only treats one as a separator when everything before it is a file
-// that really is an archive, checked by reading its magic bytes.
+// `split` only treats a `!` as a separator when what precedes it is a real
+// archive, so a `!` in an ordinary filename is safe.
 pub const SEPARATOR: char = '!';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +28,8 @@ pub enum Kind {
     Tar,
 }
 
-// What `path` actually is, by its first bytes rather than its name -- a
-// `.zip` that isn't one shouldn't open as an archive, and the `.tgz`/
-// `.z`/no-extension-at-all cases should still work. Cheap enough to call
-// on any path the user names (one open, one 4-byte read) and `None` for
-// anything unreadable, since "can't tell" and "not an archive" lead to
-// exactly the same place.
+// What `path` is, by its magic bytes rather than its name. `None` means
+// either "not an archive" or "unreadable".
 pub fn kind_of(path: &Path) -> Option<Kind> {
     use std::io::Read;
     if !path.is_file() {
@@ -56,27 +39,18 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
     let mut file = std::fs::File::open(path).ok()?;
     let read = file.read(&mut head).ok()?;
     match &head[..read] {
-        // 1f 8b is gzip's own magic; the third byte is the compression
-        // method, and 8 (deflate) is the only one ever defined.
         [0x1f, 0x8b, ..] => Some(Kind::Gzip),
-        // "PK" then either a local file header (03 04) or, for an
-        // archive with no members at all, the end-of-central-directory
-        // record on its own (05 06). "PK\x07\x08" (a spanned archive)
-        // deliberately isn't accepted -- there'd be no other volume to
-        // read.
+        // A local file header, or the end record alone for an empty
+        // archive. A spanned archive (`PK\x07\x08`) is refused: its other
+        // volumes aren't there.
         [b'P', b'K', 3, 4] | [b'P', b'K', 5, 6] => Some(Kind::Zip),
-        // Tar has no header at all -- its "magic" is `ustar` 257 bytes
-        // in, which is why this needs a second, longer look rather than
-        // another arm above.
+        // Tar's magic is 257 bytes in.
         _ => is_tar_file(path).then_some(Kind::Tar),
     }
 }
 
-// Whether a file's bytes at offset 257 say `ustar`. A pre-POSIX tar has
-// nothing there and is not recognized: without the magic there is no way
-// to tell one from an arbitrary file whose 257th byte happens to be
-// interesting, and guessing wrong means showing someone a binary as a
-// directory.
+// A pre-POSIX tar has no magic and isn't recognized. Guessing would show
+// arbitrary binaries as directories.
 fn is_tar_file(path: &Path) -> bool {
     use std::io::Read;
     let Ok(mut file) = std::fs::File::open(path) else { return false };
@@ -87,24 +61,16 @@ fn is_tar_file(path: &Path) -> bool {
 
 const TAR_BLOCK: usize = 512;
 
-// The same test against bytes already in hand -- which is how a
-// `.tar.gz` is recognized: its *file* is a gzip, and only once inflated
-// can anything tell whether what is inside is a tar or an ordinary
-// file. That is the whole reason a doubly-wrapped archive needs no
-// second `!` in its path: `x.tar.gz!/dir/f` is one archive, unwrapped
-// twice on the way in.
+// The same test on bytes in hand, which is how a `.tar.gz` is recognized
+// once inflated. So `x.tar.gz!/dir/f` needs only one `!`.
 fn is_tar(data: &[u8]) -> bool {
     data.len() >= 265 && &data[257..262] == b"ustar"
 }
 
 // Splits a virtual path into the archive and the member path inside it
-// ("" for the archive's own root). `None` for an ordinary path.
-//
-// Scans left to right and takes the first `!` whose prefix is a real
-// archive, so a directory called `weird!` on the way to a real archive
-// doesn't win, and a plain file called `notes!.txt` is never split at
-// all. Nested archives (a zip inside a zip) aren't supported, which is
-// also why the *first* match is the right one rather than the last.
+// ("" for the root); `None` for an ordinary path. The first `!` whose
+// prefix is a real archive wins, so a directory named `weird!` on the way
+// doesn't. Nested archives aren't supported.
 pub fn split(path: &str) -> Option<(PathBuf, String)> {
     for (i, _) in path.char_indices().filter(|(_, c)| *c == SEPARATOR) {
         let archive = Path::new(&path[..i]);
@@ -116,31 +82,16 @@ pub fn split(path: &str) -> Option<(PathBuf, String)> {
     None
 }
 
-// The virtual path for `inner` inside `archive` -- the inverse of
-// `split`, and the only thing that should ever build one, so the
-// spelling stays in one place.
+// The inverse of `split`, and the only place a virtual path is built.
 pub fn join(archive: &Path, inner: &str) -> String {
     let inner = inner.trim_matches('/');
     if inner.is_empty() { format!("{}{SEPARATOR}", archive.display()) } else { format!("{}{SEPARATOR}/{inner}", archive.display()) }
 }
 
-// Whether the file browser can list this path: a zip archive on disk, or
-// a directory inside one. The one question `e SOMETHING` has to answer
-// before deciding between "browse it" and "open it as a buffer", and the
-// counterpart to `Path::is_dir` for virtual paths (which name nothing on
-// disk, so `is_dir` is always false for them).
-//
-// A gzip file is deliberately not browsable: it holds one compressed
-// stream, not a directory of members, so there'd be exactly one thing to
-// pick out of it. It opens as a read-only buffer instead.
-// Whether this file is a directory of members rather than content: a
-// zip, a tar, or a gzip whose contents turn out to be a tar.
-//
-// That last case is the only one that costs anything -- deciding it
-// means inflating, since a `.tar.gz`'s own bytes say only "gzip". It is
-// also the only honest way to tell `notes.txt.gz` (open the text) from
-// `src.tar.gz` (browse it) without trusting the name, which is the rule
-// `kind_of` already sets for every other archive here.
+// Whether the file holds members rather than content: a zip, a tar, or a
+// gzip whose contents are a tar. Only the last needs inflating, and it's
+// how `notes.txt.gz` (open the text) is told from `src.tar.gz` (browse it)
+// without trusting the name.
 pub fn holds_members(path: &Path) -> bool {
     match kind_of(path) {
         Some(Kind::Zip) | Some(Kind::Tar) => true,
@@ -149,16 +100,9 @@ pub fn holds_members(path: &Path) -> bool {
     }
 }
 
-// The cheap version, for a *listing* -- which icon and colour an entry
-// gets, not how it opens.
-//
-// `holds_members` is the honest answer and this one isn't: it trusts a
-// `.tar.gz`/`.tgz` name rather than inflating, because inflating every
-// gzip in a directory to decide what to draw is not a trade worth
-// making. The distinction is safe exactly because it is cosmetic --
-// pressing Enter still goes through `is_browsable`, which reads the
-// bytes, so a misnamed file is drawn wrong for a moment and still opens
-// correctly.
+// A cheap guess for a listing's icon and colour: trusts a `.tar.gz` or
+// `.tgz` name instead of inflating every gzip in the directory. Opening
+// still goes through `is_browsable`, which reads the bytes.
 pub fn looks_like_archive(path: &Path) -> bool {
     match kind_of(path) {
         Some(Kind::Zip) | Some(Kind::Tar) => true,
@@ -170,6 +114,8 @@ pub fn looks_like_archive(path: &Path) -> bool {
     }
 }
 
+// Whether the file browser can list this path: an archive on disk, or a
+// directory inside one. `Path::is_dir` is always false for a virtual path.
 pub fn is_browsable(path: &str) -> bool {
     let Some((archive, inner)) = split(path) else {
         return holds_members(Path::new(path));
@@ -181,9 +127,8 @@ pub fn is_browsable(path: &str) -> bool {
     members.iter().any(|m| (m.name == inner && m.is_dir) || m.name.starts_with(&format!("{inner}/")))
 }
 
-// One entry in a zip's central directory. `name` is the full path inside
-// the archive, `/`-separated with no leading slash -- the format's own
-// convention, kept verbatim.
+// One member. `name` is its full path inside the archive, `/`-separated,
+// without a leading slash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub name: String,
@@ -195,23 +140,15 @@ pub struct Member {
     crc: u32,
 }
 
-// Every member of a zip archive, in the order its central directory
-// lists them (which is the order they were added, and what `unzip -l`
-// shows).
+// Every member, in the order the archive stores them.
 pub fn list(path: &Path) -> Result<Vec<Member>, String> {
     let data = archive_bytes(path)?;
     members_of(&data)
 }
 
-// The bytes an archive is actually made of: the file itself, or -- for a
-// gzip -- what is inside it. One place, so `list`, `read_member` and
-// `is_browsable` can never disagree about what a `.tar.gz` contains.
-//
-// Known cost, accepted for now: a `.tar.gz` is inflated again for every
-// member read, since nothing here holds the decompressed bytes between
-// calls. That is one inflate per file you open out of an archive, which
-// is what the read-whole-file approach above already assumes about
-// scale.
+// The file's bytes, or for a gzip what's inside it, so `list`,
+// `read_member` and `is_browsable` agree on what a `.tar.gz` contains. A
+// `.tar.gz` is inflated again for every member read.
 fn archive_bytes(path: &Path) -> Result<Vec<u8>, String> {
     match kind_of(path) {
         Some(Kind::Gzip) => gunzip(path).map(|(_, data)| data),
@@ -227,17 +164,8 @@ pub fn read_member(path: &Path, name: &str) -> Result<Vec<u8>, String> {
     extract(&data, member)
 }
 
-// What a directory listing of `inner` inside the archive looks like:
-// each immediate child once, directories included even when the archive
-// has no explicit entry for them.
-//
-// That last part is why this synthesizes rather than filters. Zip stores
-// a flat list of full paths, and whether a directory gets its own entry
-// is up to whatever wrote the archive -- `zip -r` writes them, plenty of
-// other producers don't. A browser that only listed explicit entries
-// would show an archive as empty at its root and hide everything in it,
-// so the directory structure is derived from the member names instead,
-// which is what every zip tool does.
+// The immediate children of `inner`, each once. Directories are derived
+// from member names, since many zip writers store no entries for them.
 pub fn list_dir(members: &[Member], inner: &str) -> Vec<Member> {
     let prefix = if inner.is_empty() { String::new() } else { format!("{}/", inner.trim_matches('/')) };
     let mut out: Vec<Member> = Vec::new();
@@ -247,15 +175,14 @@ pub fn list_dir(members: &[Member], inner: &str) -> Vec<Member> {
         if rest.is_empty() {
             continue;
         }
-        // A child is a directory either because it has its own entry
-        // ending in `/`, or because something deeper than it exists.
+        // A directory if it has its own entry or something below it.
         let (child, is_dir) = match rest.split_once('/') {
             Some((head, _)) => (head, true),
             None => (rest, member.is_dir),
         };
         match out.iter_mut().find(|m| m.name == child) {
-            // Seen already -- an explicit directory entry and the files
-            // under it both name it, and either order is possible.
+            // Named by its own entry and by the files under it, in either
+            // order.
             Some(existing) => existing.is_dir |= is_dir,
             None => out.push(Member {
                 name: child.to_string(),
@@ -271,26 +198,22 @@ pub fn list_dir(members: &[Member], inner: &str) -> Vec<Member> {
     out
 }
 
-// A gzip file's decompressed bytes, plus the original filename it
-// records if it has one (gzip stores the name it compressed, which is
-// how `e archive.gz` can still tell that the thing inside was a `.json`).
+// A gzip file's decompressed bytes, and the original filename if it
+// stores one, so `e archive.gz` can tell the content was a `.json`.
 pub fn gunzip(path: &Path) -> Result<(Option<String>, Vec<u8>), String> {
     gunzip_within(path, inflate::MAX_OUTPUT)
 }
 
-// `gunzip` with a caller-chosen ceiling on the decompressed size, for a
-// caller that knows what it is reading and does not want the general
-// one. The budget is the whole file's, not each member's: members
-// concatenate, so a per-member ceiling would be no ceiling at all --
-// `cat bomb.gz bomb.gz ...` would walk straight past it.
+// `gunzip` with the caller's ceiling on the decompressed size. It covers
+// the whole file: members concatenate, so a per-member ceiling could be
+// bypassed with `cat bomb.gz bomb.gz`.
 pub fn gunzip_within(path: &Path, max_out: usize) -> Result<(Option<String>, Vec<u8>), String> {
     let data = read_file(path)?;
     let mut pos = 0;
     let mut out = Vec::new();
     let mut first_name = None;
-    // Concatenated members are a legal gzip file (`cat a.gz b.gz` makes
-    // one) and decompress to the concatenation of their contents, which
-    // is what gzip itself does with them.
+    // Concatenated members are a legal gzip file and decompress to the
+    // concatenation of their contents.
     while pos < data.len() {
         let (name, body, next) = gzip_member(&data, pos, max_out.saturating_sub(out.len()))?;
         if first_name.is_none() {
@@ -327,8 +250,7 @@ fn gzip_member(data: &[u8], pos: usize, max_out: usize) -> Result<(Option<String
     if flags & 0b0001_0000 != 0 {
         read_cstring(data, &mut at)?;
     }
-    // FHCRC: a CRC16 of the header, which this doesn't check -- the
-    // CRC32 of the actual data below catches everything it would.
+    // FHCRC: the header's CRC16, not checked.
     if flags & 0b0000_0010 != 0 {
         at += 2;
     }
@@ -340,8 +262,7 @@ fn gzip_member(data: &[u8], pos: usize, max_out: usize) -> Result<(Option<String
     if inflate::crc32(&body) != want_crc {
         return Err("gzip checksum mismatch (the file is corrupt)".to_string());
     }
-    // ISIZE is the length mod 2^32, so on a >4GiB member this compares
-    // the low bits -- which is all the format itself claims.
+    // ISIZE is the length mod 2^32, so only the low bits are compared.
     if (body.len() as u32) != want_len {
         return Err("gzip length mismatch (the file is corrupt)".to_string());
     }
@@ -362,20 +283,17 @@ fn byte(data: &[u8], at: usize) -> Result<&u8, String> {
     data.get(at).ok_or_else(|| "truncated gzip header".to_string())
 }
 
-// A tar member is stored whole and uncompressed; this marks one so
-// `extract` can tell it from a zip member, whose `method` really is a
-// zip compression method.
+// Marks a tar member in `method`, which otherwise holds a zip compression
+// method.
 const TAR_STORED: u16 = u16::MAX;
 
-// Every member of a tar archive. Tar has no index: the members *are* the
-// file, each a 512-byte header followed by its own data padded up to the
-// next block, ending at two zero blocks (or simply at the end, since
-// plenty of writers omit them).
+// Tar has no index: each member is a 512-byte header followed by its
+// data padded to the next block, ending at two zero blocks or simply at
+// the end of the file.
 fn tar_members(data: &[u8]) -> Vec<Member> {
     let mut out = Vec::new();
     let mut at = 0usize;
-    // GNU's answer to tar's 100-byte name field: an `L` entry whose
-    // *data* is the next entry's real name. Carried across one iteration.
+    // GNU long names: an `L` entry's data is the next entry's name.
     let mut long_name: Option<String> = None;
     while at + TAR_BLOCK <= data.len() {
         let header = &data[at..at + TAR_BLOCK];
@@ -384,8 +302,6 @@ fn tar_members(data: &[u8]) -> Vec<Member> {
         }
         let size = octal_at(header, 124, 12);
         let data_at = at + TAR_BLOCK;
-        // Padded up to the next block boundary, which is how the next
-        // header is found.
         at = data_at + size.div_ceil(TAR_BLOCK as u64) as usize * TAR_BLOCK;
         let typeflag = header[156];
         if typeflag == b'L' {
@@ -395,8 +311,7 @@ fn tar_members(data: &[u8]) -> Vec<Member> {
         let name = match long_name.take() {
             Some(name) => name,
             None => {
-                // POSIX ustar splits a long path across `prefix` and
-                // `name`; a short one leaves the prefix empty.
+                // POSIX ustar splits a long path into `prefix` and `name`.
                 let name = tar_string(&header[..100]);
                 match tar_string(&header[345..500]) {
                     prefix if prefix.is_empty() => name,
@@ -407,11 +322,8 @@ fn tar_members(data: &[u8]) -> Vec<Member> {
         if name.is_empty() {
             continue;
         }
-        // Everything that isn't a regular file or a directory -- links,
-        // devices, the pax/GNU metadata entries -- is skipped rather
-        // than shown: none of them has content a reader wants, and a
-        // `PaxHeader` entry in a listing is noise from the tool that
-        // wrote the archive, not part of what is in it.
+        // Only regular files and directories are listed. Links, devices
+        // and pax/GNU metadata entries have no content worth showing.
         let is_dir = typeflag == b'5' || name.ends_with('/');
         if !is_dir && !matches!(typeflag, b'0' | 0) {
             continue;
@@ -442,22 +354,19 @@ fn octal_at(header: &[u8], at: usize, len: usize) -> u64 {
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    // Read whole rather than seeking around it. A zip's central
-    // directory is at the *end* and its members are at the front, so any
-    // real use touches both ends anyway, and what this opens is an
-    // archive someone is browsing in an editor -- not a disk image.
+    // Read whole: a zip's central directory is at the end and its
+    // members at the front, so both ends get read anyway.
     std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// Zip's end-of-central-directory record, which is what makes an archive
-// readable at all: it says where the central directory is. It sits at
-// the very end of the file, after a variable-length comment, so the only
-// way to find it is to scan backwards for its signature.
+// The end-of-central-directory record says where the central directory
+// is. It follows a variable-length comment at the end of the file, so it
+// is found by scanning backwards.
 const EOCD_SIG: u32 = 0x0605_4b50;
 const CENTRAL_SIG: u32 = 0x0201_4b50;
 const LOCAL_SIG: u32 = 0x0403_4b50;
-// The comment is a u16 length, so the record can't start further back
-// than this from the end.
+// The comment's length is a u16, which bounds how far back the record
+// can start.
 const MAX_COMMENT: usize = u16::MAX as usize;
 
 fn members_of(data: &[u8]) -> Result<Vec<Member>, String> {
@@ -487,10 +396,8 @@ fn members_of(data: &[u8]) -> Result<Vec<Member>, String> {
         let local_offset = u32_at(data, at + 42)? as u64;
         let raw = data.get(at + 46..at + 46 + name_len).ok_or("corrupt zip member name")?;
         let name = String::from_utf8_lossy(raw).into_owned();
-        // Bit 0 is the format's own "this entry is encrypted" flag,
-        // whichever scheme was used -- refused here rather than handed to
-        // the decompressor, which would otherwise produce noise and blame
-        // the archive for being corrupt.
+        // Bit 0 marks an encrypted entry. Refused here, or inflating it
+        // would produce noise and call the archive corrupt.
         if flags & 1 != 0 {
             return Err(format!("{name}: encrypted zip entries are not supported"));
         }
@@ -513,23 +420,20 @@ fn members_of(data: &[u8]) -> Result<Vec<Member>, String> {
 
 fn find_eocd(data: &[u8]) -> Option<usize> {
     let earliest = data.len().saturating_sub(MAX_COMMENT + 22);
-    // Backwards, so a zip whose *contents* happen to contain the
-    // signature (a zip inside a zip, stored uncompressed) doesn't win
-    // over the real record at the end.
+    // Backwards, so a zip stored uncompressed inside this one can't
+    // match first.
     (earliest..data.len().checked_sub(22)? + 1).rev().find(|&i| u32_at(data, i) == Ok(EOCD_SIG))
 }
 
-// One member's bytes, found through its local header rather than the
-// central directory's own copy of the name and extra field: the two are
-// allowed to differ in length, and it's the local one that says where
-// the data actually starts.
+// Found through the local header, not the central directory's copy of
+// the name and extra field: their lengths may differ, and the local one
+// says where the data starts.
 fn extract(data: &[u8], member: &Member) -> Result<Vec<u8>, String> {
     if member.is_dir {
         return Err(format!("{}: is a directory", member.name));
     }
-    // Tar stores its members whole and uncompressed, so a member *is* a
-    // slice -- `local_offset` is where its data starts rather than where
-    // a local header does.
+    // A tar member is stored uncompressed, and its `local_offset` is where
+    // its data starts.
     if member.method == TAR_STORED {
         let at = member.local_offset as usize;
         return data.get(at..at + member.size as usize).map(|d| d.to_vec()).ok_or_else(|| "truncated tar member data".to_string());
@@ -567,16 +471,12 @@ fn u32_at(data: &[u8], at: usize) -> Result<u32, String> {
 mod tests {
     use super::*;
 
-    // A real 3-member zip, produced once by python3's zipfile and
-    // embedded byte for byte rather than assembled here -- the point of
-    // these tests is agreement with what real tools write, which a
-    // fixture built by this file's own understanding of the format
-    // couldn't show. Contents:
+    // Written by python3's zipfile, so these tests check agreement with a
+    // real tool rather than with this file's reading of the format:
     //   notes.txt          -> "hello from a zip\n"      (deflated)
     //   dir/inner.json     -> "{\"a\": 1}\n"            (deflated)
     //   dir/deep/leaf.txt  -> "leaf\n"                  (stored)
-    // and no explicit entry for `dir/` or `dir/deep/`, which is what
-    // makes it exercise list_dir's synthesis.
+    // No entries for `dir/` or `dir/deep/`, so `list_dir` has to derive them.
     const ZIP: &[u8] = include_bytes!("testdata/sample.zip");
     // gzip of "compressed text\nsecond line\n", with FNAME set.
     const GZ: &[u8] = include_bytes!("testdata/sample.txt.gz");
@@ -618,8 +518,6 @@ mod tests {
         std::fs::remove_file(zip).unwrap();
     }
 
-    // The archive has no `dir/` or `dir/deep/` entry of its own, so
-    // every directory here is synthesized from the member names.
     #[test]
     fn lists_a_directory_inside_the_archive_including_implied_ones() {
         let zip = write_temp("dirs.zip", ZIP);
@@ -656,7 +554,6 @@ mod tests {
         std::fs::remove_file(gz).unwrap();
     }
 
-    // `cat a.gz b.gz` is a legal gzip file that decompresses to both.
     #[test]
     fn gunzips_concatenated_members_as_one_stream() {
         let mut both = GZ.to_vec();
@@ -670,8 +567,7 @@ mod tests {
     #[test]
     fn a_corrupt_gzip_body_fails_its_checksum_rather_than_returning_garbage() {
         let mut broken = GZ.to_vec();
-        // Flip a bit in the middle of the deflate stream, past the
-        // header and before the trailer.
+        // Flip a bit inside the deflate stream.
         let middle = broken.len() / 2;
         broken[middle] ^= 0x40;
         let gz = write_temp("broken.gz", &broken);
@@ -689,8 +585,6 @@ mod tests {
         std::fs::remove_file(zip).unwrap();
     }
 
-    // The separator is only a separator when what precedes it really is
-    // an archive -- otherwise `!` is just a character in a filename.
     #[test]
     fn split_leaves_an_ordinary_path_containing_a_bang_alone() {
         let plain = write_temp("bang!.txt", b"not an archive\n");
@@ -722,12 +616,8 @@ mod tests {
 mod real_world_tests {
     use super::*;
 
-    // Every gzip file on this machine's man pages, decompressed and
-    // compared byte for byte against what the real `gzip` produces. A
-    // few hundred real files written by a real compressor, which is a
-    // far better test of the decoder than any fixture chosen by hand --
-    // skipped where the directory or the gzip binary isn't there, same
-    // "quietly unavailable" contract the git tests use.
+    // Every gzipped man page found, against the real `gzip`. Skipped where
+    // there are none or no `gzip`.
     #[test]
     fn matches_real_gzip_on_every_man_page_it_can_find() {
         let Ok(dir) = std::fs::read_dir("/usr/share/man/man1") else { return };
@@ -748,8 +638,7 @@ mod real_world_tests {
         assert!(checked > 0, "found no man pages to check against");
     }
 
-    // A real tar, built by hand: one 512-byte header per member, data
-    // padded up to the next block.
+    // A minimal ustar header.
     fn tar_header(name: &str, size: u64, typeflag: u8) -> Vec<u8> {
         let mut block = vec![0u8; 512];
         block[..name.len()].copy_from_slice(name.as_bytes());
@@ -792,7 +681,6 @@ mod real_world_tests {
         assert_eq!(extract(&data, &members[1]).unwrap(), b"bravo");
     }
 
-    // POSIX ustar splits a long path across `prefix` and `name`.
     #[test]
     fn a_ustar_prefix_is_joined_back_onto_the_name() {
         let mut block = tar_header("deep.txt", 0, b'0');
@@ -803,8 +691,6 @@ mod real_world_tests {
         assert_eq!(members_of(&data).unwrap()[0].name, "a/very/long/path/deep.txt");
     }
 
-    // GNU's answer to the 100-byte name field: an `L` entry whose data
-    // is the *next* entry's real name.
     #[test]
     fn a_gnu_long_name_entry_names_the_member_after_it() {
         let long = "x".repeat(140);
@@ -820,8 +706,6 @@ mod real_world_tests {
         assert_eq!(members[0].name, long);
     }
 
-    // Links, devices and the metadata entries tools write are not
-    // content anybody wants in a listing.
     #[test]
     fn entries_that_are_not_files_or_directories_are_skipped() {
         let mut data = tar_header("link", 0, b'2');
