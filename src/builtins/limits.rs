@@ -1,8 +1,5 @@
-// `ulimit`, `umask` and `times`: the three builtins that ask the kernel
-// about this process rather than about the shell.
-//
-// Free functions taking `&mut Shell` rather than methods on it -- see
-// `builtins/mod.rs` for why the whole family moved out of `impl Shell`.
+// `ulimit`, `umask` and `times`: the builtins that ask the kernel about
+// this process rather than about the shell.
 
 use crate::exec::{Shell, current_umask, sh_eprintln, sh_println};
 
@@ -15,9 +12,9 @@ struct LimitSpec {
     div: u64,
 }
 
-/// Which `RLIMIT_*` a flag asks about -- the platform layer's answer,
-/// since the numbers differ per OS and six of them do not exist on macOS
-/// at all. `None` also covers `-p`, which no OS has an rlimit for.
+/// The `RLIMIT_*` a flag asks about, from the platform layer, since the
+/// numbers differ per OS and six don't exist on macOS. `None` also covers
+/// `-p`, which has no rlimit anywhere.
 fn resource_of(spec: &LimitSpec) -> Option<i32> {
     match spec.flag {
         'p' => None,
@@ -25,13 +22,9 @@ fn resource_of(spec: &LimitSpec) -> Option<i32> {
     }
 }
 
-// What each flag is called and how it is counted -- bish's own half of
-// `ulimit`. The resource *numbers* are the OS's, and `resource_of` asks
-// for them, so a limit this OS does not have is simply absent from `-a`
-// rather than listed with a number that means something else here.
-//
-// Order matches real bash's own `-a` listing: -R first, then the rest
-// alphabetically by flag.
+// Each flag's name and unit. The resource numbers are the OS's (see
+// `resource_of`), so a limit this OS lacks is left out of `-a`. Ordered
+// as bash's `-a`: `-R` first, then by flag.
 const LIMIT_SPECS: &[LimitSpec] = &[
     LimitSpec { flag: 'R', label: "real-time non-blocking time", unit: "microseconds", div: 1 },
     LimitSpec { flag: 'c', label: "core file size", unit: "blocks", div: 512 },
@@ -42,10 +35,9 @@ const LIMIT_SPECS: &[LimitSpec] = &[
     LimitSpec { flag: 'l', label: "max locked memory", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'm', label: "max memory size", unit: "kbytes", div: 1024 },
     LimitSpec { flag: 'n', label: "open files", unit: "", div: 1 },
-    // No RLIMIT_PIPE exists on Linux -- pipe capacity is a per-pipe
-    // fcntl setting, not an rlimit -- so bash reports a fixed 8 (i.e.
-    // POSIX's 4096-byte guarantee, in 512-byte blocks) and refuses to
-    // set it. RESOURCE_FIXED marks that; the value lives in `div`.
+    // Linux has no RLIMIT_PIPE (pipe capacity is per pipe, via fcntl), so
+    // bash reports a fixed 8, POSIX's 4096 bytes in 512-byte blocks, and
+    // refuses to set it. The value lives in `div`.
     LimitSpec { flag: 'p', label: "pipe size", unit: "512 bytes", div: 8 },
     LimitSpec { flag: 'q', label: "POSIX message queues", unit: "bytes", div: 1 },
     LimitSpec { flag: 'r', label: "real-time priority", unit: "", div: 1 },
@@ -59,11 +51,11 @@ const LIMIT_SPECS: &[LimitSpec] = &[
 // Where bash puts the `)` of the `(unit, -X)` column in `ulimit -a`.
 const PAREN_COLUMN: usize = 40;
 
-// One limit's current value as `-a` and the single-limit query form both
-// want it -- including the `-p` entry, which no getrlimit can answer.
+// A limit's current value, for `-a` and single-limit queries, including
+// `-p`, which no getrlimit answers.
 fn read_limit(spec: &LimitSpec, hard: bool) -> String {
     let Some(resource) = resource_of(spec) else {
-        // `-p`: a fixed answer, with the value kept in `div`.
+        // `-p`: a fixed answer, kept in `div`.
         return spec.div.to_string();
     };
     let limit = crate::platform::resource_limit(resource);
@@ -92,14 +84,9 @@ fn umask_symbolic(mask: u32) -> String {
     format!("u={},g={},o={}", perm_for(6), perm_for(3), perm_for(0))
 }
 
-// ulimit [-HS] [-a] [-cdefilmnqrstuvx [limit]]. `-a` doesn't attempt to
-// byte-match bash's exact column alignment (its internal padding rules
-// aren't a fixed width across all entries) -- purely cosmetic output
-// that scripts don't parse, unlike the single-limit query/set forms
-// below, which do match exactly. Moved here from a builtins.rs free
-// function (M6) so its output goes through sh.sink_out/sink_err
-// like every other builtin's, instead of always writing straight to
-// the real stdout/stderr regardless of which session ran it.
+// `ulimit [-HS] [-a] [-cdefilmnqrstuvx [limit]]`. The single-limit query
+// and set forms match bash exactly; `-a` approximates its alignment, which
+// scripts don't parse.
 pub(crate) fn run_ulimit(sh: &mut Shell, args: &[String]) -> i32 {
     let mut hard = false;
     let mut soft = false;
@@ -121,15 +108,14 @@ pub(crate) fn run_ulimit(sh: &mut Shell, args: &[String]) -> i32 {
         }
     }
     if show_all {
-        // A limit this OS does not have is left out rather than shown
-        // with a number from the other one -- `-p` excepted, which has no
-        // rlimit anywhere and a fixed answer.
+        // A limit this OS lacks is left out, except `-p`, which has a fixed
+        // answer.
         for spec in LIMIT_SPECS.iter().filter(|s| s.flag == 'p' || resource_of(s).is_some()) {
             let unit_part = if spec.unit.is_empty() { String::new() } else { format!("{}, ", spec.unit) };
             let group = format!("({}-{})", unit_part, spec.flag);
-            // bash right-aligns the closing paren at column 40, keeping
-            // at least two spaces after the label -- which is why the
-            // one over-long label (`-R`) simply pushes past it.
+            // bash right-aligns the `)` at column 40 with at least two
+            // spaces after the label, so the long `-R` label pushes past
+            // it.
             let pad = (PAREN_COLUMN.saturating_sub(spec.label.len() + group.len())).max(2);
             sh_println!(sh, "{}{}{} {}", spec.label, " ".repeat(pad), group, read_limit(spec, hard));
         }
@@ -185,14 +171,10 @@ pub(crate) fn run_ulimit(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
-// `times` -- CPU consumed by this shell and by the commands it has
-// waited for, as POSIX specifies: two lines, user then system on
-// each, the shell's own first and its children's second.
-//
-// Straight from `times(2)`, which reports all four in one call. The
-// platform layer does the dividing: the tick rate is asked for by a
-// `sysconf` name that is 2 on Linux and 3 on macOS, and asking for the
-// wrong one answers about something else entirely.
+// `times`: CPU used by this shell and by the commands it waited for, as
+// POSIX specifies: two lines, user then system, the shell's first. From
+// `times(2)`. The platform layer divides by the tick rate, whose `sysconf`
+// name is 2 on Linux and 3 on macOS.
 pub(crate) fn run_times(sh: &mut Shell, args: &[String]) -> i32 {
     if !args.is_empty() {
         sh_eprintln!(sh, "bish: times: too many arguments");
@@ -202,7 +184,7 @@ pub(crate) fn run_times(sh: &mut Shell, args: &[String]) -> i32 {
         sh_eprintln!(sh, "bish: times: cannot read process times");
         return 1;
     };
-    // bash's own shape: whole minutes, then seconds to milliseconds.
+    // bash's shape: whole minutes, then seconds to the millisecond.
     let show = |secs: f64| format!("{}m{:.3}s", (secs as i64) / 60, secs % 60.0);
     sh_println!(sh, "{} {}", show(user), show(system));
     sh_println!(sh, "{} {}", show(child_user), show(child_system));
@@ -210,7 +192,7 @@ pub(crate) fn run_times(sh: &mut Shell, args: &[String]) -> i32 {
 }
 
 pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
-    // Clustered, like every other builtin's: `umask -pS` is `-p -S`.
+    // Clustered like every builtin's flags: `umask -pS` is `-p -S`.
     let has = |want: char| args.iter().filter(|a| a.len() > 1 && a.starts_with('-')).any(|a| a.chars().skip(1).any(|c| c == want));
     let symbolic = has('S');
     match args.iter().find(|a| !a.starts_with('-')) {
@@ -218,10 +200,8 @@ pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
             Ok(m) => {
                 sh.note_umask_change();
                 crate::platform::set_umask(m);
-                // Keep this session's own remembered umask in lockstep
-                // -- see sync_real_state_in/out's own doc comment for
-                // why a mutation of this real, process-wide syscall
-                // needs a Shell-owned mirror at all.
+                // Keep this session's mirror of the process-wide umask in
+                // step (see `sync_real_state_in`).
                 sh.umask_snapshot = m;
                 0
             }
@@ -232,10 +212,8 @@ pub(crate) fn run_umask(sh: &mut Shell, args: &[String]) -> i32 {
         },
         None => {
             let cur = current_umask();
-            // `-p` prints it as the command that would set it again,
-            // which is the whole point of the flag: `umask -p` into a
-            // file, source it back, same mask. It was being accepted
-            // and ignored, so the output could not be re-read.
+            // `-p` prints the command that would set it again, so
+            // `umask -p` output can be sourced back.
             let prefix = match (has('p'), symbolic) {
                 (true, true) => "umask -S ",
                 (true, false) => "umask ",
