@@ -42,6 +42,7 @@
 // clone), so every fork still appends to the identical file, just with
 // an independently-diverging in-memory view.
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -223,34 +224,34 @@ impl History {
             live: true,
             prev: self.tail.take(),
         }));
-        if let Some(p) = &self.path {
-            use std::os::unix::fs::OpenOptionsExt;
-            // 0600, and not whatever the umask says. This file is every
-            // command anybody has typed at a bish prompt, which on a
-            // shared machine includes the ones with a password or a
-            // token in them -- it was being created 0644 under the
-            // ordinary 0022 umask, so every other user on the host could
-            // read all of it. bash creates its own history 0600;
-            // measured side by side with a fresh HOME for each.
-            //
-            // `mode` only applies to a file this call creates, so an
-            // install that already has one is tightened just below:
-            // nobody chose 0644, a umask did, and leaving it would mean
-            // the fix only ever helped new installs.
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p) {
-                tighten_history_permissions(p);
-                // One `write_all` of one line, deliberately -- not a
-                // `writeln!` per field and not a two-line record. A
-                // single write to a file opened O_APPEND is serialized
-                // on the inode, so concurrent sessions interleave
-                // whole entries and never halves of one. Every
-                // `window new`/split forks a History that keeps
-                // appending here, and a detached daemon makes
-                // concurrent writers ordinary rather than an edge case.
-                let mut line = format_record(id, parent.map(|n| n.id), cwd, entry);
-                line.push('\n');
-                let _ = f.write_all(line.as_bytes());
-            }
+
+        // 0600, and not whatever the umask says. This file is every
+        // command anybody has typed at a bish prompt, which on a
+        // shared machine includes the ones with a password or a
+        // token in them -- it was being created 0644 under the
+        // ordinary 0022 umask, so every other user on the host could
+        // read all of it. bash creates its own history 0600;
+        // measured side by side with a fresh HOME for each.
+        //
+        // `mode` only applies to a file this call creates, so an
+        // install that already has one is tightened just below:
+        // nobody chose 0644, a umask did, and leaving it would mean
+        // the fix only ever helped new installs.
+        if let Some(p) = &self.path
+            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p)
+        {
+            tighten_history_permissions(p);
+            // One `write_all` of one line, deliberately -- not a
+            // `writeln!` per field and not a two-line record. A
+            // single write to a file opened O_APPEND is serialized
+            // on the inode, so concurrent sessions interleave
+            // whole entries and never halves of one. Every
+            // `window new`/split forks a History that keeps
+            // appending here, and a detached daemon makes
+            // concurrent writers ordinary rather than an edge case.
+            let mut line = format_record(id, parent.map(|n| n.id), cwd, entry);
+            line.push('\n');
+            let _ = f.write_all(line.as_bytes());
         }
         self.appended += 1;
         self.maybe_compact();
