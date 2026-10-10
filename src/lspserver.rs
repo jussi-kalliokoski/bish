@@ -1,40 +1,18 @@
-// `bish tool lsp-server` -- the other side of lspclient.rs. A Language
-// Server Protocol server for bash, spoken over stdio, so that any
-// editor that talks LSP gets bish's own understanding of a shell
-// script: its diagnostics, its formatter, its documentation hovers, and
-// the fixes it knows how to make.
+// `bish tool lsp-server`: a Language Server Protocol server for bash over
+// stdio, the other side of lspclient.rs, giving any LSP editor bish's
+// diagnostics, formatting, hovers and fixes.
 //
-// Everything it serves already existed. `bishedit::lint::BashLinter`
-// and `bishedit::format::BashFormatter` are the rule engines, and
-// `bish tool check` and `bish tool format` are their command-line
-// front ends; `docs::hover_lines_at` is what `K` answers with in the
-// editor. This module is a third front end onto the same answers, and
-// deliberately contains no rules of its own -- a finding that differs
-// between `bish tool check` and this would be a bug in one of them, and
-// there is nowhere here for such a difference to come from.
+// It has no rules of its own: findings come from
+// `bishedit::lint::BashLinter` and `bishedit::format::BashFormatter`, as
+// for `bish tool check` and `bish tool format`, and hovers from
+// `docs::hover_lines_at`, as for `K`, so the front ends can't disagree.
+// The transport is `lsp.rs`, which doesn't care which end it is; this
+// builds the payloads its helpers take apart.
 //
-// The transport is `lsp.rs`, unchanged: it was written as a wire format
-// with no notion of which end it is, which is why it needed nothing
-// added for this. What is new is the direction. Every helper there
-// takes a server's reply apart (`hover_lines(result)`,
-// `completions(result)`); a server has to put those payloads together
-// instead, which is what this module does.
-//
-// **Blocking reads, and no threads at all.** The client is the hard
-// case -- it drives a subprocess while an editor is being typed into,
-// so it needs non-blocking pipes, a bounded outgoing queue, and polling
-// from an event loop that must never stall. A server is the easy one:
-// it is a dedicated process whose only job is to answer, so it reads
-// until a message arrives and answers it. Reaching for the client's
-// machinery here would be copying a solution to a problem this does not
-// have.
-//
-// Sync is full-document (`textDocumentSync: 1`). Incremental sync is
-// the client's own optimisation for not re-sending a large file on
-// every keystroke, and it is the *client* that has to implement it; a
-// server that asks for it is asking for range arithmetic it can decline
-// to need. Everything here re-lints a whole document anyway, since the
-// linter is a whole-document pass.
+// Blocking reads, no threads: a server's only job is to answer, unlike
+// the client, which must never stall an editor. Sync is full-document
+// (`textDocumentSync: 1`): incremental sync saves the client resending
+// files, and the linter reads whole documents anyway.
 #![allow(dead_code)]
 
 use crate::bishedit::format::BashFormatter;
@@ -49,9 +27,7 @@ use std::path::PathBuf;
 /// One open document, as the editor last told us it was.
 struct Document {
     text: String,
-    /// Kept as chars once rather than re-split per request: every
-    /// position that arrives and every span that leaves is measured in
-    /// them.
+    /// Kept as chars: every position in and span out is measured in them.
     chars: Vec<char>,
 }
 
@@ -64,20 +40,16 @@ impl Document {
 
 struct Server {
     documents: HashMap<String, Document>,
-    /// What the client and this agreed to count columns in. bish's own
-    /// unit is the `char`, which is utf-32 -- so that is what it asks
-    /// for, and anything else costs a conversion at the boundary.
+    /// The column unit agreed with the client. bish counts `char`s, which is
+    /// utf-32, so it asks for that; anything else is a conversion.
     encoding: PositionEncoding,
-    /// Set by `shutdown`, checked by `exit`: a client that exits
-    /// without shutting down first is a client that crashed, and the
-    /// spec asks a server to say so through its exit code rather than
-    /// pretend it was orderly.
+    /// Set by `shutdown`, checked by `exit`: a client exiting without
+    /// shutting down crashed, and the spec says the exit code should show it.
     shutdown_requested: bool,
 }
 
-/// `bish tool lsp-server`: read messages until stdin ends or `exit`
-/// arrives, answering each. The return value is this process's exit
-/// code.
+/// `bish tool lsp-server`: answers messages until stdin ends or `exit`
+/// arrives, returning the exit code.
 pub fn run(args: &[String]) -> i32 {
     if !cfg!(feature = "lsp") {
         eprintln!("bish tool lsp-server: the language server is not part of this build");
@@ -109,23 +81,19 @@ impl Server {
         Server { documents: HashMap::new(), encoding: PositionEncoding::Utf16, shutdown_requested: false }
     }
 
-    /// The loop, over any reader and writer rather than over stdin and
-    /// stdout specifically -- which is what lets the tests drive a whole
-    /// session by handing it bytes, exactly as `lsp.rs`'s own tests do.
+    /// The loop, over any reader and writer, so tests drive a session with
+    /// bytes, as `lsp.rs`'s do.
     fn serve(&mut self, input: &mut impl Read, output: &mut impl Write) -> i32 {
         let mut decoder = lsp::Decoder::new();
         let mut buf = [0u8; 8192];
         loop {
-            // Everything already framed is answered before another read,
-            // since one read can carry several messages and an editor
-            // that sent `initialize` and `didOpen` together is entitled
-            // to both answers.
+            // Everything framed is answered before reading again: one read
+            // can carry several messages.
             while let Some(message) = decoder.take_message() {
                 let message = match message {
                     Ok(message) => message,
-                    // A malformed frame is not recoverable: the stream's
-                    // own position is no longer known, so there is
-                    // nothing to resynchronise to.
+                    // A malformed frame loses the stream's position;
+                    // there's nothing to resynchronize to.
                     Err(e) => {
                         eprintln!("bish tool lsp-server: {e}");
                         return 1;
@@ -136,8 +104,7 @@ impl Server {
                 }
             }
             match input.read(&mut buf) {
-                // Stdin closed without an `exit`. The editor is gone;
-                // there is nobody left to answer.
+                // Stdin closed without `exit`: the editor is gone.
                 Ok(0) => return i32::from(!self.shutdown_requested),
                 Ok(n) => decoder.feed(&buf[..n]),
                 Err(e) => {
@@ -157,19 +124,16 @@ impl Server {
                 None
             }
             Message::Notification { method, params } => self.notification(&method, &params, output),
-            // A server sends requests, so it can receive responses --
-            // but this one asks the client for nothing, so anything
-            // arriving as a response is answering a question that was
-            // never put.
+            // This server asks the client nothing, so a response answers
+            // nothing.
             Message::Response { .. } => None,
         }
     }
 
     fn send(&self, output: &mut impl Write, message: Message) {
         let bytes = lsp::encode(&message);
-        // A write that fails means the editor is gone, which the next
-        // read will discover; there is no useful recovery here and
-        // nowhere to report it that the editor would see.
+        // A failed write means the editor is gone, which the next read finds;
+        // there's nowhere to report it.
         let _ = output.write_all(&bytes);
         let _ = output.flush();
     }
@@ -185,8 +149,7 @@ impl Server {
             "textDocument/codeAction" => Ok(self.code_actions(params)),
             "textDocument/hover" => Ok(self.hover(params)),
             "textDocument/documentSymbol" => Ok(self.document_symbols(params)),
-            // -32601, MethodNotFound. A client is entitled to ask for
-            // anything; saying so plainly is how it learns not to.
+            // -32601, MethodNotFound: how a client learns not to ask.
             _ => Err(ResponseError { code: -32601, message: format!("bish serves no {method}") }),
         }
     }
@@ -204,9 +167,7 @@ impl Server {
             }
             "textDocument/didChange" => {
                 let uri = uri_of(params)?;
-                // Full sync, so the last change in the list is the whole
-                // document. A client that sent ranges anyway would be
-                // ignoring what `initialize` said it could send.
+                // Full sync, so the last change is the whole document.
                 let text = match json::query(params, ".contentChanges") {
                     Ok(Value::Array(changes)) => changes.last().and_then(|c| string_at(c, ".text")),
                     _ => None,
@@ -225,10 +186,8 @@ impl Server {
             "textDocument/didClose" => {
                 let uri = uri_of(params)?;
                 self.documents.remove(&uri);
-                // An empty list, not silence: diagnostics belong to the
-                // server until it says otherwise, so a closed document
-                // whose findings were never withdrawn leaves them on
-                // screen for ever.
+                // An empty list, not silence: a closed document's findings
+                // would otherwise stay on screen.
                 self.send_diagnostics(&uri, Vec::new(), output);
                 None
             }
@@ -236,16 +195,10 @@ impl Server {
         }
     }
 
-    // -----------------------------------------------------------------
-    // Requests
-    // -----------------------------------------------------------------
-
     fn initialize(&mut self, params: &Value) -> Value {
-        // The client lists what it can count in; the server picks. bish
-        // measures in `char`s, which is utf-32 exactly, so that is the
-        // first choice and the others are a conversion at the boundary.
-        // Silence means utf-16, which is the protocol's own original
-        // and only unit.
+        // The client lists the units it can count in; the server picks.
+        // utf-32 is bish's `char` exactly, so it's first. Silence means
+        // utf-16, the protocol's original unit.
         let offered: Vec<String> = match json::query(params, ".capabilities.general.positionEncodings") {
             Ok(Value::Array(names)) => names.iter().filter_map(|n| if let Value::Str(s) = n { Some(s.clone()) } else { None }).collect(),
             _ => Vec::new(),
@@ -260,8 +213,7 @@ impl Server {
                 "capabilities".to_string(),
                 Value::Object(vec![
                     ("positionEncoding".to_string(), Value::Str(self.encoding.wire_name().to_string())),
-                    // 1 is full sync; see this module's own doc comment
-                    // for why that is a decision and not a shortcut.
+                    // 1: full sync, as the module doc explains.
                     (
                         "textDocumentSync".to_string(),
                         Value::Object(vec![
@@ -286,22 +238,15 @@ impl Server {
         ])
     }
 
-    /// The whole document, reformatted -- one edit spanning everything.
-    ///
-    /// A formatter that returned a minimal edit script would let an
-    /// editor preserve its own marks and folds better, and this does
-    /// not: `BashFormatter` reports its findings as fixes over the
-    /// original text, and `apply_fixes` already knows how to splice
-    /// them. Handing back the result as one replacement is the same
-    /// answer with less arithmetic between here and it.
+    /// The whole document reformatted, as one edit. A minimal edit script
+    /// would keep an editor's marks and folds better; this hands back
+    /// `apply_fixes`' result as one replacement.
     fn formatting(&self, params: &Value) -> Value {
         let Some(doc) = uri_of(params).and_then(|uri| self.documents.get(&uri)) else {
             return Value::Array(Vec::new());
         };
-        // A script that does not parse is not reformatted. Same refusal
-        // `bish tool format` makes, and for the same reason: guessing
-        // at the shape of something broken is how a formatter eats an
-        // afternoon's work.
+        // A script that doesn't parse isn't reformatted, as
+        // `bish tool format` refuses: guessing at a broken shape eats work.
         let Ok(findings) = BashFormatter.check(&doc.text) else {
             return Value::Array(Vec::new());
         };
@@ -316,14 +261,9 @@ impl Server {
         ])])
     }
 
-    /// Every fix bish knows how to make, for the findings inside the
-    /// range the editor asked about.
-    ///
-    /// One `Fix` is one replacement of one span, which is exactly a
-    /// `WorkspaceEdit` with a single `TextEdit` in it -- so a rule that
-    /// carries a fix becomes a quick action with no translation beyond
-    /// the coordinates. A rule that does not carry one produces no
-    /// action at all rather than an action that does nothing.
+    /// Every fix bish can make for findings in the requested range. A `Fix`
+    /// is one replacement, a `WorkspaceEdit` with one `TextEdit`; a rule
+    /// without one gives no action.
     fn code_actions(&self, params: &Value) -> Value {
         let Some(uri) = uri_of(params) else { return Value::Array(Vec::new()) };
         let Some(doc) = self.documents.get(&uri) else { return Value::Array(Vec::new()) };
@@ -360,13 +300,10 @@ impl Server {
         Value::Array(actions)
     }
 
-    /// What `K` says in bish's own editor, in a hover popup instead.
-    ///
-    /// The index is built from the document's own text every time
-    /// rather than cached, which is what makes a function's doc comment
-    /// appear as it is typed. It is also what makes this correct for a
-    /// script that `source`s another: `DocIndex` follows those on its
-    /// own, off disk, exactly as the editor's own hover does.
+    /// What `K` says in bish's editor, as a hover. The index is built from
+    /// the text each time, so a function's doc comment appears as it's
+    /// typed, and `DocIndex` follows `source`d scripts off disk as the
+    /// editor does.
     fn hover(&self, params: &Value) -> Value {
         let Some(uri) = uri_of(params) else { return Value::Null };
         let Some(doc) = self.documents.get(&uri) else { return Value::Null };
@@ -375,18 +312,13 @@ impl Server {
         let index = DocIndex::build_from_source(&doc.text, &path);
         let (line_start, line_end) = line_bounds(&doc.chars, offset);
         let line_text: String = doc.chars[line_start..line_end].iter().collect();
-        // The man page this hover is about is fetched *before* asking
-        // for the hover, on this thread. In the editor the same lookup
-        // happens in the background and the first `K` says "press K
-        // again in a moment", because a redraw must not stop to read a
-        // file. Here there is no second `K` and nothing else to do:
-        // warming the cache first means the shared code below finds the
-        // page ready and says what it actually knows.
+        // The man page is fetched first, on this thread. The editor looks
+        // it up in the background and says "press K again"; here there's no
+        // second `K`, so warming the cache lets the shared code below
+        // answer.
         warm_man_page(&line_text, offset - line_start);
-        // No live shell to ask what a variable currently holds -- that
-        // is the editor's own hover talking to its own session, and
-        // there is no session here. Everything else a hover says is a
-        // fact about the text.
+        // No live shell to ask what a variable holds; everything else a hover
+        // says is about the text.
         let lines = crate::docs::hover_lines_at(&doc.chars[line_start..line_end], offset - line_start, &line_text, &index, |_| None);
         if lines.is_empty() {
             return Value::Null;
@@ -398,22 +330,17 @@ impl Server {
     }
 
     /// The functions this script defines, for an outline.
-    ///
-    /// `docs::functions_in` rather than `DocIndex`: the index records
-    /// only documented symbols, which is right for a hover and wrong
-    /// here -- an outline wants every function, and an undocumented one
-    /// is exactly the one somebody is looking for.
+    /// `docs::functions_in`, not `DocIndex`, which records only documented
+    /// symbols: an outline wants all, the undocumented ones especially.
     fn document_symbols(&self, params: &Value) -> Value {
         let Some(uri) = uri_of(params) else { return Value::Array(Vec::new()) };
         let Some(doc) = self.documents.get(&uri) else { return Value::Array(Vec::new()) };
         let values = crate::docs::functions_in(&doc.text)
             .into_iter()
             .map(|(name, line, doc)| {
-                // `line` is 1-based and LSP counts from 0. The range
-                // is the definition's own line and no more: the scan
-                // records where a function starts and not how far it
-                // runs, and claiming a range past that would be
-                // inventing it.
+                // `line` is 1-based; LSP counts from 0. The range is the
+                // definition's line only: the scan knows where a function
+                // starts, not where it ends.
                 let at = line.saturating_sub(1) as f64;
                 let range = Value::Object(vec![
                     (
@@ -424,7 +351,7 @@ impl Server {
                 ]);
                 let mut fields = vec![
                     ("name".to_string(), Value::Str(name)),
-                    // 12 is SymbolKind.Function.
+                    // 12 is `SymbolKind.Function`.
                     ("kind".to_string(), Value::Number(12.0)),
                     ("range".to_string(), range.clone()),
                     ("selectionRange".to_string(), range),
@@ -438,18 +365,9 @@ impl Server {
         Value::Array(values)
     }
 
-    // -----------------------------------------------------------------
-    // Diagnostics
-    // -----------------------------------------------------------------
-
-    /// Everything bish has to say about a document: the linter's
-    /// findings and the formatter's, in that order.
-    ///
-    /// A script that does not parse gets the linter's findings and a
-    /// single finding for the parse error itself, rather than nothing:
-    /// "this does not parse" is the most useful thing anyone can be
-    /// told about a file that does not parse, and it is exactly what
-    /// the formatter's `Err` says.
+    /// Everything bish has to say about a document: the linter's findings,
+    /// then the formatter's. A script that doesn't parse gets a finding for
+    /// the parse error, the formatter's `Err`.
     fn findings(&self, doc: &Document) -> Vec<Diagnostic> {
         let mut findings = BashLinter.check(&doc.text);
         match BashFormatter.check(&doc.text) {
@@ -491,21 +409,14 @@ impl Server {
             ("code".to_string(), Value::Str(d.code.to_string())),
             ("message".to_string(), Value::Str(d.message.clone())),
         ];
-        // `source` names who found it, and everything here was found by
-        // bish -- including the findings relayed from somewhere else,
-        // which carry their own origin in `Diagnostic::source` and keep
-        // it.
+        // `source` names the finder: bish, unless a relayed finding carries
+        // its own origin.
         fields.push(("source".to_string(), Value::Str(d.source.clone().unwrap_or_else(|| "bish".to_string()))));
         Value::Object(fields)
     }
 
-    // -----------------------------------------------------------------
-    // Positions
-    // -----------------------------------------------------------------
-
-    /// A char offset as an LSP position, in whatever unit was
-    /// negotiated. `lsp::to_server_column` does the column half, which
-    /// is the half that differs between the two ends.
+    /// A char offset as an LSP position in the negotiated unit;
+    /// `lsp::to_server_column` does the column.
     fn position(&self, chars: &[char], offset: usize) -> (usize, usize) {
         let offset = offset.min(chars.len());
         let line = chars[..offset].iter().filter(|&&c| c == '\n').count();
@@ -520,9 +431,8 @@ impl Server {
         for _ in 0..line {
             match chars[start..].iter().position(|&c| c == '\n') {
                 Some(at) => start += at + 1,
-                // Past the end of the document: clamped rather than
-                // refused, since an editor and a server can disagree by
-                // one keystroke about how long a file is.
+                // Past the end: clamped, since editor and server can
+                // disagree by a keystroke about a file's length.
                 None => return chars.len(),
             }
         }
@@ -543,12 +453,7 @@ impl Server {
     }
 }
 
-// ---------------------------------------------------------------------
-// Small shared pieces
-// ---------------------------------------------------------------------
-
-/// The line `offset` sits on, as `[start, end)` -- the newline itself
-/// excluded, since a column is a position within a line's text.
+/// The line `offset` is on, as `[start, end)` without the newline.
 fn line_bounds(chars: &[char], offset: usize) -> (usize, usize) {
     let offset = offset.min(chars.len());
     let start = chars[..offset].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
@@ -563,7 +468,7 @@ fn range_value(start: (usize, usize), end: (usize, usize)) -> Value {
     Value::Object(vec![("start".to_string(), position(start)), ("end".to_string(), position(end))])
 }
 
-/// LSP's own numbering, which runs the other way from `Severity`'s.
+/// LSP's numbering, which runs opposite to `Severity`'s.
 fn severity_number(severity: Severity) -> f64 {
     match severity {
         Severity::Error => 1.0,
@@ -573,10 +478,8 @@ fn severity_number(severity: Severity) -> f64 {
     }
 }
 
-/// What a quick fix offers to do, in the imperative an action title
-/// wants. Deliberately describes the edit rather than repeating the
-/// finding's own message, which the editor is already showing beside
-/// it.
+/// A quick fix's title, describing the edit rather than repeating the
+/// finding's message, which the editor already shows.
 fn fix_title(fix: &Fix) -> String {
     match (fix.start == fix.end, fix.replacement.is_empty()) {
         (_, true) => "remove".to_string(),
@@ -585,8 +488,8 @@ fn fix_title(fix: &Fix) -> String {
     }
 }
 
-/// A replacement spanning lines is not a title. The first line stands
-/// for it, with an ellipsis so nobody reads it as the whole edit.
+/// A multi-line replacement isn't a title: the first line, with an
+/// ellipsis.
 fn one_line(text: &str) -> String {
     match text.split_once('\n') {
         Some((first, _)) => format!("{first} ..."),
@@ -594,18 +497,17 @@ fn one_line(text: &str) -> String {
     }
 }
 
-/// Fetches, synchronously, whichever man page a hover at this position
-/// is going to want -- and nothing if it wants none. `classify_word` is
-/// the same decision `hover_lines_at` makes a moment later, so the two
-/// cannot disagree about which page that is.
+/// Fetches, synchronously, the man page a hover here will want, if any.
+/// `classify_word` is the decision `hover_lines_at` makes next, so they
+/// agree on the page.
 fn warm_man_page(line_text: &str, col: usize) {
     use crate::docs::WordRole;
     let name = match crate::docs::classify_word(line_text, col) {
         WordRole::Command(name) => name,
         WordRole::Flag { command, .. } => command,
         WordRole::Subcommand { command, subcommand } => {
-            // The subcommand hover tries `command-subcommand` first and
-            // falls back to the command's own page, so both are wanted.
+            // The subcommand hover tries `command-subcommand`, then the
+            // command's page, so both are fetched.
             crate::bishedit::manpages::query_blocking(&format!("{command}-{subcommand}"));
             command
         }
@@ -632,8 +534,8 @@ fn number_at(value: &Value, path: &str) -> Option<usize> {
     }
 }
 
-/// `tool.rs`'s own, and the same one: a batch of fixes spliced in
-/// descending order of start so no edit moves another's offsets.
+/// `tool.rs`'s: fixes spliced in descending order of start, so none
+/// moves another's offsets.
 fn apply_fixes(text: &str, diagnostics: &[Diagnostic]) -> (String, usize, usize) {
     let mut candidates: Vec<&Fix> = diagnostics.iter().filter_map(|d| d.fix.as_ref()).collect();
     crate::sort::sort_by_key(&mut candidates, |f| std::cmp::Reverse(f.start));
@@ -655,10 +557,8 @@ fn apply_fixes(text: &str, diagnostics: &[Diagnostic]) -> (String, usize, usize)
 mod tests {
     use super::*;
 
-    /// A whole session, driven the way `lsp.rs`'s own tests drive the
-    /// framing: bytes in, bytes out, no process and no pipes. `serve`
-    /// takes a reader and a writer rather than stdin and stdout for
-    /// exactly this.
+    /// A whole session as bytes in and out, no process or pipes, as
+    /// `lsp.rs`'s tests drive framing.
     fn session(messages: &[Value]) -> (i32, Vec<Message>) {
         let mut input: Vec<u8> = Vec::new();
         for m in messages {
@@ -771,8 +671,7 @@ mod tests {
     fn it_announces_what_it_can_do_and_agrees_on_a_unit_to_count_in() {
         let (_, out) = session(&[initialize(&["utf-8", "utf-16", "utf-32"])]);
         let result = result(&out, 1.0);
-        // utf-32 is the `char`, which is what bish measures in -- so
-        // agreeing on it means no conversion at the boundary at all.
+        // utf-32 is bish's `char`: no conversion.
         assert_eq!(string_at(&result, ".capabilities.positionEncoding").as_deref(), Some("utf-32"));
         for provider in [".capabilities.documentFormattingProvider", ".capabilities.codeActionProvider", ".capabilities.hoverProvider"] {
             assert_eq!(json::query(&result, provider), Ok(&Value::Bool(true)), "{provider}");
@@ -780,8 +679,7 @@ mod tests {
         assert_eq!(string_at(&result, ".serverInfo.name").as_deref(), Some("bish"));
     }
 
-    // The protocol's own original unit, and the one a client that says
-    // nothing is entitled to assume.
+    // utf-16, the protocol's original unit, for a client that says nothing.
     #[test]
     fn a_client_that_offers_nothing_gets_utf16() {
         let (_, out) = session(&[request(1.0, "initialize", object(vec![("capabilities", object(vec![]))]))]);
@@ -797,8 +695,7 @@ mod tests {
         assert!(codes(&published[0]).contains(&"unquoted-expansion".to_string()), "{:?}", codes(&published[0]));
     }
 
-    // The findings must be the ones `bish tool check` reports, because
-    // they come from the same linter -- this is what says so.
+    // The findings are `bish tool check`'s, from the same linter.
     #[test]
     fn the_findings_are_the_linters_own() {
         let text = "x=1\necho $x\n";
@@ -828,9 +725,7 @@ mod tests {
         assert_eq!(published.len(), 3);
         assert!(codes(&published[0]).contains(&"unquoted-expansion".to_string()));
         assert!(!codes(&published[1]).contains(&"unquoted-expansion".to_string()), "the quoting fixed it");
-        // An empty list, not silence: findings belong to the server
-        // until it withdraws them, and a closed document that never did
-        // leaves them on screen for ever.
+        // An empty list, so a closed document's findings don't stay forever.
         assert_eq!(codes(&published[2]), Vec::<String>::new());
     }
 
@@ -857,9 +752,8 @@ mod tests {
         assert_eq!(result(&out, 2.0), Value::Array(Vec::new()));
     }
 
-    // A formatter that guesses at the shape of something broken is how
-    // an afternoon's work gets eaten. Same refusal `bish tool format`
-    // makes.
+    // No reformatting a script that doesn't parse, as `bish tool format`
+    // refuses.
     #[test]
     fn a_script_that_does_not_parse_is_not_reformatted() {
         let (_, out) = session(&[
@@ -868,9 +762,7 @@ mod tests {
             request(2.0, "textDocument/formatting", doc("file:///t.sh")),
         ]);
         assert_eq!(result(&out, 2.0), Value::Array(Vec::new()));
-        // ...but it is still reported, because "this does not parse" is
-        // the most useful thing anyone can be told about a file that
-        // does not parse.
+        // But the parse error is reported.
         assert!(codes(&publications(&out)[0]).contains(&"parse-error".to_string()));
     }
 
@@ -911,11 +803,8 @@ mod tests {
         assert!(text.contains("Greets somebody."), "the doc comment above the definition: {text:?}");
     }
 
-    // The server's hover is the editor's `K`, including when the
-    // answer is "nothing" -- a word inside a quoted string is prose and
-    // not a command, and both front ends say so the same way. Being
-    // consistent with `K` is the point; a server that quietly answered
-    // differently would be a second opinion nobody asked for.
+    // The hover is `K`'s, including "nothing": a word in a quoted string is
+    // prose, not a command, and both front ends say so alike.
     #[test]
     fn hover_on_prose_says_what_the_k_key_says_about_prose() {
         let line = "echo \"please deploy the app\"";
@@ -949,9 +838,7 @@ mod tests {
         assert_eq!(result(&out, 2.0), Value::Null);
     }
 
-    // An outline wants every function, and the undocumented one is
-    // exactly the one somebody is looking for the definition of --
-    // which is why this does not go through `DocIndex`.
+    // Every function, the undocumented ones too, so not `DocIndex`.
     #[test]
     fn the_outline_lists_undocumented_functions_too() {
         let (_, out) = session(&[
@@ -967,11 +854,9 @@ mod tests {
         assert_eq!(string_at(&symbols[1], ".detail"), None, "nothing to say is better than an empty string");
     }
 
-    // The whole reason `positionEncoding` is negotiated. An astral
-    // character is one `char` to bish, two UTF-16 code units to a
-    // client counting the old way -- so the column of a finding after
-    // one differs, and saying the wrong number puts the underline under
-    // the wrong text.
+    // An astral character is one `char` to bish and two UTF-16 units to an
+    // old-style client, so a later finding's column differs, and the wrong
+    // number misplaces the underline.
     #[test]
     fn a_findings_column_is_reported_in_the_unit_that_was_agreed() {
         let text = "echo \"\u{1f600}\" $x\n";
@@ -985,28 +870,19 @@ mod tests {
         assert_eq!(column(&["utf-8"]), Value::Number(12.0), "four bytes for it");
     }
 
-    // ------------------------------------------------------------------
-    // The two halves, talking to each other
-    // ------------------------------------------------------------------
-
-    /// `target/<profile>/bish`, the same way the bash corpus finds it
-    /// -- and the same reason it is current: an integration test under
-    /// `tests/` makes `cargo test` build the binary first. Skips rather
-    /// than fails when it is not there.
+    /// `target/<profile>/bish`, as the bash corpus finds it, current because
+    /// an integration test under `tests/` makes `cargo test` build it. Skips
+    /// when absent.
     fn bish_binary() -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let path = exe.parent()?.parent()?.join("bish");
         path.exists().then_some(path)
     }
 
-    /// The real client from lspclient.rs, driving the real server in
-    /// this file, over a real pipe.
-    ///
-    /// Everything above tests this server against a description of the
-    /// protocol; this tests it against the other end of it. The two
-    /// halves were written months apart against the same spec, and a
-    /// disagreement between them is exactly the kind that a test
-    /// written from the same misunderstanding as the code would miss.
+    /// The real client from lspclient.rs driving this server over a real
+    /// pipe: the tests above check against a description of the protocol,
+    /// this against the other end, which a shared misunderstanding would
+    /// slip past.
     #[test]
     fn bishs_own_client_can_talk_to_bishs_own_server() {
         let Some(binary) = bish_binary() else { return };
@@ -1021,17 +897,15 @@ mod tests {
         let mut server = crate::lspclient::Server::start(1, &command, "bish tool lsp-server", &dir, crate::lspclient::ApplyEdits::Never, Value::Null)
             .expect("the server starts");
 
-        // Polling with a deadline rather than reading once: this drives
-        // a real process over a real pipe, and how quickly it answers
-        // is a fact about the machine.
+        // A deadline rather than one read: a real process's speed depends on
+        // the machine.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !server.is_ready() && std::time::Instant::now() < deadline {
             server.service();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(server.is_ready(), "the server never finished initializing: {:?}", server.state());
-        // The negotiation really happened, over the wire, between the
-        // two ends of this codebase.
+        // The negotiation happened over the wire.
         assert_eq!(server.encoding(), PositionEncoding::Utf32);
         assert!(server.provides("documentFormattingProvider"));
         assert!(server.provides("hoverProvider"));
@@ -1046,9 +920,8 @@ mod tests {
         }
         let findings = findings.expect("the server published diagnostics the client understood");
         assert!(findings.iter().any(|d| d.code == "unquoted-expansion"), "the client decoded the server's own finding: {findings:?}");
-        // ...and they are exactly what this shell says about the file
-        // when nothing is between the two, having gone out as JSON and
-        // come back through a pipe.
+        // And they're what this shell says about the file directly, after
+        // going out as JSON and back through a pipe.
         let mut over_the_wire: Vec<String> = findings.iter().map(|d| d.code.to_string()).collect();
         let mut in_process: Vec<String> = BashLinter.check(text).into_iter().map(|d| d.code.to_string()).collect();
         in_process.extend(BashFormatter.check(text).unwrap_or_default().into_iter().map(|d| d.code.to_string()));
@@ -1068,17 +941,15 @@ mod tests {
         assert!(e.message.contains("textDocument/rename"), "{}", e.message);
     }
 
-    // The spec's own contract for the two of them: an editor that exits
-    // without shutting down first is an editor that crashed, and a
-    // server that pretended otherwise would hide it.
+    // An editor exiting without shutting down crashed, and the exit code
+    // says so.
     #[test]
     fn shutdown_then_exit_is_orderly_and_exit_alone_is_not() {
         let (orderly, _) = session(&[initialize(&["utf-32"]), request(2.0, "shutdown", Value::Null), notification("exit", Value::Null)]);
         assert_eq!(orderly, 0);
         let (abrupt, _) = session(&[initialize(&["utf-32"]), notification("exit", Value::Null)]);
         assert_eq!(abrupt, 1);
-        // Stdin simply ending is the same thing without the courtesy of
-        // saying so.
+        // Stdin just ending is the same, without saying so.
         let (dropped, _) = session(&[initialize(&["utf-32"])]);
         assert_eq!(dropped, 1);
     }
