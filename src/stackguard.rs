@@ -1,82 +1,64 @@
 // How much of this thread's stack is left, so the shell can refuse a
-// recursion instead of dying on one.
+// recursion instead of dying of one.
 //
-// Every recursive construct a script can write -- a function calling
-// itself, `eval` calling itself, a file sourcing itself, a deeply
-// parenthesised arithmetic expression -- runs on the Rust call stack,
-// and running out of it is not an error that can be caught: the process
-// aborts with `fatal runtime error: stack overflow` and dumps core.
-// Real bash aborts on three of those four as well, which is not a
-// standard worth matching.
+// Every recursive construct a script can write (a function calling
+// itself, `eval`, a file sourcing itself, deeply nested arithmetic) runs
+// on the Rust stack, and running out aborts the process with no chance
+// to recover.
 //
-// A depth counter per construct cannot answer this. Frames differ in
-// size by an order of magnitude between constructs, the constructs
-// nest inside each other, and the amount of stack available is not a
-// constant either -- it is `ulimit -s`, which a user can and does
-// change. What is actually running out is measured directly here
-// instead: the distance between a local variable now and one recorded
-// at startup, against the limit the kernel was asked for.
+// A depth counter per construct can't answer this: frame sizes differ
+// by an order of magnitude, constructs nest in each other, and the
+// stack size is `ulimit -s`, which users change. So the stack used is
+// measured directly: the distance from a local recorded at startup to
+// one now, against the limit the kernel was asked for.
 
 use std::cell::Cell;
 
-// What to assume when the kernel says "unlimited" or will not say. 8MiB
-// is Linux's own default and what every shell here is actually running
-// with; an unlimited stack still grows into something eventually, and a
-// budget derived from a real number beats one derived from `u64::MAX`.
+// What to assume when the kernel says "unlimited" or won't say: 8 MiB,
+// Linux's default. An unlimited stack still ends somewhere, and a real
+// number makes a better budget than `u64::MAX`.
 const ASSUMED_STACK: u64 = 8 * 1024 * 1024;
 
-// The fraction of the stack a script's own nesting may use up. The rest
-// is not slack: unwinding out of a refused recursion runs `Drop` for
-// every frame on the way, the error path formats and prints a message,
-// and an interactive shell then goes back to a prompt and redraws --
-// all of it on the stack that is left. Leaving a third of the stack for
-// that is not generous, it is the difference between reporting the
-// problem and dying while reporting it.
+// The fraction of the stack a script's nesting may use. The rest isn't
+// slack: unwinding a refused recursion runs every frame's `Drop`, the
+// error is formatted and printed, and an interactive shell redraws its
+// prompt, all on what's left.
 const BUDGET_NUMERATOR: u64 = 2;
 const BUDGET_DENOMINATOR: u64 = 3;
 
-// The same idea for the arithmetic parser, which gets to keep going
-// after everything else has given up.
+// The same for the arithmetic parser, which may go further.
 //
-// Its frames are tiny next to an evaluator frame, so it is almost never
-// what filled the stack -- but it is often what is running when the
-// stack finally runs out, since a function body tends to end up
-// evaluating something. Sharing one threshold meant a runaway *function*
-// was reported as `((d+1)): expression nested too deeply`, naming the
-// innermost construct instead of the one at fault. Letting the parser
-// run further keeps the diagnostic on whoever actually recursed.
+// Its frames are tiny, so it rarely filled the stack, but it's often
+// what's running when it fills, as function bodies evaluate things. A
+// shared threshold reported a runaway function as `((d+1)): expression
+// nested too deeply`; a deeper limit keeps the message on whatever
+// recursed.
 const DEEP_NUMERATOR: u64 = 5;
 const DEEP_DENOMINATOR: u64 = 6;
 
 thread_local! {
-    // Address of a local at the outermost point this thread knows
-    // about. Zero until `note_base` runs; see `used` for what that
-    // means.
+    // Address of a local at the outermost point this thread knows. Zero
+    // until `note_base` runs; see `used`.
     static BASE: Cell<usize> = const { Cell::new(0) };
-    // `budget()` memoized -- a `getrlimit` per function call would be a
-    // syscall on the hottest path in the shell.
+    // `budget()` memoised: a `getrlimit` per function call would be a
+    // syscall on the hottest path.
     static BUDGET: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Records this point as the bottom of the stack budget. Called once,
-/// as early in `main` as there is a `main` to call it from.
+/// early in `main`.
 ///
-/// Not calling it is safe: `used` falls back to the first address it is
-/// ever asked about, which is deeper than the real base and so yields a
-/// smaller number than the truth. That errs toward letting a recursion
-/// continue, which is why the fallback is not enough on its own and
-/// `main` calls this -- but it does keep a `Shell` built directly by a
-/// test from measuring against zero.
+/// Not calling it is safe: `used` falls back to the first address it's
+/// asked about, which is above the real base and so undercounts, erring
+/// toward allowing recursion. It keeps a `Shell` built directly by a test
+/// from measuring against zero.
 pub fn note_base() {
     BASE.with(|b| b.set(here()));
 }
 
-/// The address of a local in *this* frame.
-///
-/// `black_box` and an explicit binding rather than `&0u8`: a reference
-/// to a literal is const-promoted to static memory, so the obvious
-/// spelling of this measures the address of a constant in the binary
-/// and reports that the stack never moves at all.
+/// The address of a local in this frame. `black_box` and a binding, not
+/// `&0u8`: a reference to a literal is promoted to static memory, which
+/// never moves.
 #[inline(never)]
 fn here() -> usize {
     let anchor = 0u8;
@@ -92,11 +74,9 @@ fn used() -> usize {
         if b.get() == 0 {
             b.set(here);
         }
-        // Stacks grow downward on every platform this runs on, so the
-        // base is the higher address. `saturating_sub` rather than a
-        // subtraction: a thread whose stack sits above the one that
-        // called `note_base` would otherwise underflow to a huge
-        // number and refuse everything.
+        // Stacks grow downward everywhere this runs, so the base is higher.
+        // Saturating: a thread whose stack sits above the base's would
+        // otherwise underflow and refuse everything.
         b.get().saturating_sub(here)
     })
 }
@@ -113,20 +93,12 @@ fn budget() -> usize {
     value
 }
 
-/// Points the guard at a different stack, handing back the one it was
-/// using.
-///
-/// A coroutine runs on its own mapping, nowhere near the thread's, so
-/// measuring its depth against the thread's base gives an answer that
-/// is not merely wrong but wildly wrong -- the distance between two
-/// unrelated mappings, which reads as "the stack is gone" on the
-/// coroutine's very first call. Its budget is different too: a
-/// coroutine gets a fixed allocation rather than whatever `ulimit -s`
-/// says. `Coroutine::resume` swaps both in on the way into a stage and
-/// back out on the way home.
-///
-/// Only the coroutine machinery calls this, and that machinery does not
-/// exist on a target that cannot switch stacks -- hence unused there.
+/// Points the guard at a different stack, returning the one it used. A
+/// coroutine runs on its own mapping, so measuring against the thread's
+/// base gives the distance between two unrelated mappings, and its
+/// budget is a fixed allocation rather than `ulimit -s`.
+/// `Coroutine::resume` swaps both in and out. Unused on targets without
+/// stack switching.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub fn swap_stack(base: usize, budget_bytes: usize) -> (usize, usize) {
     let previous_base = BASE.with(|b| b.replace(base));
@@ -134,16 +106,14 @@ pub fn swap_stack(base: usize, budget_bytes: usize) -> (usize, usize) {
     (previous_base, previous_budget)
 }
 
-/// Whether the stack is too far gone to recurse again.
-///
-/// Asked *before* descending, not after, so the answer still has the
-/// whole remaining third of the stack to be acted on in.
+/// Whether the stack is too far gone to recurse again. Asked before
+/// descending, so the remaining third is there to act on the answer.
 pub fn nearly_exhausted() -> bool {
     used() >= budget()
 }
 
-/// `nearly_exhausted` for the arithmetic parser, which is allowed
-/// further down than anything else -- see `DEEP_NUMERATOR`.
+/// `nearly_exhausted` for the arithmetic parser, allowed further down;
+/// see `DEEP_NUMERATOR`.
 pub fn deeply_exhausted() -> bool {
     let total = budget() / BUDGET_NUMERATOR as usize * BUDGET_DENOMINATOR as usize;
     used() >= total / DEEP_DENOMINATOR as usize * DEEP_NUMERATOR as usize
@@ -169,9 +139,8 @@ mod tests {
         assert!(used() < budget());
     }
 
-    // The order matters, not the numbers: whatever fills the stack, the
-    // ordinary limit has to be reached first, so the construct that was
-    // actually recursing is the one named in the message.
+    // Whatever fills the stack, the ordinary limit is reached first, so the
+    // construct actually recursing is named.
     #[test]
     fn the_parsers_limit_comes_after_everyone_elses() {
         let ordinary = budget();
@@ -179,14 +148,12 @@ mod tests {
         assert!(deep > ordinary, "the parser must be allowed further down than a function call: {deep} vs {ordinary}");
     }
 
-    // The measurement, rather than the policy: recursing must move the
-    // number, and it must move in the direction of "less left".
+    // Recursing moves the number toward less left.
     #[test]
     fn used_grows_as_the_stack_does() {
         note_base();
         fn descend(n: usize, seen: &mut Vec<usize>) {
-            // Something big enough per frame that the difference is not
-            // lost to a tail call or an inlined nothing.
+            // Big enough per frame not to be lost to a tail call or inlining.
             let ballast = [0u8; 4096];
             seen.push(used());
             if n > 0 {
