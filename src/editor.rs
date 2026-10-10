@@ -1,20 +1,12 @@
-// A from-scratch line editor for interactive input: decodes raw terminal
-// bytes into key events, maintains an editable buffer with a cursor, and
-// redraws itself after each edit. Deliberately scoped to single-line
-// editing for now (each physical line the REPL reads is its own editing
-// session; repl.rs still owns stitching continuation lines together into
-// a multi-line program) -- but the buffer/cursor/dispatch machinery here
-// is written to be reusable, since the plan is to grow this into an
-// in-place prompt/buffer editor later (e.g. invoking $EDITOR on the
-// current input), not just a one-off REPL helper.
+// The line editor for interactive input: decodes raw terminal bytes into
+// keys, keeps an editable buffer with a cursor, and redraws after each
+// edit. One line per editing session; repl.rs stitches continuation lines
+// into a program.
 //
-// Redraws are width-aware: `compose_redraw` is given the columns that
-// belong to this line (a pane's own width, or the whole terminal's) and
-// keeps everything inside them -- truncating the prompt if even that
-// doesn't fit, and horizontally scrolling the buffer around the cursor
-// once the line is longer than what's left. Nothing here ever wraps onto
-// a second row, which is what keeps a prompt inside a split pane from
-// spilling into its neighbour.
+// Redraws fit the columns given (a pane's width or the terminal's),
+// truncating the prompt if needed and scrolling the buffer horizontally
+// around the cursor. Nothing wraps onto a second row, so a prompt in a
+// split pane can't spill into its neighbour.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -30,8 +22,6 @@ use crate::bishedit::undo::UndoTree;
 use crate::bishedit::unicode_width::char_width;
 use crate::bishedit::vimkeys::{self, KeyOutcome, Op, VimKeys};
 use crate::history::History;
-// Same cross-module use fileeditor.rs already makes of these two -- see
-// run_line_normal_mode's own doc comment on its `term_rows` param.
 use crate::repl::{erase_global_status_row, render_global_status_row};
 use crate::term;
 use crate::vt100;
@@ -39,14 +29,9 @@ use crate::vt100;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Key {
     Char(char),
-    // Raw NUL (0x00) -- most terminals send this for Ctrl+Space, which
-    // was this gesture's only spelling until `Key::CtrlG` took over as
-    // the one bish asks for. Still accepted wherever it arrives: a
-    // terminal that sends it is a terminal someone may still be pressing
-    // it on. What it does *not* do is arrive reliably -- macOS binds
-    // Ctrl+Space to switching input source, and ibus and fcitx do the
-    // same on Linux, so the key often never reaches bish at all. That is
-    // why the gesture moved.
+    // Raw NUL, which most terminals send for Ctrl+Space. Still accepted, but
+    // the gesture is `Key::CtrlG`: macOS, ibus and fcitx bind Ctrl+Space to
+    // switching input source, so it often never arrives.
     CtrlSpace,
     Enter,
     Backspace,
@@ -57,34 +42,21 @@ pub enum Key {
     Down,
     Home,
     End,
-    // "CSI 5 ~"/"CSI 6 ~" -- see decode_csi_final. Not decoded before this
-    // existed at all (fell through to Unknown), which is why neither ever
-    // did anything in any mode (Normal or Insert) of bishedit's own file
-    // editor, or the plain shell prompt -- see run_insert_mode/vimkeys.rs's
-    // own Motion::PageUp/PageDown handling for where these actually go now.
+    // `CSI 5 ~` and `CSI 6 ~`; see `decode_csi_final`, and `Motion::PageUp`
+    // for where they go.
     PageUp,
     PageDown,
-    // "CSI 200 ~" / "CSI 201 ~" -- the brackets a terminal puts around
-    // pasted text once DECSET 2004 is on.
-    //
-    // What they buy is the one thing a terminal otherwise cannot tell
-    // you: whether a burst of characters was typed or pasted. Everything
-    // that helpfully reacts to typing -- autoindent, `abbr` expansion --
-    // is wrong applied to a paste, and produces the staircase every
-    // editor that lacks this is known for.
-    //
-    // Decoded unconditionally, even for a caller that never enables the
-    // mode: a terminal that sends them anyway (tmux passing through a
-    // neighbour's request) would otherwise land "200~" in the buffer as
-    // literal text.
+    // `CSI 200 ~` and `CSI 201 ~`, which a terminal puts around pasted text
+    // with DECSET 2004 on. They tell a paste from typing, so what reacts to
+    // typing (autoindent, `abbr`) can leave a paste alone. Decoded even when
+    // the mode is off, since a terminal may send them anyway (tmux passing a
+    // neighbour's request through), and "200~" would land in the buffer.
     PasteStart,
     PasteEnd,
     Escape,
-    // xterm/tmux send these as "CSI 1 ; 3 <letter>" (modifier 3 = Alt)
-    // rather than the plain "CSI <letter>" -- see decode_csi_final.
-    // Alt-Enter: a newline in the command, rather than the end of it.
-    // Arrives as Esc + CR/LF, the same shape every other Alt-held key
-    // does (see decode_escape_prefixed).
+    // xterm and tmux send Alt+arrows as `CSI 1 ; 3 <letter>` (3 is Alt); see
+    // `decode_csi_final`. Alt-Enter, a newline within the command, arrives as
+    // Esc plus CR or LF, like other Alt keys (see `decode_escape_prefixed`).
     AltEnter,
     AltLeft,
     AltRight,
@@ -95,140 +67,88 @@ pub enum Key {
     CtrlD,
     CtrlE,
     CtrlF,
-    // No binding of their own anywhere in bish -- decoded purely so a
-    // mapping can reach them, which is what `<C-s>` for "save" wants.
+    // Unbound in bish, decoded so a mapping can use them, such as `<C-s>` for
+    // save.
     CtrlG,
     CtrlQ,
     CtrlS,
     CtrlT,
     CtrlK,
     CtrlL,
-    // Completion cycling -- see read_line's own completion handling.
-    // BackTab is xterm's CBT sequence ("CSI Z", shift-tab); CtrlN/CtrlP
-    // are the same forward/backward pair emacs-style line editors use.
+    // Completion cycling (see `read_line`). BackTab is xterm's CBT
+    // (`CSI Z`, Shift-Tab); CtrlN/CtrlP cycle forward and back.
     Tab,
     BackTab,
     CtrlN,
     CtrlP,
-    // Vim's insert-mode "do exactly one normal command, then return to
-    // insert" -- see run_one_shot_normal_command's own doc comment.
+    // vim's insert-mode one-shot Normal command; see
+    // `run_one_shot_normal_command`.
     CtrlO,
     CtrlU,
-    // 0x16. Visual *block* mode in Normal mode; nothing at the shell
-    // prompt binds it, so it is decoded here and acted on only where a
-    // rectangle means something.
+    // 0x16: Visual block in Normal mode; unbound at the prompt.
     CtrlV,
     CtrlW,
-    /// Alt-Backspace: readline's `backward-kill-word`, which stops at
-    /// the first non-alphanumeric character rather than at whitespace.
-    /// The one that deletes `bar` out of `cd foo/bar`.
+    /// Alt-Backspace: readline's `backward-kill-word`, stopping at the first
+    /// non-alphanumeric character, so it deletes `bar` from `cd foo/bar`.
     AltBackspace,
-    // Vim's insert-mode "paste this register here" -- see read_line's own
-    // Key::CtrlR arm.
+    // vim's insert-mode register paste; see `read_line`'s `Key::CtrlR` arm.
     CtrlR,
-    // No shell line-editing use yet (unlike the other Ctrl letters above) --
-    // added for bishedit's normal-mode Ctrl-Y (scroll one line up).
+    // Normal mode's scroll one line up; unbound at the prompt.
     CtrlY,
     CtrlZ,
-    // No shell line-editing use either -- added for bishedit's own
-    // Normal-mode number decrement (`Ctrl-X`, `Ctrl-A`'s own mirror).
+    // Normal mode's number decrement; unbound at the prompt.
     CtrlX,
-    // An SGR (mode 1006) mouse report -- see `read_sgr_mouse`'s own doc
-    // comment for the wire format. Decoded here purely so a real mouse
-    // event arriving at any of this codebase's several `read_key`-based
-    // loops (the shell prompt's own typing loop, bishedit's normal-mode
-    // navigation, the `e` file editor) is safely consumed as one unit
-    // rather than leaking its raw digit/`;`/`M` bytes through as
-    // individual bogus keystrokes (what happened before this variant
-    // existed -- `read_escape`'s param loop had no notion of the `<`
-    // marker byte this sequence starts with). None of those loops act on
-    // it yet -- it lands in whatever catch-all bucket already exists
-    // there for an unbound key, same as `Unknown`. The one place mouse
-    // input is actually *used* is `repl.rs`'s `drive_fg_job`, which never
-    // goes through `Key` at all (it forwards raw stdin bytes straight to
-    // a foreground job's pty, mouse sequences included) -- see its own
-    // doc comment on why real-terminal mouse reporting is enabled only
-    // while that loop owns the terminal.
+    // An SGR (mode 1006) mouse report (see `read_sgr_mouse`), decoded so
+    // it's consumed whole rather than as stray digit, `;` and `M`
+    // keystrokes in any `read_key` loop. repl.rs's `drive_fg_job` forwards
+    // raw bytes to a foreground job's pty instead, mouse reports included.
     Mouse(MouseEvent),
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MouseEvent {
-    // The raw Cb parameter from the SGR sequence: encodes which button
-    // (bits 0-1, plus bit 6 for buttons 4-7), whether this is motion
-    // while a button is held (bit 5), and Shift/Meta/Ctrl modifiers (bits
-    // 2-4) -- xterm's own ctlseqs.txt has the full bit layout. Left
-    // un-decoded into separate fields since nothing here reads it yet;
-    // whatever eventually does (click-to-focus-pane, in a later pass)
-    // can add real accessors then instead of guessing at a shape now.
+    // The raw Cb parameter: the button (bits 0-1, with bit 6 for buttons
+    // 4-7), motion with a button held (bit 5), and Shift, Meta, Ctrl (bits
+    // 2-4), per xterm's ctlseqs. The accessors below decode what's used.
     pub button: u16,
-    // 1-indexed column/row, matching the terminal's own coordinate
-    // convention (row 1 = top).
+    // 1-indexed, as the terminal counts (row 1 is the top).
     pub col: u16,
     pub row: u16,
-    // `true` for a press/drag (final byte `M`), `false` for a release
-    // (final byte `m`).
+    // `true` for a press or drag (final `M`), `false` for a release (`m`).
     pub pressed: bool,
 }
 
 impl MouseEvent {
-    // A genuine left-button press -- not a drag (bit 5, set while a
-    // button is held during motion), not a wheel event (bit 6), not some
-    // other button (bits 0-1 != 0), and not a release (`pressed ==
-    // false`, final byte 'm'). The only gesture this codebase treats as
-    // "a click" so far -- see this method's own call sites for why
-    // everything else it decodes is deliberately left alone for now.
+    // A left-button press: not a drag (bit 5), a wheel (bit 6), another
+    // button, or a release.
     pub fn is_left_click(&self) -> bool {
         self.pressed && self.button & 0x60 == 0 && self.button & 0x03 == 0
     }
 
-    // Motion reported while the left button is held (bit 5) -- what a
-    // drag is made of. Terminals only send these at all once "any-event"
-    // tracking is on (DECSET 1002, part of MOUSE_REPORTING_ENABLE), and
-    // they arrive as a stream between the press and the release.
+    // Motion with the left button held: a drag, streamed between press and
+    // release once any-event tracking (DECSET 1002) is on.
     pub fn is_left_drag(&self) -> bool {
         self.pressed && self.button & 0x40 == 0 && self.button & 0x20 != 0 && self.button & 0x03 == 0
     }
 
-    // Motion with no button held -- the mouse simply passing over a
-    // cell. Terminals send these only once "any-event" tracking is on
-    // (DECSET 1003, which `mouse_hover` asks for and the rest of the
-    // shell does not), so this is silent for anyone who has turned that
-    // off.
-    //
-    // The low two bits are the button, and 3 is their "none" -- the
-    // same encoding a release uses, which is why the motion bit is what
-    // separates the two here.
+    // Motion with no button held: hovering. Sent only with DECSET 1003, which
+    // `mouse_hover` enables. The low two bits are 3 ("none") as in a release;
+    // the motion bit tells them apart.
     pub fn is_hover(&self) -> bool {
         self.pressed && self.button & 0x40 == 0 && self.button & 0x20 != 0 && self.button & 0x03 == 0x03
     }
 
-    // Any button release. The final byte is what distinguishes it, not
-    // the button bits -- xterm reports which button was let go, but
-    // nothing here needs to know.
+    // Any release, told by the final byte; which button doesn't matter.
     pub fn is_release(&self) -> bool {
         !self.pressed
     }
 
-    // xterm's SGR mouse protocol encodes a wheel notch as bit 6 set plus
-    // the X11 button number in bits 0-1: 4/5 are the vertical wheel and
-    // 6/7 the horizontal one, which is the whole of what a terminal
-    // sends for a tilt wheel or a sideways trackpad gesture. Modifier
-    // bits (2-4) are masked out, same as is_left_click above -- a
-    // Shift/Ctrl/Alt-held wheel notch still scrolls. A wheel notch is
-    // always reported as a bare press (no matching release), but
-    // `pressed` is still checked here anyway -- cheap insurance against
-    // a terminal that behaves differently, same spirit as
-    // is_left_click's own explicit check.
-    //
-    // Not every terminal sends 66/67; the ones that don't simply produce
-    // nothing here, which is the same as before these existed. Some
-    // terminals instead fold a sideways gesture into Shift+wheel, and
-    // that is deliberately *not* treated as horizontal: the masks above
-    // say a modifier never changes what a notch means, and quietly
-    // making Shift the exception would break the vertical scrolling that
-    // rule currently guarantees.
+    // A wheel notch: bit 6 plus the X11 button in bits 0-1, 4/5 vertical and
+    // 6/7 horizontal. Modifiers are masked out, so a Shift-held notch still
+    // scrolls; a terminal folding sideways gestures into Shift+wheel gets no
+    // horizontal scroll, since a modifier never changes what a notch means.
+    // Notches arrive as presses, but `pressed` is checked anyway.
     pub fn is_scroll_up(&self) -> bool {
         self.pressed && self.button & 0x43 == 0x40
     }
@@ -246,20 +166,13 @@ impl MouseEvent {
     }
 }
 
-// How long to wait for further bytes after a lone Esc before deciding it
-// really is a standalone Esc keypress rather than the start of a sequence.
-// Real escape sequences arrive as a fast burst from the terminal; a human
-// pressing Esc alone won't have a next byte ready this soon.
+// How long to wait after a lone Esc for more bytes before taking it as a
+// key press: a sequence arrives as a burst, while a person pressing Esc
+// has nothing following.
 const ESCAPE_TIMEOUT_MS: i32 = 30;
 
-// Reads directly from fd 0 via a raw syscall rather than std::io::Stdin --
-// Stdin wraps its own internal BufReader, which can pull extra bytes out of
-// the kernel in a single underlying read and hand them out later purely
-// from userspace. term::stdin_ready's poll() only sees the kernel's view,
-// so mixing it with a buffered reader would make the poll check lie: bytes
-// already sitting in Stdin's buffer wouldn't show as "ready" even though
-// they're available for the very next read. Going straight to the syscall
-// keeps this consistent with what's actually been consumed.
+// Reads fd 0 with a raw syscall: `Stdin`'s buffer could hold bytes that
+// `term::stdin_ready`'s poll doesn't see, so the poll would lie.
 fn read_byte() -> io::Result<Option<u8>> {
     let mut b = [0u8; 1];
     match crate::platform::read_bytes(0, &mut b)? {
@@ -268,18 +181,11 @@ fn read_byte() -> io::Result<Option<u8>> {
     }
 }
 
-// The keys that are exactly one byte and need nothing read after them.
-//
-// Split out of `read_key`'s own match so it can be tested without a
-// terminal: everything else there either reads further bytes (an escape
-// sequence, a UTF-8 continuation) or depends on what came before.
-//
-// 0x07/0x11/0x13/0x14 have no meaning of their own anywhere in bish and
-// are decoded purely so `::bish map` can bind them -- `<C-s>` for "save"
-// being the obvious one. They land in the same catch-all every other
-// unbound key does. 0x11/0x13 are XON/XOFF and reach a program at all
-// only because `term::derive_raw` clears IXON: flow control is the
-// terminal's idea, not this one's.
+// The keys that are one byte with nothing after them, split out of
+// `read_key` for testing. 0x07, 0x11, 0x13 and 0x14 mean nothing in bish
+// and are decoded so `::bish map` can bind them (`<C-s>` for save).
+// 0x11/0x13 (XON/XOFF) arrive only because `term::derive_raw` clears
+// IXON.
 fn decode_solo_byte(b: u8) -> Option<Key> {
     Some(match b {
         0x00 => Key::CtrlSpace,
@@ -310,12 +216,9 @@ fn decode_solo_byte(b: u8) -> Option<Key> {
     })
 }
 
-// Reads one key event from stdin, which raw mode has already put into
-// unbuffered/no-echo/no-ISIG mode (see term::RawGuard) -- so every key,
-// including Ctrl-C and Ctrl-Z, arrives here as plain bytes rather than as
-// a signal. Handles the escape sequences a normal terminal sends for
-// arrow/Home/End/Delete, and decodes multi-byte UTF-8 so non-ASCII input
-// doesn't get mangled.
+// Reads one key from stdin in raw mode (see `term::RawGuard`), so Ctrl-C
+// and Ctrl-Z arrive as bytes, not signals. Decodes escape sequences and
+// multi-byte UTF-8.
 fn read_key() -> io::Result<Option<Key>> {
     let b = match read_byte()? {
         Some(b) => b,
@@ -335,21 +238,14 @@ fn read_key() -> io::Result<Option<Key>> {
     Ok(Some(key))
 }
 
-// Escape sequence decoding. A bare Esc keypress has nothing following it;
-// poll with a short timeout at each step to tell that apart from an actual
-// sequence (whose bytes arrive back-to-back) instead of blocking forever.
-/// The key an Esc followed by `b` stands for, where `b` is not the
-/// `[`/`O` that introduces a CSI sequence.
-///
-/// Split out from `read_escape` so the mapping can be tested without a
-/// terminal to read from.
+/// The key Esc followed by `b` stands for, `b` being other than the `[`
+/// or `O` that starts a CSI sequence. Split out for testing.
 fn decode_escape_prefixed(b: u8) -> Option<Key> {
     match b {
-        // Alt-Backspace. Terminals disagree about which byte Backspace
-        // is, and an Alt-held key is that byte with an Esc in front, so
-        // both spellings arrive here.
+        // Alt-Backspace: terminals disagree on Backspace's byte, so both
+        // arrive.
         0x7f | 0x08 => Some(Key::AltBackspace),
-        // Alt-Enter, in both spellings a terminal might send.
+        // Alt-Enter, in either spelling.
         b'\r' | b'\n' => Some(Key::AltEnter),
         _ => None,
     }
@@ -367,12 +263,9 @@ fn read_escape() -> io::Result<Key> {
         b'[' | b'O' => {}
         _ => return Ok(decode_escape_prefixed(b1).unwrap_or(Key::Unknown)),
     }
-    // An SGR mouse report ("\x1b[<Cb;Cx;CyM/m") starts with a '<' marker
-    // right after the CSI intro -- unlike every other sequence this
-    // decoder handles, whose first param byte (if any) is always a digit
-    // or ';' (see the loop just below). Peeking for it here, before that
-    // loop even starts, keeps this the only place that needs to know
-    // about it.
+    // An SGR mouse report (`\x1b[<Cb;Cx;CyM`) has a `<` after the CSI intro,
+    // where every other sequence has a digit or `;`. Checked here, before the
+    // parameter loop.
     if b1 == b'[' {
         if !term::stdin_ready(ESCAPE_TIMEOUT_MS) {
             return Ok(Key::Unknown);
@@ -384,27 +277,23 @@ fn read_escape() -> io::Result<Key> {
         if b2 == b'<' {
             return read_sgr_mouse();
         }
-        // Not a mouse report -- fall into the ordinary param-collection
-        // loop below with `b2` as its first byte, exactly as if it had
-        // been read there in the first place.
+        // Not a mouse report: continue as a normal sequence, `b2` the first
+        // byte.
         return read_csi_params(String::from(b2 as char));
     }
     read_csi_params(String::new())
 }
 
-// Collects parameter bytes (digits and ';') until the final byte (a
-// letter, or '~') arrives -- covers both the simple forms (no params,
-// e.g. "\x1b[D" for Left) and the modified ones xterm/tmux send for a
-// Ctrl/Alt/Shift-held arrow or Home/End (e.g. "\x1b[1;3D" for Alt+Left),
-// plus the "\x1b[<n>~" family (Delete/Home/End on some terminals) -- see
-// decode_csi_final for how each is told apart. `seed` is whatever byte
-// `read_escape` already consumed while peeking for a mouse report's `<`
-// marker (empty for CSI-O sequences, which never need that peek).
+// Collects parameter bytes (digits and `;`) until the final byte (a
+// letter or `~`): plain forms (`\x1b[D`), modified ones xterm and tmux send
+// (`\x1b[1;3D` is Alt+Left), and the `\x1b[<n>~` family; see
+// `decode_csi_final`. `seed` is what `read_escape` consumed checking for a
+// mouse report's `<`.
 fn read_csi_params(seed: String) -> io::Result<Key> {
     let mut params = seed;
     if params.chars().next().is_some_and(|c| !c.is_ascii_digit() && c != ';') {
-        // The peeked byte was itself the final byte (a paramless
-        // sequence like "\x1b[H" for Home) -- nothing left to collect.
+        // The peeked byte was the final byte (a paramless sequence like
+        // `\x1b[H`), so there's nothing to collect.
         let final_byte = params.pop().unwrap() as u8;
         return Ok(decode_csi_final(&params, final_byte));
     }
@@ -424,14 +313,10 @@ fn read_csi_params(seed: String) -> io::Result<Key> {
     }
 }
 
-// "\x1b[<" already consumed. Collects "Cb;Cx;Cy" then a final 'M' (press
-// or drag) or 'm' (release), matching xterm's SGR (mode 1006) mouse
-// protocol -- the only mouse encoding this decoder understands (the
-// legacy X10/UTF-8 encodings some terminals still default to are out of
-// scope: they can't represent coordinates past column/row 223, and
-// nothing in this codebase enables mouse reporting on the real terminal
-// without also requesting SGR mode -- see drive_fg_job's own doc
-// comment).
+// After `\x1b[<`: collects `Cb;Cx;Cy` and a final `M` (press or drag) or
+// `m` (release), xterm's SGR mouse protocol (mode 1006). The legacy
+// encodings can't go past column 223, and mouse reporting is never
+// enabled without SGR mode (see `drive_fg_job`).
 fn read_sgr_mouse() -> io::Result<Key> {
     let mut params = String::new();
     loop {
@@ -450,11 +335,8 @@ fn read_sgr_mouse() -> io::Result<Key> {
     }
 }
 
-// `params` is the "Cb;Cx;Cy" collected between "\x1b[<" and `final_byte`
-// (always 'M' or 'm' -- `read_sgr_mouse`'s own only two call sites for
-// this). Split out as a pure function, mirroring decode_csi_final's own
-// split from read_escape, so the actual parsing has unit test coverage
-// without needing real stdin bytes.
+// `params` is the `Cb;Cx;Cy` between `\x1b[<` and `final_byte` (`M` or
+// `m`). Pure, for testing.
 pub(crate) fn decode_sgr_mouse_final(params: &str, final_byte: u8) -> Key {
     let parts: Vec<&str> = params.split(';').collect();
     let button = parts.first().and_then(|s| s.parse::<u16>().ok());
@@ -466,13 +348,10 @@ pub(crate) fn decode_sgr_mouse_final(params: &str, final_byte: u8) -> Key {
     }
 }
 
-// `params` is whatever digit/';' bytes came between the CSI intro
-// ("\x1b[") and `final_byte`, e.g. "" (plain arrow), "3" (an "~"-form
-// like Delete), or "1;3" (xterm's "CSI 1 ; modifier <letter>" convention
-// for a modified arrow/Home/End -- modifier 3 is Alt; 2/4/5/6/7/8 are
-// Shift/Alt+Shift/Ctrl/Ctrl+Shift/Ctrl+Alt/Ctrl+Alt+Shift, none of which
-// this editor distinguishes from the plain key, matching its existing
-// scope of no Ctrl/Shift-arrow handling).
+// `params` are the digit and `;` bytes between `\x1b[` and `final_byte`:
+// "" for a plain arrow, "3" for a `~` form like Delete, or "1;3" for
+// xterm's modified keys (3 is Alt). The other modifiers (Shift, Ctrl and
+// combinations) are treated as the plain key.
 fn decode_csi_final(params: &str, final_byte: u8) -> Key {
     let parts: Vec<&str> = params.split(';').collect();
     let alt = parts.get(1) == Some(&"3");
@@ -516,21 +395,14 @@ fn decode_csi_final(params: &str, final_byte: u8) -> Key {
     }
 }
 
-// How long to wait for a keystroke before giving on_idle another chance
-// to run (see read_line's on_idle doc comment) and polling again. Short
-// enough that a job running in another window doesn't visibly stall.
-// pub(crate): repl.rs's run_normal_mode_navigation needs this same
-// interval for its own pre-wait loop (see that function's own comment
-// on why it can't just reuse read_key_idle's on_idle closure directly).
+// How long to wait for a key before running `on_idle` again (see
+// `read_line`), short enough that a job in another window doesn't visibly
+// stall. repl.rs's `run_normal_mode_navigation` uses it too.
 pub(crate) const IDLE_POLL_MS: i32 = 15;
 
-// Blocks until a key is available, but never for longer than
-// IDLE_POLL_MS at a stretch -- calls on_idle and loops back to poll again
-// in between. Once a byte is actually ready, hands off to the ordinary
-// (genuinely blocking) read_key/read_byte/read_escape machinery
-// unchanged: a real key event's remaining bytes (an escape sequence's
-// tail, a UTF-8 continuation byte) always arrive close enough behind the
-// first that there's nothing to gain by polling those sub-reads too.
+// Waits for a key in slices of IDLE_POLL_MS, calling `on_idle` between.
+// Once a byte is ready, the ordinary blocking reads take over: the rest
+// of an escape sequence or UTF-8 character arrives right behind it.
 pub(crate) fn read_key_idle(on_idle: &mut dyn FnMut()) -> io::Result<Option<Key>> {
     while !term::stdin_ready(IDLE_POLL_MS) {
         on_idle();
@@ -604,10 +476,7 @@ impl LineEditor {
         self.buf.truncate(self.cursor);
     }
 
-    // Matches the terminal driver's classic Ctrl-W (ERASEWORD): skip any
-    // whitespace immediately before the cursor, then delete back to the
-    // next whitespace boundary (or start of line).
-    /// Ctrl-W: readline's `unix-word-rubout` -- back to whitespace, so
+    /// Ctrl-W: readline's `unix-word-rubout`, back to whitespace, so
     /// `cd foo/bar` loses the whole path.
     fn kill_word_backward(&mut self) {
         let mut i = self.cursor;
@@ -621,15 +490,11 @@ impl LineEditor {
         self.cursor = i;
     }
 
-    /// Alt-Backspace: readline's `backward-kill-word`, which is the
-    /// same walk over a different alphabet -- only letters and digits
-    /// are part of a word, so `/`, `.`, `-` and `_` all end one.
-    ///
-    /// This is the one that deletes a single path component: `cd
-    /// foo/bar` loses `bar` and keeps `foo/`. Ctrl-W deliberately does
-    /// not do that, because readline's does not and bash's does not.
-    /// Pressing it again then skips the `/` and takes `foo` with it,
-    /// which is also what bash does.
+    /// Alt-Backspace: readline's `backward-kill-word`. Only letters and
+    /// digits make a word, so `/`, `.`, `-` and `_` end one: `cd foo/bar`
+    /// loses `bar` and keeps `foo/`. Ctrl-W doesn't do that, as in readline
+    /// and bash. Pressing it again skips the `/` and takes `foo`, as bash
+    /// does.
     fn kill_word_backward_to_punctuation(&mut self) {
         let mut i = self.cursor;
         while i > 0 && !self.buf[i - 1].is_alphanumeric() {
@@ -652,12 +517,9 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
-    // Replaces buf[start..end] with `text`, cursor landing right after the
-    // inserted text. The one primitive both completion cycling and
-    // Ctrl-E's discard-and-revert share: a completion candidate is
-    // spliced in as real buffer content (not a separate dimmed overlay),
-    // which is what lets "keep typing" accept it for free -- the buffer
-    // is already correct, nothing special has to happen on acceptance.
+    // Replaces `buf[start..end]` with `text`, cursor after it. Completion
+    // splices candidates in as real text, so typing on accepts one with
+    // nothing more to do.
     fn splice_word(&mut self, start: usize, end: usize, text: &str) {
         let new_chars: Vec<char> = text.chars().collect();
         let new_len = new_chars.len();
@@ -666,15 +528,11 @@ impl LineEditor {
     }
 }
 
-// Tracks an in-progress multi-candidate completion: `word_start..cursor`
-// (the buffer's *current* cursor, always kept in sync by splice_word) is
-// the currently-spliced candidate's own span, `original` is what was
-// there before completion started (restored verbatim by Ctrl-E), and
-// `selected` indexes into `candidates` for cycling. Its mere existence
-// means "more than one candidate, ghost text is currently spliced into
-// the real buffer" -- a single-candidate auto-fill never creates one
-// (see trigger_completion), matching the request's own "just fill it
-// without showing the menu" spec.
+// An in-progress multi-candidate completion. `word_start..cursor` is the
+// spliced candidate's span (`splice_word` keeps the cursor in step),
+// `original` what was there before (restored by Ctrl-E), and `selected`
+// the current candidate. It exists only with several candidates: a single
+// one is filled in directly (see `trigger_completion`).
 struct CompletionState {
     word_start: usize,
     original: String,
@@ -682,11 +540,9 @@ struct CompletionState {
     selected: usize,
 }
 
-// Runs the provider fresh (no caching, matching this feature's blanket
-// "recomputed every trigger" scope) and either fills the one candidate
-// directly (0 or 1 results never need a menu/cycling state at all) or
-// splices in the first (Tab/Ctrl-N) or last (Shift-Tab/Ctrl-P) of several
-// and returns tracking state for cycling.
+// Runs the provider and fills in a lone candidate, or splices in the
+// first (Tab, Ctrl-N) or last (Shift-Tab, Ctrl-P) of several and returns
+// the state for cycling.
 fn trigger_completion(ed: &mut LineEditor, provider: &dyn CompletionProvider, backward: bool) -> Option<CompletionState> {
     let line = ed.as_string();
     let result = provider.complete(CompletionRequest { line: &line, cursor: ed.cursor });
@@ -706,10 +562,7 @@ fn trigger_completion(ed: &mut LineEditor, provider: &dyn CompletionProvider, ba
     }
 }
 
-// Removes the currently-spliced candidate's own range (word_start..cursor,
-// which splice_word always keeps in sync) and splices in the next/previous
-// one, wrapping. `state.candidates` itself never changes across a cycle --
-// only which one is currently shown.
+// Replaces the spliced candidate with the next or previous one, wrapping.
 fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: bool) {
     let n = state.candidates.len();
     state.selected = if backward { (state.selected + n - 1) % n } else { (state.selected + 1) % n };
@@ -717,28 +570,14 @@ fn cycle_completion(ed: &mut LineEditor, state: &mut CompletionState, backward: 
     ed.splice_word(state.word_start, ed.cursor, &text);
 }
 
-// Recomputed fresh on every redraw rather than tracked across
-// keystrokes -- same no-caching reasoning as the highlighter and the
-// completion sources (fuzzy/PATH/manpages), and, more importantly, a
-// real correctness trap avoided: by the time any match arm runs, the
-// completion reset rule above it may have already cleared `completion`,
-// so recomputing a suggestion *inside* an arm could produce one in
-// exactly the keystroke where it must not exist (suggestions aren't
-// applicable while the completion menu is active). Computing once,
-// before dispatch, and treating the result purely as "what's currently
-// rendered" sidesteps that -- the value read by Right/Ctrl-Y's own arms
-// is always exactly what was just drawn.
+// Computed once per redraw, before dispatch, so the suggestion the Right
+// and Ctrl-Y arms accept is exactly what was drawn; computing inside an
+// arm could show one in the very keystroke where completion just ended.
 //
-// Gate, all of which must hold: a provider was given; no completion is
-// active (including through the single-candidate auto-fill path, which
-// leaves `completion` None once it's spliced in -- a suggestion can
-// legitimately appear right after an auto-fill completes, correctly
-// indistinguishable from ordinary typing at that point); no history
-// browse is active (Up/Down recalls a *complete* entry -- painting a
-// ghost that extends it into a *different* command would read as noise
-// while scanning, and the moment browse resets on any other key the
-// ghost returns on its own); cursor at the buffer's end (suggestions
-// are end-of-line only, see the request's own scope); buffer non-empty.
+// Shown only when: a provider was given; no completion is active (a lone
+// candidate auto-filled leaves none, so a suggestion may follow); no
+// history browse is active (a ghost extending a recalled entry would be
+// noise); the cursor is at the end; and the buffer isn't empty.
 fn compute_suggestion(ed: &LineEditor, provider: Option<&dyn SuggestionProvider>, completion_active: bool, browsing: bool) -> Option<String> {
     let provider = provider?;
     if completion_active || browsing || ed.buf.is_empty() || ed.cursor != ed.buf.len() {
@@ -749,22 +588,16 @@ fn compute_suggestion(ed: &LineEditor, provider: Option<&dyn SuggestionProvider>
     Some(suggestion.text.chars().skip(ed.buf.len()).collect())
 }
 
-// Turns the ghost tail currently being rendered into real buffer text.
-// Only ever reachable with the cursor already at the buffer's end --
-// the sole condition under which a suggestion is computed at all -- so
-// this is a plain append with the cursor landing right after it,
-// expressed through splice_word (the same primitive completion
-// acceptance already goes through) rather than opening a second
-// insertion path.
+// Appends the ghost tail being shown, through `splice_word` like
+// completion. Only reachable with the cursor at the end.
 fn accept_suggestion(ed: &mut LineEditor, tail: &str) {
     let end = ed.buf.len();
     ed.splice_word(end, end, tail);
 }
 
-// The line editor's own half of a live snippet: everything about
-// *editing* one lives in bishedit::snippet::LiveSnippet, shared with the
-// file editor, and all that's left here is the two-line buffer adapter
-// plus how it's drawn. `line` is always 0 -- this buffer is one line.
+// The line editor's side of a live snippet: editing lives in
+// `snippet::LiveSnippet`, shared with the file editor; this is the
+// buffer adapter. `line` is always 0.
 impl snippet::SnippetHost for LineEditor {
     fn replace_span(&mut self, from: (usize, usize), to: (usize, usize), text: &str) {
         self.buf.splice(from.1..to.1, text.chars());
@@ -774,26 +607,15 @@ impl snippet::SnippetHost for LineEditor {
         self.cursor = col;
     }
 
-    // One line, always -- which is what makes a multi-line snippet fold
-    // to spaces here rather than corrupting the prompt buffer.
+    // One line, so a multi-line snippet folds to spaces here.
     fn is_multiline(&self) -> bool {
         false
     }
 }
 
-// The highlight layer that makes a tentative snippet read as one: the
-// placeholder being typed into is reverse-video (the same "this is the
-// selected one" mark the completion menu already uses), the rest are
-// underlined. Both are drawn over whatever the syntax highlighter made
-// of the text underneath, since a half-finished command line is
-// routinely not valid syntax yet.
-// The char index in `ed.buf` under real-terminal column `col`, or None
-// if that column is the prompt itself or past the end of the line.
-//
-// Goes through `char_at_col` rather than subtracting indices, because a
-// column is a *display* position: one CJK character is two columns wide
-// and a combining mark is none, so the two only coincide for plain
-// ASCII.
+// The char index in `ed.buf` under terminal column `col`, or `None` for
+// the prompt or past the end. Through `char_at_col`, since columns are
+// display positions: CJK takes two, a combining mark none.
 fn buf_index_at_column(prompt: &str, ed: &LineEditor, col_origin: usize, col: usize) -> Option<usize> {
     let prompt_len = visible_len(prompt);
     let text_start = col_origin + prompt_len;
@@ -804,8 +626,7 @@ fn buf_index_at_column(prompt: &str, ed: &LineEditor, col_origin: usize, col: us
     (idx <= ed.buf.len()).then_some(idx)
 }
 
-// A mouse selection, drawn the way a Visual selection is everywhere
-// else: reversed, over the columns the selected characters occupy.
+// A mouse selection, drawn like a Visual one: reversed.
 fn selection_layer(ed: &LineEditor, range: (usize, usize)) -> Vec<StyledSpan> {
     let (from, to) = (range.0.min(range.1), range.0.max(range.1).min(ed.buf.len()));
     if from >= to {
@@ -814,6 +635,9 @@ fn selection_layer(ed: &LineEditor, range: (usize, usize)) -> Vec<StyledSpan> {
     vec![StyledSpan { start: from, end: to, fg: vt100::Color::Default, attrs: vt100::CellAttrs { reverse: true, ..vt100::CellAttrs::default() } }]
 }
 
+// A live snippet's placeholders: the active one reversed, as the
+// completion menu marks its selection, the rest underlined, all over the
+// syntax highlighting.
 fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
     live.holes()
         .into_iter()
@@ -830,25 +654,13 @@ fn snippet_layer(live: &LiveSnippet) -> Vec<StyledSpan> {
         .collect()
 }
 
-// Fish-style `abbr` expansion: called right as the keystroke that would
-// end the word at the cursor arrives (Space) or would submit the whole
-// line (Enter) -- see `Shell::abbrs`'s own doc comment for the storage
-// half of this feature. Reuses completion.rs's own word-role walker
-// (`find_word_start`/`classify_word_role`) rather than inventing a
-// second "what word is this" notion: command position only, matching
-// fish's own default (`--position command`) -- an abbreviation typed as
-// an *argument* is left alone, same as a real command name would be.
-// `true` if an expansion happened (the caller's cue that the buffer
-// changed and, for Enter specifically, that this keystroke shouldn't
-// also submit the line -- fish's own "first Enter expands, second one
-// runs" behavior).
-//
-// An expansion carrying `%s` placeholders splices in as a live snippet
-// instead of as finished text, reported through `snippet` rather than
-// through the return value -- which stays a plain `bool` so the two
-// trigger sites can keep using it as a match guard (`Key::Enter if
-// expand_abbr_at_cursor(..)`), the shape that gives Enter its
-// expand-first-submit-second behavior for free.
+// `abbr` expansion, when the key that ends the word (Space) or submits
+// the line (Enter) arrives (see `Shell::abbrs`). Uses completion.rs's
+// `find_word_start`/`classify_word_role`, and expands only in command
+// position. Returns `true` if it expanded, so Enter expands first and runs
+// on the second press. An expansion with tabstops becomes a live snippet,
+// reported through `snippet`, which keeps the return a `bool` usable as a
+// match guard (`Key::Enter if expand_abbr_at_cursor(..)`).
 fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Option<LiveSnippet>) -> bool {
     if abbrs.is_empty() {
         return false;
@@ -864,52 +676,26 @@ fn expand_abbr_at_cursor(ed: &mut LineEditor, abbrs: &[Abbr], snippet: &mut Opti
     };
     match Snippet::parse(&abbr.expansion) {
         Some(snip) => *snippet = Some(LiveSnippet::start(snip, 0, word_start, word, ed)),
-        // No tabstops: ordinary text, but still read through the same
-        // escape rules, so `\$` is a literal `$` here too.
+        // No tabstops: plain text, but with the same escapes, so `\$` is `$`.
         None => ed.splice_word(word_start, ed.cursor, &snippet::flatten(&abbr.expansion)),
     }
     true
 }
 
-// `col_origin` is the real terminal column (0-indexed) this line's own
-// column 0 actually sits at -- 0 for the ordinary case (a bare `\r`
-// already lands there), non-zero when this read_line call is running
-// inside a compositor pane that doesn't start at the terminal's left
-// edge (see read_line's own doc comment). A bare `\r` always means
-// "real column 0," which is wrong the moment a pane's own left edge
-// isn't the terminal's; `\x1b[nG` (Cursor Horizontal Absolute) moves to
-// column n of whatever row the cursor is already on instead, so it's
-// used here even for col_origin == 0 (identical effect to `\r` in that
-// case, so this is a no-op change for every non-paned caller).
-// `width`: how many columns of this row belong to this line (the
-// pane's own cols, or the real terminal's width for the ordinary
-// non-paned case). Erasing is done by overwriting exactly this many
-// columns with spaces rather than `\x1b[K` (erase to end of the
-// *physical* terminal line): the bare terminal-wide form is wrong the
-// moment another pane shares this same real row further to the right
-// -- it would wipe that pane's content too. For the ordinary
-// non-paned/full-width case this is behaviorally identical to the old
-// `\x1b[K`.
+// `col_origin` is the terminal column this line's column 0 is at: 0
+// normally, more inside a pane not at the left edge. `\x1b[nG` (Cursor
+// Horizontal Absolute) is used rather than `\r` for that reason.
 //
-// `width` also bounds how much of prompt+buffer actually gets printed:
-// once that combined text would exceed it, the real terminal's own
-// autowrap (never disabled here) would wrap the overflow to column 1 of
-// the *next* row -- fine for the non-paned case (nothing else is there
-// to collide with), but that row belongs to some other pane the moment
-// this one doesn't span the whole terminal width, so the overflowing
-// characters would render into a neighboring pane's own content. Once
-// the buffer alone is too long to fit in what's left after the prompt,
-// this horizontally scrolls just the buffer text (prompt always stays
-// fully visible) so the cursor's own position is always shown, the same
-// "long line stays on one row" behavior GNU readline itself falls back
-// to in a narrow terminal -- recomputed fresh on every redraw from the
-// cursor's current position, not a persisted scroll offset.
-// `search_matches`: (start, end) char-column ranges within `ed.buf` to
-// show as reverse-video matches. Empty for every caller except
-// run_line_normal_mode (the only context where a vim search, and thus
-// something worth highlighting, can be in progress) -- turned into
-// compose_redraw's own generic `overlay` layer here rather than being a
-// second, parallel mechanism beside it.
+// `width` is the columns of this row that belong to this line (the pane's
+// or the terminal's). Erasing writes that many spaces rather than
+// `\x1b[K`, which would wipe a neighbouring pane on the same row. It also
+// bounds what's printed: autowrap would put overflow into the next row's
+// pane, so once the buffer doesn't fit beside the prompt, the buffer
+// scrolls horizontally to keep the cursor visible, recomputed each redraw.
+//
+// `search_matches` are char ranges in `ed.buf` drawn reversed, from
+// `run_line_normal_mode`'s vim search, passed to `compose_redraw` as its
+// overlay.
 fn redraw(
     prompt: &str,
     ed: &LineEditor,
@@ -931,31 +717,15 @@ fn redraw(
     io::stdout().flush()
 }
 
-// The escape-coded string redraw() prints, split out so
-// redraw_with_completion_row can fold it into one larger string of its
-// own rather than issuing a separate print!/flush for it -- two
-// separate writes left a real, visible window between them where the
-// terminal had already rendered the intermediate "moved down, column
-// reset" state from the first write before the second one corrected it,
-// showing up as the cursor briefly jumping to the start of the row on
-// every keystroke. One write, one flush, matches this function's own
-// original design intent (build the whole string first, print it once).
+// The string `redraw` prints, separate so
+// `redraw_with_completion_row` can make one write of it plus its own:
+// two writes showed the cursor jumping between them on every key.
 //
-// `ghost`: a suggestion's full, untruncated dimmed tail, rendered right
-// after the real buffer -- empty for every caller except read_line's
-// own suggestion support, and only ever non-empty when
-// `ed.cursor == ed.buf.len()` (the caller's own gate; not re-asserted
-// here). Truncated to fit *here*, not by the caller -- see the
-// `ghost_room` computation below.
-//
-// `overlay`: whatever the caller wants marked up on top of the line --
-// a vim search's own matches in reverse video (`hlsearch`, see
-// `redraw`), or a live `abbr` snippet's placeholders (see
-// `snippet_layer`). Composed as the *last* layer (see
-// highlight::compose's own doc comment on later layers winning), so it
-// visually wins over both syntax highlighting and a suggestion's ghost
-// tail wherever they overlap -- matching vim, where `hlsearch` sits on
-// top of everything else. Empty for every caller with nothing to mark.
+// `ghost` is a suggestion's full dimmed tail, drawn after the buffer and
+// truncated here (see `ghost_room`); only non-empty with the cursor at
+// the end. `overlay` is what to mark on top (search matches, a snippet's
+// placeholders; see `snippet_layer`), composed last so it wins over
+// highlighting and the ghost, as vim's `hlsearch` does.
 fn compose_redraw(
     prompt: &str,
     ed: &LineEditor,
@@ -972,11 +742,8 @@ fn compose_redraw(
 
     let prompt_len = visible_len(prompt);
     if prompt_len >= width {
-        // The prompt alone doesn't fit this pane's width -- show as
-        // much of it as does; there's no room left for any buffer text
-        // to show anyway. A real edge case (needs a pane narrower than
-        // the prompt itself, typically a 4+ way split), not worth more
-        // than graceful degradation.
+        // The prompt alone doesn't fit, so show what does; no room is left
+        // for the buffer anyway.
         out.push_str(&truncate_visible(prompt, width));
         out.push_str("\x1b[0m");
         return out;
@@ -985,24 +752,14 @@ fn compose_redraw(
     out.push_str(prompt);
     let remaining = width - prompt_len;
 
-    // Highlight the whole buffer up front, then slice the *resolved*
-    // cells for whichever window ends up visible below -- a span that
-    // starts before the horizontally-scrolled window and extends into it
-    // still renders correctly from column 0 with no separate clipping
-    // logic, since slicing happens after per-char style is already
-    // resolved (same as how the un-highlighted code already sliced
-    // Vec<char>). Recomputed fresh on every redraw, same as the rest of
-    // this function -- no caching, matching this feature's own stated
-    // out-of-scope list (a single command line's worth of recomputation
-    // per keystroke is cheap enough that it isn't worth it).
+    // The whole buffer is highlighted, then the visible window's cells
+    // sliced out, so a span starting before the window still renders from
+    // its first column.
     let buf_text: String = ed.buf.iter().collect();
     let raw = BashHighlighter.highlight(&buf_text, ctx);
-    // The other half of what the highlighter already produces: a path
-    // that resolved against the cwd carries the `file://` URL it
-    // resolved to, and a URL typed into the line is one of its own.
-    // Both become real terminal hyperlinks here (see
-    // highlight::render_linked), so ^click on a filename at the prompt
-    // opens it.
+    // A path resolved against the cwd carries its `file://` URL, and a typed
+    // URL is one: both become terminal hyperlinks (see
+    // `highlight::render_linked`).
     let mut links: Vec<highlight::LinkSpan> = if !ctx.hyperlinks {
         Vec::new()
     } else {
@@ -1022,27 +779,18 @@ fn compose_redraw(
         })
         .collect();
 
-    // `combined` is the real buffer plus as much of the ghost tail as
-    // fits in whatever's left after the buffer -- truncated here
-    // (rather than trusting the caller to have already done it) since
-    // `remaining` is only known once the prompt's own width is
-    // accounted for, right here. Zero room (an already-overlong buffer)
-    // silently drops the whole ghost rather than wrapping it into a
-    // neighboring pane's row -- a deliberate v1 simplification, not a
-    // caller contract that could be violated. Styled as two layers over
-    // one char slice -- highlight::compose already supports this (a
-    // later layer wins per-cell), so the ghost needs no new
-    // presentation machinery of its own. With ghost == "" (or zero
-    // room) this is byte-for-byte the old ed.buf-only behavior:
-    // combined == ed.buf, the ghost layer is empty, nothing changes.
+    // `combined` is the buffer plus as much of the ghost as fits in what's
+    // left after the prompt, known only here; with no room the ghost is
+    // dropped rather than wrapped into a neighbour. Drawn as two layers with
+    // `compose`. With no ghost it's just the buffer.
     let ghost_room = remaining.saturating_sub(ed.buf.len());
     let mut combined = ed.buf.clone();
     combined.extend(ghost.chars().take(ghost_room));
     let ghost_layer = if combined.len() == ed.buf.len() {
         Vec::new()
     } else {
-        // Same (fg, attrs) pair default_style(HighlightKind::Comment)
-        // already uses -- this codebase's existing "greyed out" convention.
+        // The (fg, attrs) of `default_style(HighlightKind::Comment)`, the
+        // greyed look.
         vec![StyledSpan {
             start: ed.buf.len(),
             end: combined.len(),
@@ -1050,37 +798,26 @@ fn compose_redraw(
             attrs: vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() },
         }]
     };
-    // `overlay` last, so whatever the caller is marking up -- a vim
-    // search's own matches, a live `abbr` snippet's placeholders -- wins
-    // over the syntax highlighting underneath it, which for a
-    // half-finished command line is routinely not even valid syntax yet.
+    // `overlay` last, so the caller's marks (search matches, snippet
+    // placeholders) win over the highlighting of a line that's often not
+    // valid syntax yet.
     let cells = highlight::compose(&combined, &[&styled, &ghost_layer, overlay]);
 
     if combined.len() <= remaining {
         out.push_str(&highlight::render_linked(&cells, &links));
-        // Walks the real cursor back past the ghost tail (present or
-        // not) to land right after the real buffer, at ed.cursor's own
-        // position -- cursor-wise, the ghost doesn't exist. With no
-        // ghost this is exactly the old `ed.buf.len() - ed.cursor`.
+        // Moves the cursor back past the ghost to `ed.cursor`: as far as the
+        // cursor is concerned, the ghost isn't there.
         let back = combined.len() - ed.cursor;
         if back > 0 {
             out.push_str(&format!("\x1b[{}D", back));
         }
     } else {
-        // Right-align the visible window on the cursor whenever it
-        // would otherwise fall outside what's currently shown --
-        // clamped so the window never scrolls past showing the
-        // buffer's own tail once the cursor's at or past the end
-        // (typing forward, by far the common case). Unreachable with a
-        // non-empty ghost in practice (the caller never truncates a
-        // ghost to fit only to have combined still overflow), but the
-        // math here is unaffected either way since it only ever
-        // references ed.buf/ed.cursor, never `combined`.
+        // Right-aligns the window on the cursor when it would fall outside,
+        // clamped so the window never scrolls past the buffer's tail.
         let window_start = ed.cursor.saturating_sub(remaining - 1).min(ed.buf.len() - remaining);
         let window_end = (window_start + remaining).min(ed.buf.len());
-        // Rebased onto the window, the same way the cells themselves
-        // are sliced -- a link that starts before the visible window
-        // still hyperlinks the part of it that shows.
+        // Rebased onto the window, as the cells are, so a link starting
+        // before it still links the part that shows.
         let windowed: Vec<highlight::LinkSpan> = links
             .iter()
             .filter(|l| l.start < window_end && l.end > window_start)
@@ -1100,17 +837,11 @@ fn compose_redraw(
     out
 }
 
-// Lays out a completion menu row: every candidate's own `display` joined
-// by spaces, a bold StyledSpan per matched character (from each
-// candidate's own `matched_positions`), and the selected candidate's
-// whole span tracked separately so it can both get a reverse-video
-// StyledSpan and anchor the width-clamping window below. Building the
-// bold layer and the reverse span as two separate compose() layers
-// (rather than merging attrs by hand) means the selected candidate's
-// bold matched-character highlighting gets overwritten by its own
-// reverse-video span where they overlap -- a minor, accepted
-// simplification, since the selected candidate already stands out via
-// reverse video on its own.
+// A completion menu row: the candidates joined by spaces, a bold span
+// per matched character, and the selected candidate's span, drawn
+// reversed and anchoring the width clamp. As separate layers, the
+// reversed span covers the selected candidate's bold matches, which is
+// fine since it already stands out.
 struct CompletionRow {
     chars: Vec<char>,
     bold: Vec<StyledSpan>,
@@ -1150,43 +881,22 @@ fn build_completion_row(state: &CompletionState) -> CompletionRow {
     CompletionRow { chars: text.chars().collect(), bold, selected, selected_range }
 }
 
-/// Blanks the completion menu row, for a caller whose cursor has just
-/// moved onto it -- i.e. immediately after the `\r\n` that ends a
-/// prompt.
-///
-/// Everything drawn below the prompt line is the prompt's own
-/// affordance, and whatever runs next will not tidy it up: a command
-/// writes from the cursor onward and leaves standing whatever it does
-/// not happen to cover. That is how `e src/` + Tab, run and quit, could
-/// hand bash back a prompt line with a row of completion candidates
-/// still sitting in it -- the row outlived the shell that drew it.
-///
-/// Exactly the columns this prompt drew, never `\x1b[K` to the end of
-/// the real line: in a split window that reaches into the pane next
-/// door. The cursor is left back at column 0 where the newline put it,
-/// so nothing downstream has to know this happened.
-///
-/// Plain mode only. In grid mode the compositor owns the screen and
-/// repaints the pane wholesale, so there is nothing to clean up -- and
-/// a prompt on the pane's last row would have this writing spaces onto
-/// the tab bar after the newline scrolled.
-/// Repaints the prompt line with nothing on it but what was typed --
-/// no inline suggestion, no snippet placeholders, no mouse selection.
-///
-/// The suggestion is drawn *after* the cursor, so submitting a line
-/// left it standing and the scrollback recorded a command nobody ran:
-/// typing `echo alpha` under a history entry `echo alpha-beta-gamma`
-/// scrolled away as `echo alpha-beta-gamma`, directly above the output
-/// `alpha`. A terminal's record of what was run is the last thing that
-/// should be embellished.
-///
-/// `compose_redraw` blanks its own `width` columns before drawing, so
-/// this needs no erase of its own and stays inside the pane in grid
-/// mode exactly as every other redraw does.
+/// Repaints the prompt line with only what was typed: no suggestion,
+/// snippet placeholders or mouse selection. A suggestion drawn after the
+/// cursor would otherwise stay in the scrollback as a command nobody ran.
+/// `compose_redraw` blanks its own columns, so no erase is needed.
 fn repaint_without_affordances(prompt: &str, ed: &LineEditor, col_origin: usize, width: usize, ctx: HighlightContext) -> String {
     compose_redraw(prompt, ed, "", col_origin, width, ctx, &[])
 }
 
+/// Blanks the completion menu row, right after the `\r\n` that ends a
+/// prompt. What runs next writes from the cursor and leaves what it
+/// doesn't cover, so the candidates would outlive the shell that drew
+/// them. Only the columns this prompt drew, never `\x1b[K`, which would
+/// reach the next pane; the cursor goes back to column 0.
+///
+/// Plain mode only: in grid mode the compositor repaints the pane, and on
+/// the pane's last row this would write onto the tab bar.
 fn erase_menu_row_under_cursor(
     menu_capable: bool,
     menu_was_shown: bool,
@@ -1200,77 +910,18 @@ fn erase_menu_row_under_cursor(
     }
 }
 
-// Wraps redraw() with exactly one extra row for the completion menu,
-// positioned via relative cursor movement (down 1, then back up 1)
-// rather than absolute-row tracking or save/restore-cursor: save/
-// restore captures an *absolute* coordinate, which goes stale the
-// moment a scroll happens between save and restore -- exactly the
-// "prompt on the terminal's last row" case this needs to survive.
-//
-// IMPORTANT, and previously wrong in this comment: relative movement
-// does NOT net to zero rows moved regardless of what scrolled in
-// between. Verified directly (bypassing this codebase entirely, driving
-// a plain terminal with raw escape sequences and tmux's own cursor-
-// position introspection as the oracle): when the cursor is genuinely
-// on the terminal's true bottom margin, `\n` scrolls the whole screen up
-// by one row but leaves the cursor's own absolute row index unchanged
-// (it stays on the now-blank bottom row) -- so the content that used to
-// be "the current row" is now one row higher than the cursor. The
-// following `\x1b[1A` then moves up by exactly one row unconditionally,
-// landing exactly on that shifted content and overwriting it -- a real,
-// deterministic, single-invocation loss of one row, not a save/restore-
-// style staleness issue. This is why `menu_was_shown` below exists:
-// since this function used to run on *every* redraw (see its own
-// removed claim above), the very first time typing/output reached the
-// terminal's true last row would permanently pull the prompt up by one
-// row, and it would never be touched again -- exactly the "the
-// terminal's true last row is never used" bug this was found while
-// fixing. Gating the whole block to only run when a completion menu is
-// actually relevant (`completion.is_some() || menu_was_shown`) doesn't
-// make a single dance invocation any safer in isolation, but it makes
-// the dance rare enough in practice (only during active completion use,
-// not on every keystroke) that this residual risk is an accepted,
-// documented gap rather than a routine failure. The row is still always
-// erased once more after a completion ends (even though `completion` is
-// already None by then), clearing a stale row left over from the
-// previous call -- `menu_was_shown` is what keeps that one extra redraw
-// gated in too. `\x1b[1A` restores the *row* but not the column
-// redraw() already left the real cursor at -- the second compose_redraw
-// call is the deliberately-simple way to fix that, rather than
-// duplicating redraw()'s own column math here.
-//
-// The "move down" step is a literal `\n`, not `\x1b[1B` (Cursor Down):
-// CUD is defined to *clamp* at the terminal's bottom margin rather than
-// scroll, unlike a real linefeed, which was silently corrupting the
-// *previous* command's own output row (found via interactive testing)
-// before this used `\n` instead.
-//
-// Everything is assembled into one string and written with a single
-// print!/flush, not two separate ones -- an earlier version called
-// redraw() (its own print!+flush) for the base row, then did a second,
-// separate print!+flush for the rest. That left a real, brief window
-// after the first flush where the terminal had already rendered the
-// intermediate "moved down a row, column reset to col_origin" state
-// before the second flush corrected it -- visible as the cursor jumping
-// to the start of the row on every single keystroke (found via the
-// user's own interactive testing). One write settles directly on the
-// final state with nothing intermediate ever rendered.
-// The completion menu row's own styled content (candidate names, bold
-// matched positions, reverse-video selection), with no positioning of
-// its own -- shared by both redraw_with_completion_row's relative
-// (plain-mode) and absolute (grid-mode) paths below, which only differ
-// in *how* they get the real cursor down to this row and back.
+// The completion menu row's styled content, without positioning: shared
+// by `redraw_with_completion_row`'s relative (plain) and absolute (grid)
+// paths.
 fn render_menu_row_content(state: &CompletionState, width: usize) -> String {
     let row = build_completion_row(state);
     let cells = highlight::compose(&row.chars, &[&row.bold, &row.selected]);
     let visible: &[vt100::Cell] = if row.chars.len() <= width {
         &cells
     } else {
-        // Right-anchors the window on the selected candidate's own end,
-        // same shape as redraw()'s own cursor-visibility clamp for an
-        // overlong buffer -- a long candidate list stays truncated/
-        // scrolled to `width` rather than wrapping into a neighboring
-        // pane's row.
+        // Right-anchored on the selected candidate's end, so a long list
+        // scrolls within `width` rather than wrapping into a neighbouring
+        // pane.
         let window_start = row.selected_range.end.saturating_sub(width).min(row.chars.len() - width);
         let window_end = (window_start + width).min(row.chars.len());
         &cells[window_start..window_end]
@@ -1278,51 +929,52 @@ fn render_menu_row_content(state: &CompletionState, width: usize) -> String {
     highlight::render_styled(visible)
 }
 
+// `redraw` plus one row for the completion menu, reached by relative
+// movement (`\n` down, `\x1b[1A` up) rather than saved cursor positions,
+// which a scroll invalidates.
+//
+// That isn't free either: on the terminal's bottom row, `\n` scrolls the
+// screen but leaves the cursor's row index, so `\x1b[1A` lands on the
+// shifted content and overwrites it, losing a row. So this runs only
+// while a menu is relevant (`completion.is_some() || menu_was_shown`),
+// not on every key, which makes that loss rare; `menu_was_shown` keeps
+// one more pass to erase the row after a completion ends. The second
+// `compose_redraw` restores the column.
+//
+// Down is a literal `\n`, not `\x1b[1B`, which clamps at the bottom margin
+// instead of scrolling and overwrote the previous command's output.
+// Everything is one write, so the cursor never visibly jumps.
 fn redraw_with_completion_row(
     prompt: &str,
     ed: &LineEditor,
     ghost: &str,
     completion: Option<&CompletionState>,
-    // Whether a completion menu was showing on the *previous* redraw --
-    // the dance below still has to run once more after a completion ends
-    // (Tab-accepted, Ctrl-E-discarded, or "locked in" by an unrelated
-    // key) purely to erase that stale row, even though `completion` is
-    // already None by then. See this function's own doc comment for why
-    // it must NOT run on every other redraw too.
+    // Whether a menu showed on the previous redraw: the row has to be erased
+    // once more after a completion ends, though `completion` is `None` by
+    // then.
     menu_was_shown: bool,
     menu_capable: bool,
-    // `Some((prompt_row, pane_bottom_row))` in grid/promoted mode (an
-    // unsplit window only -- see read_line's own doc comment): both
-    // absolute, 0-indexed real terminal rows, computed once by repl.rs
-    // before this whole read_line call starts (from the session's own
-    // vt100::Screen cursor, which tracks correctly independent of the
-    // real-terminal scrolling ambiguity relative movement has -- see
-    // this function's own doc comment) and constant for its duration,
-    // the same way `col_origin`/`width` already are. `pane_bottom_row`
-    // is the pane's own last row, never the tab bar's -- when there's no
-    // room below `prompt_row` to fit within it, the menu is skipped
-    // entirely rather than risking a spill. `None` in plain mode (no
-    // fixed rect to know a row against -- relative movement handles it)
-    // and for command mode's colon-line (no meaningful pane context).
+    // `Some((prompt_row, pane_bottom_row))` in grid mode (an unsplit window;
+    // see `read_line`): absolute 0-indexed terminal rows, computed by repl.rs
+    // from the session's `vt100::Screen` cursor before the call and constant
+    // throughout. `pane_bottom_row` is the pane's last row, never the tab
+    // bar's; without room below the prompt the menu is skipped. `None` in
+    // plain mode, and on the colon line.
     row_origin: Option<(usize, usize)>,
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
-    // A live `abbr` snippet's own placeholder marking, empty the rest of
-    // the time -- see `snippet_layer`.
+    // A live snippet's placeholder marking, usually empty; see
+    // `snippet_layer`.
     overlay: &[StyledSpan],
 ) -> io::Result<()> {
     let mut out = compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay);
     if menu_capable && (completion.is_some() || menu_was_shown) {
         match row_origin {
-            // Grid/promoted mode: absolute positioning only, never
-            // relative movement -- a stray real scroll here would desync
-            // the real terminal from the session's own virtual grid,
-            // corrupting the tab bar or a neighboring pane in the
-            // meantime (the same mechanism bug the Ctrl-C fix elsewhere
-            // in this codebase addresses for a different trigger).
-            // `\x1b[{row};{col}H` jumps are unambiguous regardless of
-            // terminal scroll state, so there's no dance needed at all.
+            // Grid mode: absolute positioning only. A real scroll here
+            // would desync the terminal from the session's grid and corrupt
+            // the tab bar or a neighbouring pane; `\x1b[{row};{col}H` is
+            // unambiguous.
             Some((prompt_row, pane_bottom_row)) => {
                 let menu_row = prompt_row + 1;
                 if menu_row <= pane_bottom_row {
@@ -1332,17 +984,13 @@ fn redraw_with_completion_row(
                     if let Some(state) = completion {
                         out.push_str(&render_menu_row_content(state, width));
                     }
-                    // Absolute jump back, not \x1b[1A -- fixes both row
-                    // and column in one unambiguous move.
+                    // An absolute jump back fixes row and column at once.
                     out.push_str(&format!("\x1b[{};{}H", prompt_row + 1, col_origin + 1));
                     out.push_str(&compose_redraw(prompt, ed, ghost, col_origin, width, ctx, overlay));
                 }
-                // else: no room below the prompt within this pane --
-                // gracefully skip showing the menu this redraw, same
-                // degradation plain mode already has when `menu_capable`
-                // is false.
+                // No room below the prompt in this pane: no menu this time.
             }
-            // Plain mode: the relative-movement dance.
+            // Plain mode: the relative-movement sequence.
             None => {
                 out.push('\n');
                 out.push_str(&format!("\x1b[{}G", col_origin + 1));
@@ -1361,27 +1009,12 @@ fn redraw_with_completion_row(
     io::stdout().flush()
 }
 
-// How many terminal columns `s` actually occupies once drawn, not
-// counting invisible escape bytes -- `s` is always one of this crate's
-// own prompt strings, which only ever embed `\x1b[...m` SGR (color)
-// codes, so that's the only escape form this needs to recognize. Each
-// visible char counts for its own real display width (bishedit::
-// unicode_width::char_width), not a flat 1 -- the cwd embedded in the
-// default prompt is real, user-controlled path text, wide CJK
-// characters/emoji included, not just ASCII.
-// pub(crate): repl.rs's own freeze-with-text helper (Ctrl+G with
-// in-progress text) reuses this to know how many *visible* columns a
-// colored prompt occupies, so it can position the frozen row's
-// ScreenBuffer cursor at the right column rather than guessing.
-//
-// Grapheme-cluster-aware for the *visible* text (a ZWJ emoji sequence
-// counts once, not once per codepoint -- see bishedit::unicode_width::
-// str_width's own doc comment for the exact same fix and why): SGR
-// escapes are stripped first into a plain char buffer, then walked
-// cluster by cluster via bishedit::grapheme::next_boundary, since that
-// function needs an indexable `&[char]` slice (grapheme boundaries
-// GB11/GB12/13 look several codepoints backward) that a single-escape-
-// lookahead streaming scan can't provide directly.
+// How many columns `s` takes when drawn, ignoring its SGR codes (the only
+// escapes a prompt holds). Each character counts its display width, and
+// clusters count once (see `unicode_width::str_width`), since the cwd in a
+// prompt can hold CJK or emoji. The escapes are stripped into a char
+// buffer first, because finding cluster boundaries looks several
+// codepoints back. repl.rs uses it to place a frozen prompt's cursor.
 pub(crate) fn visible_len(s: &str) -> usize {
     let mut visible_chars: Vec<char> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -1406,33 +1039,18 @@ pub(crate) fn visible_len(s: &str) -> usize {
     len
 }
 
-// Like visible_len, but returns the prefix of `s` whose *visible*
-// portion is at most `max_visible` columns, preserving any embedded SGR
-// codes encountered along the way (they don't count against the
-// budget) rather than risking a mid-escape-sequence cut.
-//
-// Grapheme-cluster-aware, as `visible_len` is, and for the same
-// reason: a cut that lands in the middle of a ZWJ sequence or between
-// a base character and its combining mark leaves half a glyph, and
-// half a glyph is not one column narrower -- it is a different
-// character. So the input is taken apart into escape sequences (no
-// width) and visible characters (some), the cluster boundaries are
-// found in the visible characters alone -- an escape between a base
-// and its mark does not break the cluster it sits in -- and a cluster
-// is then admitted or refused whole.
-//
-// A wide character that would only *partially* fit (`max_visible` has
-// exactly one column left, the next character is two wide) is dropped
-// whole rather than split -- there's no such thing as half a CJK glyph, and this only
-// ever feeds into padding/truncation math that tolerates landing one
-// column short of the budget, never one over it.
+// The prefix of `s` at most `max_visible` columns wide, keeping its SGR
+// codes, which cost nothing. Taken by whole grapheme clusters, finding
+// boundaries among the visible characters only (an escape between a base
+// and its mark doesn't split them): half a cluster is a different
+// character. A wide character that would only partly fit is dropped,
+// since callers tolerate one column short, never one over.
 fn truncate_visible(s: &str, max_visible: usize) -> String {
     enum Piece {
         /// An SGR sequence, kept as written and costing nothing.
         Escape(String),
-        /// One visible character, and its index among the visible
-        /// characters -- which is the sequence cluster boundaries are
-        /// found in.
+        /// One visible character and its index among the visible ones, where
+        /// cluster boundaries are found.
         Visible(char, usize),
     }
 
@@ -1456,9 +1074,8 @@ fn truncate_visible(s: &str, max_visible: usize) -> String {
         visible.push(c);
     }
 
-    // Where each cluster begins. A character that is not one of these
-    // is the rest of the cluster before it, and rides along with
-    // whatever was decided about that one.
+    // Where each cluster starts; the other characters belong to the cluster
+    // before and follow its fate.
     let mut starts = vec![false; visible.len()];
     let mut i = 0;
     while i < visible.len() {
@@ -1488,116 +1105,71 @@ fn truncate_visible(s: &str, max_visible: usize) -> String {
 
 pub enum ReadOutcome {
     Line(String),
-    /// Text that arrived with newlines in it, and must not run yet.
+    /// Text with newlines in it that must not run yet. Without bracketed
+    /// paste, a pasted block arrives as characters and Enters, so each line
+    /// runs as it lands. With it, the newlines are text: `lines` are the
+    /// complete lines, which the caller appends to its continuation buffer
+    /// without running, and `rest` is what follows the last newline, which
+    /// goes back into the prompt with the cursor at `cursor`.
     ///
-    /// A paste is the reason this exists. Without bracketed paste a
-    /// pasted block arrives as characters and Enters, indistinguishable
-    /// from typing, so the shell runs each line as it lands -- half a
-    /// script executes while the rest is still being pasted, and a
-    /// paste that was meant to be edited first never gets the chance.
-    /// With it, the newlines are text: `lines` are the complete ones,
-    /// which the caller appends to its continuation buffer and does
-    /// *not* execute, and `rest` is what is left after the last
-    /// newline, which goes back into the prompt with the cursor at
-    /// `cursor` for the next read to carry on from.
-    ///
-    /// Alt-Enter produces one of these too, with a single complete
-    /// line: it is the deliberate version of the same thing, for
-    /// adding a line to a command that would otherwise have run.
+    /// Alt-Enter produces one too, with a single line: deliberately adding a
+    /// line to a command that would otherwise run.
     Pasted {
         lines: Vec<String>,
         rest: String,
         cursor: usize,
     },
     Eof,
-    // Ctrl-C (and command mode's own Escape/Backspace cancel). `text` is
-    // whatever had been typed at that moment -- not so the caller can
-    // resume it (Ctrl-C abandons the line, that's the point) but so it
-    // can record what the terminal was actually *showing* into its own
-    // grid before repainting over it. read_line draws the prompt
-    // straight to the real screen and never through any grid, so a
-    // caller that repaints from one would otherwise blank the line
-    // Ctrl-C just echoed onto and then redraw a fresh prompt over it --
-    // a visible flash, and a `^C` that vanishes instead of staying in
-    // the scrollback the way bash leaves it.
+    // Ctrl-C, or the colon line's Escape and Backspace cancel. `text` is what
+    // was typed, not to resume (Ctrl-C abandons the line) but so the caller
+    // can put what the terminal shows into its grid before repainting:
+    // `read_line` draws straight to the screen, and a caller repainting from
+    // its grid would otherwise blank the line and lose the `^C`, which bash
+    // leaves in the scrollback.
     Interrupted {
         text: String,
     },
-    // Alt+Left/Right/Up at an empty buffer -- see DirNav's own doc
-    // comment. Never fires with anything typed (see read_line's own
-    // handling), so there's no "what happens to the buffer" question.
+    // Alt+Left/Right/Up on an empty buffer; see `DirNav`.
     DirNav(DirNav),
-    // Ctrl+G -- unconditional now, regardless of what's been typed
-    // (previously gated to an empty buffer only, the same "don't discard
-    // in-progress typing" reasoning DirNav above still uses). Enters
-    // bishedit's normal-mode navigation over the current pane's own
-    // rendered content (repl.rs's run_normal_mode_navigation) -- the
-    // *only* way into command mode now (via normal mode's own ':',
-    // matching real vim) since the old direct ':'-at-the-shell-prompt
-    // shortcut was retired. `text`/`cursor` are `ed.as_string()`/
-    // `ed.cursor` at the moment Ctrl+G was pressed, so the caller can
-    // both show what's already been typed in its pane view and hand it
-    // back (via `read_line`'s own `initial` parameter) to whatever
-    // `read_line` call eventually resumes editing -- nothing is silently
-    // discarded now that this isn't empty-buffer-only anymore. `i`/`a`/
-    // `I`/`A`/`s`/`S`/`C` in normal mode all act relative to this
-    // *original* cursor (not wherever normal mode's own navigation cursor
-    // wanders off to -- see run_normal_mode_navigation's own doc comment).
-    // `wheel` is the notch that asked for this, when a wheel is what
-    // opened it rather than Ctrl+G. A promoted prompt has mouse
-    // reporting on (see repl.rs's prompt_claims_mouse), so the terminal
-    // no longer scrolls its own scrollback -- and bish's scrollback view
-    // *is* normal mode, so a notch means "show me that". Carried rather
-    // than dropped so the notch that got you here also scrolls: entering
-    // a mode and not moving reads as the wheel being broken, which is
-    // the complaint this whole path exists to answer.
+    // Ctrl+G, whatever has been typed: Normal-mode navigation over the
+    // pane's content (repl.rs's `run_normal_mode_navigation`), and from
+    // there `:` for command mode. `text` and `cursor` are the line at that
+    // moment, shown in the pane and handed back through `read_line`'s
+    // `initial` when editing resumes; `i`, `a`, `I`, `A`, `s`, `S`, `C` act
+    // relative to that cursor.
+    //
+    // `wheel` is the notch that opened it, if a wheel did. A promoted
+    // prompt has mouse reporting on (see `prompt_claims_mouse`), so the
+    // terminal doesn't scroll its scrollback, and Normal mode is bish's
+    // scrollback view, so the notch that got you there scrolls too.
     NormalMode {
         text: String,
         cursor: usize,
         wheel: Option<MouseEvent>,
     },
-    // A qualifying left click (see MouseEvent::is_left_click) anywhere
-    // during ordinary typing. Bubbled up the same way NormalMode is --
-    // read_line has no idea `windows`/panes exist at all, only its own
-    // pane's col_origin/width, so hit-testing which tab/pane the click
-    // actually landed on is entirely the caller's job (repl.rs's own
-    // hit_test_click). `text`/`cursor` are `ed.as_string()`/`ed.cursor`
-    // at the moment of the click, same reasoning as NormalMode's own
-    // fields: whatever was typed so far must not be silently discarded,
-    // even though (unlike NormalMode) resuming into the *same* buffer
-    // isn't generally what happens next -- see this outcome's own repl.rs
-    // handler for why a genuine focus change instead freezes this text
-    // into the losing pane's own grid.
+    // A left click (see `MouseEvent::is_left_click`) while typing, passed up
+    // like `NormalMode`: `read_line` doesn't know about panes, so hit-testing
+    // is repl.rs's (`hit_test_click`). `text` and `cursor` keep what was
+    // typed; on a focus change repl.rs freezes it into the old pane's grid.
     Mouse {
         event: MouseEvent,
         text: String,
         cursor: usize,
     },
-    // Ctrl+T -- the fuzzy opener (repl.rs's run_opener), over the panes
-    // that are open and the files and directories git tracks. Bubbled up
-    // rather than handled here for the same reason NormalMode is: the
-    // list is made of windows and repositories, neither of which this
-    // crate knows exist. `text`/`cursor` are what had been typed, handed
-    // back through `read_line`'s own `initial` so that closing the opener
-    // without picking anything leaves the line exactly as it was.
+    // Ctrl+T: the fuzzy opener (repl.rs's `run_opener`), passed up since
+    // its list is windows and repositories. `text` and `cursor` come back
+    // through `initial` if nothing is picked.
     Opener {
         text: String,
         cursor: usize,
     },
-    // Ctrl-L, but only when the caller opted in via `ctrl_l_reports` (see
-    // that parameter's own doc comment) -- command mode's own toggle for
-    // showing its whole command+output transcript. Whatever was typed so
-    // far is discarded, same simplification DirNav/NormalMode already
-    // make for their own callers with nothing meaningful to preserve
-    // across the jump.
+    // Ctrl-L when the caller asked for it (`ctrl_l_reports`): command mode's
+    // transcript toggle. What was typed is discarded.
     CtrlL,
 }
 
-// Directory-history navigation (browser-style back/forward, plus "up to
-// parent"), triggered by Alt+Left/Right/Up. repl.rs owns the actual
-// per-session history stack and cd logic -- this just reports which
-// direction was requested, the same "editor.rs only decodes keys, the
-// caller decides what they mean" split as NormalMode/Eof/Interrupted.
+// Directory navigation (back, forward, up), from Alt+Left/Right/Up.
+// repl.rs owns the history and the `cd`; this reports the direction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DirNav {
     Back,
@@ -1605,64 +1177,11 @@ pub enum DirNav {
     Up,
 }
 
-// Reads one line of input interactively: prompt is printed, raw mode is
-// engaged only for the duration of this call (restored on every return
-// path via RawGuard's Drop), so a foreground command run in between calls
-// sees an entirely normal terminal.
-// `history` is the calling session's own History value (see its doc
-// comment): a persistent, per-session chain, so Up/Down here naturally
-// only ever sees that session's own commands plus whatever it inherited
-// at fork time -- no separate boundary/cutoff parameter needed, the
-// scope is inherent to which chain was passed in.
-// `esc_cancels`: whether Esc, when there's no active history browse to
-// unwind instead, cancels the whole read (same ReadOutcome::Interrupted
-// as Ctrl-C, just without the "^C" echo). Off for the normal shell
-// prompt (Esc there stays a no-op outside of history browsing, matching
-// this crate's existing behavior); on for command mode, which -- like a
-// vim ':' command line -- should be cancelable by either Ctrl-C or Esc
-// regardless of what's been typed.
-// `ctrl_l_reports`: whether Ctrl-L is reported as `ReadOutcome::CtrlL`
-// instead of this crate's usual "clear the real screen" handling. Off
-// for the normal shell prompt (Ctrl-L there keeps meaning "clear
-// screen," the readline/bash convention); on for command mode, which
-// gives Ctrl-L its own meaning (toggling the command+output transcript
-// view -- see repl.rs's run_command_mode).
-// `on_idle`: called whenever this is about to block waiting for the next
-// keystroke and none has arrived yet within one poll tick -- lets
-// repl.rs's main loop (M10c) service other windows' backgrounded fg jobs
-// (draining their pty output into their own grids, reaping them if
-// they've exited) while this window sits idle at its own prompt, instead
-// of a job elsewhere silently stalling until this read finally returns.
-// A plain `|| {}` is a correct, if inert, choice for callers with nothing
-// to service (e.g. command mode's own nested read_line -- see that call
-// site's comment on why this is scoped out there for now).
-// `col_origin`/`width`: the real terminal column this prompt's own
-// column 0 actually sits at, and how many columns of that row belong
-// to it -- see redraw's own doc comment. col_origin 0 and width equal
-// to the real terminal's width for every non-paned caller (the plain
-// terminal, or a promoted-but-unsplit window, both of which start at
-// the real column 0 and own the whole row anyway); the current focused
-// pane's own rect.col/rect.cols once a window is split (see repl.rs's
-// pane_rect). The caller is responsible for having already positioned
-// the real cursor correctly (row included) before calling this --
-// read_line only ever needs to return to *this same* row's own start
-// column while redrawing during typing, never to reposition the row
-// itself (single-line editing, see this function's own scope note).
-// `initial`: text + cursor to preload the buffer with instead of starting
-// empty -- used to resume editing after a Ctrl+G excursion into
-// normal-mode navigation (see `ReadOutcome::NormalMode`'s own doc
-// comment) without losing whatever had already been typed. `None` for
-// every ordinary call (a fresh prompt has nothing to preload).
-/// What the real screen shows once a paste has been taken in: every
-/// completed line, in place, the way each would look had it been typed
-/// and submitted.
-///
-/// The first one is already on screen under the primary prompt, so it
-/// is repainted there; the rest get the continuation prompt, because
-/// that is what they are. Written straight to the real terminal like
-/// every other draw in this file -- a caller with a grid of its own
-/// feeds them into it separately (see repl.rs), exactly as it already
-/// does for a single submitted line.
+/// What the screen shows once a paste is taken in: each complete line in
+/// place, as if typed and submitted. The first is already under the
+/// primary prompt and is repainted there; the rest get the continuation
+/// prompt. Written to the terminal; a caller with a grid feeds them in
+/// separately (see repl.rs).
 #[allow(clippy::too_many_arguments)]
 fn paste_echo(
     prompt: &str,
@@ -1682,27 +1201,20 @@ fn paste_echo(
         out.push_str(&repaint_without_affordances(prompt, &shown, col_origin, width, ctx));
         out.push_str("\r\n");
     }
-    // A menu row sat directly under the first line and nothing else,
-    // so with a second line to draw it has already been written over.
+    // A menu row sat under the first line, and a second line has already
+    // overwritten it.
     if lines.len() == 1 {
         out.push_str(&erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
     }
     out
 }
 
-/// Where a pasted block leaves the prompt: the lines that are finished
-/// with, and what is still being edited.
-///
-/// The paste goes in at the cursor, and only the paste can contain
-/// newlines -- the prompt's own buffer is one line by construction --
-/// so everything before the last newline is complete and everything
-/// after it is the new line-in-progress. The cursor lands at the end of
-/// what was pasted, which is where it would be if you had typed it,
-/// with any text that was to the right of the cursor still to its
-/// right.
-///
-/// Returns no lines at all when the paste has no newlines in it: that
-/// is an ordinary insertion, and the caller does it as one.
+/// Where a pasted block leaves the prompt: the finished lines and what's
+/// still being edited. Only the paste can contain newlines, so everything
+/// before its last newline is complete and the rest is the new line. The
+/// cursor lands at the end of the paste, as if typed, with what was right
+/// of the cursor still to its right. No lines when the paste has no
+/// newline: the caller inserts it normally.
 fn splice_paste(buf: &[char], cursor: usize, paste: &str) -> (Vec<String>, String, usize) {
     if !paste.contains('\n') {
         return (Vec::new(), String::new(), 0);
@@ -1718,12 +1230,25 @@ fn splice_paste(buf: &[char], cursor: usize, paste: &str) -> (Vec<String>, Strin
     (parts, rest, after_paste.saturating_sub(before))
 }
 
+// Reads one line interactively. Raw mode is on only during the call
+// (RawGuard restores it), so a command run between calls sees a normal
+// terminal.
+//
+// `history` is the session's own history chain, so Up/Down see its
+// commands and what it inherited. `esc_cancels` makes Esc, outside a
+// history browse, cancel like Ctrl-C without the `^C` (command mode, as
+// vim's `:`). `ctrl_l_reports` returns Ctrl-L as `ReadOutcome::CtrlL`
+// instead of clearing the screen (command mode's transcript toggle).
+// `on_idle` runs while waiting for a key, so repl.rs can service other
+// windows' jobs; `|| {}` for callers with nothing to service.
+// `col_origin` and `width` are this prompt's column 0 and its columns
+// (see `redraw`): 0 and the terminal's width unless split. The caller
+// positions the cursor's row first. `initial` preloads the buffer, to
+// resume after Ctrl+G (see `ReadOutcome::NormalMode`).
 pub fn read_line(
     prompt: &str,
-    // The prompt a continuation line gets. Only ever drawn by
-    // `paste_echo` -- a line this read *starts* is always the first one
-    // -- so a caller with no such thing (command mode's colon line) can
-    // pass its ordinary prompt and never see the difference.
+    // The prompt for continuation lines, only drawn by `paste_echo`, so the
+    // colon line can pass its ordinary prompt.
     continuation_prompt: &str,
     history: &History,
     esc_cancels: bool,
@@ -1732,90 +1257,48 @@ pub fn read_line(
     col_origin: usize,
     width: usize,
     ctx: HighlightContext,
-    // `None` for callers with no meaningful shell context to complete
-    // against (command mode's own colon-line -- same clean layering
-    // HighlightContext::default() already established there). `menu_capable`
-    // is unused until a later stage wires up the actual menu row; carried
-    // as a parameter now so both repl.rs call sites only need to change
-    // their argument list once.
+    // `None` without a shell to complete against (the colon line).
     completion_provider: Option<&dyn CompletionProvider>,
-    // Same "`None` for no meaningful shell context" pattern as
-    // `completion_provider` just above -- command mode's colon-line
-    // passes `None` here too.
+    // `None` likewise.
     suggestion_provider: Option<&dyn SuggestionProvider>,
     menu_capable: bool,
-    // See redraw_with_completion_row's own doc comment on this same
-    // parameter -- threaded straight through, read_line itself never
-    // interprets it beyond passing it along to every redraw call.
+    // See `redraw_with_completion_row`; passed through.
     row_origin: Option<(usize, usize)>,
-    // The whole-shell register table (see bishedit::registers::Registers'
-    // own doc comment) -- one instance, shared globally, threaded through
-    // here for Ctrl-R (below) and passed further into run_line_normal_mode/
-    // run_one_shot_normal_command for y/p in Ctrl-E's/Ctrl-O's own vim
-    // Normal mode.
+    // The shell's register table (see `Registers`), for Ctrl-R here and for
+    // `y`/`p` in the Ctrl-E and Ctrl-O Normal modes.
     registers: &mut Registers,
-    // Fish-style abbreviations, snapshotted fresh per prompt by the
-    // caller -- same "owned snapshot, not a live borrow" pattern as
-    // `completion_provider`'s own `cwd`/`known_functions` (see
-    // `Shell::abbrs`'s own doc comment). Empty for callers with no
-    // meaningful shell context (command mode's colon-line, matching
-    // `completion_provider`/`suggestion_provider`'s own `None` there) --
-    // `expand_abbr_at_cursor` is a no-op on an empty slice either way.
+    // Abbreviations, snapshotted per prompt (see `Shell::abbrs`); empty on
+    // the colon line.
     abbrs: &[Abbr],
-    // `(term_rows, term_cols)`, `Some` when Ctrl-E's own line-local
-    // Normal mode (run_line_normal_mode, below) should draw its live
-    // `/`/`?` search input at the terminal's shared global status row
-    // (`repl::render_global_status_row`/`command_mode_row` -- the same
-    // row `:` command mode and Ctrl+G's own Normal-mode status line
-    // already use) instead of substituting it in place of the prompt --
-    // both dimensions are needed since that row spans the *terminal's*
-    // full width, not this call's own `col_origin`/`width` (which, for a
-    // split pane, is narrower). `None`: falls back to the original
-    // in-place substitution -- command mode's own colon-line already
-    // occupies that exact row with its own prompt (see that call site),
-    // so a Ctrl-E search started while composing a `:` command keeps the
-    // old behavior rather than fighting over it. A plain snapshot, not a
-    // live reference: `on_idle` below can itself resize the terminal
-    // (SIGWINCH), and a value this stale by at most one resize is a fine
-    // trade against needing `on_idle` and this to somehow share `&mut`
-    // access to the same term size.
+    // `Some((term_rows, term_cols))` when Ctrl-E's Normal mode should draw a
+    // search being typed on the global status row (as `:` and Ctrl+G's status
+    // do), full terminal width, instead of in place of the prompt. `None` on
+    // the colon line, which already occupies that row. A snapshot: `on_idle`
+    // can resize the terminal, and being one resize stale is acceptable.
     global_row_size: Option<(usize, usize)>,
-    // Called on every idle poll tick while this prompt is waiting for a
-    // key. `true` means something repainted the screen underneath this
-    // line (see repl.rs's own closure) and the prompt has to be drawn
-    // again on top of it -- without that, a background job's output
-    // arriving mid-typing simply erased whatever had been typed until the
-    // next keystroke happened to redraw it.
+    // Called on each idle tick while waiting for a key. `true` means the
+    // screen was repainted under this line (see repl.rs's closure), so the
+    // prompt is drawn again, or job output would erase what was typed.
     on_idle: &mut dyn FnMut() -> bool,
-    // The `mouse` bishopt. Off means reporting is never turned on at
-    // all, which is what hands the terminal's own selection back -- see
-    // term::RawGuard::enable_maybe_mouse.
+    // The `mouse` bishopt. Off, reporting is never enabled, leaving the
+    // terminal's own selection (see `RawGuard::enable_maybe_mouse`).
     mouse: bool,
-    // `::bish map -m command`. Empty for the shell prompt, which is not
-    // one of the remappable modes -- an empty table makes the whole
-    // mechanism inert, so that caller behaves exactly as before.
+    // `::bish map -m command`. Empty at the shell prompt, which isn't a
+    // remappable mode, making the mechanism inert there.
     mappings: Vec<crate::keymap::Mapping>,
-    // Keys a mapping already produced elsewhere and could not deliver:
-    // a right-hand side like `<Esc>:w<CR>` fires `:` here and the rest
-    // has to arrive with it. Dispatched before anything is read, and
-    // never fed to the matcher -- they are a mapping's output, not
-    // input, which is what keeps noremap intact across the handoff.
+    // Keys a mapping produced elsewhere that still need delivering:
+    // `<Esc>:w<CR>` fires `:` here, and the rest arrives with it. Dispatched
+    // before reading, never matched, which keeps noremap intact.
     queued: Vec<Key>,
 ) -> io::Result<ReadOutcome> {
     let mut guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
-    // Ask the terminal to bracket pasted text, for the whole of this
-    // read. Without it a paste is characters and Enters and nothing can
-    // tell it from typing, so a pasted script runs itself line by line
-    // as it arrives -- half of it executing while the rest is still in
-    // flight, and no chance to look at it first. The guard turns the
-    // mode back off down every exit from here, including the early
-    // returns, so a foreground command that knows nothing about it
-    // never inherits it.
+    // Bracketed paste for the whole read, so a paste can be told from typing
+    // (see `Key::PasteStart`). The guard turns it off on every exit, so a
+    // foreground command never inherits it.
     let _paste = term::BracketedPasteGuard::enable();
     let mut matcher = crate::keymap::Matcher::new(mappings);
-    // Keys a mapping expanded to, beyond the first -- delivered before
-    // anything new is read, and never run back through the matcher,
-    // which is what keeps a mapping from chaining into another.
+    // A mapping's expansion beyond its first key, delivered before reading
+    // and never matched again, so mappings don't chain.
     let mut mapped: std::collections::VecDeque<Key> = queued.into_iter().collect();
     let mut ed = match initial {
         Some((text, cursor)) => {
@@ -1827,64 +1310,38 @@ pub fn read_line(
         None => LineEditor::new(),
     };
 
-    // `u`/`Ctrl-R`/`g-`/`g+` for this line's own Ctrl-E (`run_line_normal_
-    // mode`) and Ctrl-O (`run_one_shot_normal_command`) vim Normal-mode
-    // excursions -- shared across *both* (and across however many
-    // separate excursions of either kind happen while composing this one
-    // line), so a `<C-o>dd` is undoable via a later Ctrl-E `u` just like
-    // an edit made from inside Ctrl-E itself. Fresh per `read_line` call
-    // (never persisted past submitting/cancelling this one line), unlike
-    // `marks`/`selections` below, which stay scoped to one excursion each
-    // -- those two are what a *motion* (`` `a ``, a Visual selection)
-    // resolves against, meaningful only within the excursion that set
-    // them; undo history is meaningful for as long as the line itself
-    // exists.
+    // Undo history for this line's Ctrl-E and Ctrl-O excursions, shared
+    // across all of them, so a `<C-o>dd` can be undone from a later Ctrl-E.
+    // Lives as long as the line; `marks` and `selections` only last one
+    // excursion, since what motions resolve against is meaningful only there.
     let mut undo: UndoTree<Vec<char>> = UndoTree::new(ed.buf.clone(), (0, ed.cursor));
 
-    // Fish-style history browsing: Up/Down search backward/forward through
-    // history for entries starting with whatever was typed *before*
-    // browsing started (that original text is `prefix`, restored on Esc
-    // or on Down-ing past the newest match). Any other key -- moving the
-    // cursor, editing, submitting -- silently "locks in" the currently
-    // shown entry as ordinary buffer text and ends the browse, matching
-    // fish: the suggestion just becomes your input from that point on.
+    // History browsing: Up/Down move through entries starting with what was
+    // typed before browsing (`prefix`, restored on Esc or past the newest
+    // match). Any other key keeps the shown entry as ordinary text and ends
+    // the browse.
     let mut browse: Option<(String, usize)> = None;
 
-    // In-progress completion state -- see CompletionState's own doc
-    // comment. `None` means either nothing's being completed, or the last
-    // trigger auto-filled a single candidate directly (no tracking
-    // needed for that case).
+    // An in-progress completion (see `CompletionState`); `None` also after a
+    // lone candidate was filled in.
     let mut completion: Option<CompletionState> = None;
 
-    // The `abbr` snippet currently spliced into the line, if any -- see
-    // bishedit::snippet::LiveSnippet. Mutually exclusive with `completion` in practice
-    // (nothing can start one while the other is live), but nothing
-    // depends on that beyond the redraw only ever having one extra layer
-    // to draw.
+    // The live `abbr` snippet, if any (see `snippet::LiveSnippet`). Never
+    // active together with `completion`.
     let mut snippet: Option<LiveSnippet> = None;
 
-    // Whether a completion menu was showing on the immediately-preceding
-    // redraw -- see redraw_with_completion_row's own doc comment for why
-    // this exists (its down/erase/up dance must run once more after a
-    // completion ends purely to erase the stale row, but must NOT run on
-    // every other redraw, which is what it used to do and is exactly
-    // what made the terminal's true last row permanently unreachable).
-    // Starts false: nothing has been drawn yet, so there's no stale row
-    // from a previous call to worry about.
+    // Whether a menu showed on the previous redraw, so its row is erased once
+    // after a completion ends (see `redraw_with_completion_row`).
     let mut menu_was_shown = false;
 
-    // The ghost tail currently being shown, if any -- see
-    // compute_suggestion's own doc comment for why this is a plain
-    // recomputed-every-redraw cache, not a persisted state machine.
+    // The ghost tail shown, recomputed each redraw (see
+    // `compute_suggestion`).
     let mut suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some(), browse.is_some());
 
-    // Always goes through the same clear-and-draw redraw(), even with
-    // nothing typed yet: the terminal cursor at this point may already be
-    // sitting right after a compositor-frozen idle prompt for this exact
-    // pane (see repl.rs's freeze_idle_prompt) -- a bare, non-clearing
-    // print here would append a second copy right next to it instead of
-    // redrawing over it. Behaviorally identical to the old bare print for
-    // every non-paned caller (col_origin 0, width the whole terminal).
+    // Drawn with the same clear-and-draw as every redraw, even with nothing
+    // typed: the cursor may sit after a frozen idle prompt for this pane (see
+    // repl.rs's `freeze_idle_prompt`), and a plain print would draw a second
+    // one beside it.
     redraw_with_completion_row(
         prompt,
         &ed,
@@ -1900,34 +1357,24 @@ pub fn read_line(
     )?;
     menu_was_shown = completion.is_some();
 
-    // Set only when Ctrl-E's or Ctrl-O's own sub-loop below reports a key
-    // it didn't consume itself (Ctrl-C/D/Z -- see run_line_normal_mode/
-    // run_one_shot_normal_command's own doc comments) -- reprocessed here
-    // through the exact same match arms that would have handled it had it
-    // been read directly, rather than duplicating that handling.
-    // Mouse selection over the prompt line: the char index the drag
-    // started at, and the range it currently covers. Held here rather
-    // than on `LineEditor` (which is a buffer and a cursor, nothing
-    // else) for the same reason `marks` and `selections` are -- it is
-    // scoped to this one line and meaningless past it.
+    // Mouse selection on the prompt line: where the drag started and the
+    // range it covers. Here rather than on `LineEditor`, since it's scoped to
+    // this line.
     let mut drag_anchor: Option<usize> = None;
     let mut mouse_selection: Option<(usize, usize)> = None;
 
+    // A key Ctrl-E's or Ctrl-O's loop handed back (Ctrl-C/D/Z), run
+    // through the same match arms as if read directly.
     let mut pending_key: Option<Key> = None;
 
     loop {
         let key = match pending_key.take().or_else(|| mapped.pop_front()) {
             Some(k) => k,
             None => {
-                // Waiting for the next byte out here rather than inside
-                // read_key_idle's own on_idle, for the same reason
-                // run_normal_mode_navigation and run_insert_mode both
-                // restructured theirs: only here is everything this line
-                // is drawn from actually free to redraw with. Same
-                // IDLE_POLL_MS interval read_key_idle's own loop uses, so
-                // behavior is identical once a byte does arrive.
-                // Same reason as the other input loops: a key a mapping
-                // already produced is not a byte on stdin.
+                // Waiting here rather than in `read_key_idle`'s `on_idle`,
+                // because only here is everything the line is drawn from
+                // free to redraw. A key a mapping produced isn't on stdin,
+                // so it doesn't wait.
                 while mapped.is_empty() && !term::stdin_ready(IDLE_POLL_MS) {
                     if on_idle() {
                         let mut overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
@@ -1947,9 +1394,7 @@ pub fn read_line(
                         )?;
                     }
                 }
-                // A byte is already known ready, so this on_idle closure
-                // is never actually called -- kept only to match the
-                // existing signature.
+                // A byte is ready, so `on_idle` is never called.
                 let raw = match read_key_idle(&mut || {})? {
                     Some(k) => k,
                     None => {
@@ -1960,16 +1405,13 @@ pub fn read_line(
                 if matcher.is_empty() {
                     raw
                 } else {
-                    // Not speculative: the colon line is one line of
-                    // text with its own editing rules, and a key taken
-                    // back would have to be untangled from completion
-                    // and snippet state as well. Holding costs a
-                    // keystroke of latency on a multi-key mapping, which
-                    // nobody has asked for here.
+                    // Not speculative: a key taken back on the colon line
+                    // would have to be untangled from completion and
+                    // snippet state too. Holding costs a key's latency on a
+                    // multi-key mapping.
                     let mut out = matcher.feed(raw, "command", false);
                     if out.keys.is_empty() {
-                        // Mid-sequence: nothing to dispatch yet, so go
-                        // back and wait for the key that decides it.
+                        // Mid-sequence: wait for the key that decides it.
                         continue;
                     }
                     let first = out.keys.remove(0);
@@ -1981,24 +1423,15 @@ pub fn read_line(
         if !matches!(key, Key::Up | Key::Down | Key::Escape) {
             browse = None;
         }
-        // Mirrors the browse reset immediately above: any key that isn't
-        // part of cycling/accepting/discarding a completion "locks in"
-        // whatever's currently spliced into the buffer as ordinary text
-        // and ends tracking -- the buffer is already correct, so this is
-        // the entire implementation of "keep typing accepts" (Char,
-        // Backspace, Enter, etc. all fall through to their own existing,
-        // untouched arms right after this). Ctrl-Y isn't in the exemption
-        // list either, so "accept" falls out for free with no dedicated
-        // arm of its own.
+        // Any key that doesn't cycle, accept or discard a completion keeps
+        // the spliced candidate as ordinary text and ends tracking; the
+        // buffer is already right, so that's all "keep typing accepts"
+        // needs. Ctrl-Y isn't exempt, so it accepts too.
         if completion.is_some() && !matches!(key, Key::Tab | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::CtrlE | Key::Up | Key::Down) {
             completion = None;
         }
-        // The same rule one tier over, for a live snippet: any key
-        // outside its own small vocabulary (below) accepts it as it
-        // stands and then means whatever it always meant. So a Left
-        // arrow, a Ctrl-A, or a history recall doesn't have to grow a
-        // snippet-aware case of its own -- it just finds ordinary text
-        // where the placeholders were.
+        // Likewise for a live snippet: a key outside its own vocabulary
+        // (below) accepts it as it stands, then does what it always does.
         if snippet.is_some()
             && !matches!(
                 key,
@@ -2008,14 +1441,10 @@ pub fn read_line(
             snippet.take().unwrap().accept(&mut ed);
         }
 
-        // Select-and-type: a mouse selection standing when a printable
-        // key or Backspace arrives is replaced by what is typed, the
-        // same rule the file editor's Insert mode already follows. Any
-        // other key simply drops it -- moving the cursor or reaching for
-        // history is not something to do *to* a selection.
-        //
-        // Mouse events themselves are exempt, or a drag would clear the
-        // selection it is in the middle of making.
+        // A mouse selection standing when a printable key or Backspace
+        // arrives is replaced, as in the file editor's Insert mode; any
+        // other key drops it. Mouse events don't, or a drag would clear its
+        // own selection.
         if let Some((a, b)) = mouse_selection
             && !matches!(key, Key::Mouse(_))
         {
@@ -2025,8 +1454,8 @@ pub fn read_line(
                 ed.cursor = from;
             }
             mouse_selection = None;
-            // Backspace's whole job was deleting the selection; letting
-            // it fall through would eat a further character.
+            // Backspace's job was deleting the selection; falling through
+            // would eat one more character.
             if matches!(key, Key::Backspace | Key::Delete) && from < to {
                 let overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
                 redraw_with_completion_row(prompt, &ed, "", None, menu_was_shown, menu_capable, row_origin, col_origin, width, ctx, &overlay)?;
@@ -2035,11 +1464,9 @@ pub fn read_line(
         }
 
         match key {
-            // --- a live `abbr` snippet owns these eight keys ---------
-            // Tab/Shift-Tab and Ctrl-N/Ctrl-P step between placeholders,
-            // the same two pairs that cycle a completion menu -- there's
-            // never both at once (see the `snippet` local's own comment),
-            // so the overload costs nothing.
+            // A live snippet owns these keys. Tab/Shift-Tab and
+            // Ctrl-N/Ctrl-P step between placeholders, as they cycle
+            // completions; the two are never active together.
             Key::Tab | Key::CtrlN if snippet.is_some() => {
                 let state = snippet.as_mut().unwrap();
                 state.snip.advance(false);
@@ -2050,11 +1477,9 @@ pub fn read_line(
                 state.snip.advance(true);
                 state.sync(&mut ed);
             }
-            // Enter advances like Tab, except on the last placeholder in
-            // visit order, where there's nothing left to advance *to* and
-            // it accepts instead. Accepting does not also submit: the
-            // line is left there to look over, exactly as a plain
-            // abbreviation's own first Enter leaves its expansion.
+            // Enter advances like Tab, except on the last placeholder,
+            // where it accepts. It doesn't also submit: the line stays to
+            // look over, as a plain abbreviation's first Enter leaves it.
             Key::Enter if snippet.as_ref().is_some_and(|s| !s.snip.at_last()) => {
                 let state = snippet.as_mut().unwrap();
                 state.snip.advance(false);
@@ -2063,39 +1488,30 @@ pub fn read_line(
             Key::Enter | Key::CtrlY if snippet.is_some() => {
                 snippet.take().unwrap().accept(&mut ed);
             }
-            // Ctrl-E discards the whole thing and puts the line back the
-            // way it was, abbreviation name and all -- the same key, and
-            // the same meaning, a live completion already gives it.
+            // Ctrl-E discards it all and restores the line, abbreviation
+            // name and all, as for a completion.
             Key::CtrlE if snippet.is_some() => {
                 snippet.take().unwrap().cancel(&mut ed);
             }
-            // Backspace only ever eats what was typed into the active
-            // placeholder. With nothing left in it, it stops there rather
-            // than chewing into the snippet's own literal text -- which
-            // is not something the model could put back.
+            // Backspace only eats what was typed into the active
+            // placeholder, never the snippet's literal text, which the
+            // model couldn't put back.
             Key::Backspace if snippet.is_some() => {
                 let state = snippet.as_mut().unwrap();
                 if state.snip.backspace() {
                     state.sync(&mut ed);
                 }
             }
-            // Typing (space included -- a placeholder standing in for
-            // `-m "%s"`'s message wants spaces) fills the active
-            // placeholder, replacing the `%s` shown there.
+            // Typing, spaces included, fills the active placeholder.
             Key::Char(c) if snippet.is_some() => {
                 let state = snippet.as_mut().unwrap();
                 state.snip.type_char(c);
                 state.sync(&mut ed);
             }
 
-            // Fish's own "first Enter expands, second one runs": if the
-            // word right at the cursor is a command-position abbreviation,
-            // this Enter only expands it and falls through to the ordinary
-            // post-match redraw below instead of submitting -- the same
-            // way a real terminal expects to see its own expansion before
-            // running it, not run the un-expanded short form. A second,
-            // immediate Enter then finds nothing left to expand and
-            // submits normally.
+            // If the word at the cursor is an abbreviation in command
+            // position, this Enter only expands it; the next Enter, finding
+            // nothing to expand, submits.
             Key::Enter if expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet) => {}
             Key::Enter => {
                 drop(guard.take());
@@ -2103,34 +1519,26 @@ pub fn read_line(
                 io::stdout().flush()?;
                 return Ok(ReadOutcome::Line(ed.as_string()));
             }
-            // The whole paste, read here in one go rather than a key at
-            // a time through the loop above. Every affordance in this
-            // function reacts to *typing* -- abbreviations expand,
-            // completions open, a suggestion's ghost tail appears -- and
-            // all of them are wrong applied to text that was pasted; a
-            // terminal telling the two apart is the entire point of
-            // bracketed paste, so this is where the distinction gets
-            // used.
-            //
-            // Read raw, past the key-mapping layer: a mapping is
-            // something a person asked for by pressing keys, not a
-            // transformation of text that arrived from the clipboard.
+            // The whole paste, read at once rather than key by key.
+            // Everything here that reacts to typing (abbreviations,
+            // completions, a suggestion's ghost) is wrong for pasted text,
+            // and telling the two apart is the point of bracketed paste.
+            // Read raw, past the keymap: a mapping is for keys pressed, not
+            // clipboard text.
             Key::PasteStart => {
                 let mut pasted = String::new();
                 loop {
                     match read_key_idle(&mut || {})? {
-                        // EOF mid-paste, or the closing bracket: either
-                        // way this is everything there is.
+                        // End of input, or the closing bracket: that's all
+                        // of it.
                         None | Some(Key::PasteEnd) => break,
                         Some(Key::Char(c)) => pasted.push(c),
-                        // Both spellings of a line ending arrive as
-                        // Enter, and inside a paste both mean a newline
-                        // in the text rather than "run this".
+                        // Both line endings arrive as Enter, and in a paste
+                        // mean a newline.
                         Some(Key::Enter) => pasted.push('\n'),
                         Some(Key::Tab) => pasted.push('\t'),
-                        // Anything else in a paste is a control sequence
-                        // the clipboard had no business carrying, and
-                        // there is no sensible text for it.
+                        // Any other key in a paste is a control sequence
+                        // with no sensible text.
                         Some(_) => {}
                     }
                 }
@@ -2146,11 +1554,9 @@ pub fn read_line(
                     return Ok(ReadOutcome::Pasted { lines, rest, cursor });
                 }
             }
-            // The deliberate version of the same thing: a newline in the
-            // command rather than the end of it. `for x in 1 2; do` gets
-            // a continuation line for free because it does not parse
-            // yet; this is how you get one for a command that would
-            // otherwise have run.
+            // A newline in the command rather than the end of it, for a
+            // command that would otherwise run (an incomplete one already
+            // continues).
             Key::AltEnter => {
                 let (lines, rest, cursor) = splice_paste(&ed.buf, ed.cursor, "\n");
                 drop(guard.take());
@@ -2174,25 +1580,18 @@ pub fn read_line(
                 ed.delete_forward();
             }
             Key::CtrlZ => {
-                // Restore normal terminal state before stopping, so
-                // whatever's watching this process (or using the tty
-                // while we're stopped) sees a sane tty, then re-enable
-                // raw mode and redraw once we're resumed.
+                // Restore the terminal before stopping, so whatever uses
+                // the tty meanwhile sees it sane; raw mode and a redraw
+                // come back on resume.
                 drop(guard.take());
                 term::suspend_self();
                 guard = Some(term::RawGuard::enable_maybe_mouse(0, mouse)?);
             }
             Key::Backspace => {
-                // esc_cancels is only ever set for a command-mode
-                // read_line call (see its own doc comment) -- matches
-                // real vim: Backspace on an empty Ex command line drops
-                // back out of it (here, to normal mode -- see repl.rs's
-                // run_normal_mode_navigation, the only caller that sets
-                // esc_cancels true now). Only when the buffer is truly
-                // empty, not just "cursor at 0" -- with text still to the
-                // right (e.g. after Home) Backspace has nothing to its
-                // left to delete either way, so it's a plain no-op,
-                // falling through to ed.backspace() below.
+                // Only command mode sets `esc_cancels`: as in vim,
+                // Backspace on an empty `:` line leaves it (back to Normal
+                // mode). Only when the buffer is empty; with text after the
+                // cursor it's a no-op below.
                 if esc_cancels && ed.buf.is_empty() {
                     drop(guard.take());
                     print!("{}\r\n{}", repaint_without_affordances(prompt, &ed, col_origin, width, ctx), erase_menu_row_under_cursor(menu_capable, menu_was_shown, row_origin, col_origin, width));
@@ -2202,14 +1601,10 @@ pub fn read_line(
                 ed.backspace();
             }
             Key::Delete => ed.delete_forward(),
-            // Right accepts the currently-shown suggestion, turning its
-            // ghost tail into real buffer text. `suggestion` is only
-            // ever Some with the cursor already at ed.buf.len(), where
-            // the move_right() below would have been a no-op anyway --
-            // so this is a strict refinement, never shadowing a real
-            // movement. Ctrl-F is deliberately excluded: the request
-            // names the right arrow specifically, and Ctrl-F stays a
-            // pure motion with no acceptance meaning of its own.
+            // Right accepts the suggestion shown. `suggestion` is only
+            // `Some` with the cursor at the end, where `move_right` would
+            // do nothing, so no movement is shadowed. Ctrl-F stays a plain
+            // motion.
             Key::Right if suggestion.is_some() => accept_suggestion(&mut ed, suggestion.as_deref().unwrap()),
             Key::Left | Key::CtrlB => ed.move_left(),
             Key::Right | Key::CtrlF => ed.move_right(),
@@ -2219,17 +1614,9 @@ pub fn read_line(
             Key::CtrlU => ed.kill_to_start(),
             Key::CtrlW => ed.kill_word_backward(),
             Key::AltBackspace => ed.kill_word_backward_to_punctuation(),
-            // Vim's insert-mode <C-r>{register}: reads exactly one more
-            // key as the register name and splices that register's
-            // contents in at the cursor, literally (not as a "ghost" the
-            // way a suggestion is -- it's real buffer text immediately).
-            // Anything other than a plain char for the register name
-            // (Escape, Ctrl-C, ...) is a no-op, matching vim's own "Esc
-            // cancels a pending <C-r>" -- the next read_key_idle call
-            // simply reprocesses whatever that key would have meant on
-            // its own, same as Ctrl-E/Ctrl-O's own propagated-key pattern
-            // just below, except here there's nothing worth propagating
-            // (an aborted <C-r> is just... aborted).
+            // vim's insert-mode `<C-r>{register}`: reads one key as the
+            // register name and inserts its contents. Anything but a plain
+            // char cancels, as Esc cancels a pending `<C-r>` in vim.
             Key::CtrlR => {
                 if let Some(Key::Char(c)) = read_key_idle(&mut || {
                     on_idle();
@@ -2245,27 +1632,20 @@ pub fn read_line(
                 return Ok(ReadOutcome::CtrlL);
             }
             Key::CtrlL => print!("\x1b[H\x1b[2J"),
-            // Space is the other abbr expansion trigger, alongside Enter
-            // above -- unlike Enter, a space is never withheld: the
-            // expansion (if any) lands first, then the space that
-            // triggered it is still inserted right after, matching fish
-            // ("gco" + Space becomes "git checkout " -- expansion plus the
-            // space that ended it, not one or the other).
+            // Space expands an abbreviation too, but unlike Enter is still
+            // inserted after it: `gco` + Space becomes `git checkout `.
             Key::Char(' ') => {
-                // A snippet swallows the space that triggered it: the
-                // caret is already parked inside the first placeholder,
-                // and a space there would be the first thing typed *into*
-                // it -- never what "end the abbreviation" meant. A plain
-                // expansion still gets it, unchanged.
+                // A snippet swallows the space: the caret is already in its
+                // first placeholder, where a space would be the first thing
+                // typed.
                 expand_abbr_at_cursor(&mut ed, abbrs, &mut snippet);
                 if snippet.is_none() {
                     ed.insert(' ');
                 }
             }
             Key::Char(c) => ed.insert(c),
-            // Once a completion menu is active, Up/Down cycle it instead
-            // of history browsing -- the plan's own "or up and down
-            // arrows if the completion menu is already open."
+            // With a completion menu open, Up/Down cycle it instead of
+            // history.
             Key::Up if completion.is_some() => cycle_completion(&mut ed, completion.as_mut().unwrap(), true),
             Key::Down if completion.is_some() => cycle_completion(&mut ed, completion.as_mut().unwrap(), false),
             Key::Up => {
@@ -2288,15 +1668,12 @@ pub fn read_line(
                 }
             }
             Key::Escape => match browse.take() {
-                // First priority, regardless of esc_cancels: if a history
-                // browse is active, Esc just cancels *that* and restores
-                // what was typed before it started -- matching readline/
-                // vim conventions where Esc unwinds the innermost special
-                // state before it ever means "abandon everything."
+                // An active history browse comes first: Esc cancels it and
+                // restores what was typed, unwinding the innermost state
+                // before anything else.
                 Some((prefix, _)) => ed.set_text(&prefix),
-                // Nothing to unwind: for callers that opted in (command
-                // mode -- see esc_cancels' doc comment), this is "cancel
-                // the prompt," same outcome as Ctrl-C.
+                // Nothing to unwind: for command mode (`esc_cancels`),
+                // cancel, as Ctrl-C does.
                 None if esc_cancels => {
                     drop(guard.take());
                     print!("\r\n");
@@ -2305,26 +1682,12 @@ pub fn read_line(
                 }
                 None => {}
             },
-            // Only at an empty buffer -- same reasoning as ':' arming
-            // command mode: don't let a keypress the user might not
-            // have meant to hit right now silently discard something
-            // they were in the middle of typing. Directory navigation
-            // is a "instead of typing a command" action, not something
-            // that makes sense mid-line anyway.
-            //
-            // No `\r\n` before returning (used to print one, moving to a
-            // fresh line every time) -- the caller (repl.rs) updates the
-            // session's cwd and loops back into a brand new `read_line`
-            // call with a freshly recomputed prompt string, and that
-            // call's own very first paint already goes through the same
-            // clear-and-redraw `redraw_with_completion_row` every
-            // keystroke uses (see its own call site's doc comment: "the
-            // terminal cursor at this point may already be sitting right
-            // after a ... prompt for this exact pane"). Printing a
-            // newline here defeated that -- it left the cursor one row
-            // below where the redraw would land, so instead of updating
-            // the prompt in place, every Alt-Left/Right/Up push a new,
-            // separate prompt line onto the screen instead.
+            // Only on an empty buffer: directory navigation replaces typing
+            // a command, and mustn't discard what's being typed. No `\r\n`
+            // before returning: repl.rs changes directory and calls
+            // `read_line` again, whose first paint redraws in place (see
+            // `redraw_with_completion_row`), and a newline would push a new
+            // prompt line each time.
             Key::AltLeft if ed.buf.is_empty() => {
                 drop(guard.take());
                 return Ok(ReadOutcome::DirNav(DirNav::Back));
@@ -2337,16 +1700,9 @@ pub fn read_line(
                 drop(guard.take());
                 return Ok(ReadOutcome::DirNav(DirNav::Up));
             }
-            // No trailing "\r\n" here, unlike DirNav above: entering
-            // normal mode redraws the pane's own rectangle in place (see
-            // repl.rs's run_normal_mode_navigation), not a fresh line at
-            // the real terminal's current cursor position. Unconditional
-            // now (used to be empty-buffer-only, matching DirNav above) --
-            // see ReadOutcome::NormalMode's own doc comment for why that
-            // gating is gone.
-            // Ctrl+G is the gesture; Ctrl+Space is the spelling it had
-            // before, kept because a terminal that sends NUL is a
-            // terminal someone may still be pressing it on.
+            // No `\r\n`: Normal mode redraws the pane in place (see
+            // `run_normal_mode_navigation`). Ctrl+G is the key; Ctrl+Space
+            // (NUL) is still accepted from terminals that send it.
             Key::CtrlG | Key::CtrlSpace => {
                 drop(guard.take());
                 return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: None });
@@ -2355,26 +1711,18 @@ pub fn read_line(
                 drop(guard.take());
                 return Ok(ReadOutcome::Opener { text: ed.as_string(), cursor: ed.cursor });
             }
-            // A wheel notch is the other way into the same view. Only
-            // reachable at a *promoted* prompt, and not by this arm's
-            // doing: an unpromoted one never turns mouse reporting on, so
-            // the terminal keeps scrolling its own scrollback and no
-            // event arrives here at all (see repl.rs's
-            // prompt_claims_mouse). Once promoted, that scrollback is
-            // bish's, and normal mode is where it can be read.
+            // A wheel notch also opens it. Only at a promoted prompt: an
+            // unpromoted one never enables mouse reporting, so the terminal
+            // scrolls its own scrollback (see repl.rs's
+            // `prompt_claims_mouse`).
             Key::Mouse(ev) if ev.is_scroll_up() || ev.is_scroll_down() => {
                 drop(guard.take());
                 return Ok(ReadOutcome::NormalMode { text: ed.as_string(), cursor: ed.cursor, wheel: Some(ev) });
             }
-            // Ctrl-E: a line-local vim Normal mode, always available
-            // (empty buffer or not) -- see run_line_normal_mode's own doc
-            // comment. Reassigned from this key's previous "move cursor to
-            // end of line" meaning (still reachable via the plain `End`
-            // key, just no longer double-bound).
-            // While a completion is active, Ctrl-E discards it (reverts
-            // to the original word) instead of its usual meaning --
-            // overloading it this way is deliberate per the feature
-            // request. Otherwise unchanged: vim's line-local Normal mode.
+            // Ctrl-E: with a completion active, discard it and restore the
+            // original word; otherwise a line-local vim Normal mode (see
+            // `run_line_normal_mode`). End still moves to the end of the
+            // line.
             Key::CtrlE if completion.is_some() => {
                 let state = completion.take().unwrap();
                 ed.splice_word(state.word_start, ed.cursor, &state.original);
@@ -2385,11 +1733,8 @@ pub fn read_line(
                 LineNormalExit::ToInsert => {}
                 LineNormalExit::Propagate(k) => {
                     pending_key = Some(k);
-                    // Neither propagated key (Ctrl-C/D/Z) reads
-                    // `suggestion`, so this is inert today -- kept
-                    // anyway so "the local always matches what's
-                    // actually on screen" holds by construction rather
-                    // than by which keys happen to propagate.
+                    // Neither propagated key reads `suggestion`, but it's
+                    // cleared so the local always matches the screen.
                     suggestion = None;
                     continue;
                 }
@@ -2398,10 +1743,9 @@ pub fn read_line(
                     return Ok(ReadOutcome::Eof);
                 }
             },
-            // Ctrl-O: vim's insert-mode "do exactly one normal command,
-            // then return" -- see run_one_shot_normal_command's own doc
-            // comment. Reachable directly from ordinary typing, matching
-            // real vim -- no need to already be in Ctrl-E's own mode first.
+            // Ctrl-O: vim's insert-mode one-shot Normal command (see
+            // `run_one_shot_normal_command`), straight from typing, as in
+            // vim.
             Key::CtrlO => {
                 if let Some(k) = run_one_shot_normal_command(&mut ed, registers, &mut undo, &mut || {
                     on_idle();
@@ -2411,11 +1755,9 @@ pub fn read_line(
                     continue;
                 }
             }
-            // Tab/Ctrl-N cycle forward (or trigger a fresh completion if
-            // none is active); Shift-Tab/Ctrl-P cycle backward. Ctrl-Y
-            // needs no arm of its own -- it's not in the reset
-            // exemption list above, so "accept" already happened by the
-            // time any match arm would run.
+            // Tab/Ctrl-N cycle forward, or start a completion;
+            // Shift-Tab/Ctrl-P cycle back. Ctrl-Y accepts through the reset
+            // rule above.
             Key::Tab | Key::CtrlN => match &mut completion {
                 Some(state) => cycle_completion(&mut ed, state, false),
                 None => completion = completion_provider.and_then(|p| trigger_completion(&mut ed, p, false)),
@@ -2424,27 +1766,13 @@ pub fn read_line(
                 Some(state) => cycle_completion(&mut ed, state, true),
                 None => completion = completion_provider.and_then(|p| trigger_completion(&mut ed, p, true)),
             },
-            // Ctrl-Y accepts a suggestion, the same gesture completions
-            // already use for accept. Needs no end-of-line reasoning of
-            // its own -- `suggestion` is never Some anywhere else. Can't
-            // collide with completion's own Ctrl-Y accept (not a match
-            // arm at all -- see the reset rule above): a suggestion is
-            // only ever computed while completion.is_none(), so at most
-            // one of the two is ever live at once.
+            // Ctrl-Y accepts a suggestion too. A suggestion only exists
+            // without an active completion, so the two Ctrl-Y meanings
+            // never meet.
             Key::CtrlY if suggestion.is_some() => accept_suggestion(&mut ed, suggestion.as_deref().unwrap()),
-            // Ctrl-X: no shell line-editing use (see the `Key` variant's
-            // own doc comment) -- Normal mode's own `Ctrl-A`/`Ctrl-X`
-            // (number increment/decrement) is reached via Ctrl-E's own
-            // vim excursion, same as every other Normal-mode-only key.
-            // See ReadOutcome::Mouse's own doc comment. Non-qualifying
-            // mouse events (drags, releases, wheel, other buttons) fall
-            // through to the catch-all just below, exactly as before --
-            // safely decoded, silently ignored.
-            // A click on this prompt's *own* line places the cursor and
-            // arms a drag, rather than bubbling up: the caller's
-            // hit-test is about tabs, panes and dividers, and none of
-            // those are here. Anything landing elsewhere still bubbles,
-            // exactly as before.
+            // A click on this prompt's own line places the cursor and
+            // starts a drag; elsewhere it bubbles up for the caller's tab,
+            // pane and divider hit-testing (see `ReadOutcome::Mouse`).
             Key::Mouse(ev)
                 if ev.is_left_click()
                     && row_origin.is_some_and(|(prompt_row, _)| (ev.row as usize).saturating_sub(1) == prompt_row)
@@ -2454,10 +1782,8 @@ pub fn read_line(
                 drag_anchor = Some(idx);
                 mouse_selection = None;
             }
-            // ...and dragging from it selects. The selection is what a
-            // later keystroke replaces and what Ctrl-E's own Visual
-            // machinery can act on -- one selection concept on this
-            // line, not two.
+            // ...and dragging selects. A later key replaces the selection,
+            // and Ctrl-E's Visual machinery can act on it.
             Key::Mouse(ev)
                 if ev.is_left_drag()
                     && let Some(anchor) = drag_anchor
@@ -2472,15 +1798,10 @@ pub fn read_line(
                 drop(guard.take());
                 return Ok(ReadOutcome::Mouse { event: ev, text: ed.as_string(), cursor: ed.cursor });
             }
-            // PageUp/PageDown: no meaning at the live prompt itself (no
-            // scrollback view to page through here -- that's Ctrl+G's
-            // own Normal-mode navigation's job), same as a real bash
-            // readline prompt not binding them either.
-            // A closing paste bracket with no opener is a stray: this
-            // prompt reads its own paste in one go (see Key::PasteStart
-            // above), so the only way to see one here is a terminal that
-            // had the mode on for somebody else. Dropping it still beats
-            // typing "201~".
+            // Keys with no meaning at the prompt: PageUp/PageDown (Ctrl+G's
+            // Normal mode pages scrollback), and a stray closing paste
+            // bracket from a terminal with the mode on for someone else,
+            // better dropped than typed.
             Key::AltLeft
             | Key::AltRight
             | Key::AltUp
@@ -2490,22 +1811,16 @@ pub fn read_line(
             | Key::PageUp
             | Key::PageDown
             | Key::PasteEnd
-            // Visual block on a one-line buffer would be an ordinary
-            // charwise selection, which `v` already gives -- so the
-            // prompt leaves this key alone.
+            // Visual block on one line would be a plain selection, which
+            // `v` gives.
             | Key::CtrlV
-            // Decoded so `::bish map` can bind them, and bound to
-            // nothing here -- the same place every other unbound key
-            // lands. Ctrl+G used to be among them, and is the detach
-            // gesture now; so was Ctrl+T, which opens the fuzzy opener.
+            // Decoded so `::bish map` can bind them; unbound here.
             | Key::CtrlQ
             | Key::CtrlS
             | Key::Unknown => {}
         }
-        // Recomputed fresh every iteration -- see compute_suggestion's
-        // own doc comment. Must happen after the match (so it reflects
-        // whatever the just-dispatched key actually did to the buffer/
-        // completion/browse state) and before the redraw that shows it.
+        // After the match, so it reflects what the key did, and before the
+        // redraw that shows it (see `compute_suggestion`).
         suggestion = compute_suggestion(&ed, suggestion_provider, completion.is_some() || snippet.is_some(), browse.is_some());
         let mut overlay = snippet.as_ref().map(snippet_layer).unwrap_or_default();
         overlay.extend(mouse_selection.into_iter().flat_map(|r| selection_layer(&ed, r)));
@@ -2526,47 +1841,21 @@ pub fn read_line(
     }
 }
 
-// What Ctrl-E's own line-local Normal mode (run_line_normal_mode) ended
-// with.
+// How Ctrl-E's line-local Normal mode (`run_line_normal_mode`) ended.
 enum LineNormalExit {
-    /// A motion/insert-entry command resolved -- back to ordinary insert
-    /// typing, no key left over to reprocess.
+    /// A motion or insert command resolved: back to typing, no key to
+    /// reprocess.
     ToInsert,
-    /// Ctrl-C/D/Z -- not handled here (this function only knows vim
-    /// motions/insert-entry, not "interrupt the whole read"), handed back
-    /// to the caller to process exactly as it would have if read directly
-    /// at the top of its own loop.
+    /// Ctrl-C, Ctrl-D or Ctrl-Z, handed back for the caller to process as if
+    /// it had read it.
     Propagate(Key),
-    /// `read_key_idle` returned `None` (stdin closed) mid-excursion.
+    /// Stdin closed mid-excursion.
     Eof,
 }
 
-// What run_line_normal_mode's own redraw call should show for its prompt,
-// and which char-columns of `ed.buf` to highlight (reverse video) for the
-// active search pattern -- computed together since both derive from the
-// same `vk.pending_display()` check, and Ctrl-E has no separate status
-// row to show search feedback on the way `normal_mode_status_left`/
-// `render_normal_mode_frame` do in repl.rs's own full-pane Normal mode,
-// so a search in progress here replaces the prompt text outright instead
-// (plain, not reverse-video -- distinguishes it from the ordinary mode
-// indicator, matching how the Ctrl+G status bar already shows it).
-//
-// "Active" pattern, one rule for both the prompt text and the
-// highlighting: the in-progress `/`/`?` text while one is being typed
-// (incsearch-style live feedback for free), else the last resolved
-// search's own pattern, else nothing to highlight (and the ordinary
-// `decorated_prompt` to show). For a word-based last search (`*`/`#`),
-// there's no separately-stored pattern text -- `VimKeys::last_search_
-// text`'s own doc comment explains why `motion::word_under_cursor` at
-// the buffer's current cursor reliably recovers it instead.
-// Visual mode's own active (not yet committed via `Z`) selection, if any
-// -- `vk`'s own anchor ordered against `lb`'s current cursor into a
-// `MotionRange` ready for `extract_text`/rendering/deletion. Mirrors
-// repl.rs's own `active_visual_range` exactly (see its doc comment for
-// why `Char` maps to `Inclusive`, `Line` to `Linewise`) -- duplicated
-// rather than shared since the two drive different `Buffer` impls
-// (`ScreenBuffer` there, `LineBuffer` here) and it's a handful of lines
-// either way.
+// Visual mode's active, uncommitted selection as a `MotionRange`, as
+// repl.rs's `active_visual_range` does (`Char` is `Inclusive`, `Line` is
+// `Linewise`); duplicated since the buffer types differ.
 fn active_visual_range_line(vk: &VimKeys, lb: &LineBuffer) -> Option<motion::MotionRange> {
     let (shape, anchor) = vk.visual_anchor()?;
     let cursor = lb.cursor();
@@ -2575,12 +1864,8 @@ fn active_visual_range_line(vk: &VimKeys, lb: &LineBuffer) -> Option<motion::Mot
     Some(motion::MotionRange { shape: motion_shape, from, to })
 }
 
-// The (start, end) char-column range `range` covers -- always the whole
-// single line this buffer ever has, so unlike repl.rs's own
-// `selection_columns_in_line` (which has to handle a range spanning
-// several real lines) this never needs a `None`/per-line case: `Linewise`
-// is the whole buffer (same flattening `yy`/`dd`/`cc` already use for a
-// single-line buffer), `Inclusive` is just `to.1 + 1` clamped to `len`.
+// The columns `range` covers on the one line: `Linewise` is the whole
+// buffer, `Inclusive` ends at `to.1 + 1`, clamped.
 fn selection_columns_line(range: &motion::MotionRange, len: usize) -> (usize, usize) {
     if range.shape == motion::MotionShape::Linewise {
         return (0, len);
@@ -2588,15 +1873,11 @@ fn selection_columns_line(range: &motion::MotionRange, len: usize) -> (usize, us
     (range.from.1, (range.to.1 + 1).min(len))
 }
 
-// Returns the live `/`/`?` pattern while one's being typed (`None`
-// otherwise -- a resolved/no search yields no bar text, only inline
-// match highlighting) alongside the match ranges to highlight on the
-// command line itself either way. Used to be a single dual-purpose
-// "what to show on the prompt row" string, back when a search always
-// substituted in place of the prompt; now split apart, since
-// run_line_normal_mode only does that as a fallback when it has nowhere
-// global to draw the pattern into instead (see that function's own doc
-// comment on its `term_rows` param).
+// The live `/` or `?` pattern while one is typed (else `None`), and the
+// match ranges to highlight on the line: for the pattern being typed,
+// else the last search's (a `*`/`#` search's word recovered with
+// `motion::word_under_cursor`). The pattern replaces the prompt only when
+// there's no global row to draw it in (see `run_line_normal_mode`).
 fn normal_mode_prompt_and_matches(
     ed: &mut LineEditor,
     marks: &mut HashMap<char, (usize, usize)>,
@@ -2625,11 +1906,8 @@ fn normal_mode_prompt_and_matches(
     (None, matches)
 }
 
-// Extends `matches` (search-match column ranges, rendered reverse-video
-// -- see `redraw`'s own `search_matches` doc comment) with every
-// committed selection plus the active one, if any -- Visual mode's own
-// highlighting piggybacks on exactly the same rendering, matching
-// repl.rs's own `render_normal_mode_frame`.
+// Adds every committed selection, and the active one, to `matches`, so
+// Visual highlighting reuses the search-match rendering, as in repl.rs.
 fn push_selection_matches(lb: &LineBuffer, vk: &VimKeys, matches: &mut Vec<(usize, usize)>) {
     let len = lb.ed.buf.len();
     for range in lb.selections.iter().chain(active_visual_range_line(vk, lb).iter()) {
@@ -2637,14 +1915,9 @@ fn push_selection_matches(lb: &LineBuffer, vk: &VimKeys, matches: &mut Vec<(usiz
     }
 }
 
-// Draws (`Some`) or erases (`None`) run_line_normal_mode's own live
-// search-pattern display at the shared global status row -- a no-op
-// when `global_row_size` itself is `None` (nothing global to draw
-// into, see that function's own doc comment on the param). Wrapped in
-// cursor save/restore (`\x1b7`/`\x1b8`): this writes to a row far from
-// wherever the just-completed `redraw` call left the real cursor, and
-// must leave it exactly where `redraw` put it, not where this leaves
-// off.
+// Draws (`Some`) or erases (`None`) the search pattern on the global
+// status row; nothing when `global_row_size` is `None`. Saves and restores
+// the cursor, which must stay where `redraw` left it.
 fn draw_global_search_bar(global_row_size: Option<(usize, usize)>, bar_text: Option<&str>) {
     let Some((term_rows, term_cols)) = global_row_size else { return };
     let row = match bar_text {
@@ -2655,11 +1928,8 @@ fn draw_global_search_bar(global_row_size: Option<(usize, usize)>, bar_text: Opt
     let _ = io::stdout().flush();
 }
 
-// Space-pads or truncates `text` to exactly `cols` display columns --
-// `render_global_status_row`'s own doc comment requires this of its
-// caller. Same small, duplicated-rather-than-shared shape as repl.rs's
-// own `normal_mode_status_text`/fileeditor.rs's own `status_text`, the
-// two other places that build this exact row's contents.
+// Pads or truncates `text` to exactly `cols` columns, as
+// `render_global_status_row` requires.
 fn pad_to_width(text: &str, cols: usize) -> String {
     let len = text.chars().count();
     match len.cmp(&cols) {
@@ -2669,23 +1939,11 @@ fn pad_to_width(text: &str, cols: usize) -> String {
     }
 }
 
-// Ctrl-E: a lightweight, line-local vim Normal mode over the buffer
-// currently being typed -- no promotion, no pane/scrollback, works
-// identically whether the terminal is split or not (unlike repl.rs's
-// full-pane Ctrl+G mode). Fully vim-authentic: motions and
-// insert-entry commands (`i`/`a`/`I`/`A`/`s`/`S`/`C`) both act on the
-// *live*, currently-navigated cursor, since this is a tight single-line
-// loop with immediate rendering -- there's no "look around elsewhere,
-// resume later" excursion the way Ctrl+G's full-pane mode has (see
-// that mode's own doc comment in repl.rs for why *it* instead resolves
-// insert-entry against a frozen original cursor). Ctrl-E itself is *not*
-// special-cased here as a "toggle back to insert" -- only entering this
-// mode from ordinary typing changed meaning; once inside, Ctrl-E keeps
-// its real vim Normal-mode meaning (`Motion::ScrollLineDown`, a no-op on
-// a single line but still fed through `vk.feed` like any other key,
-// unchanged). Real vim only ever returns to Insert via `i`/`a`/`I`/`A`/
-// `s`/`S`/`C` (or an explicit Escape-equivalent), never via Ctrl-E, so
-// this doesn't invent a binding vim itself doesn't have.
+// Ctrl-E: a line-local vim Normal mode over the line being typed, with
+// no promotion or pane, split or not. Motions and insert commands act on
+// the live cursor, since nothing here resumes later (unlike Ctrl+G's
+// full-pane mode). Ctrl-E keeps its vim meaning inside; as in vim, Insert
+// returns via `i`, `a`, `I`, `A`, `s`, `S`, `C`.
 #[allow(clippy::too_many_arguments)]
 fn run_line_normal_mode(
     ed: &mut LineEditor,
@@ -2695,44 +1953,24 @@ fn run_line_normal_mode(
     ctx: HighlightContext,
     registers: &mut Registers,
     undo: &mut UndoTree<Vec<char>>,
-    // `(term_rows, term_cols)`: `Some` draws a `/`/`?` pattern being
-    // typed at the terminal's shared global status row
-    // (`repl::render_global_status_row`, `repl::erase_global_status_row`
-    // to blank it back out -- the same row `:` command mode and Ctrl+
-    // Space's own Normal-mode status line already use) instead of
-    // substituting it in place of this excursion's own reverse-video
-    // prompt. Threaded straight through from `read_line`'s own
-    // identically-named param -- see its doc comment for why both
-    // dimensions are needed (that row is the *terminal's* full width,
-    // not this call's own `width` above) and why this is a plain
-    // snapshot, not a live reference. `None` falls back to the original
-    // in-place substitution.
+    // `Some((term_rows, term_cols))` draws a pattern being typed on the
+    // global status row (`repl::render_global_status_row`), full terminal
+    // width, instead of replacing the prompt. `None` replaces the prompt.
     global_row_size: Option<(usize, usize)>,
     on_idle: &mut dyn FnMut(),
 ) -> io::Result<LineNormalExit> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
-    // Visual mode's own committed selections -- see `LineBuffer::
-    // selections`' own doc comment. Fresh and empty for this excursion,
-    // same as `marks` just above.
+    // Visual mode's committed selections, empty for each excursion, like
+    // `marks`.
     let mut selections: Vec<motion::MotionRange> = Vec::new();
-    // Checkpoints whatever was typed via *ordinary* typing since the last
-    // checkpoint (read_line's own per-character loop never calls this
-    // itself) as its own group, before this excursion's first command can
-    // add one of its own on top -- without this, `undo`'s own `current`
-    // node can be stale by an arbitrary amount of ordinary typing, and if
-    // this excursion's first edit happens to land back on that stale
-    // content by coincidence, `checkpoint` would (correctly, by its own
-    // rules) treat it as a no-op and silently lose both the typed text
-    // *and* the edit as separate undo-able steps.
+    // Checkpoint what ordinary typing added first: otherwise, if the first
+    // edit here happens to recreate the stale undo content, `checkpoint`
+    // sees no change and the typing and edit are lost as separate steps.
     undo.checkpoint(&ed.buf, (0, ed.cursor));
-    // Reverse-video prompt: the mode indicator. Deliberately not a
-    // terminal cursor-shape change (DECSCUSR) -- that's global terminal
-    // state with no clean way to restore whatever the user's own
-    // terminal had configured before this feature ever touched it, so a
-    // forced "steady bar" on the way back out would itself be an
-    // unwanted, sticky change to something this feature has no business
-    // touching.
+    // The reverse-video prompt marks the mode. Not a cursor-shape change
+    // (DECSCUSR), which is global state with no way to restore the user's
+    // own setting.
     let decorated_prompt = format!("\x1b[7m{}\x1b[0m", prompt);
     let (bar_text, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk);
     let shown = if global_row_size.is_some() { decorated_prompt.clone() } else { bar_text.clone().unwrap_or_else(|| decorated_prompt.clone()) };
@@ -2744,24 +1982,15 @@ fn run_line_normal_mode(
             None => break LineNormalExit::Eof,
         };
         match key {
-            // A search actively being typed keeps Ctrl-C for itself
-            // (see vimkeys.rs's own feed_search doc comment on its
-            // Ctrl-C arm) -- only intercepted here, before vk.feed ever
-            // sees it, when no search is in progress.
+            // A search being typed keeps Ctrl-C (see vimkeys.rs's
+            // `feed_search`).
             Key::CtrlC | Key::CtrlD | Key::CtrlZ if !vk.is_search_pending() => break LineNormalExit::Propagate(key),
-            // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`P`/Escape -- intercepted
-            // here, ahead of `vk.feed`, for the same reason repl.rs's own
-            // identical arms are (see its own doc comment): "is there a
-            // selection to act on" is `LineBuffer`-owned state vimkeys.rs
-            // deliberately never sees. `vk.is_idle()` guards all of them:
-            // mid a sub-prefix (`f`, a count, ...) these keys keep their
-            // ordinary meaning instead.
-            //
-            // `Z` (single, not `ZZ` -- unlike repl.rs's own Normal mode,
-            // nothing here gives `Z` any other meaning to preserve):
-            // commits the active selection and returns to Normal mode,
-            // keeping every selection so far highlighted so another
-            // `v`/`V` can start the next one.
+            // Visual `Z`, `y`, `d`, `c`, `p`, `P` and Escape are handled
+            // here before `vk.feed`, as in repl.rs: whether a selection
+            // exists is `LineBuffer` state vimkeys never sees. Only at an
+            // idle point, so mid-prefix they keep their ordinary meaning.
+            // `Z` (single) commits the active selection and returns to
+            // Normal mode, keeping selections highlighted for the next `v`.
             Key::Char('Z') if vk.is_idle() && vk.is_visual() => {
                 let lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2770,13 +1999,9 @@ fn run_line_normal_mode(
                 let end_cursor = lb.cursor();
                 vk.end_visual(end_cursor);
             }
-            // `y`: yanks every committed selection plus the active one
-            // (if any) as one concatenated register value, then clears
-            // both -- reachable either mid an active `v`/`V` selection,
-            // or from plain Normal mode right after a `Z` with nothing
-            // new started (the `!selections.is_empty()` half of the
-            // guard). Falls through to vimkeys.rs's own ordinary
-            // `y`/`yy`/`y{motion}` handling whenever neither is true.
+            // Visual `y`: yanks every committed selection and the active
+            // one as one register value, then clears them; reachable during
+            // `v`/`V` or right after a `Z`. Otherwise ordinary `y`.
             Key::Char('y') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2788,11 +2013,7 @@ fn run_line_normal_mode(
                 lb.selections.clear();
                 vk.end_visual(end_cursor);
             }
-            // `d`: deletes every committed selection plus the active one
-            // (writing the concatenated deleted text to a register
-            // first, same as any other delete), then clears both. Same
-            // reachability as `y` just above; otherwise falls through to
-            // ordinary `d`/`dd`/`d{motion}` operator-arming.
+            // `d`: deletes them likewise, after writing them to a register.
             Key::Char('d') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2804,14 +2025,7 @@ fn run_line_normal_mode(
                 lb.selections.clear();
                 vk.end_visual(end_cursor);
             }
-            // `c`: like `d` (same deletion, same "delete always yanks"
-            // register write, reusing `delete_selections` outright), but
-            // also enters insert mode afterward -- vim's own visual `c`.
-            // Only breaks to insert if something was actually deleted,
-            // mirroring `Op::Change`'s own single-motion arm below; in
-            // practice this guard is never false here, since reaching
-            // this arm at all already means either an active selection
-            // (always yields a range) or a non-empty committed set.
+            // `c`: like `d`, then insert mode, as vim's Visual `c`.
             Key::Char('c') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2826,13 +2040,8 @@ fn run_line_normal_mode(
                     break LineNormalExit::ToInsert;
                 }
             }
-            // `p`/`P`: replaces every committed selection plus the
-            // active one with the register's content (see
-            // `put_over_selections`' own doc comment on why this
-            // broadcasts to every selection rather than mimicking real
-            // vim's single-selection swap). Same reachability as `y`/`d`;
-            // otherwise falls through to ordinary `p`/`P` put-after/
-            // before-cursor.
+            // `p`/`P`: replaces each selection with the register's content
+            // (see `put_over_selections`).
             Key::Char('p') | Key::Char('P') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2844,12 +2053,7 @@ fn run_line_normal_mode(
                 lb.selections.clear();
                 vk.end_visual(end_cursor);
             }
-            // `S`: vim-surround's own "wrap the selection" -- reads one
-            // more raw key directly (the delimiter character), the same
-            // way `:` elsewhere in this codebase reads a whole Ex command
-            // line; vimkeys.rs never sees this key at all, same reason
-            // `y`/`d`/`c`/`p` don't reach it either while Visual is
-            // active (see this loop's own module doc comment).
+            // `S`: vim-surround's wrap, reading the delimiter key directly.
             Key::Char('S') if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
                 if let Some(range) = active_visual_range_line(&vk, &lb) {
@@ -2862,9 +2066,7 @@ fn run_line_normal_mode(
                 lb.selections.clear();
                 vk.end_visual(end_cursor);
             }
-            // Escape: cancels everything -- the active selection and
-            // every previously committed one -- back to a clean Normal
-            // mode with nothing yanked/deleted/replaced.
+            // Escape: drops every selection, back to plain Normal mode.
             Key::Escape if vk.is_idle() && (vk.is_visual() || !selections.is_empty()) => {
                 let end_cursor = (0, ed.cursor);
                 vk.end_visual(end_cursor);
@@ -2896,9 +2098,8 @@ fn run_line_normal_mode(
                         Op::Lowercase | Op::Uppercase | Op::CaseToggle => {
                             case_operator_motion(&mut lb, motion, count, case_kind_for_op(op));
                         }
-                        // `>{motion}`/`<{motion}`: see indent_line/
-                        // outdent_line's own doc comment on why the
-                        // motion itself is ignored here.
+                        // The motion is ignored on one line (see
+                        // `indent_line`).
                         Op::Indent => indent_line(&mut lb),
                         Op::Outdent => outdent_line(&mut lb),
                         // One line has nothing to fold.
@@ -2925,13 +2126,9 @@ fn run_line_normal_mode(
                             registers.record_delete(register, RegisterValue { text: deleted, shape: RegisterShape::Char });
                         }
                     }
-                    // `v`/`V`: arms Visual mode with the buffer's own
-                    // current cursor as the anchor (vimkeys.rs can't read
-                    // that itself -- see `EnterVisual`'s own doc
-                    // comment). Rendering (the reverse-video highlight,
-                    // via `push_selection_matches`) and what `y`/`d`/`p`/
-                    // `Z`/Escape do from here on are handled by the
-                    // guarded arms above, at the top of this same loop.
+                    // `v`/`V`: arms Visual mode with the cursor as anchor
+                    // (vimkeys can't read it). Highlighting and the
+                    // selection keys are handled by the arms above.
                     KeyOutcome::EnterVisual(shape) => {
                         vk.begin_visual(shape, lb.cursor());
                     }
@@ -2948,9 +2145,8 @@ fn run_line_normal_mode(
                             vk.set_visual_anchor(cursor);
                         }
                     }
-                    // See the note on the other arm in this file:
-                    // nothing to ask, and nowhere to go. A single line has
-                    // nothing to fold either.
+                    // Nothing to ask, nowhere to go, and nothing to fold on
+                    // one line.
                     KeyOutcome::GotoDefinition(_)
                     | KeyOutcome::GotoReferences
                     | KeyOutcome::DocumentSymbols
@@ -2963,42 +2159,24 @@ fn run_line_normal_mode(
                             lb.set_cursor(row, col);
                         }
                     }
-                    // <C-w> is still vimkeys' own window-leader prefix
-                    // here too, matching real vim's own Normal-mode
-                    // Ctrl-W meaning -- intentionally not special-cased
-                    // away, even though there's no window/pane state for
-                    // it to act on in this context (a harmless no-op).
-                    // `Join`/`OpenLine` (`o`/`O`) are no-ops for the same
-                    // reason: `LineBuffer` is a single line by
-                    // construction (see its own doc comment) -- there's
-                    // never a next/previous line to join with or open one
-                    // beside.
+                    // `<C-w>` keeps its vim meaning, a harmless no-op
+                    // without panes, and `Join`/`OpenLine` are no-ops on
+                    // one line.
                     KeyOutcome::AddSurround { target, ch } => add_surround(&mut lb, target, ch),
                     KeyOutcome::DeleteSurround { ch } => delete_surround(&mut lb, ch),
                     KeyOutcome::ChangeSurround { ch, replacement } => change_surround(&mut lb, ch, replacement),
                     KeyOutcome::ReplaceChar { ch, count } => replace_char(&mut lb, ch, count.unwrap_or(1).max(1)),
-                    // `R`: degrades to an ordinary `i`-style insert entry
-                    // right at the cursor (no repositioning needed --
-                    // same as real `R`'s own starting point) rather than
-                    // true overtype-as-you-type. A deliberate
-                    // simplification: true Replace-mode typing behavior
-                    // would need to live inside `read_line`'s own typing
-                    // loop (this excursion always resumes there once it
-                    // breaks out to `ToInsert`), which is the single
-                    // highest-traffic code path in the whole shell -- not
-                    // a change to make for this one command. `fileeditor.
-                    // rs`'s own `run_insert_mode` has its own dedicated
-                    // loop instead, so `R` gets the real thing there.
+                    // `R` degrades to `i` at the cursor rather than
+                    // overtyping: real Replace-mode typing would have to
+                    // live in `read_line`'s typing loop, the shell's
+                    // busiest path. The file editor's `run_insert_mode` has
+                    // its own loop and does it properly.
                     KeyOutcome::EnterReplace => break LineNormalExit::ToInsert,
                     KeyOutcome::ToggleCase { count } => toggle_case(&mut lb, count.unwrap_or(1).max(1)),
                     KeyOutcome::AdjustNumber { delta } => adjust_number(&mut lb, delta),
-                    // Guarded the same way repl.rs's own Undo/Redo arms
-                    // are -- see KeyOutcome::Undo's own doc comment in
-                    // vimkeys.rs for why: real vim's Visual mode binds
-                    // bare `u`/`U` to lowercase/uppercase the selection,
-                    // not implemented in this codebase today, so `u`
-                    // simply does nothing while a selection is active
-                    // rather than misfiring as undo.
+                    // Not during Visual mode, as in repl.rs: vim's Visual
+                    // `u`/`U` change case, which isn't implemented, so `u`
+                    // does nothing rather than undo.
                     KeyOutcome::Undo(count) if !vk.is_visual() && lb.selections.is_empty() => {
                         for _ in 0..count.unwrap_or(1).max(1) {
                             let Some(snap) = undo.undo() else { break };
@@ -3013,12 +2191,9 @@ fn run_line_normal_mode(
                             lb.ed.cursor = snap.cursor.1;
                         }
                     }
-                    // `g-`/`g+`: unlike `u`/`Ctrl-R`, these can land on a
-                    // node in a completely different branch than the one
-                    // `undo`'s own `current` was just on -- see
-                    // UndoTree::time_travel_back/forward's own doc
-                    // comment. Same Visual-mode guard as `u`/`Ctrl-R`
-                    // just above, for the same reason.
+                    // `g-`/`g+` can land on another branch (see
+                    // `UndoTree::time_travel_back`). Same Visual guard as
+                    // `u`.
                     KeyOutcome::UndoSeq { forward, count } if !vk.is_visual() && lb.selections.is_empty() => {
                         for _ in 0..count.unwrap_or(1).max(1) {
                             let snap = if forward { undo.time_travel_forward() } else { undo.time_travel_back() };
@@ -3028,12 +2203,9 @@ fn run_line_normal_mode(
                         }
                     }
                     KeyOutcome::Undo(_) | KeyOutcome::Redo(_) | KeyOutcome::UndoSeq { .. } => {}
-                    // `Opener` sits with `Window` for the same reason:
-                    // this mode is line-local by design (see this
-                    // function's own doc comment), and both of those are
-                    // about panes and windows. Ctrl+T means the opener at
-                    // the prompt itself and in a pane's Normal mode,
-                    // which is where there is something to open it over.
+                    // This mode is line-local, and `Window` and `Opener`
+                    // are about panes; Ctrl+T opens the opener at the
+                    // prompt and in a pane's Normal mode.
                     KeyOutcome::Window(..)
                     | KeyOutcome::Opener
                     | KeyOutcome::Join { .. }
@@ -3043,50 +2215,29 @@ fn run_line_normal_mode(
                 }
             }
         }
-        // Commits a new undo-tree node if this key actually changed
-        // `ed.buf` -- a no-op otherwise (pure navigation, or an undo/redo
-        // that just made `ed.buf` match the node it moved to). Once per
-        // top-level key, same "one hook point, reached regardless of
-        // which arm ran" shape as repl.rs's own `render_nav_frame` uses
-        // for `TextBuffer::checkpoint_undo` -- see that one's own doc
-        // comment for why that's what actually defines an undo "group".
+        // Commits an undo node if this key changed `ed.buf`, once per key,
+        // as repl.rs's `render_nav_frame` does (see
+        // `TextBuffer::checkpoint_undo`).
         undo.checkpoint(&ed.buf, (0, ed.cursor));
         let (bar_text, matches) = normal_mode_prompt_and_matches(ed, &mut marks, &mut selections, &vk);
         let shown = if global_row_size.is_some() { decorated_prompt.clone() } else { bar_text.clone().unwrap_or_else(|| decorated_prompt.clone()) };
         redraw(&shown, ed, col_origin, width, ctx, &matches)?;
         draw_global_search_bar(global_row_size, bar_text.as_deref());
     };
-    // Every `break` above (ToInsert, Propagate, Eof) skips straight past
-    // the loop body's own trailing draw_global_search_bar call --
-    // without this, whatever the bar was last showing would keep
-    // sitting at the global row indefinitely once back in ordinary
-    // insert-mode typing, since nothing else calls it again until the
-    // next Ctrl-E excursion. Always erase here instead, regardless of
-    // which exit path was taken.
+    // Every `break` skips the loop's trailing `draw_global_search_bar`, so
+    // erase the bar here, or it would stay on the global row.
     draw_global_search_bar(global_row_size, None);
     Ok(exit)
 }
 
-// `KeyOutcome::Motion`'s ordinary handling (`apply_motion`, moving the
-// cursor) except for a `Motion::TextObject` reached while in Visual mode
-// (`viw`, `va(`, ...): vimkeys.rs can only ever hand back a plain `Motion`
-// there (it never touches a `Buffer` itself), but a text object needs to
-// move *both* Visual ends -- the anchor to the object's start, the cursor
-// to its end -- not just the cursor the way every other motion does.
-// Also where `motion::is_jump` motions get recorded for `Ctrl-O`/`Ctrl-I`
-// (`vk.push_jump`) and vim's own ``` ``` ```/`''` mark (a plain `Buffer`
-// mark keyed by an apostrophe -- see `VimKeys::push_jump`'s and
-// `feed_mark`'s own doc comments) -- this is the one place every jump
-// motion in every Buffer-owning context already passes through, so
-// recording happens here rather than at each of this function's own
-// three call sites. Falls through to `apply_motion` for every other case,
-// including a `TextObject` reached via an armed operator (handled
-// entirely inside `motion::motion_range`, not here) -- operator targets
-// aren't jumps; the cursor ends up back at the range's own start either
-// way, not somewhere new to navigate back from. Generic over `Buffer` for
-// the same reason `yank_motion` just below is -- shared by this file's
-// own run_line_normal_mode and by repl.rs's own ScreenBuffer-based Visual
-// mode.
+// Applies a motion, except a `Motion::TextObject` in Visual mode (`viw`,
+// `va(`), which moves both ends: the anchor to the object's start, the
+// cursor to its end. vimkeys can only return a plain `Motion` there.
+// Also records `motion::is_jump` motions for `Ctrl-O`/`Ctrl-I` and the
+// `'` mark (see `VimKeys::push_jump`), since every jump in every buffer
+// context passes through here. An operator's text object never gets here
+// (`motion::motion_range` handles it). Shared with repl.rs's ScreenBuffer
+// Visual mode.
 pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut dyn crate::bishedit::Buffer, m: motion::Motion, count: Option<usize>) {
     if let (true, motion::Motion::TextObject(kind, around)) = (vk.is_visual(), &m) {
         if let Some(range) = motion::text_object_range(buf, *kind, *around, count) {
@@ -3099,12 +2250,9 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut dyn crate::bishedit:
     if motion::is_jump(&m) {
         let pos = buf.cursor();
         vk.push_jump(pos);
-        // Applied *before* overwriting the `'` mark, not after: `` ` ` ``/
-        // `''` themselves resolve to `Motion::GotoMark('\'')`/`GotoMarkLine
-        // ('\'')`, which read that very mark inside `apply_motion` below --
-        // writing the new value first would make ``` ``` ``` a no-op
-        // (jump to wherever it already just landed, immediately clobbered
-        // by its own jump-recording).
+        // Applied before overwriting the `'` mark: `` ` ` `` and `''` read
+        // that mark, and writing it first would make them jump to where
+        // they already are.
         motion::apply_motion(buf, m, count);
         buf.set_mark('\'', pos);
         return;
@@ -3112,14 +2260,9 @@ pub fn apply_motion_or_reselect(vk: &mut VimKeys, buf: &mut dyn crate::bishedit:
     motion::apply_motion(buf, m, count);
 }
 
-// The `y{motion}`/`yy` glue: generic over any `bishedit::Buffer`, so this
-// is shared not just by run_line_normal_mode/run_one_shot_normal_command
-// below (both drive a `LineBuffer`) but by repl.rs's own ScreenBuffer-based
-// Ctrl+G normal mode too (yank-only there -- see that call site). `put`
-// stays private to this file: it works on a `LineEditor`'s own buffer
-// directly (not through `Buffer`), and only the LineBuffer-driven contexts
-// ever have something real to put into -- see repl.rs's own doc comment on
-// why `KeyOutcome::Put` is a deliberate no-op there.
+// The `y{motion}`/`yy` glue, shared by the line editor's modes and repl.rs's
+// ScreenBuffer Normal mode (yank only there). `put` stays private: it
+// works on a `LineEditor` directly.
 pub fn yank_motion(
     buf: &mut dyn crate::bishedit::Buffer,
     registers: &mut Registers,
@@ -3148,21 +2291,11 @@ fn put(buf: &mut Vec<char>, cursor: &mut usize, registers: &mut Registers, befor
     *cursor = new_cursor;
 }
 
-// `d{motion}`/`c{motion}`'s shared half: computes the same range
-// `yank_motion` would (writing it to a register the same way), then
-// additionally removes that text from the buffer, leaving the cursor at
-// the range's own start -- vim's own rule for both (`c{motion}` then
-// enters insert at that same position, handled by the caller). Unlike
-// `yank_motion`, this isn't generic over `impl Buffer`: mutation only
-// makes sense against a real `LineEditor`, and `ScreenBuffer`'s own
-// Normal mode never reaches this (see repl.rs's own doc comment on why
-// `Operator`/`OperatorLines` there stay yank-only regardless of `Op`).
-// Returns whether anything was actually deleted -- `Op::Change` uses this
-// to decide whether to enter insert mode at all: a motion target that
-// doesn't exist or doesn't move (`motion::motion_range` returning `None`)
-// aborts the whole `c{motion}`, the same way it already silently aborts
-// a `y{motion}`, rather than dropping into insert mode having changed
-// nothing.
+// `d{motion}`/`c{motion}`: computes `yank_motion`'s range, writes it to a
+// register, removes it, and leaves the cursor at its start, as vim does.
+// Not generic: only a `LineEditor` can be edited. Returns whether anything
+// was deleted, so a `c{motion}` whose target fails changes nothing and
+// doesn't enter insert mode.
 fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion::Motion, count: Option<usize>, register: Option<char>) -> bool {
     let Some(range) = motion::motion_range(lb, motion, count) else {
         return false;
@@ -3172,16 +2305,12 @@ fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion:
     registers.record_delete(register, RegisterValue { text, shape });
     let (from_col, to_col) = (range.from.1, range.to.1);
     match range.shape {
-        // A single-line buffer's own "linewise" is always the whole
-        // buffer -- same flattening `whole_lines`/`yank_lines` already
-        // established for `yy`.
+        // On a one-line buffer, linewise is the whole buffer, as for `yy`.
         motion::MotionShape::Linewise => {
             lb.ed.buf.clear();
             lb.ed.cursor = 0;
         }
-        // A block on a buffer that has exactly one line is that line's
-        // own inclusive span -- the shell prompt has no second row for a
-        // rectangle to reach into.
+        // A block on one line is that line's inclusive span.
         motion::MotionShape::Inclusive | motion::MotionShape::Blockwise => {
             let end = (to_col + 1).min(lb.ed.buf.len());
             lb.ed.buf.drain(from_col..end);
@@ -3195,13 +2324,8 @@ fn delete_motion(lb: &mut LineBuffer, registers: &mut Registers, motion: motion:
     true
 }
 
-// `dd`/`cc`'s own whole-line shorthand -- see `delete_motion`'s own doc
-// comment on the single-line "linewise means the whole buffer"
-// flattening (same one `yank_lines`/`whole_lines` use for `yy`). Unlike
-// `delete_motion`, there's no failure case: `count` lines always exist to
-// delete (clamped to just "the" line, since there's only ever one), so
-// `Op::Change` never needs to check a return value here the way it does
-// for `delete_motion` -- `cc` always enters insert.
+// `dd`/`cc`: the whole buffer (see `delete_motion`). Always succeeds, so
+// `cc` always enters insert.
 fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<usize>, register: Option<char>) {
     let text = motion::whole_lines(lb, count.unwrap_or(1).max(1));
     registers.record_delete(register, RegisterValue { text, shape: RegisterShape::Line });
@@ -3209,15 +2333,9 @@ fn delete_lines(lb: &mut LineBuffer, registers: &mut Registers, count: Option<us
     lb.ed.cursor = 0;
 }
 
-// `>{motion}`/`>>`/`<{motion}`/`<<`: same "linewise means the whole
-// buffer" flattening `delete_lines`'s own doc comment establishes for
-// `dd`/`cc` -- there's only ever one line here, so both the motion form
-// and the double-tap shorthand collapse to the same "shift the one
-// line" action, and `count`/the motion itself are ignored (vim's own
-// indent amount is always exactly one shiftwidth regardless of how many
-// lines a count would otherwise select, and there's no second line for
-// a motion to extend into). A genuinely empty line is left alone, same
-// as fileeditor::indent_rows's own rule.
+// `>`/`<` and `>>`/`<<`: shift the one line by a shiftwidth; the count and
+// motion have nothing more to reach. An empty line is left alone, as in
+// `fileeditor::indent_rows`.
 fn indent_line(lb: &mut LineBuffer) {
     if lb.ed.buf.is_empty() {
         return;
@@ -3235,12 +2353,8 @@ fn outdent_line(lb: &mut LineBuffer) {
     lb.ed.cursor = 0;
 }
 
-// Visual mode's own `y`: every selection in `lb.selections` (already in
-// commit order -- `Z` pushes, this reads, the caller clears afterward),
-// concatenated with no separator -- mirrors repl.rs's own
-// `yank_selections` exactly (see its doc comment for why: a `Linewise`
-// part already ends in `\n`, a charwise part butts directly against its
-// neighbor).
+// Visual `y`: every selection in commit order, concatenated, as repl.rs's
+// `yank_selections` does.
 fn yank_selections_line(lb: &LineBuffer, registers: &mut Registers, register: Option<char>) {
     if lb.selections.is_empty() {
         return;
@@ -3256,13 +2370,8 @@ fn yank_selections_line(lb: &LineBuffer, registers: &mut Registers, register: Op
     registers.record_yank(register, RegisterValue { text, shape });
 }
 
-// Visual mode's own `d`: removes every selection from the buffer,
-// writing the concatenated deleted text to a register first (vim's own
-// "delete always yanks" rule, same as any other delete operator).
-// Returns whether anything was actually selected -- mirrors
-// `delete_motion`'s own `bool` result, though this call site never
-// checks it for a change-to-insert decision the way that one does (there
-// is no Visual `c` yet).
+// Visual `d`: writes the selections to a register (vim's delete always
+// yanks) and removes them. Returns whether anything was selected.
 fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: Option<char>) -> bool {
     if lb.selections.is_empty() {
         return false;
@@ -3277,30 +2386,21 @@ fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: O
     }
     registers.record_delete(register, RegisterValue { text, shape });
 
-    // A `Linewise` selection (`V`) already covers the whole single-line
-    // buffer -- same flattening `yy`/`dd`/`cc` already use -- so it
-    // subsumes every other selection in the set outright; no per-range
-    // removal needed (or safe: the buffer's about to be empty either
-    // way).
+    // A `Linewise` selection covers the whole buffer and subsumes the rest.
     if lb.selections.iter().any(|r| r.shape == motion::MotionShape::Linewise) {
         lb.ed.buf.clear();
         lb.ed.cursor = 0;
         return true;
     }
 
-    // Removed highest start-column first, so removing a rightward
-    // selection never shifts a still-pending leftward one's own columns
-    // -- `leftmost` is captured from the *original* (pre-removal) ranges
-    // for exactly that reason: the leftmost range's own start column
-    // never moves no matter what's removed to its right.
+    // Removed from the rightmost start column first, so pending ones keep
+    // their columns; `leftmost` comes from the original ranges, whose
+    // leftmost start never moves.
     let leftmost = lb.selections.iter().map(|r| r.from.1).min().unwrap_or(0);
     let mut ranges = lb.selections.clone();
     crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from.1));
     for range in &ranges {
-        // Re-clamped to the buffer's *current* length on every iteration
-        // (not computed once up front) -- panic-safe even against
-        // pathologically overlapping selections, which nothing currently
-        // prevents the user from creating.
+        // Re-clamped each time, so even overlapping selections can't panic.
         let len = lb.ed.buf.len();
         let start = range.from.1.min(len);
         let end = (range.to.1 + 1).min(len).max(start);
@@ -3310,14 +2410,9 @@ fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: O
     true
 }
 
-// Visual mode's own `S{ch}` -- vim-surround's own "wrap the selection"
-// command. Wraps every committed selection plus the active one in `ch`'s
-// own delimiter pair -- "wrap every one of these", the same multi-
-// selection extension `put_over_selections`' own doc comment already
-// establishes for `p`. Highest start-column first, so wrapping a
-// rightward selection never shifts a still-pending leftward one's own
-// columns. Cursor lands on the leftmost selection's own inserted open
-// delimiter, mirroring `add_surround`'s single-target convention.
+// Visual `S{ch}`: vim-surround's wrap, around every committed selection
+// and the active one, rightmost first so pending ones keep their columns.
+// The cursor lands on the leftmost new open delimiter.
 fn surround_selections(lb: &mut LineBuffer, ch: char) {
     if lb.selections.is_empty() {
         return;
@@ -3339,18 +2434,11 @@ fn surround_selections(lb: &mut LineBuffer, ch: char) {
     lb.ed.cursor = leftmost_open_at;
 }
 
-// Visual mode's own `p`/`P` (both the same in Visual mode, matching real
-// vim: there's no "before/after the cursor" when replacing a selected
-// range, only "instead of it"): replaces *every* selection with the same
-// register content -- a deliberate departure from real vim's own
-// single-selection swap (where the replaced text lands back in the
-// register): with several selections, broadcasting one register's worth
-// of text to each -- "replace every one of these with that" -- is the
-// actually useful multi-selection behavior (and keeps the register
-// intact for pasting the same replacement again), so the old, replaced-
-// away text is simply discarded here rather than overwriting the
-// register a caller may still want. Returns whether anything was
-// actually selected/replaced.
+// Visual `p`/`P` (the same in Visual mode): replaces every selection with
+// the register's content. vim swaps the replaced text into the register;
+// with several selections, putting the same text into each is the useful
+// reading, and the register is kept for the next put. Returns whether
+// anything was replaced.
 fn put_over_selections(lb: &mut LineBuffer, registers: &mut Registers, register: Option<char>) -> bool {
     if lb.selections.is_empty() {
         return false;
@@ -3378,22 +2466,14 @@ fn put_over_selections(lb: &mut LineBuffer, registers: &mut Registers, register:
         lb.ed.buf.splice(start..end, insert_chars.iter().copied());
         leftmost_insert_at = start;
     }
-    // Cursor on the last character of the leftmost replacement -- the
-    // same "ends on the last inserted character" rule `apply_put`'s own
-    // doc comment already establishes for a single `p`.
+    // On the last character of the leftmost replacement, as `apply_put` does.
     lb.ed.cursor = (leftmost_insert_at + insert_chars.len()).saturating_sub(1).min(lb.ed.buf.len().saturating_sub(1));
     true
 }
 
-// `ys{motion}`/`yss`'s own target resolution: a motion resolves exactly
-// like any other operator target (`motion::motion_range`, `None` on a
-// failed/empty one -- same silent no-op `yank_motion`/`delete_motion`
-// already give a failed target); `yss` needs no such lookup at all --
-// `LineBuffer` is always exactly one line (see its own doc comment), so
-// "the current line" is simply the whole buffer, linewise, every time
-// (unlike `TextBuffer`'s own multi-line version of this same target --
-// see `fileeditor.rs`'s own `resolve_surround_target` -- `count` has
-// nothing further to extend into here).
+// The `ys`/`yss` target: a motion's range via `motion::motion_range`, or
+// for `yss` the whole one-line buffer, linewise (see fileeditor.rs's
+// multi-line `resolve_surround_target`).
 fn resolve_surround_target(lb: &mut LineBuffer, target: &vimkeys::SurroundTarget) -> Option<motion::MotionRange> {
     match target {
         vimkeys::SurroundTarget::Motion(m, count) => motion::motion_range(lb, m.clone(), *count),
@@ -3401,13 +2481,9 @@ fn resolve_surround_target(lb: &mut LineBuffer, target: &vimkeys::SurroundTarget
     }
 }
 
-// `ys{motion}{ch}`/`yss{ch}`: wraps `target`'s resolved range in `ch`'s
-// own delimiter pair. Splices the close delimiter in first, then the
-// open one -- inserting at/after `close_at` can never shift `open_at`'s
-// own column, so no further adjustment is needed regardless of shape
-// (see `motion::surround_insert_points`'s own doc comment). Cursor lands
-// on the inserted open delimiter's own first character, matching
-// vim-surround.
+// `ys{motion}{ch}`/`yss{ch}`: wraps the range in `ch`'s pair, close first
+// so the open column doesn't move (see `motion::surround_insert_points`).
+// The cursor lands on the open delimiter, as in vim-surround.
 fn add_surround(lb: &mut LineBuffer, target: vimkeys::SurroundTarget, ch: char) {
     let Some(range) = resolve_surround_target(lb, &target) else {
         return;
@@ -3423,11 +2499,9 @@ fn add_surround(lb: &mut LineBuffer, target: vimkeys::SurroundTarget, ch: char) 
     lb.ed.cursor = open_col;
 }
 
-// `ds{ch}`: removes the nearest enclosing pair named by `ch`, plus any
-// padding `motion::surround_delete_spans` decides to strip -- close side
-// first, so removing it can never shift the open side's own column. A
-// no-op if `ch` doesn't name a valid target or no such pair encloses the
-// cursor.
+// `ds{ch}`: removes the enclosing pair and the padding
+// `motion::surround_delete_spans` picks, close side first. A no-op
+// without a valid target or pair.
 fn delete_surround(lb: &mut LineBuffer, ch: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
@@ -3441,10 +2515,8 @@ fn delete_surround(lb: &mut LineBuffer, ch: char) {
     lb.ed.cursor = open_range.from.1.min(lb.ed.buf.len().saturating_sub(1));
 }
 
-// `cs{ch}{replacement}`: like `delete_surround`, but replaces the found
-// pair's own two delimiter characters with `replacement`'s pair instead
-// of removing them -- never touches any padding around them (unlike
-// `ds`).
+// `cs{ch}{replacement}`: replaces the pair's delimiters, leaving padding
+// alone.
 fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     let Some(kind) = motion::surround_target_kind(ch) else {
         return;
@@ -3462,10 +2534,8 @@ fn change_surround(lb: &mut LineBuffer, ch: char, replacement: char) {
     lb.ed.cursor = open_col;
 }
 
-// `Ctrl-A`/`Ctrl-X`: adjusts the decimal number found at or after the
-// cursor by `delta`, replacing it and leaving the cursor on the new
-// number's own last digit. A no-op if there's no number on the line
-// from the cursor onward.
+// `Ctrl-A`/`Ctrl-X`: adds `delta` to the number at or after the cursor,
+// leaving the cursor on its last digit. A no-op without one.
 fn adjust_number(lb: &mut LineBuffer, delta: i64) {
     let Some(m) = motion::find_number(lb, lb.cursor()) else {
         return;
@@ -3486,24 +2556,17 @@ fn case_kind_for_op(op: Op) -> motion::CaseKind {
     }
 }
 
-// `gu{motion}`/`gU{motion}`/`g~{motion}`: transforms the case of every
-// character in the motion's resolved range, leaving the cursor at the
-// range's own start -- same "operator leaves the cursor at `from`" rule
-// `delete_motion`'s own doc comment establishes. A no-op on a failed/
-// empty target, same as any other operator.
+// `gu`, `gU`, `g~` with a motion: changes case over the range, cursor at
+// its start. A no-op on a failed target.
 fn case_operator_motion(lb: &mut LineBuffer, motion: motion::Motion, count: Option<usize>, kind: motion::CaseKind) {
     let Some(range) = motion::motion_range(lb, motion, count) else {
         return;
     };
     let (from_col, to_col) = (range.from.1, range.to.1);
     match range.shape {
-        // A single-line buffer's own "linewise" is always the whole
-        // buffer -- same flattening `delete_motion`/`yank_lines` already
-        // establish for `yy`/`dd`.
+        // Linewise is the whole buffer here.
         motion::MotionShape::Linewise => case_operator_lines(lb, kind),
-        // A block on a buffer that has exactly one line is that line's
-        // own inclusive span -- the shell prompt has no second row for a
-        // rectangle to reach into.
+        // A block on one line is that line's inclusive span.
         motion::MotionShape::Inclusive | motion::MotionShape::Blockwise => {
             let end = (to_col + 1).min(lb.ed.buf.len());
             for c in lb.ed.buf[from_col..end].iter_mut() {
@@ -3521,10 +2584,7 @@ fn case_operator_motion(lb: &mut LineBuffer, motion: motion::Motion, count: Opti
     }
 }
 
-// `guu`/`gUU`/`g~~`: the same whole-line shorthand `yy`/`dd`/`cc` already
-// establish (see `delete_lines`'s own doc comment) -- transforms the
-// whole (single-line) buffer. No `count` parameter: unlike `dd`/`yy`,
-// there's never more than the one line for a wider count to reach.
+// `guu`, `gUU`, `g~~`: the whole one-line buffer.
 fn case_operator_lines(lb: &mut LineBuffer, kind: motion::CaseKind) {
     for c in lb.ed.buf.iter_mut() {
         *c = motion::case_transform(*c, kind);
@@ -3532,10 +2592,8 @@ fn case_operator_lines(lb: &mut LineBuffer, kind: motion::CaseKind) {
     lb.ed.cursor = 0;
 }
 
-// `~`: toggles the case of `count` characters starting at the cursor,
-// then advances the cursor to just past the last one toggled (clamped
-// to the buffer's own last character) -- see `KeyOutcome::ToggleCase`'s
-// own doc comment. A no-op on an empty buffer.
+// `~`: toggles `count` characters' case and moves past them, clamped to
+// the last character (see `KeyOutcome::ToggleCase`).
 fn toggle_case(lb: &mut LineBuffer, count: usize) {
     let (_, col) = lb.cursor();
     let len = lb.ed.buf.len();
@@ -3549,11 +2607,8 @@ fn toggle_case(lb: &mut LineBuffer, count: usize) {
     lb.ed.cursor = end.min(len.saturating_sub(1));
 }
 
-// `r{ch}`: replaces `count` characters starting at the cursor with `ch`
-// each, staying in Normal mode. Refuses (no-op) if fewer than `count`
-// characters remain on the line from the cursor onward -- matches vim:
-// `r` never crosses a line break or extends the buffer, unlike `s`
-// (substitute, which deletes then inserts and so has no such limit).
+// `r{ch}`: replaces `count` characters with `ch`, staying in Normal mode.
+// A no-op if fewer remain, as in vim.
 fn replace_char(lb: &mut LineBuffer, ch: char, count: usize) {
     let (_, col) = lb.cursor();
     let len = lb.ed.buf.len();
@@ -3566,29 +2621,17 @@ fn replace_char(lb: &mut LineBuffer, ch: char, count: usize) {
     lb.ed.cursor = col + count - 1;
 }
 
-// A single- or two-character-wide (`motion::surround_delete_spans`'s own
-// `Inclusive` ranges, always same-line for `LineBuffer`) removal --
-// `delete_surround`'s own primitive, kept separate from `delete_motion`
-// above since it never writes a register (`ds` doesn't yank, matching
-// vim-surround).
+// Removes a one- or two-character range for `ds`, without writing a
+// register, as vim-surround doesn't.
 fn delete_char_range_line(lb: &mut LineBuffer, range: &motion::MotionRange) {
     let from = range.from.1.min(lb.ed.buf.len());
     let to = (range.to.1 + 1).min(lb.ed.buf.len()).max(from);
     lb.ed.buf.drain(from..to);
 }
 
-// vim's own "`cw`/`cW` act like `ce`/`cE`" rule: when the cursor sits on
-// a non-blank character, changing "to the next word" would otherwise eat
-// the trailing whitespace before that word too (via `WordForward`'s own
-// exclusive-to-the-next-word-start semantics), which reads wrong when
-// what follows is about to be retyped -- vim redirects it to "to the end
-// of the current word" instead, matching what a user actually means.
-// `motion::motion_shape`'s own doc comment flagged this as deliberately
-// unhandled until a real change operator existed to need it; this is
-// that. Only ever called for `Op::Change`, and only changes anything for
-// exactly these two motions -- every other motion (and `Op::Delete`,
-// which never calls this) is unaffected, matching vim (`dw` still eats
-// the trailing whitespace; only `cw` gets the redirect).
+// vim's rule that `cw`/`cW` act as `ce`/`cE` on a non-blank character:
+// changing to the next word's start would also eat the whitespace before
+// it. Only for `Op::Change`; `dw` still takes the whitespace.
 fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion {
     let on_word_char = matches!(lb.ed.buf.get(lb.ed.cursor), Some(c) if !c.is_whitespace());
     match motion {
@@ -3598,19 +2641,11 @@ fn redirect_cw_to_ce(lb: &LineBuffer, motion: &motion::Motion) -> motion::Motion
     }
 }
 
-// Ctrl-O (vim's insert-mode "do exactly one normal command, then return
-// to insert"): reachable directly from ordinary typing, no need to
-// already be in Ctrl-E's own line-local mode first, matching real vim.
-// Reads and resolves exactly one VimKeys-recognized command -- a full
-// multi-key sequence like `2f)`, not just one keystroke -- by looping
-// until `vk.feed` stops returning `Pending`, applies it once, then always
-// returns to insert (the cursor ends up wherever that one command left
-// it -- e.g. `<C-o>b` really does leave the cursor at the start of the
-// previous word once back in insert, exactly like real vim; it isn't
-// snapped back). `Some(key)` is only ever returned for Ctrl-C/D/Z,
-// handled by the caller the same way run_line_normal_mode's own
-// `Propagate` is. No terminal cursor-shape change here either -- same
-// reasoning as run_line_normal_mode's own doc comment.
+// Ctrl-O, vim's one-shot Normal command from insert: reads one whole
+// command (`2f)` included) until `vk.feed` stops returning `Pending`,
+// applies it, and returns to insert with the cursor where the command
+// left it (`<C-o>b` stays at the previous word). `Some(key)` only for
+// Ctrl-C/D/Z, which the caller handles like `Propagate`.
 fn run_one_shot_normal_command(
     ed: &mut LineEditor,
     registers: &mut Registers,
@@ -3619,29 +2654,20 @@ fn run_one_shot_normal_command(
 ) -> io::Result<Option<Key>> {
     let mut vk = VimKeys::new();
     let mut marks: HashMap<char, (usize, usize)> = HashMap::new();
-    // Never actually driven in this loop (see EnterVisual's own arm
-    // below) -- exists only because `LineBuffer` always needs one to
-    // construct, same reasoning as `marks`.
+    // Unused here (Visual mode isn't entered), but `LineBuffer` needs one.
     let mut selections: Vec<motion::MotionRange> = Vec::new();
-    // Same "checkpoint whatever ordinary typing did since the last
-    // checkpoint, before this excursion's own edit can add one on top"
-    // reasoning as run_line_normal_mode's own doc comment.
+    // Checkpoint ordinary typing first; see `run_line_normal_mode`.
     undo.checkpoint(&ed.buf, (0, ed.cursor));
     let result = loop {
         let key = match read_key_idle(on_idle)? {
             Some(k) => k,
-            // EOF mid-command: nothing resolved to apply -- the outer
-            // loop's own next read_key_idle call will see the same EOF
-            // and handle it properly: not lossy, just deferred by one
-            // iteration.
+            // End of input mid-command: the outer loop's next read sees it
+            // too.
             None => break None,
         };
         match key {
-            // Same reasoning as run_line_normal_mode's own conditional
-            // interception: a search actively being typed keeps Ctrl-C
-            // for itself (vimkeys.rs's feed_search cancels just the
-            // search), so it's only intercepted here when no search is
-            // in progress.
+            // A search being typed keeps Ctrl-C (see vimkeys.rs's
+            // `feed_search`).
             Key::CtrlC | Key::CtrlD | Key::CtrlZ if !vk.is_search_pending() => break Some(key),
             _ => {
                 let mut lb = LineBuffer { ed, marks: &mut marks, selections: &mut selections };
@@ -3656,14 +2682,8 @@ fn run_one_shot_normal_command(
                         lb.ed.cursor = new_cursor;
                         break None;
                     }
-                    // Ctrl-O already unconditionally returns to insert
-                    // after any resolved outcome, so `Op::Change` here
-                    // needs no "did it actually delete anything" check
-                    // the way run_line_normal_mode's own arm does --
-                    // `<C-o>cw` returns to insert either way, matching
-                    // Ctrl-O's own "do exactly one command, then resume
-                    // typing" contract regardless of what that command
-                    // did.
+                    // Insert follows any outcome here, so `c{motion}`
+                    // needn't check whether it deleted anything.
                     KeyOutcome::Operator(op, motion, count, register) => {
                         match op {
                             Op::Yank => yank_motion(&mut lb, registers, motion, count, register),
@@ -3723,11 +2743,7 @@ fn run_one_shot_normal_command(
                         replace_char(&mut lb, ch, count.unwrap_or(1).max(1));
                         break None;
                     }
-                    // `R`: same degrade-to-`i` simplification as
-                    // run_line_normal_mode's own arm (see its doc
-                    // comment) -- Ctrl-O always returns to insert
-                    // afterward anyway, matching its own "do exactly one
-                    // command, then resume typing" contract regardless.
+                    // `R` degrades to `i`, as in `run_line_normal_mode`.
                     KeyOutcome::EnterReplace => break None,
                     KeyOutcome::ToggleCase { count } => {
                         toggle_case(&mut lb, count.unwrap_or(1).max(1));
@@ -3737,14 +2753,9 @@ fn run_one_shot_normal_command(
                         adjust_number(&mut lb, delta);
                         break None;
                     }
-                    // EnterVisual: a no-op here too, same reasoning as
-                    // run_line_normal_mode's own arm just above -- Ctrl-O
-                    // is "do exactly one command, then resume typing"
-                    // anyway, which Visual mode's whole point (extending a
-                    // selection over several subsequent keys) doesn't fit.
-                    // `Join`/`OpenLine` are no-ops here for the same
-                    // single-line reason `run_line_normal_mode`'s own arm
-                    // documents.
+                    // No-ops here: Visual mode extends over several keys,
+                    // which a one-shot command can't, and `Join`/`OpenLine`
+                    // need more than one line.
                     KeyOutcome::Window(..)
                     | KeyOutcome::Opener
                     | KeyOutcome::EnterVisual(_)
@@ -3753,21 +2764,16 @@ fn run_one_shot_normal_command(
                     | KeyOutcome::Join { .. }
                     | KeyOutcome::OpenLine { .. }
                     | KeyOutcome::Jump { .. }
-                    // `gd`/`gr` want a language server and a real file
-                    // on disk; a prompt line has neither.
+                    // `gd` and `gr` need a language server and a file.
                     | KeyOutcome::GotoDefinition(_)
                     | KeyOutcome::GotoReferences
                     | KeyOutcome::DocumentSymbols
                     | KeyOutcome::CodeActions
                     | KeyOutcome::Fold(..)
                     | KeyOutcome::None => break None,
-                    // `<C-o>u`/`<C-o>Ctrl-R`/`<C-o>g-`/`<C-o>g+`: real vim
-                    // treats these as ordinary one-shot Normal commands
-                    // too. No Visual-mode guard needed here the way
-                    // run_line_normal_mode's own arms have one --
-                    // `EnterVisual` is a no-op just above, so `vk.is_
-                    // visual()` can never be true by the time any of
-                    // these could fire.
+                    // `<C-o>u`, `<C-o>Ctrl-R`, `<C-o>g-`, `<C-o>g+`, as in
+                    // vim. No Visual guard: Visual mode is never entered
+                    // here.
                     KeyOutcome::Undo(count) => {
                         for _ in 0..count.unwrap_or(1).max(1) {
                             let Some(snap) = undo.undo() else { break };
@@ -3798,34 +2804,20 @@ fn run_one_shot_normal_command(
             }
         }
     };
-    // Checkpoints once, right before returning -- this function always
-    // applies exactly one command then returns, so there's no per-
-    // iteration redraw hook to piggyback on the way run_line_normal_
-    // mode's own loop has; this is the equivalent single point reached
-    // regardless of which arm actually ran.
+    // Checkpoint once, before returning, since exactly one command ran.
     undo.checkpoint(&ed.buf, (0, ed.cursor));
     Ok(result)
 }
 
-// Adapts `LineEditor`'s single line as a `bishedit::Buffer` -- just
-// enough for `motion::apply_motion` to navigate it (`line_count` always
-// 1, viewport_* degenerate -- no vertical scrolling in one line).
-// Mutation (insert-entry's own deletes) deliberately bypasses this trait
-// (it has none yet -- see bishedit's own module doc comment) and works
-// directly on `ed.buf`/`ed.cursor` via `vimkeys::apply_insert_cmd`
-// instead. `marks` is a fresh, empty map each time a `LineBuffer` is
-// constructed (once per Ctrl-E excursion or Ctrl-O one-shot) -- not
-// persisted across separate excursions, a fine simplification for a
-// short-lived command line.
+// `LineEditor`'s single line as a `bishedit::Buffer`, enough for
+// `motion::apply_motion` (one line, no vertical scrolling). Editing goes
+// straight to `ed.buf`/`ed.cursor` (via `vimkeys::apply_insert_cmd`), not
+// through the trait. `marks` start empty with each excursion.
 struct LineBuffer<'a> {
     ed: &'a mut LineEditor,
     marks: &'a mut HashMap<char, (usize, usize)>,
-    // Visual mode's own committed selections -- see repl.rs's own
-    // `ScreenBuffer::selections` doc comment for the shared design (a
-    // plain `Vec<motion::MotionRange>`, `Z` pushes, `y`/`d`/`p` read and
-    // clear). Fresh, empty each `LineBuffer` construction here too, same
-    // as `marks` just above -- Visual mode doesn't persist across
-    // separate Ctrl-E excursions.
+    // Visual mode's committed selections (see repl.rs's
+    // `ScreenBuffer::selections`), empty for each excursion.
     selections: &'a mut Vec<motion::MotionRange>,
 }
 
@@ -3873,11 +2865,6 @@ impl<'a> crate::bishedit::Buffer for LineBuffer<'a> {
 mod tests {
     use super::*;
 
-    // decode_csi_final is a pure function, unlike read_key/read_escape
-    // (which read real bytes off stdin) -- this editor's first test
-    // module, added alongside completion's Tab/Shift-Tab decoding since
-    // that's the one piece of this stage testable without a real
-    // terminal.
     #[test]
     fn decode_csi_final_shift_tab_is_back_tab() {
         assert_eq!(decode_csi_final("", b'Z'), Key::BackTab);
@@ -3894,60 +2881,49 @@ mod tests {
     #[test]
     fn visible_len_counts_display_width_not_char_count() {
         assert_eq!(visible_len("abc"), 3);
-        // Embedded SGR codes never count.
+        // SGR codes never count.
         assert_eq!(visible_len("\x1b[1;32mabc\x1b[0m"), 3);
-        // A wide CJK char counts for 2, not 1.
+        // A wide CJK char counts 2.
         assert_eq!(visible_len("a中b"), 4);
     }
 
     #[test]
     fn visible_len_is_grapheme_cluster_aware() {
-        // A ZWJ family emoji sequence (7 codepoints) counts as its own
-        // one-cluster width (2), not the sum of every codepoint (8) --
-        // see bishedit::unicode_width::str_width's own identical fix.
+        // A ZWJ family (7 codepoints) counts its cluster width, 2, not 8.
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
         assert_eq!(visible_len(family), 2);
-        // Still correct with real SGR codes wrapped around it, and
-        // plain text on either side.
+        // Also with SGR codes around it and text either side.
         assert_eq!(visible_len(&format!("a\x1b[1;32m{family}\x1b[0mb")), 1 + 2 + 1);
     }
 
     #[test]
     fn truncate_visible_drops_a_wide_char_that_would_only_partially_fit() {
-        // "a" (1) + "中" (2) would need 3 columns; asking for 2 drops the
-        // wide char whole rather than splitting it.
+        // `a` plus `中` needs 3 columns; with 2 the wide char is dropped
+        // whole.
         assert_eq!(truncate_visible("a中b", 2), "a");
         assert_eq!(truncate_visible("a中b", 3), "a中");
-        // A leading SGR code is preserved; truncation still stops for
-        // good once the wide char after it wouldn't fit (matching this
-        // function's own pre-existing "stop entirely, don't scan past
-        // the cut" behavior -- a trailing reset code past that point
-        // isn't included either).
+        // A leading SGR code is kept, and truncation stops at the wide char
+        // that doesn't fit, without the reset after it.
         assert_eq!(truncate_visible("\x1b[1ma中\x1b[0m", 1), "\x1b[1ma");
     }
 
-    // The gap this function's own comment used to flag: a cut that
-    // lands inside a cluster leaves half a glyph, which is not one
-    // column narrower -- it is a different character.
+    // A cut inside a cluster would leave a different character, not a
+    // narrower one.
     #[test]
     fn truncate_visible_never_cuts_a_cluster_in_half() {
         let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-        // Two columns for the whole family, so a budget of two takes it
-        // and a budget of one takes none of it -- never the first
-        // person in it.
+        // The family is two columns: a budget of two takes it, one takes
+        // none of it.
         assert_eq!(truncate_visible(family, 2), family);
         assert_eq!(truncate_visible(family, 1), "");
         assert_eq!(truncate_visible(&format!("a{family}"), 2), "a", "one column left is not enough for the family");
         assert_eq!(truncate_visible(&format!("a{family}"), 3), format!("a{family}"));
-        // A base and its combining mark are one cluster and one
-        // column, so the mark is never left behind on its own.
+        // A base and its mark are one cluster, one column.
         assert_eq!(truncate_visible("e\u{301}x", 1), "e\u{301}");
         assert_eq!(truncate_visible("ae\u{301}x", 2), "ae\u{301}");
     }
 
-    // An SGR code inside a cluster does not break it: the colours are
-    // not part of the text, and the cluster they interrupt is still one
-    // glyph.
+    // An SGR code inside a cluster doesn't split it.
     #[test]
     fn truncate_visible_keeps_a_cluster_whole_across_a_colour_change() {
         let coloured = "a\u{1f468}\x1b[1m\u{200d}\u{1f469}\x1b[0m";
@@ -3955,11 +2931,8 @@ mod tests {
         assert_eq!(truncate_visible(coloured, 2), "a", "the pair does not fit, so none of it goes");
     }
 
-    // The four kinds of report that share one encoding, told apart by
-    // the motion bit and the low two. Hover is the one that needs
-    // DECSET 1003 to arrive at all, and it looks exactly like a release
-    // except for the motion bit -- which is why that is what separates
-    // them here.
+    // The four kinds of report share an encoding: hover (DECSET 1003 only)
+    // looks like a release except for the motion bit.
     #[test]
     fn a_motion_with_no_button_is_a_hover_and_nothing_else_is() {
         let ev = |button| MouseEvent { button, col: 1, row: 1, pressed: true };
@@ -3986,11 +2959,8 @@ mod tests {
         assert_eq!(decode_csi_final("6", b'~'), Key::PageDown);
     }
 
-    /// The two backward-kills are different keys with different
-    /// alphabets, which is the whole reason both exist. Checked against
-    /// a real bash through a pty before being written down here: Ctrl-W
-    /// is `unix-word-rubout` and takes `foo/bar` whole; Alt-Backspace
-    /// is `backward-kill-word` and takes one path component.
+    /// Ctrl-W is `unix-word-rubout` and takes `foo/bar` whole; Alt-Backspace
+    /// is `backward-kill-word` and takes one component, as bash does.
     #[test]
     fn a_finished_prompt_paints_what_was_typed_and_not_the_suggestion() {
         let mut ed = LineEditor::new();
@@ -3999,13 +2969,12 @@ mod tests {
         }
         let ctx = HighlightContext::default();
 
-        // What the live prompt shows: the typed text plus the ghost of
-        // a history entry it might become.
+        // The live prompt: what was typed plus a history entry's ghost.
         let live = compose_redraw("$ ", &ed, "-beta-gamma", 0, 40, ctx, &[]);
         assert!(live.contains("beta-gamma"), "the suggestion is on screen while editing");
 
-        // What gets left behind once the line is submitted. Anything
-        // else and the scrollback records a command nobody ran.
+        // What's left once submitted: anything more and the scrollback
+        // records a command nobody ran.
         let finished = repaint_without_affordances("$ ", &ed, 0, 40, ctx);
         assert!(finished.contains("echo alpha"), "what was typed stays");
         assert!(!finished.contains("beta-gamma"), "what was only suggested does not");
@@ -4013,9 +2982,8 @@ mod tests {
 
     #[test]
     fn a_finished_prompt_blanks_the_completion_row_under_it() {
-        // Only the columns this prompt drew, and the cursor ends back
-        // at column 0 where the newline left it -- so the caller's
-        // `\r\n` still means exactly what it did.
+        // Only the columns this prompt drew, and the cursor back at column
+        // 0, so the caller's `\r\n` means what it did.
         let out = erase_menu_row_under_cursor(true, true, None, 3, 12);
         assert_eq!(out, "\x1b[4G            \r");
         assert!(!out.contains("\x1b[K"), "never to the end of the real line -- a split window has a neighbour there");
@@ -4029,9 +2997,8 @@ mod tests {
 
     #[test]
     fn grid_mode_leaves_the_row_to_the_compositor() {
-        // There the pane is repainted wholesale, and a prompt on its
-        // last row would have this writing spaces onto the tab bar
-        // after the newline scrolled.
+        // In grid mode the pane is repainted wholesale, and on its last row
+        // this would write onto the tab bar.
         assert_eq!(erase_menu_row_under_cursor(true, true, Some((5, 20)), 3, 12), "");
     }
 
@@ -4052,8 +3019,7 @@ mod tests {
         let mut ed = typed("cd foo/bar");
         ed.kill_word_backward_to_punctuation();
         assert_eq!(ed.as_string(), "cd foo/", "Alt-Backspace stops at the slash");
-        // Again, and the separator goes with the component in front of
-        // it -- bash does this too.
+        // Again: the separator goes with the component before it, as in bash.
         ed.kill_word_backward_to_punctuation();
         assert_eq!(ed.as_string(), "cd ");
 
@@ -4062,8 +3028,8 @@ mod tests {
         ed.kill_word_backward_to_punctuation();
         assert_eq!(ed.as_string(), "cd foo/");
 
-        // `.`, `-` and `_` end a word as surely as `/` does: readline
-        // counts only letters and digits as part of one.
+        // `.`, `-` and `_` end a word too: readline counts only letters and
+        // digits.
         for (text, want) in [("echo a.b", "echo a."), ("echo a-b", "echo a-"), ("echo a_b", "echo a_")] {
             let mut ed = typed(text);
             ed.kill_word_backward_to_punctuation();
@@ -4076,26 +3042,16 @@ mod tests {
         assert_eq!(ed.as_string(), "echo one ");
     }
 
-    /// Drives a real `bish` prompt over a pty and returns everything it
-    /// wrote.
-    ///
-    /// The unit tests above pin the arithmetic; this pins the property
-    /// that made the arithmetic worth having -- that a pasted script
-    /// does not run itself. Nothing short of a real terminal can say
-    /// that, because the distinction being tested is one only a
-    /// terminal makes.
-    ///
-    /// `None` when there is nothing to drive (no built binary) or when
-    /// the shell never got as far as a prompt, which is a busy machine
-    /// rather than a finding -- the same call the vimdiff harness makes
-    /// about an editor that never answered its handshake.
+    /// Drives a real `bish` prompt over a pty and returns what it wrote, to
+    /// check that a pasted script doesn't run itself, which only a real
+    /// terminal can show. `None` without a built binary, or when the shell
+    /// never reached a prompt (a busy machine, not a finding, as vimdiff
+    /// decides).
     fn at_a_prompt(sends: &[&str]) -> Option<Vec<String>> {
         use std::io::{Read, Write};
         let exe = std::env::current_exe().ok()?;
-        // Current, rather than whatever `cargo build` last left here
-        // -- see `tests/the_binary_under_test_is_the_one_just_built.rs`,
-        // which exists because this test passed with its own fix
-        // disabled until that file did.
+        // Current, not whatever `cargo build` last left (see
+        // `tests/the_binary_under_test_is_the_one_just_built.rs`).
         let bish = exe.parent()?.parent()?.join("bish");
         if !bish.exists() {
             return None;
@@ -4113,9 +3069,8 @@ mod tests {
         let mut child = crate::pty::spawn_attached(cmd, &pty.slave_path).ok()?;
         let mut master = pty.master;
         crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
-        // One drained chunk per send, so a caller can say *when* a line
-        // appeared and not merely that it did -- which is the whole
-        // question here.
+        // One drained chunk per send, so a caller can say when a line
+        // appeared.
         let settle = |master: &mut std::fs::File| -> String {
             let mut seen = String::new();
             let mut quiet = 0;
@@ -4154,7 +3109,7 @@ mod tests {
         Some(chunks)
     }
 
-    /// Everything the terminal was told to draw, minus how to draw it.
+    /// What the terminal was told to draw, without the escapes.
     fn without_escapes(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars().peekable();
@@ -4188,14 +3143,9 @@ mod tests {
 
     #[test]
     fn a_pasted_script_does_not_run_itself() {
-        // Two complete commands and the start of a third, as a paste.
-        // Before bracketed paste this ran the first two on the spot --
-        // the newlines were Enters and nothing could tell them from
-        // typing -- which is a script half-executing while the rest of
-        // it is still arriving.
-        // Each command prints something its own source text does not
-        // contain, so "it ran" and "it was echoed to the screen" cannot
-        // be confused for one another.
+        // Two complete commands and the start of a third, as a paste. Each
+        // prints something its source doesn't contain, so running and
+        // echoing can't be confused.
         let paste = "\u{1b}[200~echo a$((1+1))\necho b$((2+2))\necho c$((3+3\u{1b}[201~";
         let Some(chunks) = at_a_prompt(&[paste, "))\r"]) else {
             return;
@@ -4204,8 +3154,8 @@ mod tests {
         assert!(during.contains("echo a$((1+1))"), "the paste never arrived: {during:?}");
         assert!(!during.contains("a2"), "the paste ran a command: {during:?}");
         assert!(!during.contains("b4"), "the paste ran a command: {during:?}");
-        // ...and all three ran together on the Enter that finished the
-        // line the paste ended in the middle of.
+        // ...and all three ran together on the Enter finishing the line the
+        // paste ended in.
         let after = without_escapes(&chunks[1]);
         for want in ["a2", "b4", "c6"] {
             assert!(after.contains(want), "`{want}` never ran: {after:?}");
@@ -4214,16 +3164,16 @@ mod tests {
 
     #[test]
     fn alt_enter_decodes_from_either_line_ending() {
-        // Same shape as Alt-Backspace: the key's own byte behind an Esc,
-        // in whichever spelling the terminal uses for Enter.
+        // Like Alt-Backspace: the key's byte behind an Esc, in either Enter
+        // spelling.
         assert_eq!(decode_escape_prefixed(b'\r'), Some(Key::AltEnter));
         assert_eq!(decode_escape_prefixed(b'\n'), Some(Key::AltEnter));
     }
 
     #[test]
     fn a_paste_without_newlines_is_an_ordinary_insertion() {
-        // No lines to hand back means the caller inserts it as text,
-        // which is what a paste of a single command should be.
+        // No lines means the caller inserts it as text, as a one-command
+        // paste should be.
         let buf: Vec<char> = "echo ".chars().collect();
         let (lines, rest, cursor) = splice_paste(&buf, 5, "hello");
         assert!(lines.is_empty(), "{lines:?}");
@@ -4234,15 +3184,14 @@ mod tests {
     fn a_paste_splits_at_its_newlines_and_keeps_the_tail() {
         let (lines, rest, cursor) = splice_paste(&[], 0, "echo one\necho two\necho thr");
         assert_eq!(lines, vec!["echo one".to_string(), "echo two".to_string()]);
-        // The tail is still being edited, with the cursor after what
-        // was pasted -- exactly where typing it would have left it.
+        // The tail is still being edited, the cursor after the paste, where
+        // typing would leave it.
         assert_eq!((rest.as_str(), cursor), ("echo thr", 8));
     }
 
     #[test]
     fn a_paste_that_ends_in_a_newline_leaves_an_empty_line() {
-        // The command is complete and nothing has run: the next Enter
-        // is what submits it. That is the whole safety property.
+        // Complete, and nothing has run: the next Enter submits it.
         let (lines, rest, cursor) = splice_paste(&[], 0, "echo x\necho y\n");
         assert_eq!(lines, vec!["echo x".to_string(), "echo y".to_string()]);
         assert_eq!((rest.as_str(), cursor), ("", 0));
@@ -4250,9 +3199,8 @@ mod tests {
 
     #[test]
     fn a_paste_goes_in_at_the_cursor() {
-        // `echo | wc` with the cursor after `echo `, pasting two lines:
-        // the text that was to the right of the cursor stays to the
-        // right of it, on the line the paste ended in.
+        // `echo | wc` with the cursor after `echo `: the text right of the
+        // cursor stays right of it, on the line the paste ended in.
         let buf: Vec<char> = "echo | wc".chars().collect();
         let (lines, rest, cursor) = splice_paste(&buf, 5, "a\nb");
         assert_eq!(lines, vec!["echo a".to_string()]);
@@ -4262,7 +3210,7 @@ mod tests {
 
     #[test]
     fn alt_enter_splits_the_line_where_the_cursor_is() {
-        // The deliberate version: one newline, at the cursor.
+        // Alt-Enter: one newline, at the cursor.
         let buf: Vec<char> = "echo a echo b".chars().collect();
         let (lines, rest, cursor) = splice_paste(&buf, 7, "\n");
         assert_eq!(lines, vec!["echo a ".to_string()]);
@@ -4271,8 +3219,8 @@ mod tests {
 
     #[test]
     fn alt_backspace_decodes_from_either_backspace_byte() {
-        // A terminal may send DEL or BS for Backspace, and an Alt-held
-        // key is that byte behind an Esc.
+        // A terminal may send DEL or BS for Backspace, behind an Esc when
+        // Alt is held.
         assert_eq!(decode_escape_prefixed(0x7f), Some(Key::AltBackspace));
         assert_eq!(decode_escape_prefixed(0x08), Some(Key::AltBackspace));
         assert_eq!(decode_escape_prefixed(b'q'), None);
@@ -4284,15 +3232,13 @@ mod tests {
         for c in "echo hi".chars() {
             ed.insert(c);
         }
-        // Prompt is 3 columns, line starts at real column 5.
+        // The prompt is 3 columns, and the line starts at column 5.
         let at = |col| buf_index_at_column("$ >", &ed, 2, col);
         assert_eq!(at(4), None, "still inside the prompt");
         assert_eq!(at(5), Some(0), "first character of the line");
         assert_eq!(at(10), Some(5));
 
-        // A wide character is two columns, so index and column stop
-        // agreeing -- which is the whole reason this goes through
-        // char_at_col rather than subtracting.
+        // A wide character is two columns, so index and column part ways.
         let mut wide = LineEditor::new();
         for c in "\u{4f60}\u{597d}x".chars() {
             wide.insert(c);
@@ -4312,29 +3258,27 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start, spans[0].end), (1, 4));
         assert!(spans[0].attrs.reverse);
-        // Dragged backwards is the same selection.
+        // Dragged backwards, the same selection.
         assert_eq!(selection_layer(&ed, (4, 1)).first().map(|s| (s.start, s.end)), Some((1, 4)));
-        // An empty one draws nothing rather than a zero-width span.
+        // An empty one draws nothing.
         assert!(selection_layer(&ed, (2, 2)).is_empty());
-        // ...and one running past the end is clamped, not a panic.
+        // ...and one past the end is clamped.
         assert_eq!(selection_layer(&ed, (4, 99)).first().map(|s| (s.start, s.end)), Some((4, 6)));
     }
 
     #[test]
     fn every_control_byte_decodes_to_a_key_of_its_own() {
-        // 0x07/0x11/0x13/0x14 used to fall through to `Unknown`, so a
-        // mapping could not name them. 0x11 and 0x13 are XON/XOFF, and
-        // they reach us at all only because `derive_raw` clears IXON --
-        // flow control is the terminal's idea, not this program's.
+        // 0x07, 0x11, 0x13 and 0x14 decode so mappings can name them (0x11
+        // and 0x13, XON/XOFF, arrive because `derive_raw` clears IXON).
         assert_eq!(decode_solo_byte(0x07), Some(Key::CtrlG));
         assert_eq!(decode_solo_byte(0x11), Some(Key::CtrlQ));
         assert_eq!(decode_solo_byte(0x13), Some(Key::CtrlS));
         assert_eq!(decode_solo_byte(0x14), Some(Key::CtrlT));
-        // The neighbours they sit between are unmoved.
+        // Their neighbours are unchanged.
         assert_eq!(decode_solo_byte(0x06), Some(Key::CtrlF));
         assert_eq!(decode_solo_byte(0x12), Some(Key::CtrlR));
         assert_eq!(decode_solo_byte(0x15), Some(Key::CtrlU));
-        // ...and the ones that are something else entirely stay so.
+        // ...and so are the bytes that mean something else.
         assert_eq!(decode_solo_byte(0x09), Some(Key::Tab));
         assert_eq!(decode_solo_byte(0x0d), Option::None, "CR is Enter, but that arm reads no further byte either -- it stays in read_key");
     }
@@ -4347,10 +3291,8 @@ mod tests {
 
     #[test]
     fn decode_sgr_mouse_final_carries_the_raw_button_code() {
-        // Bit 5 (0x20) set means "motion while a button is held" in SGR's
-        // own Cb encoding -- a drag, not a fresh press. This decoder
-        // deliberately doesn't interpret that bit itself (see MouseEvent's
-        // own doc comment); just confirms the raw code round-trips.
+        // Bit 5 (0x20) means motion with a button held, a drag. The decoder
+        // leaves it to the accessors; this checks the code round-trips.
         assert_eq!(decode_sgr_mouse_final("32;1;1", b'M'), Key::Mouse(MouseEvent { button: 32, col: 1, row: 1, pressed: true }));
     }
 
@@ -4373,16 +3315,15 @@ mod tests {
         assert!(!up.is_scroll_down());
         assert!(down.is_scroll_down());
         assert!(!down.is_scroll_up());
-        // Neither is ever mistaken for a click.
+        // Neither is a click.
         assert!(!up.is_left_click());
         assert!(!down.is_left_click());
     }
 
     #[test]
     fn mouse_event_wheel_ignores_modifier_bits() {
-        // Shift/Meta/Ctrl (bits 2-4) held during a wheel notch -- still a
-        // wheel event, same as is_left_click already ignores them for an
-        // ordinary click.
+        // Shift, Meta and Ctrl (bits 2-4) on a wheel notch: still a wheel
+        // event.
         let shift_wheel_up = MouseEvent { button: 64 | 0x04, col: 1, row: 1, pressed: true };
         assert!(shift_wheel_up.is_scroll_up());
     }
@@ -4399,8 +3340,8 @@ mod tests {
         assert!(MouseEvent { button: 66 | 0x04, col: 1, row: 1, pressed: true }.is_scroll_left());
     }
 
-    // The four are mutually exclusive, which is what lets a caller test
-    // them in any order.
+    // The four are mutually exclusive, so a caller can test them in any
+    // order.
     #[test]
     fn mouse_event_wheel_directions_never_overlap() {
         for button in [64u16, 65, 66, 67] {
@@ -4430,8 +3371,9 @@ mod tests {
 
     #[test]
     fn ghost_uses_the_existing_dim_grey_convention() {
-        // Same (Indexed(8), dim) pair default_style(HighlightKind::Comment)
-        // already uses -- vt100::sgr_codes turns that into "0;2;90".
+        // The (Indexed(8), dim) pair
+        // `default_style(HighlightKind::Comment)` uses, which
+        // `vt100::sgr_codes` writes as `0;2;90`.
         let ed = make_editor("ls", 2);
         let out = compose_redraw("$ ", &ed, " -la", 0, 40, HighlightContext::default(), &[]);
         assert!(out.contains("\x1b[0;2;90m"), "{out:?}");
@@ -4445,12 +3387,8 @@ mod tests {
         assert!(out.contains(&format!("\x1b[{}D", ghost.chars().count())), "{out:?}");
     }
 
-    // Regression guard for the branch-test swap from `ed.buf.len() <=
-    // remaining` to `combined.len() <= remaining`: with no ghost,
-    // combined must equal ed.buf exactly, producing byte-for-byte the
-    // same output as before this feature existed -- no stray dim
-    // styling, no extra cursor-walk distance beyond the ordinary
-    // buf.len() - cursor case (which is 0 here, cursor already at the end).
+    // With no ghost the output is exactly the plain buffer's: no stray dim
+    // styling, no extra cursor movement.
     #[test]
     fn empty_ghost_changes_nothing() {
         let ed = make_editor("ls", 2);
@@ -4461,9 +3399,8 @@ mod tests {
 
     #[test]
     fn ghost_longer_than_remaining_width_truncates_rather_than_wrapping() {
-        // prompt "$ " (2 cols) + width 6 -> remaining 4; buffer "ls" (2
-        // chars) leaves exactly 2 columns of room. A 10-char ghost must
-        // be cut down to those 2 chars, not spill past the pane's width.
+        // `$ ` (2 columns) in width 6 leaves 4; `ls` takes 2, so a 10-char
+        // ghost is cut to 2.
         let ed = make_editor("ls", 2);
         let out = compose_redraw("$ ", &ed, "0123456789", 0, 6, HighlightContext::default(), &[]);
         assert!(out.contains("01"), "{out:?}");
@@ -4472,14 +3409,9 @@ mod tests {
 
     #[test]
     fn overlong_buffer_suppresses_the_ghost_entirely() {
-        // The buffer alone already exceeds `remaining` -- compose_redraw
-        // takes the horizontal-scroll branch, which never has any room
-        // left for a ghost tail at all. Cursor at 24, the string's own
-        // length (end of buffer, same as every other make_editor call
-        // here) -- 25 panicked compose_redraw's window math with a
-        // subtract-with-overflow, since a cursor a full char past the
-        // buffer's end is a state LineEditor's own invariant never
-        // allows outside this one test's own typo.
+        // The buffer alone exceeds the room, so the horizontal-scroll
+        // branch runs, with no room for a ghost. Cursor at 24, the end of
+        // the buffer.
         let ed = make_editor("a very long command line", 24);
         let out = compose_redraw("$ ", &ed, "ignored-ghost", 0, 10, HighlightContext::default(), &[]);
         assert!(!out.contains("ignored-ghost"), "{out:?}");
@@ -4526,7 +3458,7 @@ mod tests {
         let mut selections: Vec<motion::MotionRange> = Vec::new();
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         let mut registers = make_registers();
-        // Left at column 0 never moves -- motion_range returns None.
+        // Left at column 0 doesn't move, so `motion_range` gives `None`.
         let deleted = delete_motion(&mut lb, &mut registers, motion::Motion::Left, None, None);
         assert!(!deleted);
         assert_eq!(ed.buf.iter().collect::<String>(), "abc");
@@ -4535,15 +3467,9 @@ mod tests {
 
     #[test]
     fn delete_motion_linewise_clears_the_whole_single_line_buffer() {
-        // `Motion::Down` is a no-op on a single-line buffer (there's only
-        // ever one line to move to -- motion_range would report "nothing
-        // moved" and delete_motion would correctly do nothing, same as
-        // the failed-target test above). `GotoFirstLine` still counts as
-        // "moved" here because it also repositions the column to the
-        // first non-blank, which is enough to give motion_range a real
-        // range to work with while still being Linewise-classified --
-        // exercising delete_motion's whole-buffer-clear branch, which
-        // ignores the specific from/to columns entirely.
+        // `GotoFirstLine` moves to the first non-blank, giving
+        // `motion_range` a real Linewise range, which exercises the
+        // whole-buffer branch.
         let mut ed = make_editor("  foo bar", 5);
         let mut marks = HashMap::new();
         let mut selections: Vec<motion::MotionRange> = Vec::new();
@@ -4723,7 +3649,7 @@ mod tests {
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         surround_selections(&mut lb, ']');
         assert_eq!(ed.buf.iter().collect::<String>(), "[foo] bar [baz]");
-        // cursor lands on the leftmost selection's own open delimiter
+        // The cursor lands on the leftmost selection's open delimiter.
         assert_eq!(ed.cursor, 0);
     }
 
@@ -4863,7 +3789,7 @@ mod tests {
         let lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForward), motion::Motion::WordEnd);
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::WordForwardBig), motion::Motion::WordEndBig);
-        // Unaffected motions pass through unchanged.
+        // Other motions pass through.
         assert_eq!(redirect_cw_to_ce(&lb, &motion::Motion::LineEnd), motion::Motion::LineEnd);
     }
 
@@ -4878,9 +3804,8 @@ mod tests {
 
     #[test]
     fn change_via_delete_motion_then_insert_mirrors_the_cw_to_ce_redirect() {
-        // "cw" from the middle of "foo" should change only through the
-        // 'o' -- not through the trailing space into "bar" -- matching
-        // vim's own cw-acts-like-ce rule.
+        // `cw` in the middle of `foo` changes only to the `o`, not through
+        // the space, as vim's `cw` acts like `ce`.
         let mut ed = make_editor("foo bar", 1); // 'o' of foo
         let mut marks = HashMap::new();
         let mut selections: Vec<motion::MotionRange> = Vec::new();
@@ -4921,11 +3846,9 @@ mod tests {
         assert_eq!(registers.read(None).shape, RegisterShape::Line);
     }
 
-    // Regression-shaped test for the deletion-order reasoning in
-    // `delete_selections`' own doc comment: two ranges removed
-    // rightmost-first so the leftward one's own columns never shift,
-    // with the register holding both pieces concatenated in *commit*
-    // order regardless of their spatial order.
+    // Two ranges removed rightmost first, so the left one's columns hold,
+    // with the register holding both in commit order whatever their
+    // positions.
     #[test]
     fn delete_selections_removes_every_range_leftmost_cursor_concatenated_register() {
         let mut ed = make_editor("foo bar baz", 0);
@@ -4974,9 +3897,8 @@ mod tests {
         assert!(put_over_selections(&mut lb, &mut registers, None));
         assert_eq!(ed.buf.iter().collect::<String>(), "X X baz");
         assert_eq!(ed.cursor, 0);
-        // The register itself is untouched -- a deliberate departure
-        // from real vim's single-selection swap (see this function's own
-        // doc comment) -- so the same replacement can be pasted again.
+        // The register is untouched, unlike vim's swap, so the same text
+        // can be put again.
         assert_eq!(registers.read(None).text, "X");
     }
 
@@ -5014,8 +3936,7 @@ mod tests {
         let mut selections: Vec<motion::MotionRange> = Vec::new();
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::TextObject(motion::TextObjectKind::Word, false), None);
-        // anchor jumps to the word's own start, not wherever 'v' was
-        // originally pressed -- matches vim's own viw behavior.
+        // The anchor moves to the word's start, as in vim's `viw`.
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (0, 4))));
         assert_eq!(lb.cursor(), (0, 6));
     }
@@ -5028,9 +3949,8 @@ mod tests {
         let mut selections: Vec<motion::MotionRange> = Vec::new();
         let mut lb = LineBuffer { ed: &mut ed, marks: &mut marks, selections: &mut selections };
         apply_motion_or_reselect(&mut vk, &mut lb, motion::Motion::GotoLastLine, None);
-        // GotoLastLine on a single-line buffer doesn't move the cursor,
-        // but it's still a jump motion -- the pre-motion position (0, 0)
-        // is what gets recorded either way.
+        // `GotoLastLine` on one line doesn't move, but is a jump, so (0, 0)
+        // is recorded.
         assert_eq!(vk.jump_back((0, 0)), Some((0, 0)));
         assert_eq!(lb.get_mark('\''), Some((0, 0)));
     }
@@ -5068,9 +3988,7 @@ mod tests {
         pairs.iter().map(|(n, e)| Abbr::new(n, e)).collect()
     }
 
-    // The two trigger sites both pass a `&mut Option<LiveSnippet>`;
-    // these tests are about plain (placeholder-free) expansions, where it
-    // is never written to.
+    // Plain expansions only, which never write the snippet slot.
     fn expand(ed: &mut LineEditor, table: &[Abbr]) -> bool {
         let mut snippet = None;
         let expanded = expand_abbr_at_cursor(ed, table, &mut snippet);
@@ -5097,9 +4015,8 @@ mod tests {
 
     #[test]
     fn expand_abbr_at_cursor_does_nothing_in_argument_position() {
-        // "gco" here is the *argument* to "echo", not the command itself --
-        // fish's own default (`--position command`) leaves this alone, and
-        // so does this port (see expand_abbr_at_cursor's own doc comment).
+        // `gco` is an argument to `echo` here, not the command, so it's left
+        // alone.
         let mut ed = make_editor("echo gco", 8);
         let table = abbrs(&[("gco", "git checkout")]);
         assert!(!expand(&mut ed, &table));
@@ -5108,9 +4025,7 @@ mod tests {
 
     #[test]
     fn expand_abbr_at_cursor_only_matches_the_word_ending_exactly_at_the_cursor() {
-        // Cursor sits right after "gc", not "gco" -- "gco" isn't the word
-        // at the cursor at all, so no expansion should fire even though
-        // "gco" appears later on the line.
+        // The cursor is after `gc`, so the word at the cursor isn't `gco`.
         let mut ed = make_editor("gco", 2);
         let table = abbrs(&[("gco", "git checkout"), ("gc", "git commit")]);
         assert!(expand(&mut ed, &table));
@@ -5124,13 +4039,8 @@ mod tests {
         assert_eq!(ed.as_string(), "gco");
     }
 
-    // --- `abbr` snippets -------------------------------------------
-    //
-    // The keystroke *dispatch* (which key advances, accepts, cancels)
-    // lives inline in read_line's own match and needs a real terminal;
-    // what's testable here is everything underneath it -- the model
-    // (bishedit::snippet's own tests) and the seam between the model and
-    // the line editor, which is this.
+    // `abbr` snippets. The key dispatch lives in `read_line` and needs a
+    // terminal; this tests the seam between the model and the line editor.
 
     fn start_snippet(line: &str, cursor: usize, expansion: &str) -> (LineEditor, LiveSnippet) {
         let mut ed = make_editor(line, cursor);
@@ -5152,16 +4062,14 @@ mod tests {
         let (ed, state) = start_snippet("foo", 3, "bar -x $1 -y $2 | qoo");
         assert_eq!(ed.as_string(), "bar -x $1 -y $2 | qoo");
         assert_eq!(state.holes()[0].0, (0, 7), "the first tabstop starts after `bar -x `");
-        // The caret parks at the first tabstop, not at the end of the
-        // expansion the way a plain abbreviation leaves it.
+        // The caret parks at the first tabstop, not at the end.
         assert_eq!(ed.cursor, 7);
     }
 
     #[test]
     fn a_snippet_only_ever_rewrites_its_own_span_of_the_line() {
         let (mut ed, mut state) = start_snippet("foo", 3, "cd $1");
-        // Text typed after the abbreviation would normally be to the
-        // right; simulate the same thing by expanding mid-line.
+        // Expanded mid-line, as with text typed after the abbreviation.
         assert_eq!(ed.as_string(), "cd $1");
         type_text(&mut ed, &mut state, "src");
         assert_eq!(ed.as_string(), "cd src");
@@ -5203,7 +4111,7 @@ mod tests {
     fn the_layer_is_offset_by_where_the_snippet_actually_sits() {
         let (_, state) = start_snippet("echo hi; foo", 12, "cd $1");
         let layer = snippet_layer(&state);
-        // "echo hi; cd " is 12 chars, then the `$1`.
+        // `echo hi; cd ` is 12 chars, then `$1`.
         assert_eq!((layer[0].start, layer[0].end), (12, 14));
     }
 
@@ -5219,10 +4127,8 @@ mod tests {
         assert_eq!(ed.as_string(), "bar -x ex -y why");
     }
 
-    // The prompt is one line, so a snippet that spans several folds to
-    // spaces rather than corrupting the buffer -- and every offset the
-    // model computed still lines up, since a newline becomes exactly one
-    // space.
+    // A multi-line snippet folds to spaces on the one-line prompt, one space
+    // per newline, so the model's offsets still line up.
     #[test]
     fn a_multi_line_expansion_folds_to_one_line_at_the_prompt() {
         let (mut ed, mut state) = start_snippet("foo", 3, "if $1; then\n\t$0\nfi");
