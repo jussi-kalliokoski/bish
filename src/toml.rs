@@ -1,26 +1,19 @@
 // TOML (v1.0.0), tokenized for highlighting.
 //
-// Where `ini.rs` could be line-oriented -- INI has no construct that
-// spans a line, so every line is independently interpretable -- TOML
-// has three that do: multi-line strings (`"""`/`'''`), multi-line
-// arrays, and inline tables. So this is a real lexer over the whole
-// input rather than a per-line pass.
+// Unlike INI (`ini.rs`, line by line), TOML has constructs spanning
+// lines (multi-line strings, arrays, inline tables), so this lexes the
+// whole input.
 //
-// The one piece of *grammar* it carries is which position it is in,
-// because TOML spells a key and a value with the same characters:
-// `title` is a key, `inf` is a float, and `true` is a boolean only in
-// value position -- `true = 1` is a perfectly good key/value pair. A
-// small context stack (are we inside an array, an inline table, or at
-// the top level; before or after this pair's `=`) is what tells them
-// apart, and it is the thing a scan for `=` on each line would get
-// wrong the moment an array spanned two lines.
+// It tracks one piece of grammar, position, as a key and a value are
+// spelled alike: `inf` is a float and `true` a boolean only as values,
+// and `true = 1` is a valid pair. A small context stack (top level,
+// array or inline table; before or after `=`) tells them apart where a
+// per-line scan for `=` would fail on a two-line array.
 //
-// Tokenizing never fails: anything unreadable becomes `Invalid` and the
-// scan continues, so a buffer mid-keystroke still produces something a
-// highlighter can colour up to and past the mistake -- the same
-// contract `json::tokens` documents, and for the same reason.
-//
-// Offsets are **char** offsets, matching `highlight::HighlightSpan`.
+// Never fails: anything unreadable becomes `Invalid` and scanning goes
+// on, so a half-typed buffer still colours past the mistake, as with
+// `json::tokens`. Offsets are char offsets, as in
+// `highlight::HighlightSpan`.
 #![allow(dead_code)]
 
 use std::ops::Range;
@@ -35,33 +28,28 @@ pub struct Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     Comment,
-    /// A whole table header, brackets included: `[table]` or
-    /// `[[array.of.tables]]`. Emitted *before* the tokens for anything
-    /// quoted inside it, so a highlighter can paint the header as one
-    /// thing and let those show through -- the same layering
-    /// `IniHighlighter` uses for `[remote "origin"]`.
+    /// A table header, brackets included: `[table]` or
+    /// `[[array.of.tables]]`. Emitted before the tokens of anything quoted
+    /// inside, so a highlighter can paint the header and let those show
+    /// through, as `IniHighlighter` does for `[remote "origin"]`.
     TableHeader,
     /// One segment of a key: `a` and `b` in `a.b = 1`, bare or quoted.
     Key,
-    /// A string of any of TOML's four kinds, quotes included. `escapes`
-    /// are spans within it, and are always empty for a literal
-    /// (`'`-quoted) string, where a backslash is a backslash.
+    /// A string of any of the four kinds, quotes included. `escapes` are
+    /// spans within it, always empty for a `'`-quoted literal.
     Str {
         escapes: Vec<Range<usize>>,
     },
-    /// An integer or float in any of TOML's spellings, `inf`/`nan`
-    /// included.
+    /// An integer or float in any spelling, `inf`/`nan` included.
     Number,
     Bool,
-    /// An offset date-time, local date-time, local date or local time.
-    /// Its own kind rather than a `Number` because it is not one, and
-    /// its own rather than a `Str` because nobody quoted it.
+    /// A date-time, date or time: not a number, and not quoted, so its own
+    /// kind.
     DateTime,
-    /// `=` `.` `,` and the brackets and braces of arrays and inline
-    /// tables. A table header's own brackets are part of `TableHeader`
-    /// instead.
+    /// `=` `.` `,` and the brackets and braces of arrays and inline tables;
+    /// a header's brackets are in `TableHeader`.
     Punctuation,
-    /// Anything that isn't TOML. Carried rather than raised.
+    /// Anything that isn't TOML, carried rather than raised.
     Invalid,
 }
 
@@ -70,7 +58,7 @@ pub fn tokens(text: &str) -> Vec<Token> {
     Lexer { chars: &chars, pos: 0, out: Vec::new(), stack: Vec::new(), expect: Expect::Key, line_start: true }.run()
 }
 
-// Which of the two things the same characters would mean here.
+// Which of the two things the same characters mean here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
     Key,
@@ -89,8 +77,8 @@ struct Lexer<'a> {
     out: Vec<Token>,
     stack: Vec<Ctx>,
     expect: Expect,
-    // Whether nothing but whitespace has been seen on this line -- what
-    // makes a `[` a table header rather than an array.
+    // Whether only whitespace has been seen on this line, which makes `[` a
+    // table header rather than an array.
     line_start: bool,
 }
 
@@ -103,10 +91,9 @@ impl Lexer<'_> {
             let Some(c) = self.peek() else { break };
             if c == '\n' {
                 self.pos += 1;
-                // A newline ends a key/value pair, but only at the top
-                // level: inside an array or an inline table it is just
-                // whitespace, which is exactly why this can't be done
-                // one line at a time.
+                // A newline ends a pair only at the top level; in an array
+                // or inline table it's whitespace, which is why this can't
+                // go line by line.
                 if self.stack.is_empty() {
                     self.expect = Expect::Key;
                     self.line_start = true;
@@ -150,9 +137,8 @@ impl Lexer<'_> {
         self.push(TokenKind::Comment, start);
     }
 
-    // `[name]` or `[[name]]`, to the closing bracket or, failing that,
-    // the end of the line -- a header being typed is still a header, and
-    // must not swallow the rest of the file looking for its `]`.
+    // `[name]` or `[[name]]`, to the closing bracket or the end of the line:
+    // a header being typed mustn't swallow the file looking for `]`.
     fn table_header(&mut self) {
         let start = self.pos;
         let mut quoted: Vec<(usize, usize, Vec<Range<usize>>)> = Vec::new();
@@ -170,9 +156,8 @@ impl Lexer<'_> {
                     }
                     break;
                 }
-                // A quoted segment is a string sitting inside the
-                // header, and has to be consumed as one or a `]` inside
-                // it would end the header early.
+                // A quoted segment is consumed as a string, or a `]` in it
+                // would end the header.
                 '"' | '\'' => {
                     let at = self.pos;
                     let escapes = self.string();
@@ -199,13 +184,11 @@ impl Lexer<'_> {
                 self.pos += 1;
                 self.push(TokenKind::Punctuation, start);
             }
-            // An inline table's `}` with no key after the last comma --
-            // `{ a = 1, }` is not legal TOML, but it is what one looks
-            // like halfway through being written.
+            // An inline table's `}` after a trailing comma: `{ a = 1, }`
+            // isn't legal, but it's what one looks like mid-typing.
             Some('}') | Some(',') | Some(']') => self.structure(),
-            // A quoted key is still a key, not a string: what it names
-            // is a field, and colouring it as a value would say
-            // otherwise.
+            // A quoted key is a key: it names a field, and colouring it as
+            // a value would say otherwise.
             Some('"') | Some('\'') => {
                 self.string();
                 self.push(TokenKind::Key, start);
@@ -232,8 +215,8 @@ impl Lexer<'_> {
                 self.after_value();
             }
             Some('[') | Some(']') | Some('{') | Some('}') | Some(',') => self.structure(),
-            // `=` in value position is a second one on the same pair --
-            // not TOML, but not worth mistaking for anything either.
+            // A second `=` on one pair: not TOML, and not mistaken for
+            // anything.
             Some('=') => {
                 self.pos += 1;
                 self.push(TokenKind::Punctuation, start);
@@ -246,9 +229,8 @@ impl Lexer<'_> {
                 let kind = if text == "true" || text == "false" {
                     TokenKind::Bool
                 } else if is_date_or_time(&text) {
-                    // `1979-05-27 07:32:00` -- a space between the date
-                    // and the time is legal, and is the one place in
-                    // TOML where whitespace sits inside a single value.
+                    // `1979-05-27 07:32:00`: a space between date and time
+                    // is legal, the one whitespace inside a TOML value.
                     self.maybe_join_time(&text);
                     TokenKind::DateTime
                 } else if is_number(&text) {
@@ -266,9 +248,9 @@ impl Lexer<'_> {
         }
     }
 
-    // The brackets and braces that open and close arrays and inline
-    // tables, and the commas between their elements. Each one moves the
-    // context, which is what decides whether the next word is a key.
+    // The brackets and braces of arrays and inline tables, and the commas
+    // between elements. Each moves the context, deciding whether the next
+    // word is a key.
     fn structure(&mut self) {
         let start = self.pos;
         let c = self.peek().unwrap_or(' ');
@@ -288,8 +270,8 @@ impl Lexer<'_> {
                 self.after_value();
             }
             ',' => {
-                // A comma separates array elements (values) but inline
-                // table entries (which start with a key).
+                // A comma separates array values, but inline table entries
+                // start with a key.
                 self.expect = match self.stack.last() {
                     Some(Ctx::InlineTable) => Expect::Key,
                     _ => Expect::Value,
@@ -299,16 +281,14 @@ impl Lexer<'_> {
         }
     }
 
-    // What follows a completed value: another element in an array, a
-    // comma in an inline table, or -- at the top level -- the end of the
-    // pair, which the newline handler above takes care of.
+    // After a value: another array element, a comma in an inline table, or
+    // at the top level the end of the pair (the newline handler's job).
     fn after_value(&mut self) {
         self.expect = Expect::Value;
     }
 
-    // A date with no time attached may still gain one after a single
-    // space. Only then: `key = 1979-05-27` followed by a comment or
-    // another pair must not absorb what comes next.
+    // A date may gain a time after a single space, but only then:
+    // `key = 1979-05-27` followed by a comment or pair must not absorb it.
     fn maybe_join_time(&mut self, text: &str) {
         if text.contains(':') || self.peek() != Some(' ') {
             return;
@@ -324,11 +304,10 @@ impl Lexer<'_> {
         }
     }
 
-    // Consumes a string of whichever of TOML's four kinds starts here,
-    // returning its escape spans (always empty for a literal one).
-    // Never runs past the end of the input, and a single-quoted or
-    // single-double-quoted string never runs past its own line -- so
-    // typing an opening quote doesn't restyle the rest of the file.
+    // Consumes a string of whichever kind starts here, returning its
+    // escape spans (none for a literal). Never past the end, and a
+    // single-line string never past its line, so typing an opening quote
+    // doesn't restyle the file.
     fn string(&mut self) -> Vec<Range<usize>> {
         let quote = self.peek().unwrap_or('"');
         let multiline = self.at(1) == Some(quote) && self.at(2) == Some(quote);
@@ -342,8 +321,8 @@ impl Lexer<'_> {
             if c == '\\' && escaped {
                 let at = self.pos;
                 self.pos += 1;
-                // `\uXXXX` and `\UXXXXXXXX` are the long ones; every
-                // other escape is the backslash and one character.
+                // `\uXXXX` and `\UXXXXXXXX` are long; other escapes are one
+                // character.
                 let width = match self.peek() {
                     Some('u') => 5,
                     Some('U') => 9,
@@ -374,15 +353,14 @@ fn is_bare_key(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
-// The characters a scalar (number, boolean or date-time) can be spelled
-// with, so one can be taken in a single run and identified afterwards.
+// The characters a scalar (number, boolean, date-time) can contain, so
+// one is taken in a run and identified after.
 fn is_scalar(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '.' | ':')
 }
 
-// `1979-05-27...` or `07:32:00...`. Shape only -- whether the fields are
-// in range is a validator's question, and colouring `1979-13-45` as a
-// date says what it was written as, which is the honest answer.
+// `1979-05-27...` or `07:32:00...`, by shape only: range checks are a
+// validator's, and `1979-13-45` coloured as a date is what was written.
 fn is_date_or_time(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |n: usize| bytes.len() > n && bytes[..n].iter().all(|b| b.is_ascii_digit());
@@ -394,15 +372,14 @@ fn is_number(text: &str) -> bool {
     if matches!(body, "inf" | "nan") {
         return true;
     }
-    // Prefixed integers, which have their own alphabets and no sign.
+    // Prefixed integers have their own alphabets and no sign.
     for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
         if let Some(rest) = text.strip_prefix(prefix) {
             let rest = rest.replace('_', "");
             return !rest.is_empty() && rest.chars().all(|c| c.is_digit(radix));
         }
     }
-    // Underscores are digit separators anywhere between digits; being
-    // strict about *where* is a validator's job, not a colour's.
+    // Underscores separate digits; where exactly is a validator's concern.
     let plain = body.replace('_', "");
     !plain.is_empty() && plain.chars().next().is_some_and(|c| c.is_ascii_digit()) && plain.parse::<f64>().is_ok()
 }
@@ -411,31 +388,21 @@ fn is_number(text: &str) -> bool {
 // Parsing
 // ---------------------------------------------------------------------
 
-// The lexer above exists to *colour* TOML: it never fails, and it emits
-// a table header as one span so a highlighter can paint it whole. That
-// is the wrong shape for reading a document, which has to fail, and has
-// to fail somewhere in particular.
+// The lexer above colours TOML: it never fails, and emits a header as
+// one span. Reading a document must fail, and at a particular place.
 //
-// So this is a second, direct recursive-descent pass over the same
-// characters rather than a parser layered on those tokens. Two small
-// readers of one bounded grammar, each shaped for its own job, beats one
-// reader contorted to serve both -- the same call `dotenv.rs` makes
-// about not being built on `ini.rs`.
+// So this is a separate recursive-descent pass over the characters: two
+// small readers shaped for their jobs, as `dotenv.rs` isn't built on
+// `ini.rs`.
 //
-// The result is a `json::Value`, which is not a compromise: TOML's data
-// model is JSON's plus dates, and reusing it means `Cargo.toml` answers
-// the same `.package.name` path query `json` already implements, and
-// `:format` and every other consumer of that type comes along free. A
-// date-time is carried as its own literal text -- there is no richer
-// type here to put it in, and every TOML-to-JSON converter does the
-// same.
+// The result is a `json::Value`: TOML's data model is JSON's plus
+// dates, so `Cargo.toml` answers the same `.package.name` queries as
+// `json`, and `:format` and other consumers come free. A date-time is
+// kept as its text, as TOML-to-JSON converters do.
 
-/// Where a document stopped making sense, and why.
-///
-/// `at` is a **char** offset, like every other position in this file --
-/// which is what lets `:diag` underline the actual mistake rather than
-/// reporting it against the whole buffer the way a message with the
-/// position baked into its text forces.
+/// Where a document stopped making sense, and why. `at` is a char
+/// offset, so `:diag` can underline the mistake rather than the whole
+/// buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub at: usize,
@@ -448,17 +415,13 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Reads a whole TOML document.
+/// Reads a whole TOML 1.0.0 document: bare, quoted and dotted keys,
+/// `[table]` and `[[array of tables]]`, all four string forms, integers
+/// in every base with underscores, floats with `inf`/`nan`, booleans,
+/// date-times, arrays and inline tables.
 ///
-/// Accepts TOML 1.0.0's grammar: bare/quoted/dotted keys, `[table]` and
-/// `[[array of tables]]`, all four string forms, integers in every base
-/// with underscores, floats including `inf`/`nan`, booleans, date-times,
-/// arrays and inline tables.
-///
-/// What it deliberately does not do is *validate* a date-time beyond its
-/// shape -- `1979-13-99` parses as the string it looks like. Checking
-/// calendars is a different job from reading a config file, and nothing
-/// downstream of this asks.
+/// Date-times are checked by shape only: `1979-13-99` parses as the
+/// string it looks like.
 pub fn parse(text: &str) -> Result<crate::json::Value, ParseError> {
     let chars: Vec<char> = text.chars().collect();
     Parser { chars: &chars, pos: 0, root: Vec::new(), defined: Vec::new(), tables: Vec::new(), arrays: Vec::new() }.run()
@@ -467,16 +430,15 @@ pub fn parse(text: &str) -> Result<crate::json::Value, ParseError> {
 struct Parser<'a> {
     chars: &'a [char],
     pos: usize,
-    // The document, as `json::Value::Object`'s own field list.
+    // The document, as `json::Value::Object`'s field list.
     root: Vec<(String, crate::json::Value)>,
-    // Every key path a value was actually written to, for catching a
-    // duplicate. Paths rather than a set of names because `a.b` and
-    // `c.b` are different keys.
+    // Every key path written to, for catching duplicates; paths, since
+    // `a.b` and `c.b` differ.
     defined: Vec<Vec<String>>,
     // Table headers seen, for catching `[a]` twice.
     tables: Vec<Vec<String>>,
-    // Paths that are arrays of tables, so `[[a]]` appends where `[a]`
-    // would collide.
+    // Paths that are arrays of tables, so `[[a]]` appends where `[a]` would
+    // collide.
     arrays: Vec<Vec<String>>,
 }
 
@@ -524,8 +486,7 @@ impl<'a> Parser<'a> {
         Err(ParseError { at: self.pos.min(self.chars.len().saturating_sub(1)), message: message.into() })
     }
 
-    // Spaces and tabs only -- a newline is a separator here, never
-    // trivia.
+    // Spaces and tabs only: a newline separates here.
     fn skip_blanks(&mut self) {
         while matches!(self.peek(), Some(' ') | Some('\t')) {
             self.pos += 1;
@@ -540,8 +501,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // Everything between one thing and the next: blanks, comments and
-    // newlines.
+    // Blanks, comments and newlines between things.
     fn skip_trivia(&mut self) {
         loop {
             self.skip_blanks();
@@ -553,9 +513,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // After a pair or a header, the rest of the line must be empty.
-    // Catching this is most of what makes the difference between "this
-    // file is broken" and pointing at where.
+    // After a pair or header the rest of the line must be empty, which is
+    // most of what lets an error point somewhere.
     fn end_of_line(&mut self) -> Result<(), ParseError> {
         self.skip_blanks();
         self.skip_comment();
@@ -607,8 +566,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // `[table]`, `[a.b]`, `[[array]]`. Returns the path the pairs that
-    // follow belong to.
+    // `[table]`, `[a.b]`, `[[array]]`; returns the path following pairs
+    // belong to.
     fn table_header(&mut self) -> Result<Vec<String>, ParseError> {
         let opened = self.pos;
         self.pos += 1;
@@ -636,10 +595,9 @@ impl<'a> Parser<'a> {
             if !self.arrays.contains(&path) {
                 self.arrays.push(path.clone());
             }
-            // A new element of the array starts empty, so the keys the
-            // *previous* one defined are no longer taken. Without this,
-            // two `[[fruit]]` blocks each with a `name` read as the same
-            // key twice -- which is the whole idiom.
+            // A new array element starts empty, freeing the keys the
+            // previous one defined, or two `[[fruit]]` blocks each with
+            // `name` would collide.
             self.defined.retain(|d| !d.starts_with(&path[..]));
         } else {
             if self.tables.contains(&path) || self.defined.contains(&path) {
@@ -700,8 +658,7 @@ impl<'a> Parser<'a> {
         !self.chars.get(i).copied().is_some_and(Self::is_bare_key_char)
     }
 
-    // A date-time and a number start the same way, so this decides
-    // between them by looking for the shape only a date has: four digits
+    // A date-time and a number start alike; only a date has four digits
     // and a `-`, or two digits and a `:`.
     fn number_or_datetime(&mut self) -> Result<crate::json::Value, ParseError> {
         if self.looks_like_datetime() {
@@ -769,8 +726,8 @@ impl<'a> Parser<'a> {
     fn take_number_body(&mut self) -> String {
         let start = self.pos;
         while self.peek().is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-')) {
-            // An exponent's own sign is part of the number; a `-`
-            // anywhere else ends it.
+            // An exponent's sign is part of the number; a `-` elsewhere
+            // ends it.
             if matches!(self.peek(), Some('+') | Some('-')) && !matches!(self.chars.get(self.pos - 1), Some('e') | Some('E')) {
                 break;
             }
@@ -779,8 +736,7 @@ impl<'a> Parser<'a> {
         self.chars[start..self.pos].iter().collect()
     }
 
-    // All four of TOML's strings. Returns the *value*, unquoted and
-    // unescaped.
+    // All four string forms. Returns the value, unquoted and unescaped.
     fn string(&mut self) -> Result<crate::json::Value, ParseError> {
         let opened = self.pos;
         let quote = self.bump().expect("caller checked");
@@ -788,8 +744,8 @@ impl<'a> Parser<'a> {
         let multiline = self.peek() == Some(quote) && self.peek_at(1) == Some(quote);
         if multiline {
             self.pos += 2;
-            // A newline immediately after the opening delimiter is not
-            // part of the value.
+            // A newline right after the opening delimiter isn't part of the
+            // value.
             if self.peek() == Some('\r') {
                 self.pos += 1;
             }
@@ -866,8 +822,8 @@ impl<'a> Parser<'a> {
                 None => Err(ParseError { at, message: format!("\\{c}{n:04X} is not a character") }),
             };
         }
-        // A backslash at the end of a line in a multi-line string eats
-        // the newline and the whitespace after it.
+        // A backslash ending a line in a multi-line string eats the newline
+        // and the whitespace after.
         if multiline && (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
             while matches!(self.peek(), Some(' ') | Some('\t') | Some('\n') | Some('\r')) {
                 self.pos += 1;
@@ -925,9 +881,8 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     return Ok(crate::json::Value::Object(fields));
                 }
-                // An inline table is a single-line construct in TOML
-                // 1.0, and saying so is more useful than the "expected
-                // ',' or '}'" a newline would otherwise produce.
+                // An inline table is single-line in TOML 1.0, and saying so
+                // beats "expected ',' or '}'".
                 Some('\n') | None => {
                     return Err(ParseError { at: opened, message: "unterminated inline table -- it must fit on one line".to_string() });
                 }
@@ -971,15 +926,15 @@ impl<'a> Parser<'a> {
     }
 }
 
-// The last path the parser recorded -- `run` writes each pair's value at
-// the path it just defined, and this is that path.
+// The path the parser recorded last: `run` writes each pair's value at
+// the path it just defined.
 fn full_path_of(defined: &[Vec<String>]) -> Vec<String> {
     defined.last().cloned().unwrap_or_default()
 }
 
-// Walks (creating as it goes) to the table `path` names, and hands back
-// its field list. An array of tables resolves to its *last* element,
-// which is what makes pairs after a `[[x]]` land in the one it opened.
+// Walks to (creating) the table `path` names and returns its fields. An
+// array of tables resolves to its last element, so pairs after `[[x]]`
+// land in the one it opened.
 fn table_at<'t>(root: &'t mut Vec<(String, crate::json::Value)>, path: &[String]) -> Result<&'t mut Vec<(String, crate::json::Value)>, String> {
     let mut cur = root;
     for segment in path {
@@ -1016,8 +971,7 @@ fn insert_nested(root: &mut Vec<(String, crate::json::Value)>, path: &[String], 
 mod tests {
     use super::*;
 
-    // Each token as (its text, its kind), which reads like what you'd
-    // see rather than like a list of offsets.
+    // Each token as (text, kind), which reads like what you'd see.
     fn lex(text: &str) -> Vec<(String, TokenKind)> {
         let chars: Vec<char> = text.chars().collect();
         tokens(text).into_iter().map(|t| (chars[t.start..t.end].iter().collect(), t.kind)).collect()
@@ -1039,8 +993,8 @@ mod tests {
         );
     }
 
-    // The reason this carries a context at all: the same word is a key
-    // on the left of `=` and a value on the right.
+    // The reason for the context: the same word is a key left of `=` and a
+    // value right of it.
     #[test]
     fn the_same_word_is_a_key_or_a_value_depending_on_the_side() {
         assert_eq!(kinds("true = false"), vec![TokenKind::Key, TokenKind::Punctuation, TokenKind::Bool]);
@@ -1069,15 +1023,14 @@ mod tests {
         assert_eq!(lex("[[bin]]"), vec![("[[bin]]".to_string(), TokenKind::TableHeader)]);
     }
 
-    // ...with a quoted segment layered inside it, so a header holding a
-    // string still shows one.
+    // ...with a quoted segment inside it still showing.
     #[test]
     fn a_quoted_segment_of_a_header_is_also_a_string() {
         assert_eq!(lex("[a.\"b.c\"]"), vec![("[a.\"b.c\"]".to_string(), TokenKind::TableHeader), ("\"b.c\"".to_string(), str_kind())]);
     }
 
-    // A `[` after a value opens an array; only one at the start of a
-    // line opens a table.
+    // A `[` after a value opens an array; only one starting a line opens a
+    // table.
     #[test]
     fn a_bracket_is_a_table_only_at_the_start_of_a_line() {
         assert_eq!(kinds("ports = [1, 2]").last(), Some(&TokenKind::Punctuation));
@@ -1085,8 +1038,8 @@ mod tests {
         assert_eq!(kinds("[table]"), vec![TokenKind::TableHeader]);
     }
 
-    // The case a per-line scan gets wrong: inside an array a newline is
-    // whitespace, so what follows is still a value, not a new key.
+    // Where a per-line scan fails: in an array a newline is whitespace, so
+    // what follows is still a value.
     #[test]
     fn an_array_spanning_lines_stays_in_value_position() {
         assert_eq!(
@@ -1104,8 +1057,8 @@ mod tests {
         );
     }
 
-    // An inline table's own entries start with keys, which is what makes
-    // a comma mean something different inside `{}` than inside `[]`.
+    // An inline table's entries start with keys, so a comma means
+    // something else in `{}` than in `[]`.
     #[test]
     fn an_inline_table_has_keys_inside_it() {
         assert_eq!(
@@ -1147,13 +1100,13 @@ mod tests {
         }
     }
 
-    // The one place whitespace sits inside a single TOML value.
+    // The one place whitespace sits inside a single value.
     #[test]
     fn a_date_and_a_time_separated_by_a_space_are_one_value() {
         assert_eq!(lex("k = 1979-05-27 07:32:00").last().unwrap().0, "1979-05-27 07:32:00");
     }
 
-    // ...but only when a time really follows.
+    // ...but only when a time follows.
     #[test]
     fn a_date_does_not_swallow_what_merely_comes_after_it() {
         assert_eq!(lex("k = 1979-05-27 # when").last().unwrap().0, "# when");
@@ -1177,8 +1130,8 @@ mod tests {
         assert_eq!(escapes("k = 'a\\nb'"), 0, "a literal string has no escapes");
     }
 
-    // A single-quoted string ends at its own line, so an unterminated
-    // one doesn't restyle everything below it.
+    // A single-quoted string ends at its line, so an unterminated one
+    // doesn't restyle what follows.
     #[test]
     fn an_unterminated_single_line_string_ends_at_its_line() {
         let toks = lex("k = \"open\nj = 1");
@@ -1187,7 +1140,7 @@ mod tests {
         assert_eq!(toks[3].1, TokenKind::Key);
     }
 
-    // ...whereas a `"""` string is meant to span lines and does.
+    // ...while a `"""` string spans lines.
     #[test]
     fn a_multiline_string_really_spans_lines() {
         let toks = lex("k = \"\"\"a\nb\"\"\"\nj = 1");
@@ -1209,8 +1162,8 @@ mod tests {
         );
     }
 
-    // A `#` inside a string is text, which is the whole reason strings
-    // are consumed before comments are looked for.
+    // A `#` inside a string is text, which is why strings are consumed
+    // before comments are looked for.
     #[test]
     fn a_hash_inside_a_string_is_not_a_comment() {
         assert_eq!(lex("k = \"a # b\"").last().unwrap().0, "\"a # b\"");
@@ -1230,10 +1183,9 @@ mod tests {
         }
     }
 
-    // Every token's text, concatenated with the gaps, must be the input
-    // back again: nothing overlapping, nothing out of order, nothing
-    // invented. (Table headers are skipped -- they deliberately overlap
-    // the quoted segments they contain.)
+    // Token texts plus the gaps rebuild the input: nothing overlapping, out
+    // of order, or invented. Headers are skipped; they overlap their quoted
+    // segments.
     #[test]
     fn tokens_cover_the_input_in_order_without_overlapping() {
         let text = "# c\n[a.b]\nx = 1\ny = [1, {z = \"s\"}]\nd = 1979-05-27T07:32:00Z\n";
@@ -1308,8 +1260,7 @@ path = "src/main.rs"
         assert_eq!(q(src, ".neg"), "-3");
         assert_eq!(q(src, ".yes"), "true");
         assert_eq!(q(src, ".no"), "false");
-        // A date-time keeps its own text: there is no richer type here
-        // to put it in.
+        // A date-time keeps its text.
         assert_eq!(q(src, ".when"), "\"1979-05-27T07:32:00Z\"");
         assert_eq!(q(src, ".day"), "\"1979-05-27\"");
     }
@@ -1355,11 +1306,8 @@ path = "src/main.rs"
         assert_eq!(parse("# only a comment\n").unwrap(), Value::Object(Vec::new()));
     }
 
-    // The half `:diag` exists for: every failure has to point somewhere
-    // in particular, not just say that the file is broken.
-    // Reading real files, not invented ones: a parser for a config
-    // format is only worth having if it reads the configs that are
-    // actually on the machine.
+    // Real files: a config parser is worth having only if it reads the
+    // configs on the machine.
     #[test]
     fn every_toml_file_on_this_machine_parses() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
@@ -1380,8 +1328,7 @@ path = "src/main.rs"
         for root in ["/home/jussi/.cargo/registry/src", concat!(env!("CARGO_MANIFEST_DIR"))] {
             walk(std::path::Path::new(root), &mut files, 0);
         }
-        // Nothing to prove on a machine with no TOML on it; the invented
-        // cases above still cover the grammar.
+        // With no TOML on this machine there's nothing to prove here.
         if files.len() < 5 {
             return;
         }
@@ -1397,6 +1344,7 @@ path = "src/main.rs"
         assert!(files.len() >= 50, "only found {} files -- this test proves nothing at that size", files.len());
     }
 
+    // Every failure points somewhere, for `:diag` to underline.
     #[test]
     fn a_failure_names_a_position() {
         let at = |src: &str| parse(src).unwrap_err().at;
@@ -1405,7 +1353,7 @@ path = "src/main.rs"
         assert_eq!(at("a = 1\nb = \n"), 10, "points past the `=` with nothing after it");
         assert!(msg("a = 1\nb = \n").contains("value"));
 
-        // The opening quote, not wherever the scan gave up.
+        // The opening quote, not where the scan gave up.
         assert_eq!(at("a = \"unterminated\n"), 4);
         assert!(msg("a = \"unterminated\n").contains("unterminated"));
 
@@ -1424,7 +1372,7 @@ path = "src/main.rs"
         assert!(parse("a = 1\na = 2\n").unwrap_err().message.contains("twice"));
         assert!(parse("[t]\n[t]\n").unwrap_err().message.contains("twice"));
         assert!(parse("x = { a = 1, a = 2 }\n").unwrap_err().message.contains("twice"));
-        // ...but the same *name* under two different tables is fine.
+        // ...but the same name under two tables is fine.
         assert_eq!(q("[a]\nn = 1\n[b]\nn = 2\n", ".b.n"), "2");
     }
 }
