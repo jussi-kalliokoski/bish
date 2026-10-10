@@ -1,12 +1,10 @@
-// Rendering a parsed man page to a terminal: what `:preview` shows for a
-// `.1` file, and the same shape markdown/render.rs already has -- one
-// styled line per `Vec<String>` entry, wrapped by display width so CJK
-// and emoji stop in the right place.
+// Renders a parsed man page to a terminal, for `:preview` of a `.1`
+// file: one styled line per entry, like markdown/render.rs, wrapped by
+// display width.
 //
-// Deliberately close to what `man` itself puts on screen, because that
-// is the layout every reader of these pages already knows: headings
-// flush left and bold, body indented, a tagged paragraph's tag on its
-// own line with the body indented under it.
+// Laid out as `man` shows pages, since readers know it: headings flush
+// left and bold, body indented, a tag on its own line with its body
+// indented under it.
 
 use crate::bishedit::unicode_width::str_width;
 
@@ -30,16 +28,15 @@ impl Default for Options {
     }
 }
 
-// man's own body indent. Headings sit outside it, which is what makes a
-// page scannable by section.
+// man's body indent; headings sit outside it, so sections stand out.
 const BODY_INDENT: usize = 3;
 const TAG_INDENT: usize = 7;
 
 pub fn to_lines(doc: &Document, opts: &Options) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(header) = &doc.header {
-        // The running header man puts at the top: title(section) on the
-        // left, the manual name centred, the same on the right.
+        // man's running header: title(section) left, the manual name centred,
+        // title(section) right.
         let left = format!("{}({})", header.title, header.section);
         let centre = if header.manual.is_empty() { header.source.clone() } else { header.manual.clone() };
         out.push(format!("{BOLD}{}{RESET}", header_line(&left, &centre, opts.width)));
@@ -57,9 +54,8 @@ pub fn to_lines(doc: &Document, opts: &Options) -> Vec<String> {
     while out.last().is_some_and(|l| l.trim().is_empty()) {
         out.pop();
     }
-    // Blocks each end with their own separator and headings open with
-    // one, so runs of blanks are collapsed here rather than by making
-    // every block track what came before it.
+    // Each block ends with a separator and headings open with one, so runs
+    // of blanks are collapsed here.
     let mut collapsed: Vec<String> = Vec::with_capacity(out.len());
     for line in out {
         if line.trim().is_empty() && collapsed.last().is_some_and(|l| l.trim().is_empty()) {
@@ -87,8 +83,8 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
             if !out.is_empty() {
                 out.push(String::new());
             }
-            // A section heading is flush left; a subsection is indented
-            // once -- man's own convention.
+            // A section heading is flush left; a subsection indented once,
+            // as man does.
             let pad = if *level == 1 { 0 } else { BODY_INDENT };
             let text: String = content.iter().map(styled_of).collect();
             out.push(format!("{}{HEADING}{text}{RESET}", " ".repeat(pad)));
@@ -147,9 +143,8 @@ fn paint(text: &str, style: Style) -> String {
         out.push_str(BOLD);
     }
     if style.italic {
-        // Underline, not italic: `man` has rendered italic as underline
-        // on a terminal for forty years, and a reader of these pages
-        // reads underline as "this is a placeholder you substitute".
+        // Underline, not italic: man shows italic as underline on a terminal,
+        // and readers take it to mean a placeholder.
         out.push_str(UNDERLINE);
     }
     out.push_str(text);
