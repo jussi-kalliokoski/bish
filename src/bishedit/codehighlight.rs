@@ -1,43 +1,26 @@
-// Token scanners for the languages the editor already recognises by
-// extension but had nothing to colour them with: rust, python,
-// javascript and typescript. Opening a `.rs` file here showed plain
-// uncoloured text unless a language server happened to be running and
-// painting semantic tokens over the top.
+// Token scanners for Rust, Python, JavaScript, TypeScript, YAML, CSS, HTML
+// and Go.
 //
-// These are deliberately *token*-level and nothing more. What a name
-// means -- a type, a function, a module -- is a question that needs the
-// program understood, and there is already something in this editor
-// that answers it properly: a language server's semantic tokens, which
-// are layered last in `fileeditor::buffer_spans` and paint over
-// whatever these produce. So the job here is only to get comments,
-// strings, numbers and keywords right, which is what makes a file
-// readable when no server is running, and to stay out of the way when
-// one is.
+// Token-level only: comments, strings, numbers and keywords. What a name
+// means needs a language server, whose semantic tokens are layered last in
+// `fileeditor::buffer_spans` and paint over these.
 //
-// Each language gets its own scanner rather than a shared one driven by
-// a table of rules. Their comment and number syntax really is the same,
-// but the parts that go wrong are exactly the parts that differ: Rust's
-// lifetimes look like unterminated character literals, Python's string
-// prefixes attach to the quote, JavaScript's template literals nest
-// arbitrary code inside a string. A shared engine would have to grow a
-// flag for each of those, and a flag per language is a scanner per
-// language with the structure hidden.
+// One scanner per language rather than a shared table-driven one: the parts
+// that go wrong are the parts that differ (Rust lifetimes, Python string
+// prefixes, JavaScript template literals), and a flag per language would be
+// a scanner per language with the structure hidden.
 //
-// Nothing here reports an error. A buffer being typed into is invalid
-// most of the time, and an unterminated string simply runs to the end
-// of what it can reach -- text going uncoloured past a mistake is a
-// quieter and more honest signal than painting an error the moment a
-// quote is opened. Same call `JsonHighlighter` already makes.
+// Nothing here reports an error. A buffer being typed into is invalid most
+// of the time, so an unterminated string runs as far as it can, as in
+// `JsonHighlighter`.
 
 use super::highlight::HighlightKind;
 use std::ops::Range;
 
 type Spans = Vec<(Range<usize>, HighlightKind)>;
 
-// Byte offsets throughout, which is what a `HighlightSpan` holds. A
-// byte at or above 0x80 is part of a UTF-8 sequence and can only be
-// inside an identifier or a string as far as any of this is concerned,
-// so it counts as an identifier character and never as punctuation.
+// Byte offsets, as a `HighlightSpan` holds. A byte at or above 0x80 is part
+// of a UTF-8 sequence, so it counts as an identifier character.
 struct Scan<'a> {
     src: &'a [u8],
     pos: usize,
@@ -71,9 +54,8 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// Everything to the end of the line, the newline itself excluded --
-    /// a comment that swallowed its own newline would colour the blank
-    /// space to the right of it on a terminal that fills to the edge.
+    /// To the end of the line, excluding the newline, which would otherwise
+    /// colour the empty space to its right.
     fn skip_to_end_of_line(&mut self) {
         while !self.done() && self.here() != b'\n' {
             self.pos += 1;
@@ -117,9 +99,8 @@ impl<'a> Scan<'a> {
         true
     }
 
-    /// A quoted run. `multiline` says whether a newline ends it: it does
-    /// in JavaScript and Python's single-quoted forms, and does not in
-    /// Rust, where an ordinary `"` string may span lines.
+    /// A quoted run. `multiline` says whether a newline ends it: it does in
+    /// JavaScript and Python's single-quoted forms, not in Rust.
     fn quoted(&mut self, quote: u8, multiline: bool) {
         let start = self.pos;
         self.pos += 1;
@@ -137,7 +118,7 @@ impl<'a> Scan<'a> {
         self.push(start, HighlightKind::String);
     }
 
-    /// A run delimited by a repeated quote -- Python's `"""`.
+    /// A run delimited by a tripled quote: Python's `"""`.
     fn triple_quoted(&mut self, quote: u8) {
         let start = self.pos;
         let fence = [quote, quote, quote];
@@ -153,27 +134,24 @@ impl<'a> Scan<'a> {
         self.push(start, HighlightKind::String);
     }
 
-    /// Digits and whatever a number may carry with them: a base prefix,
-    /// `_` separators, an exponent, a decimal point, and a type suffix
-    /// glued to the end (`1u8`, `1.5f64`, `10n`). Taking the suffix as
-    /// part of the number is what stops it being scanned as an
-    /// identifier immediately afterwards.
+    /// Digits plus a base prefix, `_` separators, an exponent, a decimal
+    /// point and a type suffix (`1u8`, `1.5f64`, `10n`), so the suffix
+    /// isn't scanned as an identifier.
     fn number(&mut self) {
         let start = self.pos;
         self.pos += 1;
         while !self.done() {
             let c = self.here();
-            // An exponent's sign counts only directly after the `e`,
-            // and only in a number that has an exponent to sign: `e` is
-            // a digit in hex, so `0x1E-3` is a subtraction and `1.2e-3`
-            // is one number. A leading `0` is what tells them apart,
-            // since every based literal starts with one.
+            // An exponent's sign counts only right after the `e` of a
+            // number that can have an exponent. `e` is a hex digit, so
+            // `0x1E-3` is a subtraction and `1.2e-3` one number; a based
+            // literal starts with `0`.
             if matches!(c, b'+' | b'-') && matches!(self.at(self.pos - 1), b'e' | b'E') && self.at(start) != b'0' {
                 self.pos += 1;
                 continue;
             }
-            // A `.` is part of the number unless it is a method call on
-            // one: `1.max(2)` is a number, a dot and a name.
+            // A `.` is part of the number unless it's a method call:
+            // `1.max(2)`.
             if c == b'.' && !self.at(self.pos + 1).is_ascii_digit() && self.at(self.pos + 1) != 0 && ident_char(self.at(self.pos + 1)) {
                 break;
             }
@@ -216,7 +194,7 @@ fn ident_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_' || c >= 0x80
 }
 
-// --- rust --------------------------------------------------------------
+// Rust
 
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let",
@@ -231,18 +209,15 @@ pub fn rust(text: &str) -> Spans {
             continue;
         }
         let c = s.here();
-        // A raw string carries its own fence: `r"..."`, or `r#"..."#`
-        // with as many `#` as it likes, which is how a Rust string holds
-        // a quote without escaping one.
+        // A raw string: `r"..."`, or `r#"..."#` with any number of `#`.
         if (c == b'r' || c == b'b') && rust_raw_string(&mut s) {
             continue;
         }
         match c {
             b'"' => s.quoted(b'"', true),
-            // `'` is a character literal or a lifetime, and the two look
-            // alike until the closing quote does or does not arrive.
-            // Scanning it as a string either way would paint the rest of
-            // the file from the first `&'a str` onwards.
+            // `'` starts a character literal or a lifetime, which look
+            // alike until the closing quote does or doesn't arrive. Scanned
+            // as a string, `&'a str` would paint the rest of the file.
             b'\'' => {
                 if rust_lifetime(&mut s) {
                     continue;
@@ -257,8 +232,7 @@ pub fn rust(text: &str) -> Spans {
     s.out
 }
 
-/// `r"..."`, `r#"..."#`, `br"..."`, `br#"..."#` -- true if one started
-/// here and was consumed.
+/// `r"..."`, `r#"..."#`, `br"..."`, `br#"..."#`; true if one was consumed.
 fn rust_raw_string(s: &mut Scan) -> bool {
     let start = s.pos;
     let mut at = s.pos;
@@ -307,8 +281,7 @@ fn rust_lifetime(s: &mut Scan) -> bool {
     }
     let start = s.pos;
     s.pos = at;
-    // `'static` is the one lifetime that is also a keyword, and reads
-    // as one.
+    // `'static` is a lifetime that reads as a keyword.
     let kind = match s.text(&(start + 1..at)) {
         "static" => HighlightKind::Keyword,
         _ => HighlightKind::Variable,
@@ -317,7 +290,7 @@ fn rust_lifetime(s: &mut Scan) -> bool {
     true
 }
 
-// --- python ------------------------------------------------------------
+// Python
 
 const PYTHON_KEYWORDS: &[&str] = &[
     "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except",
@@ -325,8 +298,8 @@ const PYTHON_KEYWORDS: &[&str] = &[
     "with", "yield",
 ];
 
-/// The letters that may sit in front of a quote: raw, bytes, formatted,
-/// unicode, in either case and in either order.
+/// The letters that may precede a quote (raw, bytes, formatted, unicode),
+/// in either case and order.
 fn python_string_prefix(word: &str) -> bool {
     !word.is_empty() && word.len() <= 2 && word.bytes().all(|c| matches!(c.to_ascii_lowercase(), b'r' | b'b' | b'f' | b'u'))
 }
@@ -340,8 +313,7 @@ pub fn python(text: &str) -> Spans {
         let c = s.here();
         match c {
             b'"' | b'\'' => python_string(&mut s),
-            // A decorator names what is being applied, which reads as
-            // part of the declaration rather than as an expression.
+            // A decorator reads as part of the declaration.
             b'@' if ident_start(s.at(s.pos + 1)) => {
                 let start = s.pos;
                 s.pos += 1;
@@ -354,13 +326,11 @@ pub fn python(text: &str) -> Spans {
             c if ident_start(c) => {
                 let range = s.word();
                 let word = s.text(&range).to_string();
-                // `f"..."` is a prefix and its quote is what follows;
-                // `f` alone is a name.
+                // `f"..."` is a prefix and a string; `f` alone is a name.
                 if python_string_prefix(&word) && matches!(s.here(), b'"' | b'\'') {
                     let start = range.start;
                     python_string(&mut s);
-                    // Redraw the string to include its own prefix, which
-                    // is part of what the string is.
+                    // Extend the string's span over its prefix.
                     if let Some(last) = s.out.last_mut() {
                         last.0.start = start;
                     }
@@ -384,7 +354,7 @@ fn python_string(s: &mut Scan) {
     }
 }
 
-// --- javascript and typescript -----------------------------------------
+// JavaScript and TypeScript
 
 const JS_KEYWORDS: &[&str] = &[
     "async",
@@ -433,10 +403,7 @@ const JS_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
-/// TypeScript is JavaScript plus the words that describe types, so it
-/// is the same scanner with a longer keyword list rather than a second
-/// one. Everything lexical -- comments, strings, templates, numbers --
-/// is identical between them.
+/// TypeScript is JavaScript's scanner with the type keywords added.
 const TS_EXTRA_KEYWORDS: &[&str] = &[
     "abstract",
     "any",
@@ -496,11 +463,9 @@ fn js_like(text: &str, keywords: &[&str]) -> Spans {
     s.out
 }
 
-/// A template literal is a string with holes in it. The string is
-/// painted first and each `${...}` over the top, the same layering a
-/// JSON string's escapes already use -- so the quoted text reads as
-/// quoted text and the expressions in it read as something else,
-/// without this having to lex JavaScript recursively.
+/// A template literal is a string with holes. The string is painted first
+/// and each `${...}` over it, as a JSON string's escapes are, so this
+/// needn't lex JavaScript recursively.
 fn template(s: &mut Scan) {
     let start = s.pos;
     s.pos += 1;
@@ -535,30 +500,24 @@ fn template(s: &mut Scan) {
     }
 }
 
-// --- yaml --------------------------------------------------------------
+// YAML
 //
-// Line-oriented, because YAML is: what a line means is decided by its
-// indentation and its first non-space character, not by anything
-// carried over from the line before -- with one exception, a block
-// scalar, whose body is everything indented past the line that opened
-// it.
-//
-// The flow forms (`{a: 1}`, `[1, 2]`) are read the same way as the
-// block forms rather than being parsed as nested structure. At token
-// level that is the same answer: a key is a word before a colon either
-// way.
+// Line-oriented, because YAML is: a line's meaning comes from its
+// indentation and first character, except in a block scalar, whose body is
+// everything indented past the line that opened it. Flow forms (`{a: 1}`)
+// are read like block forms; at token level a key is a word before a colon
+// either way.
 
-/// The words YAML gives a meaning of their own. Case-insensitive
-/// because 1.1 said so and files in the wild still use `True` and `NO`.
+/// Case-insensitive because YAML 1.1 was, and files still use `True` and
+/// `NO`.
 const YAML_CONSTANTS: &[&str] = &["true", "false", "yes", "no", "on", "off", "null", "~"];
 
 pub fn yaml(text: &str) -> Spans {
     let mut out: Spans = Vec::new();
     let mut at = 0usize;
-    // Set by `|` or `>` at the end of a line: everything indented
-    // further than the line that opened it is that scalar's text, and
-    // nothing in it is YAML at all -- a `#` in a shell script inside a
-    // CI file is not a comment about the CI file.
+    // Set by `|` or `>` at the end of a line: everything indented further
+    // is the scalar's text, so a `#` in an embedded shell script isn't a
+    // YAML comment.
     let mut block: Option<usize> = None;
     for line in text.split_inclusive('\n') {
         let end = at + line.trim_end_matches('\n').len();
@@ -567,8 +526,7 @@ pub fn yaml(text: &str) -> Spans {
 
         if let Some(opened_at) = block {
             if trimmed.is_empty() || indent > opened_at {
-                // One span per line rather than one for the block, so
-                // that a line-at-a-time renderer sees it.
+                // One span per line, so a line-at-a-time renderer sees it.
                 if !trimmed.is_empty() {
                     out.push((at + indent..end, HighlightKind::String));
                 }
@@ -582,7 +540,6 @@ pub fn yaml(text: &str) -> Spans {
             at += line.len();
             continue;
         }
-        // A document marker is the whole line and nothing else.
         if trimmed == "---" || trimmed == "..." {
             out.push((at + indent..end, HighlightKind::Keyword));
             at += line.len();
@@ -594,13 +551,11 @@ pub fn yaml(text: &str) -> Spans {
     out
 }
 
-/// One line's worth, from its first non-space character to its end.
 fn yaml_line(text: &str, start: usize, end: usize, out: &mut Spans, block: &mut Option<usize>, indent: usize) {
     let bytes = text.as_bytes();
     let mut i = start;
 
-    // A sequence dash is punctuation, and what follows it is a fresh
-    // line as far as everything below is concerned.
+    // A sequence dash is punctuation, and what follows starts afresh.
     while i < end && bytes[i] == b'-' && (i + 1 >= end || bytes[i + 1] == b' ') {
         out.push((i..i + 1, HighlightKind::Operator));
         i += 2;
@@ -610,17 +565,14 @@ fn yaml_line(text: &str, start: usize, end: usize, out: &mut Spans, block: &mut 
         }
     }
 
-    // A comment is only a comment at the start of a token, which after
-    // the dashes above means here.
+    // A comment only starts a token, which after the dashes means here.
     if i < end && bytes[i] == b'#' {
         out.push((i..end, HighlightKind::Comment));
         return;
     }
 
-    // The key, if this line has one: everything up to a `:` that is
-    // followed by a space or ends the line. A colon inside a quoted key
-    // does not count, which is the whole reason this scans rather than
-    // splitting on ':'.
+    // The key: everything up to a `:` followed by a space or the line end,
+    // skipping colons inside quotes.
     if let Some(colon) = yaml_key_end(bytes, i, end) {
         out.push((i..colon, HighlightKind::Key));
         out.push((colon..colon + 1, HighlightKind::Operator));
@@ -633,7 +585,6 @@ fn yaml_line(text: &str, start: usize, end: usize, out: &mut Spans, block: &mut 
     if i >= end {
         return;
     }
-    // What is left is the value.
     match bytes[i] {
         b'#' => out.push((i..end, HighlightKind::Comment)),
         b'|' | b'>' => {
@@ -652,8 +603,7 @@ fn yaml_line(text: &str, start: usize, end: usize, out: &mut Spans, block: &mut 
     }
 }
 
-/// Where this line's key ends, if it has one. `None` for a line that is
-/// a bare value.
+/// Where this line's key ends; `None` for a bare value.
 fn yaml_key_end(bytes: &[u8], from: usize, end: usize) -> Option<usize> {
     let mut i = from;
     let mut quote = None;
@@ -662,8 +612,6 @@ fn yaml_key_end(bytes: &[u8], from: usize, end: usize) -> Option<usize> {
             q @ (b'"' | b'\'') if quote.is_none() => quote = Some(q),
             q if Some(q) == quote => quote = None,
             b':' if quote.is_none() && (i + 1 >= end || bytes[i + 1] == b' ') => return Some(i),
-            // A comment cannot be inside a key, so anything from here on
-            // is not one.
             b'#' if quote.is_none() && i > from && bytes[i - 1] == b' ' => return None,
             _ => {}
         }
@@ -672,8 +620,7 @@ fn yaml_key_end(bytes: &[u8], from: usize, end: usize) -> Option<usize> {
     None
 }
 
-/// The rest of a line after its key: a scalar, and possibly a trailing
-/// comment.
+/// The rest of a line after its key: a scalar, and maybe a comment.
 fn yaml_value(text: &str, from: usize, end: usize, out: &mut Spans) {
     let bytes = text.as_bytes();
     let mut i = from;
@@ -706,8 +653,8 @@ fn yaml_value(text: &str, from: usize, end: usize, out: &mut Spans) {
                     i += 1;
                 }
                 let word = &text[start..i];
-                // A date is not a number, and neither is `1.2.3`. Both
-                // are plain scalars, which get no colour.
+                // Dates and versions (`1.2.3`) are plain scalars, not
+                // numbers.
                 if word.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E' | 'x' | 'b' | 'o'))
                     && word.matches('.').count() <= 1
                     && word.matches('-').count() <= 1
@@ -734,20 +681,16 @@ fn yaml_value(text: &str, from: usize, end: usize, out: &mut Spans) {
     }
 }
 
-// --- css ---------------------------------------------------------------
+// CSS
 //
-// Three things a stylesheet is made of, and which one a token is
-// depends only on where the braces are: outside a block it is a
-// selector, inside one it is a property up to the colon and a value
-// after it. `#fff` is an id selector in the first place and a colour in
-// the second, which is the whole reason this tracks depth rather than
-// scanning words.
+// Whether a token is a selector, property or value depends on the braces:
+// outside a block it's a selector, inside a property up to the colon and a
+// value after. `#fff` is an id in one place and a colour in the other.
 
 pub fn css(text: &str) -> Spans {
     let mut s = Scan::new(text);
     let mut depth = 0usize;
-    // Whether the cursor has passed a `:` inside the current
-    // declaration -- what separates a property from its value.
+    // Past the `:` in the current declaration, i.e. in the value.
     let mut in_value = false;
     let mut selector_start = None;
     while !s.done() {
@@ -755,11 +698,9 @@ pub fn css(text: &str) -> Spans {
             continue;
         }
         let c = s.here();
-        // Outside a block, everything that is not blank is part of the
-        // selector until a `{` closes it -- `.card > p::before` is one
-        // name for one thing, punctuation and all. Recorded here rather
-        // than in each arm so that a selector cannot start on a space
-        // and cannot carry over a `;` from the at-rule before it.
+        // Outside a block everything up to the `{` is one selector,
+        // punctuation and all. Started here so a selector can't start on a
+        // space or carry over the previous at-rule's `;`.
         if depth == 0 && !c.is_ascii_whitespace() && !matches!(c, b'@' | b';') && selector_start.is_none() {
             selector_start = Some(s.pos);
         }
@@ -793,16 +734,12 @@ pub fn css(text: &str) -> Spans {
                 in_value = false;
                 selector_start = None;
             }
-            // An at-rule names what it is, and its prelude is a
-            // selector-shaped thing either way.
             b'@' if ident_start(s.at(s.pos + 1)) => {
                 let start = s.pos;
                 s.pos += 1;
                 css_ident(&mut s);
-                // At the top level this names a rule; inside a value it
-                // names a colour, which is GTK's own extension and the
-                // only place a stylesheet this editor is likely to open
-                // uses one.
+                // At top level this names a rule; inside a value it names a
+                // colour, GTK's extension.
                 let kind = match in_value {
                     true => HighlightKind::Variable,
                     false => HighlightKind::Keyword,
@@ -831,8 +768,7 @@ pub fn css(text: &str) -> Spans {
             c if c.is_ascii_digit() || (c == b'.' && s.at(s.pos + 1).is_ascii_digit()) => {
                 let start = s.pos;
                 s.number();
-                // The unit is part of the measurement: `10px` is one
-                // thing, not a number and a name.
+                // The unit is part of the number: `10px`.
                 if !s.done() && (ident_start(s.here()) || s.here() == b'%') {
                     if s.here() == b'%' {
                         s.pos += 1;
@@ -856,18 +792,15 @@ pub fn css(text: &str) -> Spans {
     s.out
 }
 
-/// A CSS identifier, which may contain hyphens: `font-family` is one
-/// property name and not two, and splitting it was the first thing a
-/// real stylesheet showed up.
+/// A CSS identifier, hyphens included: `font-family`.
 fn css_ident(s: &mut Scan) {
     while !s.done() && (ident_char(s.here()) || s.here() == b'-') {
         s.pos += 1;
     }
 }
 
-/// The whole selector as one span, `.`s and `#`s and all: a selector is
-/// one thing to a reader, the same call `IniHighlighter` makes for a
-/// section header.
+/// The whole selector as one span, as `IniHighlighter` does for a section
+/// header.
 fn css_selector(s: &mut Scan, start: usize) {
     let mut end = s.pos;
     while end > start && s.at(end - 1).is_ascii_whitespace() {
@@ -878,15 +811,10 @@ fn css_selector(s: &mut Scan, start: usize) {
     }
 }
 
-// --- html --------------------------------------------------------------
+// HTML
 //
-// Its own scanner rather than the WHATWG tokenizer in html/tokenizer.rs,
-// which the browser uses: that one emits tokens without source spans
-// (one `Char` at a time, positions kept privately), so it would have to
-// grow an offset on every token to be useful here -- a change to the
-// code path the browser depends on, for the benefit of colouring text.
-// A scanner that only has to be right about where a tag begins and ends
-// is a smaller thing to be sure of.
+// Not html/tokenizer.rs: that emits tokens without source offsets, and
+// adding them would change the browser's code path to colour text.
 
 pub fn html(text: &str) -> Spans {
     let mut s = Scan::new(text);
@@ -914,9 +842,7 @@ pub fn html(text: &str) -> Spans {
             html_tag(&mut s);
             continue;
         }
-        // A character reference is a piece of this text that is not
-        // literal -- the same thing a string's escape is, and the same
-        // kind.
+        // A character reference, coloured like a string escape.
         if s.here() == b'&' {
             let start = s.pos;
             let mut at = s.pos + 1;
@@ -937,9 +863,8 @@ pub fn html(text: &str) -> Spans {
     s.out
 }
 
-/// One tag, from `<` to the matching `>`. Returns having consumed it --
-/// and, for `<script>` and `<style>`, having consumed and scanned their
-/// contents with the scanner for the language inside them.
+/// One tag, `<` to `>`. For `<script>` and `<style>`, also their contents,
+/// with the scanner for the language inside.
 fn html_tag(s: &mut Scan) {
     let open = s.pos;
     s.pos += 1;
@@ -966,7 +891,6 @@ fn html_tag(s: &mut Scan) {
                 }
                 s.push(start, HighlightKind::Key);
             }
-            // An unquoted attribute value, which HTML still allows.
             c if !c.is_ascii_whitespace() && c != b'/' => {
                 let start = s.pos;
                 while !s.done() && !s.here().is_ascii_whitespace() && s.here() != b'>' {
@@ -981,10 +905,8 @@ fn html_tag(s: &mut Scan) {
     s.out.push((s.pos.min(tag_end)..tag_end, HighlightKind::Keyword));
     s.pos = tag_end;
 
-    // `<script>` and `<style>` hold another language, and this editor
-    // has a scanner for both. The raw text runs to the matching end tag
-    // and nothing inside it is markup, which is exactly what makes it
-    // safe to hand over.
+    // The raw text runs to the matching end tag and none of it is markup,
+    // so it can be handed to the other scanner.
     if closing {
         return;
     }
@@ -1007,16 +929,11 @@ fn html_tag(s: &mut Scan) {
     }
 }
 
-// --- go ----------------------------------------------------------------
+// Go
 //
-// Lexically the simplest of the C-family languages here: no
-// preprocessor, no nested comments, no string prefixes, one kind of
-// character literal. The one thing it has that none of the others do is
-// the **raw string**, delimited by backticks, which runs across lines
-// and has no escapes at all -- a `\` in one is a backslash and a `"` is
-// a quote. Reading it as an ordinary string is how a scanner ends up
-// painting the rest of a file from the first regexp literal onwards,
-// since those are exactly what raw strings are used for.
+// The one thing it has that the others don't is the backtick raw string,
+// which spans lines and has no escapes. Read as an ordinary string, the
+// first regexp literal paints the rest of the file.
 
 const GO_KEYWORDS: &[&str] = &[
     "break",
@@ -1046,12 +963,8 @@ const GO_KEYWORDS: &[&str] = &[
     "var",
 ];
 
-/// Not keywords, and Go is precise about that -- every one of these can
-/// be shadowed by a declaration, which is why the specification calls
-/// them predeclared identifiers rather than reserved words. They read
-/// as part of the language all the same, and an editor that coloured
-/// `func` but not `string` would be describing the grammar rather than
-/// the program.
+/// Predeclared identifiers, not keywords (any can be shadowed), but they
+/// read as part of the language.
 const GO_PREDECLARED: &[&str] = &[
     "any",
     "append",
@@ -1107,9 +1020,7 @@ pub fn go(text: &str) -> Spans {
         }
         match s.here() {
             b'"' => s.quoted(b'"', false),
-            // A rune literal. `'` is never anything else in Go -- there
-            // are no lifetimes here, which is the one place the Rust
-            // scanner has to think.
+            // A rune literal; Go has no lifetimes.
             b'\'' => s.quoted(b'\'', false),
             b'`' => go_raw_string(&mut s),
             c if c.is_ascii_digit() || (c == b'.' && s.at(s.pos + 1).is_ascii_digit()) => s.number(),
@@ -1126,10 +1037,7 @@ pub fn go(text: &str) -> Spans {
     s.out
 }
 
-/// A raw string: everything to the next backtick, whatever is in
-/// between. No escapes, so a backslash cannot hide the terminator --
-/// which is the whole reason to have them, and the reason this is four
-/// lines rather than a call to `quoted`.
+/// No escapes, so a backslash can't hide the terminator.
 fn go_raw_string(s: &mut Scan) {
     let start = s.pos;
     s.pos += 1;
@@ -1144,8 +1052,7 @@ fn go_raw_string(s: &mut Scan) {
 mod tests {
     use super::*;
 
-    // What a scanner produces, as text: each span's own source with its
-    // kind, which is far easier to read in a failure than a list of byte
+    // Each span's text with its kind, easier to read in a failure than byte
     // offsets.
     fn painted(text: &str, spans: Spans) -> Vec<(String, HighlightKind)> {
         spans.into_iter().map(|(r, k)| (text[r].to_string(), k)).collect()
@@ -1166,9 +1073,7 @@ mod tests {
         );
     }
 
-    // The case that decides whether this is usable on real Rust at all:
-    // a lifetime is not an unterminated character literal, and reading
-    // it as one paints the rest of the file.
+    // A lifetime isn't an unterminated character literal.
     #[test]
     fn a_rust_lifetime_is_not_a_string() {
         let text = "fn f<'a>(s: &'a str) -> char { 'x' }";
@@ -1234,9 +1139,7 @@ mod tests {
         assert!(ts.contains(&("string".to_string(), HighlightKind::Keyword)), "{ts:?}");
     }
 
-    // A buffer being typed into is invalid most of the time. An
-    // unterminated string takes what it can reach and the scanner stops
-    // there rather than looping or panicking.
+    // An unterminated string takes what it can reach; no loop, no panic.
     #[test]
     fn an_unterminated_construct_ends_with_the_text() {
         for (text, spans) in [
@@ -1249,12 +1152,10 @@ mod tests {
         }
     }
 
-    // Real source, not a snippet: this module's own, which has the
-    // constructs that are hard on purpose -- nested block comments,
-    // raw strings containing quotes, lifetimes, character literals.
-    // The assertion is not what it paints but that every span it
-    // produces is a well-formed range inside the text, since a scanner
-    // that loses its place produces one that is not.
+    // This module's own source, which has nested block comments, raw
+    // strings containing quotes, lifetimes and character literals. Every
+    // span has to be a well-formed range; a scanner that loses its place
+    // makes one that isn't.
     #[test]
     fn the_rust_scanner_survives_this_projects_own_source() {
         let text = include_str!("codehighlight.rs");
@@ -1264,8 +1165,8 @@ mod tests {
             assert!(range.start < range.end && range.end <= text.len(), "malformed span {range:?}");
             assert!(text.is_char_boundary(range.start) && text.is_char_boundary(range.end), "span {range:?} splits a character");
         }
-        // The whole file is not one string, which is what a scanner
-        // that walked into a raw string and never came out would say.
+        // Not one string for the whole file, as a scanner stuck in a raw
+        // string would say.
         let longest = spans.iter().map(|(r, _)| r.end - r.start).max().unwrap_or(0);
         assert!(longest < text.len() / 4, "one span covers {longest} of {} bytes", text.len());
     }
@@ -1281,9 +1182,7 @@ mod tests {
         assert!(spans.contains(&("true".to_string(), HighlightKind::Keyword)), "{spans:?}");
     }
 
-    // The case that makes a CI file readable rather than misleading: a
-    // block scalar's body is text, and a `#` in a shell script inside
-    // one is a comment about the script, not about the YAML.
+    // A block scalar's body is text: a `#` in it is the script's comment.
     #[test]
     fn a_block_scalar_is_text_and_not_yaml() {
         let text = "run: |\n  # not a yaml comment\n  echo hi: there\nnext: 1\n";
@@ -1318,8 +1217,6 @@ mod tests {
         assert!(spans.contains(&("*defaults".to_string(), HighlightKind::Variable)), "{spans:?}");
     }
 
-    // Dates and versions are plain scalars. Painting `1.2.3` as a
-    // number would be saying something about it that is not true.
     #[test]
     fn a_version_is_not_a_number() {
         let text = "version: 1.2.3\nwhen: 2026-09-07\nport: 8080\n";
@@ -1338,9 +1235,6 @@ mod tests {
         assert!(spans.contains(&("10px".to_string(), HighlightKind::Number)), "a unit belongs to its measurement: {spans:?}");
     }
 
-    // `#fff` is an id selector outside a block and a colour inside one.
-    // Which it is depends only on the braces, which is why this tracks
-    // them rather than scanning words.
     #[test]
     fn a_hash_means_different_things_on_either_side_of_a_brace() {
         let text = "#main { color: #abc; }";
@@ -1371,8 +1265,6 @@ mod tests {
         assert!(spans.contains(&("</a".to_string(), HighlightKind::Keyword)), "{spans:?}");
     }
 
-    // The raw-text elements hold another language, and this editor has
-    // a scanner for both of them.
     #[test]
     fn script_and_style_are_scanned_as_what_they_hold() {
         let text = "<style>p { color: red }</style><script>let x = 1; // n</script>";
@@ -1400,11 +1292,6 @@ mod tests {
         assert!(spans.contains(&("int".to_string(), HighlightKind::Keyword)), "a predeclared type reads as part of the language: {spans:?}");
     }
 
-    // The one thing Go has that none of the others do. A raw string
-    // runs across lines and has no escapes, so a backslash cannot hide
-    // the terminator -- and reading one as an ordinary string paints
-    // the rest of the file, which is exactly what would happen to every
-    // file containing a regexp.
     #[test]
     fn a_go_raw_string_has_no_escapes_and_spans_lines() {
         let text = "re := `a\\d+\n\"quoted\"`\nn := 1";
@@ -1425,8 +1312,6 @@ mod tests {
         assert!(strings[0].ends_with('`'), "it ended at the backtick, not before it: {strings:?}");
     }
 
-    // `'` is always a rune literal here -- Go has no lifetimes, which is
-    // the one place the Rust scanner has to think and this one does not.
     #[test]
     fn a_go_rune_is_just_a_character() {
         let text = "c := 'x'; d := '\\n'";
@@ -1434,9 +1319,6 @@ mod tests {
         assert!(spans.contains(&("'x'".to_string(), HighlightKind::String)), "{spans:?}");
     }
 
-    // Predeclared identifiers are not reserved words -- Go lets you
-    // shadow every one of them. They still read as part of the
-    // language, which is the call every Go editor makes.
     #[test]
     fn go_predeclared_names_are_coloured_even_though_they_are_not_keywords() {
         let text = "var s string = \"x\"\nb := make([]byte, len(s))\nif b == nil { panic(true) }";
@@ -1447,8 +1329,8 @@ mod tests {
         assert!(!spans.iter().any(|(t, _)| t == "s" || t == "b"), "an ordinary name gets nothing: {spans:?}");
     }
 
-    // Every scanner has to make progress on every byte it sees, or a
-    // buffer with the wrong character in it hangs the editor.
+    // Every scanner makes progress on every byte, or a stray character
+    // hangs the editor.
     #[test]
     fn every_scanner_terminates_on_arbitrary_bytes() {
         let text = "a\u{e9}'\"`#@${}/*//\\0 1.2e-3 0x_ r#\" \u{1f600}";
