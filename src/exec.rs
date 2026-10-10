@@ -8529,7 +8529,19 @@ impl Shell {
             "let" => {
                 let mut last = 0i64;
                 for a in &argv[1..] {
-                    match self.eval_arith(a) {
+                    // `arith::eval` and not `eval_arith`: by the time an
+                    // argument reaches a builtin the word stage has
+                    // already expanded it once, and `eval_arith`'s own
+                    // pass -- which `$(( ))` needs, because the parser
+                    // hands it its interior raw -- would be a second
+                    // one. A second pass is how `x='$(touch M)'; let
+                    // "y=$x+1"` came to run the command: the first pass
+                    // turned `$x` into its value and the second ran what
+                    // was in it. bash expands `let`'s text not at all --
+                    // every `$` form reaching it errors, including a
+                    // single-quoted `$x` -- so this matches it and
+                    // closes that in one move.
+                    match arith::eval(a, self) {
                         Ok(v) => last = v,
                         Err(e) => {
                             sh_eprintln!(self, "bish: let: {}", e);
@@ -20399,6 +20411,34 @@ mod tests {
         shell.run_source_here("set -r", "<test>");
         let result = shell.run_source_here("cd /tmp", "<test>");
         assert!(matches!(result, ExecResult::Status(1)), "{result:?}");
+    }
+
+    // `let` must not expand its own argument. The word stage already
+    // did, so a second pass runs whatever the first pass produced:
+    // `x='$(cmd)'; let "y=$x+1"` executed cmd, which makes `let
+    // "n=$untrusted"` -- an ordinary thing to write -- command
+    // execution. bash expands `let`'s text not at all, so this is its
+    // behaviour as well as the safe one.
+    #[test]
+    fn let_does_not_expand_what_was_already_expanded() {
+        let mut shell = Shell::new();
+        // Arithmetic still works, including through a variable: the word
+        // stage substitutes the value and `let` evaluates it.
+        shell.run_source_here("x=5; let 'y=x+1'", "<test>");
+        assert_eq!(shell.lookup_var("y"), "6");
+        shell.run_source_here("let \"z=$x*2\"", "<test>");
+        assert_eq!(shell.lookup_var("z"), "10");
+
+        // A command substitution that survived the word stage -- because
+        // it was quoted, or because it came out of a variable -- is a
+        // syntax error and not a command.
+        for form in ["let \"q=$sub+1\"", "let \"$sub\"", "let 'q=$(echo 9)'"] {
+            let mut shell = Shell::new();
+            shell.run_source_here("sub='$(echo 9)'", "<test>");
+            let result = shell.run_source_here(form, "<test>");
+            assert!(matches!(result, ExecResult::Status(2)), "{form}: {result:?}");
+            assert_eq!(shell.lookup_var("q"), "", "{form}: nothing may have been assigned");
+        }
     }
 
     // A re-exec'd child is handed the shell's state as a script, and
