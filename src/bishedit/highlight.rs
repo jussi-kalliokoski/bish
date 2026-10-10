@@ -1,19 +1,12 @@
-// Syntax highlighting, built on top of each language's real parser
-// rather than a parallel implementation (see plan.md / the approved
-// design doc for this feature) -- Highlighter is a small trait so a
-// regex-, treesitter-, or LSP-backed source can slot in later. Two
-// implementors today, both following that same rule: BashHighlighter
-// over lexer::tokenize_spanned, and JsonHighlighter over json::tokens,
-// which the `json` builtin's own parser is built on too. Wired into
-// editor.rs's redraw() (and, since that function is shared, command
-// mode's colon-line and Ctrl-E's line-local normal-mode view get it for
-// free too) and into fileeditor.rs, which picks by the buffer's own
+// Syntax highlighting, driven by each language's real parser rather than
+// a parallel one: BashHighlighter over `lexer::tokenize_spanned`,
+// JsonHighlighter over `json::tokens`, MarkdownHighlighter over
+// `crate::markdown`. Used by editor.rs's `redraw` (the prompt, the colon
+// line, Ctrl-E's view) and by fileeditor.rs, which picks by the buffer's
 // language.
 //
-// #![allow(dead_code)] stays regardless of wiring -- HighlightKind::Number
-// is reserved but intentionally unpopulated (see its own doc comment),
-// and the Highlighter trait exists for future non-Bash implementors this
-// crate doesn't have yet.
+// `dead_code` is allowed because `HighlightKind::Number` is reserved for
+// bash and the trait has room for implementors not written yet.
 #![allow(dead_code)]
 
 use crate::bishedit::manpages;
@@ -23,62 +16,32 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
-// Session state the highlighter needs beyond the raw buffer text -- kept
-// as one small `Copy` bundle (just two Option<&T> references) rather than
-// growing the parameter list of every function in the highlight_into/
-// highlight_tok/highlight_word recursion chain by one for each new piece
-// of context a feature ends up needing (cwd today, known_functions added
-// alongside it for command-validity checking). `Default` gives callers
-// with nothing to offer (command mode's own colon-line) a plain, explicit
-// "no context" value instead of threading a `None` through every field by
-// hand.
+// Session state the highlighter needs beyond the text, as one `Copy`
+// bundle instead of a parameter per feature down the whole recursion.
+// `Default` is "no context", for the colon line.
 #[derive(Clone, Copy, Default)]
 pub struct HighlightContext<'a> {
     pub cwd: Option<&'a Path>,
-    // The current session's own defined shell function names (not
-    // bodies) -- used by the command-validity check so calling a
-    // function you just defined doesn't show up as an "invalid command"
-    // error. Deliberately NOT extended to aliases: this shell's own
-    // `alias` builtin stores and queries aliases but never expands them
-    // at command-run time (see exec.rs's own doc comment on the
-    // `aliases` field), so an alias name would actually fail to run if
-    // typed as a command -- treating it as "valid" here would be
-    // actively misleading.
+    // The session's function names, so calling a function just defined isn't
+    // an invalid command. Aliases aren't included.
     pub known_functions: Option<&'a HashSet<String>>,
-    // Command names the *line* has that the shell does not -- the
-    // editor's colon line, where `:preview` and `:diag` are real
-    // commands and live nowhere on PATH, so checking PATH for them
-    // paints a working command as an error. `None` at the ordinary
-    // prompt, whose vocabulary is the shell's and nothing more.
+    // Command names the line has that the shell doesn't: on the editor's
+    // colon line `:preview` and `:diag` are real commands found nowhere on
+    // PATH. `None` at the ordinary prompt.
     pub line_commands: Option<&'a [&'a str]>,
-    // The session's own `PATH`, which is what the command-validity check
-    // resolves a bare name against -- *not* the real process
-    // environment's. An exported variable no longer reaches the real
-    // environment at all (`export_to_environment` is a documented no-op;
-    // a child is built from the shell's own exported names instead), so
-    // `std::env::var("PATH")` is frozen at whatever bish inherited when
-    // it started. Anything that puts a directory on PATH afterwards -- a
-    // `.bishrc`, or a per-directory hook like mise's or direnv's, firing
-    // on every `cd` -- would otherwise have every command in that
-    // directory painted as an error while running perfectly well.
-    // `None` falls back to the real environment, for a context with no
-    // shell behind it (a test, `bish tool check`).
+    // The session's `PATH`, which the command-validity check resolves names
+    // against. The process environment's is frozen at startup (exports reach
+    // children, not the environment), so a directory added by `.bishrc` or a
+    // `cd` hook would otherwise make its commands look invalid. `None` falls
+    // back to the environment, for a context with no shell (a test,
+    // `bish tool check`).
     pub path: Option<&'a str>,
-    // Unlike cwd/known_functions above, never read by the highlight_into
-    // recursion itself (that step only ever produces a HighlightKind, not
-    // a color) -- carried on this same bundle purely because every real
-    // call site already has `ctx` in scope right where it turns those
-    // HighlightKinds into StyledSpans via resolve_style, and a second
-    // parameter threaded in parallel the whole way down would be more
-    // churn than it's worth for one more `Option<&T>`. See resolve_style/
-    // ColorOverrides/HL_NAMES just above default_style.
+    // Not read by the highlighting, which only produces kinds: carried here
+    // because every call site that turns kinds into styles (`resolve_style`)
+    // already has `ctx`.
     pub color_overrides: Option<&'a ColorOverrides>,
-    // The `hyperlinks` bishopt, carried here for the same reason
-    // `color_overrides` is: never read by the highlighting itself, but
-    // every call site that turns these spans into terminal output
-    // already has `ctx` in scope. `false` by default so a context built
-    // for analysis rather than for a terminal (a test, `bish tool
-    // check`) emits nothing.
+    // The `hyperlinks` bishopt, carried for the same reason. `false` by
+    // default, so an analysis context (a test, `bish tool check`) emits none.
     pub hyperlinks: bool,
 }
 
@@ -91,90 +54,59 @@ pub enum HighlightKind {
     Variable,
     Substitution,
     Comment,
-    // Every JSON number. Still never produced for bash: that would need
-    // its own small scanner over $((...))'s interior (digit runs, $var
-    // refs), which has different lexical rules than the shell grammar
-    // and isn't attempted here.
+    // Every JSON number. Never produced for bash, which would need a scanner
+    // for `$((...))`'s interior.
     Number,
-    // A plain unquoted argument recognized as one of its command's own
-    // flags (from a man-page-mined list, see manpages.rs) -- any argument
-    // position, exact string match only.
+    // An argument that is one of its command's flags (mined from man pages;
+    // see manpages.rs), in any position, matched exactly.
     Flag,
-    // A plain unquoted argument recognized as the subcommand immediately
-    // following its command name (single level only, e.g. "commit" in
-    // "git commit").
+    // The argument right after a command name, when it's a known subcommand:
+    // `commit` in `git commit`. One level only.
     Subcommand,
-    // A plain unquoted argument that isn't a recognized Flag/Subcommand
-    // but does resolve to a real file/directory against the shell's cwd.
+    // An argument that isn't a flag or subcommand but names a file or
+    // directory under the shell's cwd.
     Link,
-    // A refinement *within* a string's own text -- narrower than, and
-    // layered on top of, that string's own base span: printf's "%s" in a
-    // builtin's argument, or a JSON string's `\n`/`\uXXXX` escape. The
-    // two are the same thing to a reader (a piece of this text that
-    // isn't literal), which is why they share a kind rather than each
-    // having their own.
+    // A non-literal piece inside a string, layered over its span: printf's
+    // `%s` in an argument, or a JSON escape.
     FormatSpecifier,
-    // A command-name word (the first word of a simple command, or
-    // whichever word follows a pipe/&&/||/;/keyword boundary) that isn't
-    // a known builtin, a defined shell function, a PATH-resolvable
-    // executable, or -- for a name containing '/' -- a directly
-    // executable file. A *valid* command name gets no new styling at all
-    // ("displayed as it was before"); this only ever fires on the
-    // negative case.
+    // A command name that isn't a builtin, a function, on PATH, or (for a
+    // name with `/`) an executable file. A valid command name gets no styling
+    // at all.
     InvalidCommand,
-    // Markdown's own three text styles. They carry no colour of their
-    // own (Color::Default) because what they mean *is* the weight or
-    // slant -- a bold heading that also changed hue would be saying two
-    // things where the document said one.
+    // Markdown's text styles. No colour of their own: the weight or slant is
+    // the meaning.
     Emphasis,
     Strong,
     Struck,
-    // A field name -- a JSON object's key, and whatever the equivalent
-    // turns out to be in the next structured-data language. Its own kind
-    // rather than reusing Variable, which means something specific and
-    // different (`$foo`, a shell expansion); they share a default colour
-    // because they play the same "this names the thing beside it" role,
-    // but stay separately themeable.
+    // A field name, such as a JSON key. Separate from Variable (`$foo`) but
+    // the same default colour, since both name the thing beside them.
     Key,
 }
 
-/// A run of `text` that reads as one thing, in **character** offsets --
-/// the unit `compose` indexes its `&[char]` by, and so the unit every
-/// `Highlighter` owes its caller.
+/// A run of `text` that reads as one thing, in character offsets, which is
+/// what `compose` indexes by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSpan {
     pub start: usize,
     pub end: usize,
     pub kind: HighlightKind,
-    // The file:// URL for a Link-kind span; None for every other kind.
-    // Not used for anything yet (no OSC 8 terminal hyperlinks) -- carried
-    // purely as data for a future consumer.
+    // The URL for a Link span, for OSC 8 hyperlinks; `None` otherwise.
     pub link: Option<String>,
 }
 
-/// Offsets in `HighlightSpan` are **character** offsets into `text`, not
-/// byte offsets: `compose` paints over a `&[char]`, one cell per
-/// character, and `lint::Diagnostic`, `url::find` and the LSP's own
-/// converted positions all count the same way. Every implementation here
-/// but one already produces them naturally, having been written against
-/// a `Vec<char>` in the first place; the exception is `CodeHighlighter`,
-/// whose scanners walk a `&str` and are converted at that seam.
+/// Spans are in character offsets, not bytes: `compose` paints over a
+/// `&[char]`, and `lint::Diagnostic`, `url::find` and converted LSP
+/// positions count the same way. `CodeHighlighter`'s scanners count bytes
+/// and are converted at that seam.
 pub trait Highlighter {
     fn highlight(&self, text: &str, ctx: HighlightContext) -> Vec<HighlightSpan>;
 }
 
-/// Rewrites byte offsets into character offsets, in place -- for a
-/// `Highlighter` whose underlying scanner counts bytes.
-///
-/// One walk of the text answers every offset at once: they are sorted
-/// first, so the walk and the answers advance together. An offset that
-/// lands *inside* a character (nothing here produces one, but a scanner
-/// that lost its place could) reads as that character's own index rather
-/// than panicking -- the same "a few spans come out wrong beats a crash"
-/// choice `next_span` already makes.
+/// Rewrites byte offsets into character offsets in place, in one walk over
+/// sorted offsets. An offset inside a character maps to that character
+/// rather than panicking.
 fn char_offsets(text: &str, spans: &mut [HighlightSpan]) {
-    // One byte, one character, same number: nothing to do, which is the
-    // case for very nearly every buffer.
+    // ASCII: bytes and characters are the same.
     if text.is_ascii() {
         return;
     }
@@ -192,7 +124,6 @@ fn char_offsets(text: &str, spans: &mut [HighlightSpan]) {
         }
         count = index + 1;
     }
-    // Whatever is left is the end of the text, or past it.
     answer[next..].fill(count);
     for span in spans.iter_mut() {
         span.start = answer[wanted.partition_point(|&w| w < span.start)];
@@ -210,19 +141,11 @@ impl Highlighter for BashHighlighter {
     }
 }
 
-// JSON, over the same json::tokens the `json` builtin's own parser reads
-// -- so what the editor paints and what `json` accepts can never drift
-// apart, the same reason BashHighlighter is driven by the real lexer.
-//
-// It ignores `ctx` entirely: cwd, known functions and command validity
-// are all shell notions with no JSON counterpart. What it does need that
-// a value parser doesn't is to keep going through nonsense, since a
-// buffer being typed is invalid JSON almost all of the time -- hence
-// working from the flat token stream rather than a parsed Value. An
-// invalid token gets no span at all: highlighting is not diagnostics,
-// and text simply going uncoloured as you type past a mistake is a
-// quieter, more honest signal than painting an error the moment a quote
-// is still open.
+// JSON, over the `json::tokens` the `json` builtin's parser reads, so
+// what's painted and what `json` accepts can't drift apart. It ignores
+// `ctx`, and works from the flat token stream rather than a parsed value
+// so it keeps going through invalid input. An invalid token gets no span:
+// highlighting isn't diagnostics.
 pub struct JsonHighlighter;
 
 impl Highlighter for JsonHighlighter {
@@ -231,11 +154,8 @@ impl Highlighter for JsonHighlighter {
     }
 }
 
-// JSON as `tsconfig.json`, `devcontainer.json` and every `.vscode` file
-// actually write it: with comments. The same spans off the same
-// tokenizer, from the stream that keeps them -- see
-// `json::tokens_with_comments`, and see the JSON entry in plan.md for
-// why there is one scanner here rather than two.
+// JSON with comments, as `tsconfig.json` and `.vscode` files are written,
+// from `json::tokens_with_comments`.
 pub struct JsoncHighlighter;
 
 impl Highlighter for JsoncHighlighter {
@@ -248,14 +168,10 @@ fn json_spans(toks: &[crate::json::Token]) -> Vec<HighlightSpan> {
     let mut out = Vec::new();
     for (i, tok) in toks.iter().enumerate() {
         let kind = match &tok.kind {
-            // The one piece of structure this needs, and one token of
-            // lookahead is all it takes: a string is a key exactly
-            // when a colon follows it. Reading it off the flat stream
-            // rather than a parse tree is what keeps it working in a
-            // buffer that doesn't parse yet.
+            // A string is a key when a colon follows it, which works on the
+            // flat stream in a buffer that doesn't parse yet.
             crate::json::TokenKind::Str(_) => {
-                // Past any comment between the two, so
-                // `"key" /* why */: 1` still reads as a key.
+                // Past any comment, so `"key" /* why */: 1` is still a key.
                 let next = toks[i + 1..].iter().find(|t| t.kind != crate::json::TokenKind::Comment);
                 match next.map(|t| &t.kind) {
                     Some(crate::json::TokenKind::Colon) => HighlightKind::Key,
@@ -274,9 +190,8 @@ fn json_spans(toks: &[crate::json::Token]) -> Vec<HighlightSpan> {
             crate::json::TokenKind::Invalid(_) => continue,
         };
         out.push(HighlightSpan { start: tok.start, end: tok.end, kind, link: None });
-        // Layered on top of the string's own span just above, the
-        // same way printf's format specifiers sit inside their
-        // argument -- compose paints later spans over earlier ones.
+        // Over the string's span, as printf's specifiers sit over their
+        // argument: `compose` paints later spans over earlier ones.
         for esc in &tok.escapes {
             out.push(HighlightSpan { start: esc.start, end: esc.end, kind: HighlightKind::FormatSpecifier, link: None });
         }
@@ -284,19 +199,12 @@ fn json_spans(toks: &[crate::json::Token]) -> Vec<HighlightSpan> {
     out
 }
 
-// Markdown, over crate::markdown's own parse -- the same rule the other
-// two follow: the highlighter is driven by the real parser, so what the
-// editor colours and what a preview renders can't disagree.
+// Markdown, over `crate::markdown`'s parse, so the editor and a preview
+// can't disagree. The spans come from the parse, which gets emphasis
+// right where a scan gets `snake_case` and `a * b` wrong.
 //
-// This is where carrying source spans through that parser pays off. A
-// markdown highlighter written as a scan would have to re-derive
-// emphasis, and get `snake_case` and `a * b` wrong exactly where a scan
-// always does; here the spans come from the parse that already decided.
-//
-// Fenced code blocks are highlighted in *their own* language, by handing
-// the block's text to whichever Highlighter its info string names and
-// shifting the spans -- so a ```bash block inside a markdown file reads
-// exactly as a `.bash` buffer does.
+// A fenced code block is highlighted in its own language, by handing its
+// text to the Highlighter its info string names and shifting the spans.
 pub struct MarkdownHighlighter;
 
 impl Highlighter for MarkdownHighlighter {
@@ -306,8 +214,8 @@ impl Highlighter for MarkdownHighlighter {
         for block in &doc.blocks {
             markdown_block(block, text, ctx, &mut out);
         }
-        // A link reference definition is not part of any block, so its
-        // own span has to be picked up from the document.
+        // A link reference definition belongs to no block, so its span comes
+        // from the document.
         for link_ref in &doc.link_refs {
             out.push(span(link_ref.span.clone(), HighlightKind::Link));
         }
@@ -323,8 +231,7 @@ fn markdown_block(block: &crate::markdown::Block, source: &str, ctx: HighlightCo
     use crate::markdown::Block;
     match block {
         Block::Heading { content, span: whole, .. } => {
-            // The whole line, marker included: a heading is one thing to
-            // a reader, and colouring only the `#` would say otherwise.
+            // The whole line, marker included: a heading is one thing.
             out.push(span(whole.clone(), HighlightKind::Keyword));
             markdown_inlines(content, out);
         }
@@ -370,9 +277,8 @@ fn markdown_block(block: &crate::markdown::Block, source: &str, ctx: HighlightCo
 fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<HighlightSpan>) {
     use crate::markdown::Inline;
     for inline in inlines {
-        // Each construct's own span first, then its children over the
-        // top -- `compose` lets a later span win, which is how `**a `b`
-        // c**` ends up bold with the code span still coloured.
+        // Each construct's span first, then its children over it, so
+        // `**a `b` c**` is bold with the code span still coloured.
         match inline {
             Inline::Code { span: s, .. } => out.push(span(s.clone(), HighlightKind::String)),
             Inline::Emph { content, span: s } => {
@@ -405,17 +311,9 @@ fn markdown_inlines(inlines: &[crate::markdown::Inline], out: &mut Vec<Highlight
     }
 }
 
-// roff -- man page source -- over crate::roff's own lexical pass, not
-// its interpreter. That distinction is the point: a highlighter must
-// colour the source as written, so the `.de` and `.ie` scaffolding a
-// `.env` files. Reads `dotenv::parse`'s items directly, the same
-// one-layer arrangement Markdown and INI have.
-//
-// The interpolation spans are the point. A `.env` is mostly opaque
-// strings, and `$DATABASE_URL` inside one is the single piece of the
-// line whose text is not what it says -- so it gets `Variable`, the
-// kind that already means exactly that (`$foo`, a shell expansion)
-// everywhere else in bish.
+// `.env` files, from `dotenv::parse`'s items. An interpolation
+// (`$DATABASE_URL`) is the one part of a line that isn't what it says, so
+// it gets `Variable`, as a shell expansion does.
 pub struct DotenvHighlighter;
 
 impl Highlighter for DotenvHighlighter {
@@ -451,15 +349,14 @@ fn dotenv_value(value: &crate::dotenv::Value, out: &mut Vec<HighlightSpan>) {
         crate::dotenv::ValueKind::Quoted | crate::dotenv::ValueKind::Literal => Some(HighlightKind::String),
         crate::dotenv::ValueKind::Number => Some(HighlightKind::Number),
         crate::dotenv::ValueKind::Bool => Some(HighlightKind::Keyword),
-        // Same call INI makes: most values are a path, a URL or a
-        // token, and colouring those would only make the file louder.
+        // Most values are a path, a URL or a token; colouring them would only
+        // make the file louder.
         crate::dotenv::ValueKind::Bare => None,
     };
     if let Some(base) = base {
         out.push(span(value.span.clone(), base));
     }
-    // Layered over whatever the value's own kind gave it, the way a
-    // JSON string's escapes sit over the string.
+    // Over the value's own kind, as a JSON string's escapes sit over it.
     for esc in &value.escapes {
         out.push(span(esc.clone(), HighlightKind::FormatSpecifier));
     }
@@ -468,10 +365,8 @@ fn dotenv_value(value: &crate::dotenv::Value, out: &mut Vec<HighlightSpan>) {
     }
 }
 
-// TOML. Reads `toml::tokens` straight through -- the tokenizer already
-// carries the one piece of grammar that matters here (whether a word is
-// in key or value position), because that is a property of TOML and not
-// of colouring it. See toml.rs's own header.
+// TOML, straight from `toml::tokens`, which already knows whether a word
+// is in key or value position (see toml.rs).
 pub struct TomlHighlighter;
 
 impl Highlighter for TomlHighlighter {
@@ -480,9 +375,7 @@ impl Highlighter for TomlHighlighter {
         for tok in crate::toml::tokens(text) {
             let kind = match &tok.kind {
                 crate::toml::TokenKind::Comment => HighlightKind::Comment,
-                // The whole header, brackets included -- a table is one
-                // thing to a reader, the same call IniHighlighter makes
-                // for `[core]` and markdown_block for a heading's `#`.
+                // The whole header, brackets included: a table is one thing.
                 crate::toml::TokenKind::TableHeader => HighlightKind::Keyword,
                 crate::toml::TokenKind::Key => HighlightKind::Key,
                 crate::toml::TokenKind::Str { escapes } => {
@@ -494,16 +387,11 @@ impl Highlighter for TomlHighlighter {
                 }
                 crate::toml::TokenKind::Number => HighlightKind::Number,
                 crate::toml::TokenKind::Bool => HighlightKind::Keyword,
-                // Not a number, but it belongs with them: an unquoted
-                // literal scalar, and `1979-05-27` sitting beside `1234`
-                // in the same column should read the same way. There is
-                // no narrower kind, and inventing one for a single
-                // language would be a kind nothing else could use.
+                // A date is an unquoted literal scalar and reads like the
+                // numbers beside it; there's no narrower kind.
                 crate::toml::TokenKind::DateTime => HighlightKind::Number,
                 crate::toml::TokenKind::Punctuation => HighlightKind::Operator,
-                // Left uncoloured, the same as JSON's own Invalid:
-                // going plain as you type past a mistake is a quieter
-                // signal than painting an error the moment a quote opens.
+                // Uncoloured, as JSON's Invalid is.
                 crate::toml::TokenKind::Invalid => continue,
             };
             out.push(span(tok.start..tok.end, kind));
@@ -512,18 +400,12 @@ impl Highlighter for TomlHighlighter {
     }
 }
 
-// INI, and the family of config formats that are INI in all but name.
-// Reads `ini::parse`'s items directly -- the same one-layer arrangement
-// MarkdownHighlighter has, and for the same reason: a second scanner
-// that "just looks for `=`" is how a highlighter starts disagreeing
-// with the parser it is supposed to describe. It can afford to, because
-// unlike JSON an INI parse never fails; see ini.rs's own header for
-// which dialect disagreements it takes a side on.
+// INI and the formats that are INI in all but name, from `ini::parse`'s
+// items, so the highlighter can't disagree with the parser. An INI parse
+// never fails; see ini.rs for the dialect choices.
 //
-// Values are coloured by kind rather than uniformly: a number, a
-// boolean and a quoted string say something a reader can use, while the
-// great majority of values -- a path, a command line, a URL -- are
-// arbitrary text that colouring would only make louder.
+// Only numbers, booleans and quoted strings are coloured: most values (a
+// path, a command line, a URL) are arbitrary text.
 pub struct IniHighlighter;
 
 impl Highlighter for IniHighlighter {
@@ -533,12 +415,10 @@ impl Highlighter for IniHighlighter {
             match item {
                 crate::ini::Item::Comment { span: s } => out.push(span(s.clone(), HighlightKind::Comment)),
                 crate::ini::Item::Section { sub, span: s, .. } => {
-                    // The whole header, brackets included: a section is
-                    // one thing to a reader, the same call
-                    // markdown_block makes for a heading's own `#`.
+                    // The whole header, brackets included: a section is one
+                    // thing.
                     out.push(span(s.clone(), HighlightKind::Keyword));
-                    // Layered over it, since a subsection really is a
-                    // string sitting inside the header.
+                    // Over it: a subsection is a string inside the header.
                     if let Some(sub) = sub {
                         out.push(span(sub.clone(), HighlightKind::String));
                     }
@@ -565,19 +445,19 @@ fn ini_value(value: &crate::ini::Value, out: &mut Vec<HighlightSpan>) {
         crate::ini::ValueKind::Quoted => HighlightKind::String,
         crate::ini::ValueKind::Number => HighlightKind::Number,
         crate::ini::ValueKind::Bool => HighlightKind::Keyword,
-        // Left uncoloured on purpose -- see IniHighlighter's own comment.
         crate::ini::ValueKind::Plain => return,
     };
     out.push(span(value.span.clone(), kind));
-    // Over the string's own span, exactly as a JSON string's escapes sit
-    // over theirs.
+    // Over the string's span, as JSON escapes are.
     for esc in &value.escapes {
         out.push(span(esc.clone(), HighlightKind::FormatSpecifier));
     }
 }
 
-// generated page opens with stays visible as what it is rather than
-// being executed away.
+// roff (man page source), over `crate::roff`'s lexical pass rather than
+// its interpreter: a highlighter colours the source as written, so the
+// `.de` and `.ie` scaffolding a generated page opens with stays visible
+// rather than being executed away.
 pub struct RoffHighlighter;
 
 impl Highlighter for RoffHighlighter {
@@ -588,14 +468,11 @@ impl Highlighter for RoffHighlighter {
             .filter_map(|token| {
                 let kind = match token.kind {
                     TokenKind::Comment => HighlightKind::Comment,
-                    // The `.` that makes a line a request, and the
-                    // request itself: the two halves of roff's only
-                    // piece of syntax.
+                    // The `.` that makes a line a request, and the request:
+                    // roff's only syntax.
                     TokenKind::Control => HighlightKind::Operator,
                     TokenKind::Request => HighlightKind::Keyword,
-                    // `\fB`, `\(bu`, `\*[x]` -- substitutions, which
-                    // is what makes them worth telling apart from the
-                    // text they sit inside.
+                    // `\fB`, `\(bu`, `\*[x]`: substitutions within the text.
                     TokenKind::Escape => HighlightKind::Substitution,
                     TokenKind::Argument => HighlightKind::String,
                     TokenKind::Text => return None,
@@ -606,9 +483,8 @@ impl Highlighter for RoffHighlighter {
     }
 }
 
-// Which highlighter a language name has, if any -- the one table, shared
-// by the file editor's own per-buffer choice and by fenced code blocks
-// inside a markdown document.
+// The highlighter for a language name, shared by the file editor and by
+// fenced code blocks in markdown.
 pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> {
     match language {
         "bash" | "sh" | "shell" => Some(Box::new(BashHighlighter)),
@@ -619,8 +495,7 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
         "ini" => Some(Box::new(IniHighlighter)),
         "toml" => Some(Box::new(TomlHighlighter)),
         "dotenv" => Some(Box::new(DotenvHighlighter)),
-        // Token scanners rather than real parsers -- see
-        // codehighlight.rs for why that is the right depth for these.
+        // Token scanners rather than parsers; see codehighlight.rs.
         "rust" => Some(Box::new(CodeHighlighter(super::codehighlight::rust))),
         "python" => Some(Box::new(CodeHighlighter(super::codehighlight::python))),
         "javascript" => Some(Box::new(CodeHighlighter(super::codehighlight::javascript))),
@@ -633,37 +508,26 @@ pub fn highlighter_for_language(language: &str) -> Option<Box<dyn Highlighter>> 
     }
 }
 
-// The adapter for codehighlight.rs's scanners: each is a plain function
-// from text to (range, kind) pairs, with no use for `ctx` -- cwd, known
-// functions and command validity are shell notions with no counterpart
-// in a program in another language.
+// Adapts codehighlight.rs's scanners, which have no use for `ctx`.
 pub struct CodeHighlighter(CodeScanner);
 
-/// What every scanner in codehighlight.rs is: text in, spans out.
 type CodeScanner = fn(&str) -> Vec<(std::ops::Range<usize>, HighlightKind)>;
 
 impl Highlighter for CodeHighlighter {
     fn highlight(&self, text: &str, _ctx: HighlightContext) -> Vec<HighlightSpan> {
-        // The one place in this module where the two units meet. A
-        // scanner over a `&str` has byte offsets and nothing else --
-        // `s.pos`, a `Range<usize>` from `str::find` -- while everything
-        // downstream counts characters, and the two agree right up until
-        // the text stops being ASCII. Converted here rather than in each
-        // of the eight scanners, which would be eight chances to forget.
+        // Scanners over a `&str` produce byte offsets, and everything
+        // downstream counts characters; the two agree until the text isn't
+        // ASCII. Converted here once rather than in each scanner.
         let mut spans: Vec<HighlightSpan> = (self.0)(text).into_iter().map(|(range, kind)| span(range, kind)).collect();
         char_offsets(text, &mut spans);
         spans
     }
 }
 
-// A resolved (start, end, color, attrs) span -- the presentation-layer
-// sibling of HighlightSpan, once a HighlightKind has been mapped to an
-// actual color. Kept as its own type (rather than just carrying
-// HighlightKind through to compose) because it's the seam future
-// presentation features (selections, search highlights, inline coverage,
-// diffs, completions) plug into: any of those just needs to build its own
-// Vec<StyledSpan> and hand it to compose as one more layer, with no
-// dependency on HighlightKind or the highlighter at all.
+// A span resolved to a colour and attributes. Separate from
+// HighlightSpan so other layers (selections, search matches, diffs,
+// completions) can build their own and hand them to `compose` without
+// knowing about HighlightKind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledSpan {
     pub start: usize,
@@ -672,14 +536,9 @@ pub struct StyledSpan {
     pub attrs: vt100::CellAttrs,
 }
 
-// A run of characters that is a hyperlink, for OSC 8 emission.
-//
-// Its own type rather than a field on `StyledSpan` because a link is a
-// different axis from colour: it composes *with* whatever styling the
-// text already has instead of replacing it, and nineteen of the twenty
-// places that build a StyledSpan have nothing to say about links. This
-// is the same "build your own layer and hand it over" seam StyledSpan's
-// own doc comment describes, one axis along.
+// A run that is a hyperlink, for OSC 8. Not a field on `StyledSpan`
+// because a link composes with the text's styling rather than replacing
+// it, and nearly every StyledSpan has nothing to say about links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSpan {
     pub start: usize,
@@ -687,20 +546,17 @@ pub struct LinkSpan {
     pub url: String,
 }
 
-// OSC 8, the terminal hyperlink: `ESC ] 8 ; params ; URI ST` opens one
-// and the same with an empty URI closes it. Terminals that don't know it
-// skip the whole sequence, which is why this needs no capability check
-// -- an OSC with an unknown number is defined to be ignored, and the
-// text between the two sequences is printed either way.
+// OSC 8: `ESC ] 8 ; params ; URI ST` opens a link and the same with an
+// empty URI closes it. A terminal ignores an OSC it doesn't know and
+// prints the text either way, so no capability check is needed.
 fn osc8_open(url: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\")
 }
 
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
-// Indexed(0-15), matching prompt.rs's own existing bold+low-8-ANSI
-// convention, not Rgb -- there's no light/dark-aware theme system yet to
-// make a fixed RGB choice safe.
+// Low-8 ANSI colours, matching prompt.rs, rather than RGB, which would
+// need to know whether the background is light or dark.
 pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
     let bold = vt100::CellAttrs { bold: true, ..vt100::CellAttrs::default() };
     let dim = vt100::CellAttrs { dim: true, ..vt100::CellAttrs::default() };
@@ -714,16 +570,13 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
         HighlightKind::Operator => (vt100::Color::Indexed(7), vt100::CellAttrs::default()),
         HighlightKind::Comment => (vt100::Color::Indexed(8), dim),
         HighlightKind::Number => (vt100::Color::Indexed(6), vt100::CellAttrs::default()),
-        // "Bold for now" per the feature request -- no new color, just
-        // weight, so a flag/subcommand match doesn't fight for attention
-        // with the actual grammar-level colors above.
+        // Weight only, so flags don't compete with the grammar's colours.
         HighlightKind::Flag => (vt100::Color::Default, bold),
         HighlightKind::Subcommand => (vt100::Color::Default, bold),
         HighlightKind::Link => (vt100::Color::Default, underline),
         HighlightKind::FormatSpecifier => (vt100::Color::Indexed(1), bold),
-        // Plain red, not bold -- distinct enough from FormatSpecifier's
-        // bold red given the two never appear near each other, and
-        // matches "error (red text)" from the feature request literally.
+        // Plain red, not bold; FormatSpecifier's bold red never appears
+        // near it.
         HighlightKind::InvalidCommand => (vt100::Color::Indexed(1), vt100::CellAttrs::default()),
         HighlightKind::Key => (vt100::Color::Indexed(6), bold),
         HighlightKind::Emphasis => (vt100::Color::Default, vt100::CellAttrs { italic: true, ..vt100::CellAttrs::default() }),
@@ -732,64 +585,34 @@ pub fn default_style(kind: HighlightKind) -> (vt100::Color, vt100::CellAttrs) {
     }
 }
 
-// A session's live foreground-color overrides, keyed by HighlightKind --
-// what `::bish hl`'s own colours (see exec.rs's `Shell::hl` and KNOWN_
-// BISHOPTS and HL_NAMES just below) resolve to, once a caller with
-// an actual live Shell to read them from (repl.rs's main prompt loop) has
-// built one. A plain HashMap, not bishopt-aware itself -- this crate
-// doesn't know what a "bishopt" is (see this module's own doc comment on
-// why: a future non-shell consumer shouldn't have to bring exec.rs's
-// whole builtin-dispatch machinery along just to render highlighted
-// text), it only knows how to take a resolved color if it's given one.
+// A session's foreground overrides by HighlightKind, from `::bish hl`
+// (see `Shell::hl` and `HL_NAMES`). Built by a caller with a live Shell
+// (repl.rs's prompt loop); this module doesn't know about bishopts, so a
+// non-shell consumer needn't bring exec.rs along.
 pub type ColorOverrides = std::collections::HashMap<HighlightKind, vt100::Color>;
 
-// default_style(kind), with `overrides` (if any) substituted in for just
-// the foreground color -- attrs (bold/dim/underline) stay exactly what
-// default_style itself says regardless; bishopt's Color type has no way
-// to express weight, so there's nothing to override there. `overrides:
-// None` (HighlightContext's own default -- every caller with no live
-// Shell to read from, e.g. fileeditor.rs's own buffer highlighting)
-// behaves identically to calling default_style directly.
+// `default_style`, with the foreground from `overrides` if set. The
+// attributes always come from `default_style`: a colour can't express
+// weight. `None` (no live Shell, e.g. fileeditor.rs) is `default_style`.
 pub fn resolve_style(kind: HighlightKind, overrides: Option<&ColorOverrides>) -> (vt100::Color, vt100::CellAttrs) {
     let (default_fg, attrs) = default_style(kind);
     let fg = overrides.and_then(|o| o.get(&kind)).copied().unwrap_or(default_fg);
     (fg, attrs)
 }
 
-// Which bishopt Color option name (see exec.rs's KNOWN_BISHOPTS) drives
-// each colorable HighlightKind's foreground -- lives here, not exec.rs,
-// since HighlightKind is this crate's own type and exec.rs otherwise has
-// no reason to depend on it.
+// The `::bish hl` name for each colourable kind. Not everything that
+// command accepts: its namespace is open, so a language server's semantic
+// token types are settable before anything here knows them.
 //
-// The names `::bish hl` knows these by. Not an exhaustive list of what
-// that command accepts -- its namespace is open, so a name absent from
-// here is simply one nothing in bish produces *yet*, which is what
-// makes a language server's semantic token types settable before
-// anything here knows about them.
+// Flag, Subcommand and Link draw in the terminal's foreground, and are
+// here anyway: an unset name produces no override (see repl.rs's
+// `hl_colors`), which is the default, so naming one is what lets a theme
+// colour it. `ui_col_*` (theme.rs) is a closed registry with a parseable
+// default per option, which is why LineNumber and Divider have no option
+// there.
 //
-// Flag/Subcommand/Link are in it even though they draw in the
-// terminal's own foreground (vt100::Color::Default) rather than a colour
-// of their own. They were left out for years on the grounds that a CSS
-// colour can only ever produce a concrete one, and there is no way to
-// write "inherit the terminal's default" -- which was decisive while
-// these were `syn_col_*` bishopts, because a KNOWN_BISHOPTS entry has to
-// carry a default that parses. It stopped being decisive when syntax
-// colours moved to `::bish hl`, whose namespace is open and has no
-// registered defaults at all: a name nobody has set produces no override
-// (see the `filter_map` in repl.rs's own hl_colors reader), which is
-// exactly what "inherit" was asking for, and `::bish hl --unset` goes
-// back to it. So they cost nothing until somebody names them, and a
-// theme can now colour a flag -- which is the one thing a shell has a
-// lot of.
-//
-// The old rule still holds where it came from, and theme.rs still
-// applies it: `ui_col_*` is a closed registry with a parseable default
-// per option, which is why LineNumber and Divider have no option there.
-//
-// Markdown's Emphasis/Strong/Struck stay out, for a different reason
-// that has not expired: what they mean *is* the weight or the slant (see
-// their own doc comment), so a colour for them would say a second thing
-// where the document said one.
+// Markdown's Emphasis, Strong and Struck stay out: their weight or slant is
+// their meaning.
 pub const HL_NAMES: &[(HighlightKind, &str)] = &[
     (HighlightKind::Keyword, "keyword"),
     (HighlightKind::Operator, "operator"),
@@ -807,17 +630,11 @@ pub const HL_NAMES: &[(HighlightKind, &str)] = &[
     (HighlightKind::Link, "link"),
 ];
 
-// The `HighlightKind` a language server's semantic token type falls
-// back to when nothing has been said about that name with `::bish hl`.
-//
-// Only the names that genuinely mean the same thing here. The point of
-// semantic tokens is that the server knows things a lexer cannot -- that
-// this identifier is a parameter and that one a constant -- so the
-// mapping is deliberately partial: a type with no bish equivalent
-// (`function`, `class`, `typeParameter`) yields nothing at all, leaving
-// whatever the local highlighter made of it and waiting for a
-// `::bish hl --set function ...` to give it a colour of its own. That
-// is also why `HL_NAMES` is not the list of what `::bish hl` accepts.
+// The kind a language server's semantic token type falls back to when
+// `::bish hl` says nothing about that name. Partial on purpose: a type
+// with no bish equivalent (`function`, `class`, `typeParameter`) gets
+// nothing, keeping the local highlighter's answer until
+// `::bish hl --set function ...` colours it.
 pub fn kind_for_semantic_type(name: &str) -> Option<HighlightKind> {
     Some(match name {
         "keyword" | "modifier" => HighlightKind::Keyword,
@@ -825,22 +642,15 @@ pub fn kind_for_semantic_type(name: &str) -> Option<HighlightKind> {
         "comment" => HighlightKind::Comment,
         "number" => HighlightKind::Number,
         "operator" => HighlightKind::Operator,
-        // A parameter, a property and an enum member are all "a name
-        // standing for a value" as far as anything bish draws is
-        // concerned.
+        // A parameter, property and enum member all stand for a value.
         "variable" | "parameter" | "property" | "enumMember" => HighlightKind::Variable,
         _ => return None,
     })
 }
 
-// Builds one Cell per char, then paints each layer's spans over it in
-// order -- a later layer (or a later span within the same layer, though
-// BashHighlighter's own output is always non-overlapping by construction)
-// always wins for any char it covers. This is deliberately a plain
-// function, not a trait/registry: it has exactly one caller (redraw(), in
-// a later stage), which already knows its own layer set at each call
-// site -- adding a selection/search-match/diagnostic layer later is "pass
-// one more slice," not an interface change.
+// One cell per char, then each layer's spans painted over it in order: a
+// later layer, or a later span within one, wins. A plain function, so
+// adding a layer is passing one more slice.
 pub fn compose(chars: &[char], layers: &[&[StyledSpan]]) -> Vec<vt100::Cell> {
     let mut cells: Vec<vt100::Cell> = chars.iter().map(|&ch| vt100::Cell { ch, ..vt100::Cell::default() }).collect();
     for layer in layers {
@@ -855,20 +665,10 @@ pub fn compose(chars: &[char], layers: &[&[StyledSpan]]) -> Vec<vt100::Cell> {
     cells
 }
 
-/// Adds `spans`' attributes to cells already composed, leaving every
-/// colour exactly as it was.
-///
-/// The other axis `compose` does not have. A `StyledSpan` *replaces*
-/// what is under it, which is right for a selection or a search match
-/// -- those are saying "this run is now something else" -- and wrong
-/// for a mark that means "and also, this one is the same symbol as the
-/// one under your cursor": stripping the colour off an identifier to
-/// point it out makes it stand out less, not more. Same reasoning
-/// `LinkSpan` is a separate type for, and the same shape: one axis
-/// composing over another rather than fighting it.
-///
-/// Attributes are OR-ed rather than assigned, so an underlined run
-/// inside a bold one ends up both.
+/// Adds `spans`' attributes to composed cells, keeping every colour.
+/// A `StyledSpan` replaces what's under it, which suits a selection, but a
+/// mark like "same symbol as under the cursor" should add to the colour,
+/// not strip it. Attributes are OR-ed, so underlined inside bold is both.
 pub fn compose_attrs(cells: &mut [vt100::Cell], spans: &[StyledSpan]) {
     for span in spans {
         let end = span.end.min(cells.len());
@@ -883,18 +683,14 @@ pub fn compose_attrs(cells: &mut [vt100::Cell], spans: &[StyledSpan]) {
     }
 }
 
-// Turns a resolved cell sequence back into an SGR-coded string, reusing
-// vt100::sgr_codes -- the same run-coalescing step repl.rs's render_row
-// already does for a live pane's grid, just fed synthesized cells instead
-// of ones read off a Screen.
+// Turns cells back into an SGR-coded string with `vt100::sgr_codes`, the
+// run-coalescing repl.rs's `render_row` uses.
 pub fn render_styled(cells: &[vt100::Cell]) -> String {
     render_linked(cells, &[])
 }
 
-// The same, with OSC 8 hyperlinks opened and closed around the runs
-// `links` covers. Emitted exactly the way the SGR codes beside them are
-// -- on the transition, not per character -- so a link costs two escape
-// sequences however long it is.
+// The same, with OSC 8 links opened and closed around the runs `links`
+// covers, on the transition, so a link costs two sequences however long.
 pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
     let mut out = String::new();
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
@@ -915,15 +711,11 @@ pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
             out.push_str(&vt100::sgr_codes(cell.fg, cell.bg, cell.attrs));
             last = Some(key);
         }
-        // The last gate before synthesized text becomes terminal bytes.
-        // Every cell run that reaches here was built out of text this
-        // shell did not write -- a filename in a completion menu, a line
-        // of a file, a search result -- and a control character in one
-        // is spliced straight into the terminal's own escape stream. A
-        // file called `evil<ESC>[2J.txt` cleared the screen just by
-        // being offered as a completion. Exactly the hazard the
-        // `url::is_safe` check a few lines up already covers for this
-        // function's other input.
+        // The last gate before text becomes terminal bytes. These cells
+        // come from text bish didn't write (a filename in a completion
+        // menu, a line of a file), and a control character in one would be
+        // spliced into the escape stream: a file named `evil<ESC>[2J.txt`
+        // would clear the screen when offered.
         out.push(crate::term::safe_char(cell.ch));
     }
     if open.is_some() {
@@ -933,14 +725,10 @@ pub fn render_linked(cells: &[vt100::Cell], links: &[LinkSpan]) -> String {
     out
 }
 
-// Renders a plain source line (no prompt, no cursor, no ghost/search
-// layers) fully syntax-highlighted, as an SGR-coded string ending in a
-// reset. The same highlight -> StyledSpan -> compose -> render_styled
-// pipeline editor.rs's own compose_redraw runs for the live, being-typed
-// buffer, minus the parts only a live edit needs -- for callers that just
-// need to echo a *finished* line (e.g. into a promoted pane's grid once
-// it's been submitted) and want it to keep looking like it did while it
-// was still being typed, instead of reverting to plain text.
+// A finished source line, highlighted, as an SGR-coded string ending in
+// a reset: the same pipeline as editor.rs's `compose_redraw` without the
+// live-edit layers. For echoing a submitted line (into a promoted pane's
+// grid, say) so it keeps looking as it did while typed.
 pub fn render_line(text: &str, ctx: HighlightContext) -> String {
     let chars: Vec<char> = text.chars().collect();
     let styled: Vec<StyledSpan> = BashHighlighter
@@ -955,38 +743,27 @@ pub fn render_line(text: &str, ctx: HighlightContext) -> String {
     render_styled(&cells)
 }
 
-// Consumes the next raw_capture_spans entry, if any. `.get()` rather than
-// direct indexing: raw_capture_spans and the token stream can only desync
-// if a heredoc body (whose $VAR/$(...) expansions push spans through
-// push_var same as anything else, but whose *source positions* aren't
-// reliably tracked -- see raw_capture_spans's own doc comment in
-// lexer.rs) sits earlier in the same `text`. That needs an embedded
-// newline to reach a non-empty body at all, which never happens for the
-// single-line buffer this is actually called on -- but staying
-// panic-safe here costs nothing and turns an unreachable-in-practice edge
-// case into "a few spans come out wrong" instead of a crash.
+// The next `raw_capture_spans` entry, if any. `.get()` because the spans
+// can desync from the tokens after a heredoc body, whose positions aren't
+// tracked (see lexer.rs). That needs a multi-line `text`, which this is
+// never called with, but a few wrong spans beat a panic.
 fn next_span(raw_spans: &[Range<usize>], cursor: &mut usize) -> Option<Range<usize>> {
     let r = raw_spans.get(*cursor).cloned();
     *cursor += 1;
     r
 }
 
-// Re-lexes `text` (a full command line, or -- recursively -- the raw
-// interior of a $(...) /`...`/<(...) />(...) ) and appends every span it
-// finds to `out`, shifted by `offset` so nested spans land in the outer
-// caller's coordinate space. `chars` is rebuilt fresh at each recursion
-// level from that level's own `text` (not threaded from the caller) --
-// raw_capture_spans positions are always relative to whatever text they
-// were captured from, so this stays a purely local computation.
+// Lexes `text` (a command line, or the interior of a `$(...)`,
+// backticks, `<(...)` or `>(...)`) and appends its spans to `out`,
+// shifted by `offset` into the caller's coordinates. Each level re-derives
+// its own `chars`, since `raw_capture_spans` positions are relative to the
+// text they came from.
 fn highlight_into(text: &str, offset: usize, ctx: HighlightContext, out: &mut Vec<HighlightSpan>) {
     let chars: Vec<char> = text.chars().collect();
     let res = lexer::tokenize_spanned(text);
     let mut cursor = 0usize;
-    // Fresh per call -- every recursion level ($(...), backtick,
-    // <(...)/>(...), a (...) subshell) gets its own independent command
-    // context, never inherited from the enclosing command (e.g. `git
-    // commit $(echo -m)` starts a wholly new command inside the
-    // substitution).
+    // Every level starts a new command: `git commit $(echo -m)` begins
+    // afresh inside the substitution.
     let mut cmd_pos = CmdPos::ExpectCommand;
     for i in 0..res.items.len() {
         match &res.items[i] {
@@ -994,18 +771,11 @@ fn highlight_into(text: &str, offset: usize, ctx: HighlightContext, out: &mut Ve
                 out.push(HighlightSpan { start: offset + r.start, end: offset + r.end, kind: HighlightKind::Comment, link: None });
             }
             SpannedItem::Tok(tok, span) => {
-                // A CommandName word immediately followed by an empty
-                // "()" is bash's function-definition syntax (`name() {
-                // ...}` / `name () { ... }`) -- `name` there isn't being
-                // invoked as a command at all (it wouldn't even be
-                // defined yet on this very line), so command-validity
-                // checking must not apply to it. Detected by lookahead
-                // rather than real parsing, since this is still purely
-                // lexer-driven -- a heuristic, but a safe one: at worst a
-                // malformed line that merely *looks* like a function
-                // definition skips a validity check it would otherwise
-                // have gotten, never the reverse (a false "invalid", not
-                // a false "valid").
+                // A command name followed by an empty `()` is a function
+                // definition, and the name isn't invoked (it isn't even
+                // defined yet), so it isn't checked. Detected by lookahead:
+                // at worst a line that only looks like a definition skips a
+                // check, never gets a false "invalid".
                 let is_function_def_name = matches!(cmd_pos, CmdPos::ExpectCommand)
                     && matches!(tok, Tok::Word(chunks, _) if matches!(chunks.as_slice(), [Chunk::Str(_)]))
                     && matches!(res.items.get(i + 1), Some(SpannedItem::Tok(Tok::Subshell { raw, .. }, _)) if raw.is_empty());
@@ -1018,14 +788,11 @@ fn highlight_into(text: &str, offset: usize, ctx: HighlightContext, out: &mut Ve
 // Which command-name/argument-position state a word is in, resolved from
 // `CmdPos` right before it's processed.
 enum WordRole {
-    // A leading NAME=value/NAME+=value word before the real command name
-    // -- doesn't itself get classified as a command name or argument.
+    // A leading `NAME=value` or `NAME+=value` before the command name.
     AssignmentPrefix,
     CommandName,
-    // `command`: the resolved command name, if the command-name word was
-    // itself a plain [Chunk::Str(_)] (None for e.g. `$CMD arg` -- no
-    // static name to look anything up against). `arg_index` is 0-based,
-    // counting only real argument words (not the command name itself).
+    // `command` is the command name when it was a plain word (`None` for
+    // `$CMD arg`). `arg_index` counts arguments from 0, excluding the name.
     Argument { command: Option<String>, arg_index: usize },
 }
 
@@ -1035,15 +802,10 @@ enum CmdPos {
     InCommand { name: Option<String>, arg_index: usize },
 }
 
-// Whether encountering this token means "a new simple command can start
-// right after this" -- i.e. resets CmdPos back to ExpectCommand. Closing
-// tokens (RBrace, RParen, KwFi, KwDone, KwLBracket2, KwRBracket2) do NOT
-// reset -- they end a group/test-expression, not start a new command list
-// on their own; a new command still needs its own `;`/`&&`/newline/etc
-// after them first. Factored out as its own pure function (rather than
-// splitting highlight_tok's existing per-kind match arms) so the reset
-// rule itself is directly unit-testable without needing to drive the
-// whole highlighter.
+// Whether a new simple command can start after this token. Closers
+// (`}`, `)`, `fi`, `done`, `[[`, `]]`) don't reset: a new command still
+// needs a separator after them. Its own function so the rule can be
+// tested directly.
 pub(crate) fn resets_command_position(tok: &Tok) -> bool {
     matches!(
         tok,
@@ -1083,12 +845,8 @@ fn is_valid_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-// `NAME=value` / `NAME+=value` shape -- a hand-duplicated check (rather
-// than reusing parser.rs's own word_as_assignment) since that operates on
-// a fully-parsed Word/Chunk shape from a different code path; this stays
-// consistent with this crate's existing precedent of a small duplicated
-// helper over coupling the editor-analysis path to the execution path
-// (tokenize_spanned's own relationship to tokenize() is the same idea).
+// The `NAME=value` shape, checked on chunks rather than with parser.rs's
+// `word_as_assignment`, which works on a parsed Word.
 pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     let [Chunk::Str(s)] = chunks else { return false };
     let Some(eq) = s.find('=') else { return false };
@@ -1096,11 +854,8 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     is_valid_ident(name)
 }
 
-// Hand-duplicated from exec.rs's own KNOWN_BUILTINS (private, and itself
-// already documented there as "kept in sync with run_single's dispatch
-// match by hand") -- kept separate rather than exposing that list to stay
-// decoupled from the shell's execution engine, matching every other
-// editor-analysis-vs-execution split in this file.
+// A copy of exec.rs's `KNOWN_BUILTINS`, keeping the editor's analysis
+// independent of the execution engine.
 pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     ":",
     "cd",
@@ -1159,12 +914,8 @@ pub(crate) const KNOWN_BUILTINS: &[&str] = &[
     "printf",
 ];
 
-// A command name is valid if it's a known builtin, one of the line's own
-// commands, one of the session's own defined functions, a directly
-// executable file (for a name containing '/'), or resolvable on PATH
-// otherwise. Deliberately does NOT check aliases -- see
-// HighlightContext::known_functions's own doc comment on why an alias
-// name isn't actually safe to call "valid" in this shell.
+// Valid: a builtin, one of the line's own commands, a session function,
+// an executable file (for a name with `/`), or on PATH. Not aliases.
 fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
     if KNOWN_BUILTINS.contains(&name) {
         return true;
@@ -1195,13 +946,8 @@ pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-// Mirrors the PATH-walking half of exec.rs's own resolve_in_path (that
-// function is private and also handles the '/'-containing case this
-// module already splits out separately in is_valid_command_name, so it's
-// duplicated rather than reused -- same rationale as KNOWN_BUILTINS
-// above). No caching, matching exec.rs's own real spawn path, which also
-// re-resolves PATH fresh every time rather than maintaining a command
-// cache.
+// The PATH half of exec.rs's `resolve_in_path`, which is private and also
+// handles names with `/`. Not cached, like the real spawn path.
 fn is_in_path(name: &str, path_var: Option<&str>) -> bool {
     let inherited;
     let path_var = match path_var {
@@ -1215,16 +961,10 @@ fn is_in_path(name: &str, path_var: Option<&str>) -> bool {
     path_var.split(':').any(|dir| is_executable_file(&Path::new(dir).join(name)))
 }
 
-// Command-name completion's PATH source: every executable filename on
-// `path_var` -- the session's own PATH, for the same reason
-// HighlightContext::path exists; `None` falls back to the real
-// environment's -- that starts with `prefix`, deduplicated. Filtered by prefix *before*
-// returning (not left to the caller's fuzzy step) so a single keystroke
-// never has to score every executable on the system. One read_dir per PATH
-// directory; a directory that fails to open (stale/nonexistent entry) is
-// silently skipped, same tolerance real PATH resolution already has. The
-// same name can legitimately live in multiple PATH dirs -- only the name
-// is returned, so first-found-wins is fine and a HashSet dedups it.
+// Every executable name on `path_var` (the session's PATH; `None` falls
+// back to the environment's) that starts with `prefix`, deduplicated.
+// Filtered here so a keystroke doesn't score every executable on the
+// system. A directory that won't open is skipped, as in PATH resolution.
 pub(crate) fn enumerate_path_matches(prefix: &str, path_var: Option<&str>) -> Vec<String> {
     let inherited;
     let path_var = match path_var {
@@ -1255,12 +995,9 @@ pub(crate) fn enumerate_path_matches(prefix: &str, path_var: Option<&str>) -> Ve
     out
 }
 
-// Thin wrapper: resolves `command`'s man-page data (if ready yet -- see
-// manpages::query's own doc comment on why this never blocks) and
-// delegates the actual matching to classify_plain_argument_core, which
-// takes the data directly rather than going through the real cache/thread
-// -- that's the seam this module's own tests use to stay deterministic
-// without spawning `man`.
+// Resolves `command`'s man-page data if ready (`manpages::query` never
+// blocks) and delegates to `classify_plain_argument_core`, which tests call
+// with canned data.
 fn classify_plain_argument(
     text: &str,
     word_span: &Range<usize>,
@@ -1276,15 +1013,9 @@ fn classify_plain_argument(
     classify_plain_argument_core(text, word_span, arg_index, man.as_deref(), ctx.cwd, offset)
 }
 
-// Priority order, matching "if the unquoted argument is not a flag or a
-// sub-command, we'll check if it's a file": a `-`-prefixed word is
-// checked ONLY against flags (any argument position) and never falls
-// through to subcommand/file-link matching, even on a miss -- a
-// flag-shaped argument is never meaningfully a file path either.
-// Subcommand matching is gated to arg_index == 0 (the word immediately
-// after the command name) -- single-level only, per this feature's v1
-// scope. The file/dir Link fallback lands in a later stage; for now a
-// non-flag, non-subcommand argument just stays uncolored, same as today.
+// A `-` word is checked only against flags, in any position, and never
+// falls through, since it isn't meaningfully a path either. Subcommands
+// only at `arg_index == 0`, one level. Anything else may be a file link.
 fn classify_plain_argument_core(
     text: &str,
     word_span: &Range<usize>,
@@ -1317,57 +1048,37 @@ fn classify_plain_argument_core(
     resolve_file_link(text, cwd).map(|url| out_span(HighlightKind::Link, Some(url)))
 }
 
-// Resolves `text` (a fully-plain, unquoted argument -- never `~`-prefixed:
-// the lexer always rewrites a leading `~` into a Chunk::Var, so such a
-// word never reaches this function as a single Chunk::Str) against `cwd`
-// if relative, and checks whether it's a real file/directory. `cwd` being
-// None (command mode's own colon-line, see its call site's own doc
-// comment) means "don't know, don't guess" -- skip Link detection
-// entirely rather than resolving against this process's own cwd, which
-// can legitimately differ from the session's Shell.cwd.
-//
-// A fresh Path::exists() syscall every call, not cached -- filesystem
-// state can change moment to moment, unlike man-page content.
+// Resolves `text` (plain and unquoted; a leading `~` always becomes a
+// `Chunk::Var`, so never that) against `cwd` and checks that it exists.
+// `cwd: None` (the colon line) skips links rather than guessing with the
+// process's cwd, which can differ from the session's. Not cached: the
+// filesystem changes.
 fn resolve_file_link(text: &str, cwd: Option<&Path>) -> Option<String> {
     let cwd = cwd?;
     let candidate = if Path::new(text).is_absolute() { std::path::PathBuf::from(text) } else { cwd.join(text) };
     if candidate.exists() { Some(format!("file://{}", candidate.display())) } else { None }
 }
 
-// Strips a trailing "=value" or " <placeholder>" suffix from a `-`-
-// prefixed argument, per this feature's v1 exact-match scope (no bundled
-// short-flag decomposition, e.g. "-la" is never split into "-l"/"-a").
-// Only ever called after the caller has already confirmed `text` starts
-// with '-'.
+// Strips a trailing `=value` or ` <placeholder>` from a flag. Matching is
+// exact: `-la` is never split into `-l` and `-a`.
 fn strip_flag_suffix(text: &str) -> &str {
     let end = text.find(|c: char| c == '=' || c == ' ').unwrap_or(text.len());
     &text[..end]
 }
 
-// One match arm today (printf) -- a plain function rather than a trait/
-// registry, since the extensibility axis here is "add a match arm," which
-// this handles cleanly with no dynamic registration/discovery needed.
-// Revisit only if a second, structurally different consumer of refiners
-// shows up.
 fn builtin_refine(command: &str, arg_index: usize, raw_text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
     match command {
-        // printf's format string is its first argument in the common
-        // case -- `printf -v NAME FORMAT ...` shifts it to arg_index 2,
-        // which this doesn't detect (a documented v1 gap: degrades to no
-        // highlighting for that call shape, never a wrong one, since
-        // arg_index 0 there is just "-v" with no '%' chars to match).
+        // printf's format is its first argument, except after `-v NAME`,
+        // which this doesn't detect; `-v` itself has no `%` to match.
         "printf" if arg_index == 0 => scan_printf_directives(raw_text),
         _ => Vec::new(),
     }
 }
 
-// Mirrors exec.rs's own printf_format_once grammar exactly, not full C
-// printf: flags are only '-' and '0' (no '+', space, '#'); width is a
-// digit run; precision is '.' plus a digit run; conversion is exactly one
-// of s b c q d i u o x X, or a literal "%%". An unrecognized conversion
-// char is skipped without emitting a span (matches printf_format_once's
-// own "emitted literally, nothing consumed" behavior) -- `i` has already
-// advanced past the '%' by then, so this can't loop forever.
+// exec.rs's `printf_format_once` grammar, not full C printf: flags `-`
+// and `0`, a width, a `.` precision, and one of `s b c q d i u o x X`, or
+// `%%`. An unknown conversion gets no span, as `printf_format_once` prints
+// it literally; `i` is already past the `%`, so this can't loop.
 fn scan_printf_directives(text: &[char]) -> Vec<(Range<usize>, HighlightKind)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1418,15 +1129,10 @@ fn highlight_tok(
     if resets_command_position(tok) {
         *cmd_pos = CmdPos::ExpectCommand;
     }
-    // `for`/`select`'s NAME and `case`'s WORD, and anything following
-    // `in` (the for/select word list, or -- lexically indistinguishable
-    // from here -- a case pattern), are never command names: they're a
-    // loop variable, a match subject, or plain list words. Route them
-    // through the same "no command in scope" state an unresolved `$CMD
-    // arg` argument already gets (WordRole::Argument{command: None,
-    // ..}), which is inert -- no validity check, no styling -- rather
-    // than the ExpectCommand state the generic reset above just set,
-    // which would flag them as invalid command names.
+    // `for`/`select`'s NAME, `case`'s WORD and anything after `in` (a word
+    // list or, indistinguishably here, a case pattern) are never commands.
+    // They get the inert "no command in scope" argument role rather than
+    // ExpectCommand, which would flag them as invalid commands.
     if matches!(tok, Tok::KwFor | Tok::KwSelect | Tok::KwCase | Tok::KwIn) {
         *cmd_pos = CmdPos::InCommand { name: None, arg_index: 0 };
     }
@@ -1482,20 +1188,16 @@ fn highlight_tok(
 
         Tok::Newline => {}
 
-        // A (...) subshell command grouping -- the parens themselves stay
-        // uncolored (unlike Chunk::Sub below, which does mark its
-        // delimiters); only the interior recursively highlights.
+        // A `(...)` subshell: the parens stay uncoloured, unlike
+        // `Chunk::Sub`'s delimiters, and the interior is highlighted.
         Tok::Subshell { raw, .. } => {
             if let Some(inner) = next_span(raw_spans, cursor) {
                 highlight_into(raw, offset + inner.start, ctx, out);
             }
         }
 
-        // A bare ((...)) arithmetic command -- one flat Substitution span
-        // covering the whole thing (this token's own span already
-        // includes both paren pairs), no recursion: arithmetic has
-        // different lexical rules than the shell grammar (`<`/`>` are
-        // comparisons here, not redirects).
+        // A bare `((...))`: one Substitution span over the whole token, not
+        // recursed into, since `<` and `>` are comparisons there.
         Tok::Arith(_raw) => {
             next_span(raw_spans, cursor); // capture_double_paren's own capture_balanced_parens push
             out.push(whole(HighlightKind::Substitution));
@@ -1505,20 +1207,14 @@ fn highlight_tok(
     }
 }
 
-// An all-plain word ([Chunk::Str(_)], the common unquoted case with no
-// quoting/escaping/expansion at all) is checked against classify_plain_
-// argument (flags/subcommands/file-links -- a later stage) instead of
-// just staying uncolored; otherwise each chunk is walked in order,
-// consuming one raw_capture_spans entry per non-Str chunk (see that
-// field's own doc comment in lexer.rs for the exact invariant this relies
-// on), with LiteralStr chunks additionally offered to builtin_refine
-// (printf's %s/%d/etc -- also a later stage).
+// A wholly plain word (one `Chunk::Str`) goes to
+// `classify_plain_argument` for flags, subcommands and file links.
+// Otherwise each chunk is walked in order, taking one `raw_capture_spans`
+// entry per non-Str chunk (see lexer.rs), and literal strings are offered
+// to `builtin_refine`.
 //
-// `cmd_pos` is resolved into this word's own WordRole *before* the
-// all-plain fast path, since both branches need to know it: is this word
-// a leading NAME=value assignment (doesn't advance past ExpectCommand),
-// the command name itself (advances to InCommand), or the Nth argument
-// of an already-known command.
+// `cmd_pos` becomes this word's role first, since both paths need it: a
+// leading `NAME=value`, the command name, or the Nth argument.
 fn highlight_word(
     chunks: &[Chunk],
     word_span: &Range<usize>,
@@ -1547,12 +1243,8 @@ fn highlight_word(
 
     if let [Chunk::Str(s)] = chunks {
         match &role {
-            // A *valid* command name gets no new styling at all --
-            // "displayed as it was before" -- so this only ever pushes a
-            // span on the negative case. A function-definition name
-            // (`name() { ... }`) isn't a command invocation at all --
-            // skip validity checking entirely rather than false-flagging
-            // the very name being defined on this line.
+            // A valid command name gets no span. A function definition's
+            // name isn't an invocation, so it isn't checked.
             WordRole::CommandName => {
                 if !is_function_def_name && !is_valid_command_name(s, &ctx) {
                     out.push(HighlightSpan {
@@ -1588,15 +1280,9 @@ fn highlight_word(
                 }
             }
 
-            // Terminal, no recursion. The span covers just the
-            // name/index/op text itself -- not the leading `$` (or the
-            // `${`/`}` braces, for the braced forms) -- a deliberate v1
-            // simplification: the identifier is colored, the sigil/braces
-            // stay neutral, a fairly common convention in editors, and it
-            // avoids needing the same delimiter-disambiguation this
-            // module does for Chunk::Sub below (bare `$NAME` vs `${NAME}`
-            // isn't distinguishable from the chunk alone, only from the
-            // source text).
+            // No recursion. The span covers the name, index or operator,
+            // not the `$` or the braces: `$NAME` and `${NAME}` can't be
+            // told apart from the chunk alone.
             Chunk::Var { .. }
             | Chunk::VarExpand { .. }
             | Chunk::ArrayVar { .. }
@@ -1610,13 +1296,9 @@ fn highlight_word(
                 }
             }
 
-            // $(...) command substitution or `...` backtick substitution
-            // -- Chunk::Sub doesn't record which delimiter style produced
-            // it (one variant covers both), so the char immediately
-            // before the captured interior disambiguates: a backtick
-            // means a 1-char delimiter on each side, anything else means
-            // the grammar's only other route here, "$(", a 2-char/1-char
-            // pair.
+            // `$(...)` or backticks: `Chunk::Sub` doesn't say which, so the
+            // char before the interior decides: a backtick is a 1-char
+            // delimiter each side, anything else `$(` and `)`.
             Chunk::Sub { raw, .. } => {
                 if let Some(r) = next_span(raw_spans, cursor) {
                     let is_backtick = r.start >= 1 && chars.get(r.start - 1) == Some(&'`');
@@ -1627,11 +1309,8 @@ fn highlight_word(
                 }
             }
 
-            // $((...)) arithmetic expansion within a word -- same flat,
-            // non-recursive treatment as the bare ((...)) command above,
-            // just needing the surrounding "$((" / "))" computed manually
-            // since (unlike Tok::Arith) there's no wrapping token span
-            // that already includes them.
+            // `$((...))` in a word: flat like `((...))`, with the
+            // delimiters computed since no token span includes them.
             Chunk::Arith { .. } => {
                 if let Some(r) = next_span(raw_spans, cursor) {
                     let full_start = r.start.saturating_sub(3);
@@ -1640,10 +1319,8 @@ fn highlight_word(
                 }
             }
 
-            // <(cmd) / >(cmd) process substitution -- same delimiter-plus-
-            // recurse treatment as Chunk::Sub, but unambiguous (each
-            // variant has exactly one possible delimiter pair), so no
-            // peeking needed.
+            // `<(cmd)` and `>(cmd)`: like `Chunk::Sub`, with one possible
+            // delimiter pair each.
             Chunk::ProcSubIn { raw } => push_procsub(raw, offset, raw_spans, cursor, ctx, out),
             Chunk::ProcSubOut { raw } => push_procsub(raw, offset, raw_spans, cursor, ctx, out),
         }
@@ -1661,11 +1338,8 @@ fn push_procsub(raw: &str, offset: usize, raw_spans: &[Range<usize>], cursor: &m
 
 #[cfg(test)]
 mod tests {
-    // A filename is text somebody else wrote, and `render_linked` is the
-    // last thing between it and the terminal's escape stream. Before
-    // this gate, offering `evil<ESC>[2J.txt` in a completion menu
-    // cleared the user's screen -- confirmed against the real binary
-    // over a pty, with a control run in a directory without such a file.
+    // A filename is text somebody else wrote, and `render_linked` stands
+    // between it and the terminal's escape stream.
     #[test]
     fn a_control_character_never_reaches_the_terminal_as_one() {
         let render = |text: &str| {
@@ -1676,21 +1350,18 @@ mod tests {
         assert!(!out.contains("\x1b[2J"), "the screen-clearing sequence must not survive: {out:?}");
         assert!(out.contains("evil\u{FFFD}[2J.txt"), "{out:?}");
 
-        // The only escapes left are this function's own SGR framing --
-        // the same ones a name with nothing hostile in it produces.
+        // The only escapes left are this function's own SGR framing.
         let (_, benign) = render("evilX[2J.txt");
         assert_eq!(out.matches('\x1b').count(), benign.matches('\x1b').count(), "the text contributed an escape of its own");
 
-        // One character in, one out, so every index into the run still
-        // means what it meant -- match positions, selection spans, the
-        // caret column.
+        // One character in, one out, so match positions, selections and the
+        // caret column still line up.
         assert_eq!(super::compose(&"evil\x1b[2J.txt".chars().collect::<Vec<_>>(), &[]).len(), len);
     }
 
     use super::*;
 
-    // The text each JSON span actually covers, so a test reads as what
-    // you'd see on screen rather than as a list of offsets.
+    // The text each span covers, so a failure reads as what's on screen.
     fn json_kinds(text: &str) -> Vec<(String, HighlightKind)> {
         let chars: Vec<char> = text.chars().collect();
         let mut spans = JsonHighlighter.highlight(text, HighlightContext::default());
@@ -1720,17 +1391,14 @@ mod tests {
     fn keywords_and_operators() {
         let text = "if true; then echo hi; fi";
         let spans = kinds(text);
-        // "if" .. "then" .. ";" .. ";" .. "fi"
         assert!(spans.contains(&(0, 2, HighlightKind::Keyword))); // if
         assert!(spans.contains(&(9, 13, HighlightKind::Keyword))); // then
         assert!(spans.contains(&(23, 25, HighlightKind::Keyword))); // fi
         assert!(spans.iter().any(|s| s.2 == HighlightKind::Operator));
     }
 
-    // A here-string or heredoc on a numbered descriptor is one redirect,
-    // and what follows it is the script again. The highlighter's own
-    // lexer read `3<<<x` as `3<` and then a heredoc, so every line after
-    // it was coloured as the body of a document nobody had started.
+    // A here-string or heredoc on a numbered descriptor is one redirect, and
+    // the script continues after it: `3<<<x` isn't `3<` plus a heredoc.
     #[test]
     fn a_numbered_here_string_or_heredoc_ends_where_it_ends() {
         let text = "cat 3<<<x\nif true; then :; fi";
@@ -1788,7 +1456,7 @@ mod tests {
         let spans = kinds(text);
         assert!(spans.contains(&(5, 15, HighlightKind::Substitution)));
         assert_eq!(&text[5..15], "$((1 + 2))");
-        // no separate spans for anything inside the parens
+        // Nothing inside the parens gets its own span.
         assert_eq!(spans.iter().filter(|s| s.0 >= 5 && s.1 <= 15).count(), 1);
     }
 
@@ -1796,9 +1464,8 @@ mod tests {
     fn subshell_parens_are_uncolored_but_interior_recurses() {
         let text = "(echo 'hi')";
         let spans = kinds(text);
-        // No span at all covers either paren (index 0 or 10); the nested
-        // single-quoted string recurses correctly, offset back into the
-        // outer text's own coordinates.
+        // Neither paren gets a span; the nested string is offset back into
+        // the outer coordinates.
         assert_eq!(spans, vec![(7, 9, HighlightKind::String)]);
         assert_eq!(&text[7..9], "hi");
     }
@@ -1807,7 +1474,7 @@ mod tests {
     fn dollar_paren_substitution_delimiters_and_interior() {
         let text = "echo $(echo hi)";
         let spans = kinds(text);
-        // "$(" at 5..7, ")" at 14..15
+        // `$(` at 5..7, `)` at 14..15.
         assert!(spans.contains(&(5, 7, HighlightKind::Substitution)));
         assert!(spans.contains(&(14, 15, HighlightKind::Substitution)));
     }
@@ -1820,9 +1487,7 @@ mod tests {
         assert!(spans.contains(&(13, 14, HighlightKind::Substitution)));
     }
 
-    // The user's own motivating example: the single-quoted string nested
-    // inside $(...) must independently highlight as its own String span,
-    // not flatten into the outer Substitution color.
+    // A single-quoted string inside `$(...)` gets its own String span.
     #[test]
     fn nested_single_quote_inside_substitution_recurses() {
         let text = "echo \"yooo, $(printf 'hello %' world)\"";
@@ -1836,7 +1501,6 @@ mod tests {
             quote_end,
             spans
         );
-        // The outer "yooo, " literal run also gets its own String span.
         let outer_start = text.find("yooo, ").unwrap();
         assert!(spans.contains(&(outer_start, outer_start + "yooo, ".len(), HighlightKind::String)));
     }
@@ -1859,15 +1523,12 @@ mod tests {
 
     #[test]
     fn incomplete_line_highlights_up_to_the_error_point() {
-        // An unclosed single quote -- tokenize_spanned stops with an
-        // error, but "echo" before it must still highlight normally
-        // (i.e. produce no spans, being a plain word) rather than the
-        // whole line going uncolored.
+        // The lexer stops with an error at the unclosed quote, and `echo`
+        // before it is still highlighted, as a plain word.
         let text = "echo 'unterminated";
         let spans = BashHighlighter.highlight(text, HighlightContext::default());
-        // No panic, and no spans at all is the correct result here since
-        // "echo" alone is a plain, uncolored word and the unterminated
-        // quote never got far enough to produce a LiteralStr chunk.
+        // No panic, and no spans: `echo` is plain and the quote never
+        // produced a literal chunk.
         assert_eq!(spans, vec![]);
     }
 
@@ -1905,9 +1566,7 @@ mod tests {
     #[test]
     fn render_styled_coalesces_runs_of_identical_style_into_one_sgr_code() {
         let chars: Vec<char> = "abcd".chars().collect();
-        // "ab" plain, "cd" colored -- two distinct runs, so exactly two
-        // SGR escapes should appear (one per run), not four (one per
-        // char).
+        // Two runs, so two SGR escapes, not one per char.
         let layer = [StyledSpan { start: 2, end: 4, fg: vt100::Color::Indexed(3), attrs: vt100::CellAttrs::default() }];
         let cells = compose(&chars, &[&layer]);
         let rendered = render_styled(&cells);
@@ -1928,19 +1587,16 @@ mod tests {
         let layer = [StyledSpan { start: 0, end: 3, fg: vt100::Color::Indexed(2), attrs: vt100::CellAttrs::default() }];
         let cells = compose(&chars, &[&layer]);
         let rendered = render_styled(&cells);
-        // One SGR to enter the style, one to reset -- no per-char churn.
+        // One SGR to enter the style, one to reset.
         assert_eq!(rendered.matches('\x1b').count(), 2);
     }
 
-    // The scanners in codehighlight.rs count bytes; every other
-    // highlighter in this module, and everything that reads any of them,
-    // counts characters. Two units that agree for as long as the text is
-    // ASCII and then quietly stop.
+    // The scanners in codehighlight.rs count bytes and everything else counts
+    // characters; the two agree only on ASCII.
     #[test]
     fn every_highlighter_reports_the_unit_compose_indexes_by() {
-        // The assertion is always about the span *after* the non-ASCII
-        // character, since that is the one an offset in the wrong unit
-        // moves.
+        // Each assertion is about the span after the non-ASCII character,
+        // which an offset in the wrong unit moves.
         let cases: &[(&str, &str, HighlightKind, &str)] = &[
             ("rust", "let \u{e4} = 1;", HighlightKind::Number, "1"),
             ("go", "var \u{e4} = 1", HighlightKind::Number, "1"),
@@ -1962,9 +1618,8 @@ mod tests {
         }
     }
 
-    // An offset that lands inside a character reads as that character
-    // rather than panicking -- nothing here produces one, but a scanner
-    // that lost its place could, and a wrong colour beats a crash.
+    // An offset inside a character maps to that character instead of
+    // panicking.
     #[test]
     fn an_offset_inside_a_character_does_not_panic() {
         let text = "a\u{e4}b";
@@ -1974,21 +1629,14 @@ mod tests {
         assert_eq!((spans[1].start, spans[1].end), (1, 3));
     }
 
-    // Regression test for a real bug caught during interactive
-    // verification: a promoted/windowed pane echoed the *plain* submitted
-    // line into its grid on Enter, so a compositor redraw right after
-    // (e.g. the next command's output arriving) replaced the
-    // still-visible, syntax-highlighted line with uncolored text -- to a
-    // user it read as "pressing enter clears the highlighting." render_line
-    // is the fix's core: it must actually emit SGR codes for a line that
-    // highlight_word would style, not just echo the text back verbatim.
+    // `render_line` emits SGR codes, so a submitted line echoed into a
+    // pane's grid stays highlighted.
     #[test]
     fn render_line_carries_syntax_highlighting_as_sgr_codes() {
         let rendered = render_line("if true; then echo hi; fi", HighlightContext::default());
         assert!(rendered.contains('\x1b'), "{rendered:?}");
         assert!(rendered.ends_with("\x1b[0m"), "{rendered:?}");
-        // Stripping every SGR sequence must round-trip back to the exact
-        // original text -- render_line adds color, never touches content.
+        // With the SGR sequences stripped the text is unchanged.
         let mut stripped = String::new();
         let mut in_escape = false;
         for ch in rendered.chars() {
@@ -2044,35 +1692,26 @@ mod tests {
 
     #[test]
     fn hl_names_covers_every_kind_a_colour_could_mean_anything_for() {
-        // Markdown's three text styles stay out: what they mean *is* the
-        // weight or the slant, so a colour for them would say a second
-        // thing where the document said one. The only reason left for
-        // keeping a kind out of this table -- see its own doc comment
-        // for the one that expired.
+        // Markdown's text styles stay out: their weight or slant is their
+        // meaning.
         for attribute_only in [HighlightKind::Emphasis, HighlightKind::Strong, HighlightKind::Struck] {
             assert!(!HL_NAMES.iter().any(|(k, _)| *k == attribute_only), "{attribute_only:?}");
         }
-        // The three that used to be out are in, and still draw in the
-        // terminal's own foreground until a theme says otherwise. The
-        // assertion is on the *default*, which is what keeps this from
-        // being the commit that quietly gives every flag a colour on a
-        // fresh install: an open namespace means absence is "inherit",
-        // so a kind in this table and a kind with a colour of its own
-        // are two different questions.
+        // Flag, Subcommand and Link draw in the terminal's foreground until
+        // a theme says otherwise. Being in the table and having a colour of
+        // one's own are different questions: absence from a theme means
+        // inherit.
         for inherits in [HighlightKind::Flag, HighlightKind::Subcommand, HighlightKind::Link] {
             assert!(HL_NAMES.iter().any(|(k, _)| *k == inherits), "{inherits:?}");
             assert_eq!(default_style(inherits).0, vt100::Color::Default, "{inherits:?} must still inherit with nothing set");
         }
-        // Bump when a kind is genuinely added -- and give it a colour in
-        // every theme bish ships, which theme.rs's own guard will insist
-        // on anyway.
+        // Bump when a kind is added, and give it a colour in every shipped
+        // theme; theme.rs's guard insists.
         assert_eq!(HL_NAMES.len(), 14);
     }
 
     fn tok(word: &str) -> Tok {
-        // Small helper for resets_command_position tests -- lexes just
-        // enough to get a real Tok of the right variant without hardcoding
-        // every enum's exact field shape by hand.
+        // Lexes just enough to get a real Tok of the right variant.
         match lexer::Lexer::new(word).tokenize() {
             Ok(mut toks) if toks.len() == 1 => toks.pop().unwrap().0,
             other => panic!("expected exactly one token from {word:?}, got {other:?}"),
@@ -2124,22 +1763,17 @@ mod tests {
         assert!(!is_assignment_prefix_word(&plain_chunks("1FOO=bar"))); // invalid ident
         assert!(!is_assignment_prefix_word(&plain_chunks("echo"))); // no '='
         assert!(!is_assignment_prefix_word(&plain_chunks("=bar"))); // empty name
-        // Not a single plain Chunk::Str -- e.g. a word containing an
-        // expansion -- never counts as an assignment prefix here.
+        // A word that isn't a single plain `Chunk::Str` is never an
+        // assignment prefix.
         assert!(!is_assignment_prefix_word(&[Chunk::Var { name: "FOO".to_string(), quoted: false, braced: false }]));
     }
 
     #[test]
     fn command_name_and_argument_positions_produce_no_spurious_spans() {
-        // "one"/"two" are never going to match "echo"'s real flags or
-        // subcommands (assuming man is even present and this is the
-        // first-ever query for "echo" in this test binary run, the real
-        // manpages::query call this now makes returns Pending
-        // synchronously -- no data yet, no spans -- regardless, since
-        // classify_plain_argument only ever emits a span on an *exact*
-        // match). This is really exercising the state-machine wiring
-        // itself: an assignment prefix, a command name, and two
-        // arguments, none of which should produce spurious output.
+        // Exercises the state machine: an assignment prefix, a command name
+        // and two arguments, none producing a span. A first query for
+        // `echo`'s man page is Pending anyway, and spans need an exact
+        // match.
         assert_eq!(kinds("FOO=bar echo one two"), vec![]);
     }
 
@@ -2171,9 +1805,7 @@ mod tests {
     #[test]
     fn classify_plain_argument_core_flag_miss_never_falls_through() {
         let data = man(&["-a"], &["commit"]);
-        // "-x" doesn't match any known flag, and starting with '-' means
-        // it must never be checked against subcommands either, even at
-        // arg_index 0.
+        // `-x` matches no flag and, starting with `-`, is never a subcommand.
         let got = classify_plain_argument_core("-x", &(0..2), 0, Some(&data), None, 0);
         assert_eq!(got, None);
     }
@@ -2192,8 +1824,7 @@ mod tests {
             classify_plain_argument_core("commit", &span, 0, Some(&data), None, 0),
             Some(HighlightSpan { start: 4, end: 10, kind: HighlightKind::Subcommand, link: None })
         );
-        // Same text, later argument position -- single-level subcommand
-        // support only, per this feature's v1 scope.
+        // Subcommands only at `arg_index == 0`.
         assert_eq!(classify_plain_argument_core("commit", &span, 1, Some(&data), None, 0), None);
     }
 
@@ -2226,9 +1857,7 @@ mod tests {
 
     #[test]
     fn resolve_file_link_returns_none_without_a_cwd() {
-        // Command mode's own colon-line passes None -- "don't know, don't
-        // guess" rather than resolving against this process's own cwd,
-        // which can legitimately differ from the session's Shell.cwd.
+        // The colon line passes `None`: no guessing with the process's cwd.
         assert_eq!(resolve_file_link("Cargo.toml", None), None);
     }
 
@@ -2307,14 +1936,12 @@ mod tests {
     fn builtin_refine_only_fires_for_printf_at_arg_index_zero() {
         let text = chars_of("%s");
         assert_eq!(builtin_refine("printf", 0, &text), vec![(0..2, HighlightKind::FormatSpecifier)]);
-        // `-v NAME FORMAT` shifts the real format string to arg_index 2 --
-        // a documented v1 gap, degrading to no highlighting rather than a
-        // wrong one.
+        // `-v NAME FORMAT` moves the format to `arg_index` 2, which isn't
+        // detected: no highlighting rather than wrong highlighting.
         assert_eq!(builtin_refine("printf", 2, &text), vec![]);
         assert_eq!(builtin_refine("echo", 0, &text), vec![]);
     }
 
-    // The user's own example from the feature request.
     #[test]
     fn printf_format_specifier_is_highlighted_within_the_quoted_string() {
         let text = "printf 'hello %s' world";
@@ -2337,19 +1964,13 @@ mod tests {
     #[test]
     fn is_valid_command_name_recognizes_a_real_path_executable() {
         let ctx = HighlightContext::default();
-        // coreutils -- safe to assume present on any Unix test runner,
-        // same assumption this whole feature already leans on for `man`.
+        // coreutils, assumed present on any Unix test runner.
         assert!(is_valid_command_name("true", &ctx));
         assert!(is_valid_command_name("ls", &ctx));
     }
 
-    // The bug this guards: `export PATH="$PATH:$HOME/bin"` -- or a
-    // per-directory hook rewriting PATH on every `cd`, which is how
-    // mise and direnv work -- put a directory on the *session's* PATH,
-    // where every command bish runs resolves against it, while the real
-    // process environment kept the PATH bish started with. So `cargo`
-    // in a repo whose toolchain the hook had just activated ran fine
-    // and was painted as an error.
+    // Commands resolve against the session's PATH, which a `cd` hook or
+    // `export PATH=...` can change after the process environment was fixed.
     #[test]
     fn a_bare_name_resolves_against_the_sessions_path_not_the_processs() {
         let dir = crate::tempdir::TempDir::new("highlight-path-tests");
@@ -2363,12 +1984,10 @@ mod tests {
         let path = dir.path().display().to_string();
         let ctx = HighlightContext { path: Some(&path), ..HighlightContext::default() };
         assert!(is_valid_command_name("bish-test-hookbin", &ctx));
-        // And the real environment is genuinely not consulted once a
-        // session has handed its own PATH over: `ls` is on every test
-        // runner's PATH and on no part of this one.
+        // And the environment isn't consulted once a session hands its PATH
+        // over: `ls` is on every runner's PATH and nowhere on this one.
         assert!(!is_valid_command_name("ls", &ctx));
-        // Falling back to the real environment is still what a context
-        // with no shell behind it gets.
+        // A context with no shell still falls back to the environment.
         assert!(is_valid_command_name("ls", &HighlightContext::default()));
     }
 
@@ -2387,27 +2006,23 @@ mod tests {
         assert!(!is_valid_command_name("other_func", &ctx));
     }
 
-    // The editor's colon line: `:preview` is a real command that no
-    // PATH scan will ever find, and painting it as an error says the
-    // opposite of the truth. The same line still has to be honest about
-    // a name that really is nothing.
+    // The colon line's `:preview` is real and on no PATH, while a name that
+    // is nothing is still flagged.
     #[test]
     fn is_valid_command_name_recognizes_one_of_the_lines_own_commands() {
         let commands = ["preview", "diag"];
         let ctx = HighlightContext { line_commands: Some(&commands), ..HighlightContext::default() };
         assert!(is_valid_command_name("preview", &ctx));
         assert!(!is_valid_command_name("bish-definitely-not-a-real-command-xyz", &ctx));
-        // ...and they belong to that line alone: the ordinary prompt has
-        // no `preview` to run.
+        // ...and only on that line.
         assert!(!is_valid_command_name("preview", &HighlightContext::default()));
     }
 
     #[test]
     fn is_valid_command_name_recognizes_a_direct_executable_path() {
         let ctx = HighlightContext::default();
-        // The test binary itself -- guaranteed to exist and be executable,
-        // and (being an absolute path) exercises the '/'-containing branch
-        // rather than the PATH-walking one.
+        // The test binary: exists, executable, and an absolute path, so the
+        // `/` branch is taken rather than the PATH walk.
         let exe = std::env::current_exe().unwrap();
         assert!(is_valid_command_name(exe.to_str().unwrap(), &ctx));
     }
@@ -2417,8 +2032,7 @@ mod tests {
         let ctx = HighlightContext::default();
         let cwd = std::env::current_dir().unwrap();
         let toml = cwd.join("Cargo.toml");
-        // A real file, but not executable -- must fail the permission-bit
-        // check, not just "does this path exist."
+        // A real file without the execute bit fails.
         assert!(!is_valid_command_name(toml.to_str().unwrap(), &ctx));
     }
 
@@ -2428,10 +2042,9 @@ mod tests {
         assert!(!is_valid_command_name("/definitely/not/a/real/path/xyz", &ctx));
     }
 
-    // Real temp-dir fixture: a stale (nonexistent) PATH entry ahead of a
-    // real one containing an executable + a non-executable file. Handed
-    // in rather than exported, so nothing else running in this test
-    // binary can see it.
+    // A stale PATH entry ahead of a real one holding an executable and a
+    // non-executable file. Handed in, not exported, so other tests can't see
+    // it.
     #[test]
     fn enumerate_path_matches_filters_by_prefix_and_executable_bit() {
         let dir = std::env::temp_dir().join(format!("bish-completion-test-{}", std::process::id()));
@@ -2465,8 +2078,7 @@ mod tests {
 
     #[test]
     fn valid_command_name_gets_no_new_styling() {
-        // "displayed as it was before" -- a real, PATH-resolvable command
-        // name gets no span at all, same as prior to this feature.
+        // A valid command name gets no span.
         assert_eq!(kinds("true"), vec![]);
     }
 
@@ -2481,9 +2093,7 @@ mod tests {
 
     #[test]
     fn command_validity_is_checked_after_every_reset_point() {
-        // Both "true" (real) and the bogus name after the pipe must be
-        // independently checked -- confirms the validity check reaches
-        // every CommandName position, not just the very first word.
+        // Every command-name position is checked, not just the first word.
         let text = "true | bish-definitely-not-a-real-command-xyz";
         let spans = kinds(text);
         assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand && s.0 == 0), "{spans:?}");
@@ -2491,21 +2101,15 @@ mod tests {
         assert!(spans.contains(&(second_start, text.len(), HighlightKind::InvalidCommand)), "{spans:?}");
     }
 
-    // Regression test for a real bug caught during interactive
-    // verification: a function *definition* line was flagging its own
-    // name as an invalid command, since the lexer sees "myfunc" followed
-    // by an empty "()" (bash's function-definition syntax) the exact same
-    // way it would see a nonsensical "myfunc()" command invocation -- and
-    // the function obviously isn't registered yet on the very line that
-    // defines it.
+    // A function definition's own name isn't flagged: on the defining line
+    // it isn't registered yet, and `myfunc()` looks like an invocation to the
+    // lexer.
     #[test]
     fn function_definition_name_is_never_flagged_invalid() {
         let text = "myfunc() { echo hi; }";
         let spans = kinds(text);
         assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
-        // Nothing at all for "myfunc" itself (not even a Flag/Subcommand/
-        // Link false match) -- just the braces/semicolon as ordinary
-        // Operators, exactly as if this feature didn't exist.
+        // Nothing for `myfunc`, only the braces and `;` as operators.
         assert_eq!(
             spans,
             vec![
@@ -2516,12 +2120,8 @@ mod tests {
         );
     }
 
-    // Regression test for a real bug caught during interactive
-    // verification: `for i in 1 2 3` was flagging both "i" (the loop
-    // variable, right after `for`) and "1" (the first list word, right
-    // after `in`) as invalid commands -- the generic keyword reset put
-    // cmd_pos back to ExpectCommand, and neither word is ever a command
-    // name.
+    // `for i in 1 2 3`: neither the loop variable nor a list word is a
+    // command name.
     #[test]
     fn for_loop_variable_and_list_words_are_never_flagged_invalid() {
         let text = "for i in 1 2 3; do echo $i; done";
@@ -2545,11 +2145,8 @@ mod tests {
 
     #[test]
     fn function_definition_name_with_a_space_before_parens_is_also_recognized() {
-        // `name () { ... }` (whitespace before the parens) is equally
-        // valid bash function-definition syntax -- confirms the lookahead
-        // isn't accidentally relying on token adjacency implying no space
-        // (this tokenizer has no whitespace tokens at all, so this is
-        // really just confirming that fact holds).
+        // `name () { ... }` is a definition too. The tokenizer has no
+        // whitespace tokens, so this holds by construction.
         let spans = kinds("myfunc () { :; }");
         assert!(!spans.iter().any(|s| s.2 == HighlightKind::InvalidCommand), "{spans:?}");
     }
@@ -2568,8 +2165,8 @@ mod tests {
         );
     }
 
-    // A string is a key exactly when a colon follows it, which is what
-    // makes an array of strings stay strings.
+    // A string is a key only when a colon follows it, so an array of strings
+    // stays strings.
     #[test]
     fn json_strings_in_an_array_are_not_keys() {
         let kinds: Vec<HighlightKind> = json_kinds(r#"["a", "b"]"#).into_iter().map(|(_, k)| k).collect();
@@ -2593,8 +2190,8 @@ mod tests {
         );
     }
 
-    // The escape spans are emitted after the string's own span, which is
-    // what makes compose paint them over it rather than under.
+    // Escape spans come after the string's span, so `compose` paints them
+    // over it.
     #[test]
     fn json_marks_string_escapes_inside_the_string_that_holds_them() {
         let spans = JsonHighlighter.highlight(r#""a\nb""#, HighlightContext::default());
@@ -2604,8 +2201,7 @@ mod tests {
         assert_eq!((spans[1].start, spans[1].end), (2, 4));
     }
 
-    // Half-typed JSON is the normal state of a buffer being edited: the
-    // mistake itself goes uncoloured, everything around it does not.
+    // Half-typed JSON: the mistake goes uncoloured, the rest doesn't.
     #[test]
     fn json_keeps_highlighting_past_invalid_input() {
         assert_eq!(
@@ -2640,8 +2236,7 @@ mod tests {
         assert_eq!(md_kinds("## Two\n"), vec![("## Two".to_string(), HighlightKind::Keyword)]);
     }
 
-    // The spans include the delimiters, so `**` is bold along with what
-    // it wraps rather than left as stray punctuation.
+    // The spans include the delimiters, so `**` is bold too.
     #[test]
     fn markdown_emphasis_spans_cover_their_delimiters() {
         assert_eq!(
@@ -2655,8 +2250,7 @@ mod tests {
         );
     }
 
-    // The reason this is driven by the real parser: a scan would colour
-    // these, and be wrong.
+    // A scan would colour these, wrongly.
     #[test]
     fn markdown_does_not_highlight_what_is_not_markup() {
         assert!(md_kinds("snake_case_name and 2 * 3 * 4\n").is_empty());
@@ -2669,8 +2263,6 @@ mod tests {
         assert_eq!(link.link.as_deref(), Some("/dest"));
     }
 
-    // A fenced block is highlighted in its own language, with the spans
-    // shifted to where that block actually sits in the document.
     #[test]
     fn a_fenced_code_block_is_highlighted_in_its_own_language() {
         let src = "text\n\n```bash\nif true; then echo hi; fi\n```\n";
@@ -2725,9 +2317,8 @@ mod tests {
         );
     }
 
-    // The highlighter must not interpret: a page's own macro
-    // definitions stay visible as source rather than being executed
-    // away the way the parser executes them.
+    // The highlighter doesn't interpret: a page's macro definitions stay
+    // visible as source.
     #[test]
     fn roff_highlighting_does_not_expand_macros() {
         let kinds = roff_kinds(".de Flag\n.B \\\\$1\n..\n.Flag x\n");
@@ -2748,8 +2339,8 @@ mod tests {
         );
     }
 
-    // The subsection is a string sitting inside the header, so both
-    // spans are emitted and compose paints the later one over the first.
+    // Both spans are emitted, and `compose` paints the subsection's over the
+    // header's.
     #[test]
     fn ini_paints_a_subsection_over_its_header() {
         assert_eq!(
@@ -2758,8 +2349,6 @@ mod tests {
         );
     }
 
-    // The great majority of values are arbitrary text, and colouring
-    // them would only make the file louder without saying anything.
     #[test]
     fn ini_leaves_an_ordinary_value_uncoloured() {
         assert_eq!(
@@ -2791,8 +2380,8 @@ mod tests {
         );
     }
 
-    // Only at the start of a line -- a `#` in a systemd command is part
-    // of the command. See ini.rs's header for why that side was taken.
+    // A `#` comments only at the start of a line: in a systemd command it's
+    // part of the command (see ini.rs).
     #[test]
     fn ini_highlights_whole_line_comments_only() {
         assert_eq!(ini_kinds("; a note"), vec![("; a note".to_string(), HighlightKind::Comment)]);
@@ -2800,8 +2389,7 @@ mod tests {
         assert!(!trailing.iter().any(|(_, k)| *k == HighlightKind::Comment));
     }
 
-    // A continuation's text is value, not a key -- the visible payoff of
-    // the parser knowing the difference.
+    // A continuation's text is value, not a key.
     #[test]
     fn ini_does_not_read_a_continuation_line_as_a_key() {
         let spans = ini_kinds("install_requires =\n    foo >= 1.0\n");
@@ -2826,23 +2414,21 @@ mod tests {
         assert_eq!(jsonc_kinds("/* why */ 1"), vec![("/* why */".to_string(), HighlightKind::Comment), ("1".to_string(), HighlightKind::Number)]);
     }
 
-    // A comment between a key and its colon must not cost the key its
-    // colour -- the lookahead skips past comments to find the colon.
+    // The lookahead skips comments to find the colon.
     #[test]
     fn jsonc_still_sees_a_key_through_a_comment() {
         let kinds = jsonc_kinds("{\"a\" /* c */: 1}");
         assert!(kinds.iter().any(|(t, k)| t == "\"a\"" && *k == HighlightKind::Key));
     }
 
-    // An unterminated comment ends at the end of the input rather than
-    // swallowing nothing -- what one looks like while being typed.
+    // An unterminated comment runs to the end of the input.
     #[test]
     fn jsonc_tolerates_an_unterminated_block_comment() {
         assert_eq!(jsonc_kinds("/* open"), vec![("/* open".to_string(), HighlightKind::Comment)]);
     }
 
-    // Strict JSON is untouched: a `/` there is not a comment, it is a
-    // character that cannot start a value.
+    // In strict JSON a `/` isn't a comment, just a character that can't
+    // start a value.
     #[test]
     fn plain_json_has_no_comments() {
         assert!(!json_kinds("// not a comment").iter().any(|(_, k)| *k == HighlightKind::Comment));
@@ -2868,7 +2454,6 @@ mod tests {
         );
     }
 
-    // The payoff from the tokenizer knowing which side of `=` it is on.
     #[test]
     fn toml_colours_the_same_word_by_position() {
         let kinds = |text: &str| toml_kinds(text).into_iter().map(|(_, k)| k).collect::<Vec<_>>();
@@ -2921,8 +2506,7 @@ mod tests {
         assert_eq!(kinds[1], ("A".to_string(), HighlightKind::Key));
     }
 
-    // The distinctive one: the piece of the value whose text is not
-    // what it says.
+    // An interpolation is the part of the value that isn't what it says.
     #[test]
     fn dotenv_marks_interpolation_inside_the_value_that_holds_it() {
         let kinds = dotenv_kinds("A=\"${HOME}/bin\"");
@@ -2936,7 +2520,6 @@ mod tests {
         assert!(!kinds.iter().any(|(_, k)| *k == HighlightKind::Variable), "single quotes interpolate nothing");
     }
 
-    // An ordinary value -- a path, a URL, a token -- stays plain.
     #[test]
     fn dotenv_leaves_a_bare_value_uncoloured() {
         assert_eq!(dotenv_kinds("PATH_TO=/usr/bin"), vec![("PATH_TO".to_string(), HighlightKind::Key), ("=".to_string(), HighlightKind::Operator)]);
@@ -2961,8 +2544,6 @@ mod tests {
         assert!(out.contains("\x1b]8;;https://x\x1b\\here\x1b]8;;\x1b\\"), "got {out:?}");
     }
 
-    // Emitted on the transition, like the SGR codes beside them: a link
-    // costs two sequences however long it is.
     #[test]
     fn render_linked_opens_and_closes_once_per_run() {
         let out = render_linked(&cells_of("aaaa"), &[link(0, 4, "https://x")]);
@@ -2979,17 +2560,15 @@ mod tests {
     #[test]
     fn render_linked_handles_two_adjacent_links() {
         let out = render_linked(&cells_of("abcd"), &[link(0, 2, "https://a"), link(2, 4, "https://b")]);
-        // The first run's close and the second's open sit back to back;
-        // the SGR reset for the default style lands between the open and
-        // the text, which is why this checks the pieces rather than one
-        // contiguous literal.
+        // The first run's close and the second's open sit back to back,
+        // with the default style's SGR reset between the open and the text,
+        // so the pieces are checked separately.
         assert!(out.contains("\x1b]8;;https://a"), "got {out:?}");
         assert!(out.contains("ab\x1b]8;;\x1b\\\x1b]8;;https://b\x1b\\cd"), "got {out:?}");
     }
 
-    // The URL comes out of a file and is about to be spliced into an
-    // escape sequence, so one holding a control character is dropped
-    // rather than repaired.
+    // A URL holding a control character is dropped, not repaired: it would be
+    // spliced into an escape sequence.
     #[test]
     fn render_linked_refuses_a_url_that_could_break_out_of_the_sequence() {
         for url in ["https://x\x1b]0;pwned\x07", "https://x\x07", "https://x\n", ""] {
@@ -2999,7 +2578,7 @@ mod tests {
         }
     }
 
-    // With no links this has to be byte-for-byte what it always was.
+    // With no links the output is exactly `render_styled`'s.
     #[test]
     fn render_styled_is_render_linked_with_nothing_to_link() {
         let cells = cells_of("hello");
