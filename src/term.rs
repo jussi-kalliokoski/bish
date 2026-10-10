@@ -405,10 +405,38 @@ impl Drop for NoEchoGuard {
 /// means what it meant. U+FFFD rather than `?` because it says "this
 /// could not be shown" rather than looking like part of the name.
 pub fn safe_char(c: char) -> char {
-    match c.is_control() {
+    match c.is_control() || is_bidi_control(c) {
         true => '\u{FFFD}',
         false => c,
     }
+}
+
+/// The characters that reorder what is written around them.
+///
+/// `char::is_control` is C0 and C1 and nothing else, so every one of
+/// these went through untouched -- and they are instructions to a
+/// renderer in exactly the sense the comment above means. A file named
+/// `safe<U+202E>txt.exe` lists itself as `safeexe.txt`, which is the
+/// oldest spoof there is, and a source line with an override in a
+/// comment reads one way and runs another, which is Trojan Source
+/// (CVE-2021-42574). Both were measured reaching the terminal: the
+/// filename through the browser's listing, the line through the editor.
+///
+/// This is also the one part of the sanitiser that is not purely about
+/// safety. bish draws a grid and puts the cursor at a column it computed
+/// itself; a run the terminal is free to reverse has no stable column,
+/// so bidirectional text was never rendered *correctly* here, it was
+/// rendered in an order bish's own arithmetic did not agree with. One
+/// visible replacement per control is an honest answer to that, where
+/// passing them through was a quiet wrong one -- and it is the trade
+/// being made, not an oversight: a genuine Hebrew or Arabic document
+/// shows these markers in bish where it would reorder elsewhere.
+///
+/// Deliberately only the reordering ones. The zero-width joiners are
+/// invisible rather than reordering, and one of them is how an emoji
+/// family is spelled.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// `safe_char` over a whole string, for the places that build terminal
@@ -496,4 +524,38 @@ pub fn query_cursor_column() -> Option<usize> {
         col.push(b as char);
     }
     col.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{safe_char, safe_text};
+
+    // The sanitiser's own contract: one character in, one out, and
+    // nothing left that a terminal reads as an instruction rather than
+    // as text.
+    #[test]
+    fn safe_text_neutralises_what_reorders_and_keeps_what_joins() {
+        // What it always did.
+        assert_eq!(safe_text("evil\x1b[2J.txt"), "evil\u{fffd}[2J.txt");
+        // And what it used to let through: `char::is_control` is C0 and
+        // C1 only, so every bidirectional control was text as far as it
+        // was concerned.
+        for c in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}',
+        ] {
+            assert_eq!(safe_char(c), '\u{fffd}', "{c:?} reorders what is written around it");
+        }
+        // The spoof this closes, as it would arrive: a name that lists
+        // itself as `safeexe.txt`.
+        assert_eq!(safe_text("safe\u{202e}txt.exe"), "safe\u{fffd}txt.exe");
+        // One character in, one out -- every match position, selection
+        // span and caret column depends on it.
+        assert_eq!(safe_text("a\u{202e}b\u{2069}c").chars().count(), 5);
+        // The joiners are invisible rather than reordering, and one of
+        // them is how an emoji family is spelled.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(safe_text(family), family);
+        assert_eq!(safe_char('\u{200b}'), '\u{200b}');
+    }
 }
