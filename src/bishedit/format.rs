@@ -1,51 +1,27 @@
-// A structural formatter for bish scripts -- built the same way lint.rs
-// is, on top of lexer::tokenize_spanned's flat, char-offset-spanned
-// token/comment stream, rather than a parallel implementation or the
-// (unspanned) AST. See lint.rs's own doc comment for why the AST
-// doesn't carry the source positions this needs.
+// A formatter for bish scripts, built like lint.rs on
+// `lexer::tokenize_spanned`'s spanned token stream (the AST has no source
+// positions; see lint.rs).
 //
-// The whole formatter reduces to one idea: a token's own span is very
-// nearly never rewritten -- its literal source text (expansion syntax,
-// a subshell's raw interior, everything) is copied through verbatim,
-// and all this normally changes is the *gap* between one real item's
-// end and the next real item's start.
+// A token's text is copied through verbatim, and what changes is the gap
+// between one item's end and the next one's start. Indentation is the gap
+// before a line's first token; joining `then`/`do`/`in`/`{` onto their
+// header line is choosing `; ` or ` ` as that gap instead of a newline. Two
+// rules touch a token: the `function` keyword is deleted (see
+// `Tok::KwFunction` below), and a wholly literal word is requoted to its
+// plainest form (`canonical_quoting`).
 //
-// Two rules do touch a token, and both are named where they are: the
-// `function` keyword is deleted (see Tok::KwFunction below), and a word
-// that is one wholly-literal run is requoted to its plainest form (see
-// `canonical_quoting`). Everything else still only moves whitespace. Indentation is just the gap
-// immediately before a line's first token; joining `then`/`do`/`in`/
-// `{` onto their own header line (deliberately, per the user's own
-// design -- not "detect and preserve the existing style") is choosing
-// "; " (or " ") as that gap's text instead of a newline.
-// $(...)/`...`/(...)/((...)) stay untouched with zero special-casing as
-// a direct consequence of that same rule: their entire raw text,
-// newlines included, is one token's own span (see Tok::Subshell/
-// Tok::Arith) -- deliberately not recursed into for this first version,
-// unlike lint.rs's own raw_capture_spans recursion. `[[ ... ]]` is the
-// opposite case: its contents are ordinary individual items (see
-// Parser::parse_test_atoms), so they fall out of the general gap rules
-// with no special-casing at all.
+// `$(...)`, backticks, `(...)` and `((...))` are each one token, newlines
+// included, so their interiors are never reformatted. `[[ ... ]]` holds
+// ordinary items and follows the general rules.
 //
-// "Real items" deliberately excludes plain Tok::Newline/Tok::Semi --
-// pure separators, never content in their own right -- from the walk
-// entirely; their source text is just part of whatever gap surrounds
-// them, inspected (for a literal ';' already there, or for a heredoc
-// body -- see below) rather than treated as something needing its own
-// leading/trailing gap. This is what keeps a script that already
-// spells `if cond; then` from getting a *second*, redundant "; "
-// spliced in right next to its own real semicolon.
+// `Tok::Newline` and `Tok::Semi` are separators, not items: they're part of
+// the gap around them, which is how `if cond; then` doesn't get a second
+// `; `.
 //
-// The one real hazard is heredoc bodies: Tok::HereDoc's own span only
-// covers the "<<DELIM"/"<<-DELIM" operator text -- the body itself
-// (consumed by Lexer::capture_heredoc_body) is never given a span at
-// all, so it ends up as part of the gap between the item before it and
-// the next real item after its terminator line. A gap containing
-// anything other than whitespace/';' is never something this formatter
-// generates on its own, so any gap like that is left completely
-// untouched rather than guessed at -- covers heredoc bodies without
-// needing to track them specially, and is a safe fallback for anything
-// else unexpected (a `\` line continuation, say).
+// A heredoc's body has no span, so it ends up inside a gap. A gap holding
+// anything but whitespace and `;` is never generated here, so such a gap is
+// left untouched, which covers heredoc bodies and anything else unexpected
+// (a `\` line continuation, say).
 
 use crate::bishedit::lint::{Diagnostic, Fix, Severity};
 use crate::lexer::{self, SpannedItem, Tok};
@@ -55,12 +31,8 @@ use std::borrow::Cow;
 pub struct BashFormatter;
 
 impl BashFormatter {
-    // Err(parse error message) if the script doesn't parse at all --
-    // refuses to reformat something that isn't valid bish in the first
-    // place, same spirit as a real formatter bailing on a syntax error
-    // rather than guessing at one. Not `bishedit::lint`'s own `Linter`
-    // trait despite sharing its Diagnostic/Fix types: that trait's own
-    // `check` can't fail, and a formatter genuinely needs to be able to.
+    // Err if the script doesn't parse: nothing invalid is reformatted. Not
+    // the `Linter` trait, whose `check` can't fail.
     pub fn check(&self, source: &str) -> Result<Vec<Diagnostic>, String> {
         let toks = lexer::Lexer::new(source).tokenize()?;
         Parser::new(toks).parse_program()?;
@@ -94,10 +66,9 @@ enum Joiner {
 
 struct Block {
     kind: BlockKind,
-    // The depth of the block's own header line (the `if`/`for`/`while`/
-    // `until`/`select`/`case`/`{` itself, or -- for CaseArm -- the
-    // `pattern)` line). Body content is always header_depth + 1; a
-    // closer/dedenting keyword always targets header_depth itself.
+    // The depth of the block's header line (the opening keyword or `{`, or
+    // for a CaseArm its `pattern)` line). The body is one deeper; a closer
+    // goes back to this depth.
     header_depth: usize,
     awaiting: Option<Joiner>,
 }
@@ -110,36 +81,24 @@ fn current_depth(stack: &[Block]) -> usize {
     }
 }
 
-// Like current_depth, but always one level under the innermost open
-// block's own header, even while it's still awaiting its own join
-// keyword (then/do/in) -- used only for indenting a *preserved* line
-// break within a header/condition itself (e.g. a multi-line `[[ ... ]]`
-// before `then`), which should read as visually under the header the
-// same way a wrapped condition would in any other language, without
-// changing where current_depth says a *new* nested block's own header
-// sits (current_depth's whole point -- see e.g. a condition that is
-// itself another `if`, which must stay flush with the outer header, not
-// jump ahead of it).
+// One level under the innermost open block's header, even while it's still
+// awaiting `then`/`do`/`in`: the indent for a line break preserved inside a
+// header, such as a multi-line `[[ ... ]]` before `then`. Unlike
+// `current_depth`, which places a nested block's header: a condition that
+// is itself an `if` stays flush with the outer header.
 fn content_depth(stack: &[Block]) -> usize {
     stack.last().map(|b| b.header_depth + 1).unwrap_or(0)
 }
 
 // Whether the parentheses at `real[i]` belong to the word before them
-// rather than opening a subshell of their own. Two shapes, and between
-// them they are the only ways a Word is legally followed by a Subshell
-// at all:
+// rather than opening a subshell. The only two ways a Word is legally
+// followed by a Subshell:
 //
-//     NAME()      a function definition -- the parens are empty, and a
-//                 real subshell command never is
-//     NAME=(...)  an array assignment, or `NAME+=(...)` to append
+//     NAME()      a function definition: the parens are empty, and a
+//                 subshell command never is
+//     NAME=(...)  an array assignment, or `NAME+=(...)`
 //
-// The gap before either one has to be nothing. `f () { ...; }` is at
-// least legal and merely unidiomatic, but `arr= (a b)` is a syntax
-// error in bash -- which is what made this worth fixing: the formatter
-// was writing it, and bish's own parser used to be lenient enough to
-// keep running the result, so nothing here noticed. (That leniency is
-// gone too now; this rule is what keeps the formatter from writing the
-// broken spelling in the first place.)
+// Neither takes a gap; `arr= (a b)` is a syntax error in bash.
 fn parens_belong_to_previous_word(chars: &[char], real: &[&SpannedItem], i: usize, inner: &str) -> bool {
     let Some(SpannedItem::Tok(Tok::Word(..), span)) = i.checked_sub(1).and_then(|j| real.get(j)).copied() else {
         return false;
@@ -147,14 +106,11 @@ fn parens_belong_to_previous_word(chars: &[char], real: &[&SpannedItem], i: usiz
     inner.is_empty() || span.end.checked_sub(1).and_then(|last| chars.get(last)) == Some(&'=')
 }
 
-// Whether `real[lbrace_idx]` (an LBrace) is a function body's own
-// opening brace -- `foo() {` / `function foo {` / `function foo() {`
-// -- rather than a bare `{ ... }` group command, matching
-// Parser::looks_like_func_def/parse_function_kw's own two productions
-// (src/parser.rs:406-440). No Newline/Semi-skipping needed here (unlike
-// the parser's own lookback) since `real` has already filtered those
-// out -- the immediately preceding real items are exactly the tokens
-// that matter.
+// Whether `real[lbrace_idx]` opens a function body (`foo() {`,
+// `function foo {`, `function foo() {`) rather than a `{ ... }` group,
+// following `Parser::looks_like_func_def` and `parse_function_kw`. `real`
+// has no separators, so the preceding items are exactly the ones that
+// matter.
 fn is_function_brace(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
     let at = |off: usize| -> Option<&Tok> {
         let idx = lbrace_idx.checked_sub(off)?;
@@ -170,13 +126,7 @@ fn is_function_brace(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
     }
 }
 
-// True for is_function_brace's own "no `()`" production (`function foo
-// {`) specifically -- i.e. real[lbrace_idx-1] is the function's Word and
-// real[lbrace_idx-2] is KwFunction directly, with no Subshell("") (empty
-// parens) in between. Used to decide whether normalizing to `NAME() {
-// ... }` (see Tok::KwFunction's own arm below, and the user's own
-// JS-style convention this whole rule follows) needs to synthesize `()`
-// or they're already there.
+// `function foo {`, with no `()`: normalizing to `foo() {` has to add them.
 fn function_brace_omits_parens(real: &[&SpannedItem], lbrace_idx: usize) -> bool {
     let at = |off: usize| -> Option<&Tok> {
         let idx = lbrace_idx.checked_sub(off)?;
@@ -215,79 +165,46 @@ fn span_of(item: &SpannedItem) -> std::ops::Range<usize> {
     }
 }
 
-// One forward pass over `real` (already Newline/Semi-filtered -- see
-// this module's own doc comment), resolving -- for every adjacent pair,
-// including the implicit boundaries before the first item and after
-// the last -- what the gap between them ought to be, and comparing that
-// against what's actually there. `forced_next` carries a gap
-// requirement set by the item just processed (e.g. KwThen always wants
-// a line break right after itself, at the body's new depth) forward to
-// the *next* iteration, where it's read before that iteration's own
-// item gets to set (or clear) its own leading requirement -- the two
-// never alias the same variable at the same time, since a closer's own
-// leading requirement (e.g. KwFi dedenting) always takes priority over
-// whatever the previous item optimistically forced (see the empty
-// `if ...; then fi` case).
-// Quoting a word that does not need it is noise, and this is the one
-// rule here that rewrites a token rather than the gap beside it (the
-// `function` keyword's own deletion below is the other).
+// Quoting a word that doesn't need it is noise. Three answers, in order:
 //
-// Three answers, in order:
+// - Nothing in the text needs quoting: drop the quotes.
+// - Something does, but nothing needs double quotes (no expansion or
+//   substitution): single-quote it.
+// - Otherwise leave it.
 //
-// - Nothing in the text needs a shell to be told to leave it alone:
-//   drop the quotes entirely.
-// - Something does, but nothing in it needs *double* quotes -- no
-//   expansion, no substitution: single-quote it, which is the form that
-//   says "this is exactly these characters" with the fewest rules
-//   attached.
-// - Otherwise leave the source alone.
-//
-// Only ever applied to a word that is one wholly-literal run. A word
-// built out of several pieces -- `"$(foo)"'\n'a"$(bar)"` -- is left
-// exactly as written: each piece is quoted the way it is for its own
-// reason, and rewriting the parts to a single canonical whole is a
-// different and much larger decision than this rule is making.
+// Only for a word that is one wholly literal run. A word built from several
+// pieces (`"$(foo)"'\n'a"$(bar)"`) is left as written: each piece is quoted
+// for its own reason.
 fn canonical_quoting(text: &str) -> Option<String> {
     if bare_is_safe(text) {
         return Some(text.to_string());
     }
     match text.contains('\'') {
-        // A `'` inside would end the quote, and `'\''` is not obviously
-        // an improvement on whatever is already there.
+        // A `'` inside would end the quote, and `'\''` is no improvement.
         true => None,
         false => Some(format!("'{text}'")),
     }
 }
 
-// Whether `text` means itself with no quoting at all.
-//
-// An allow-list, not a deny-list, and a short one: every character here
-// is one that neither the lexer nor any later expansion pass gives a
-// meaning to. That is what makes this safe for the places a word is not
-// simply an argument -- a `case` pattern or the right-hand side of
-// `[[ x == y ]]` are matched as globs, and no glob metacharacter is on
-// this list, so a pattern that was literal stays literal.
+// Whether `text` means itself with no quoting at all. A short allow-list of
+// characters nothing gives a meaning to. No glob metacharacter is on it, so
+// this is safe in a `case` pattern and beside `[[ x == y ]]` too.
 fn bare_is_safe(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
-    // `#` opens a comment and `~` names a home directory, but only
-    // where a word begins -- which is exactly where bash's own
-    // `printf %q` escapes them and nowhere else.
+    // `#` and `~` matter only where a word begins, which is where bash's
+    // `printf %q` escapes them.
     let safe_anywhere = |c: char| c.is_alphanumeric() || "%+-./:@_=".contains(c);
     if !text.chars().enumerate().all(|(i, c)| safe_anywhere(c) || (i > 0 && (c == '#' || c == '~'))) {
         return false;
     }
-    // `2>file` redirects fd 2 where `"2">file` writes the word. The
-    // formatter's own spacing makes that hard to reach, but "hard to
-    // reach" is not a reason to hand back a different program.
+    // `2>file` redirects fd 2, where `"2">file` writes the word.
     if text.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    // `"a=b" cmd` runs a command called `a=b`; `a=b cmd` sets a
-    // variable. Anything shaped like an assignment keeps its quotes --
-    // which still leaves `--flag=value` alone to lose them, since a
-    // name cannot start with `-`.
+    // `"a=b" cmd` runs a command called `a=b`; `a=b cmd` sets a variable. A
+    // name can't start with `-`, so `--flag=value` still loses its quotes.
     let name = text.split('=').next().unwrap_or_default();
     let assignment_shaped = text.contains('=')
         && !name.is_empty()
@@ -296,34 +213,34 @@ fn bare_is_safe(text: &str) -> bool {
     !assignment_shaped
 }
 
-// The literal text of a word that is one wholly-literal run, or `None`
-// for anything else: a word with an expansion in it, one built from
-// several pieces, or one that was never quoted to begin with.
+// The text of a word that is one wholly literal run; `None` for an
+// expansion, several pieces, or a word that was never quoted.
 fn sole_literal(chunks: &[lexer::Chunk], plain: bool) -> Option<&str> {
     if plain {
         return None;
     }
     match chunks {
-        // `''` and `""` both arrive as one empty `Str`, since there is
-        // no literal run for the lexer to record.
+        // `''` and `""` both arrive as one empty `Str`.
         [lexer::Chunk::Str(text)] if text.is_empty() => Some(text),
         [lexer::Chunk::LiteralStr(text, _)] => Some(text),
         _ => None,
     }
 }
 
+// One pass over `real`, deciding for every adjacent pair (and before the
+// first and after the last item) what the gap should be, and comparing it
+// with what's there. `forced_next` carries a requirement set by the item
+// just processed (`then` wants a line break after it) to the next
+// iteration. A closer's own requirement (`fi` dedenting) takes priority
+// over it; see the empty `if ...; then fi` case.
 fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
     let mut stack: Vec<Block> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut prev_end = 0usize;
     let mut forced_next: Option<String> = None;
-    // Set by Tok::KwFunction's own arm below when it's just pushed a
-    // dedicated fix deleting `function` -- consumed (same take()-once
-    // pattern as forced_next/prev_forced) by the very next iteration (the
-    // function's own name) to skip its generic gap diagnostic entirely,
-    // since that gap has already been folded into the deletion fix. See
-    // that arm's own doc comment for why letting both run risks an
-    // overlapping-fix conflict.
+    // Set when the `Tok::KwFunction` arm has deleted `function`: the next
+    // item (the name) then skips its gap check, since that gap is part of
+    // the deletion and two fixes over one span would conflict.
     let mut suppress_next_gap = false;
 
     for i in 0..=real.len() {
@@ -332,17 +249,12 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
         let item = real.get(i).copied();
         let this_start = item.map(|it| span_of(it).start).unwrap_or(chars.len());
 
-        // In a case's pattern list (top of stack is Case, `in` already
-        // consumed, no arm open yet): `|` and the `)` that ends the
-        // pattern list get no surrounding space ("foo|bar)"), matching
-        // ordinary shell style -- everything else still uses the
-        // generic rules below.
+        // In a case's pattern list (`in` consumed, no arm open), `|` and
+        // the closing `)` take no spaces: `foo|bar)`.
         let in_case_patterns = matches!(stack.last(), Some(b) if b.kind == BlockKind::Case && b.awaiting.is_none());
         let comment_precedes = i > 0 && matches!(real.get(i - 1), Some(SpannedItem::Comment(_)));
-        // Captured *before* this item's own match arm below can mutate
-        // `stack` (an opener like KwFor/KwCase/a bare LBrace pushes a
-        // new block for its own body, which must not affect where the
-        // opener keyword *itself* -- i.e. this same gap -- lands).
+        // Before this item's arm can push a block for its own body, which
+        // mustn't move where the opener itself lands.
         let depth_before = content_depth(&stack);
 
         let mut leading_override: Option<String> = None;
@@ -427,24 +339,17 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     leading_override = Some(String::new());
                     forced_next = Some(String::new());
                 }
-                // Parentheses that belong to the word in front of them
-                // rather than opening a subshell of their own -- see
-                // `parens_belong_to_previous_word`. Neither shape takes
-                // a space, and for an array assignment that is not
-                // style: `arr= (a b)` is a syntax error in bash.
+                // Parentheses that belong to the word before them; see
+                // `parens_belong_to_previous_word`.
                 Tok::Subshell { raw: inner, .. } if parens_belong_to_previous_word(chars, real, i, inner) => {
                     leading_override = Some(String::new());
                 }
                 Tok::LBrace => {
                     let is_func = is_function_brace(real, i);
                     if is_func && !comment_precedes {
-                        // `function foo {` (no `()`) -- the Tok::KwFunction
-                        // arm below strips `function` itself and suppresses
-                        // its own gap check so there's nothing else to
-                        // collide with here; synthesizing `()` right in
-                        // this same gap-fix (rather than as its own,
-                        // separately-positioned fix) is what keeps this a
-                        // single, unambiguous edit at this position.
+                        // `function foo {`: the `KwFunction` arm deleted
+                        // `function` and suppressed its gap check, so
+                        // adding `()` in this gap's fix is a single edit.
                         let parens = if function_brace_omits_parens(real, i) { "()" } else { "" };
                         leading_override = Some(format!("{parens} "));
                     }
@@ -452,38 +357,9 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                     stack.push(Block { kind: BlockKind::Brace, header_depth: hd, awaiting: None });
                     forced_next = Some(newline_at(current_depth(&stack)));
                 }
-                // `function foo { ... }` / `function foo() { ... }` ->
-                // `foo() { ... }`, matching real bash's/JS's own
-                // parenthesized style rather than the `function` keyword
-                // spelling -- the user's own convention for this rule.
-                // Only touches the brace-bodied shape (checked all the
-                // way through to a genuine LBrace, not just "the next
-                // token or two look right"): `function foo` followed by
-                // anything else (a bare command, `if`/`case`/... as the
-                // body -- valid but rare bash) isn't something dropping
-                // the keyword alone would correctly rewrite, so it's left
-                // untouched entirely, same "don't touch what isn't
-                // squarely in scope" tolerance as the heredoc-body/
-                // subshell-interior cases in this module's own doc
-                // comment.
-                //
-                // Deletes exactly `function` plus whatever gap follows it
-                // up to the function's own name -- never the gap *before*
-                // `function` itself (still resolved completely normally
-                // for this same iteration, by the code below, since
-                // deleting the keyword doesn't change how the statement
-                // it belongs to should be indented). Sets suppress_next_gap
-                // so the *next* iteration (the name) skips its own
-                // generic gap diagnostic entirely -- that gap has already
-                // been folded into this single deletion fix, and letting
-                // both run would risk two overlapping fixes fighting over
-                // the same span (see apply_fixes' own overlap handling in
-                // tool.rs) whenever the source had unusual spacing right
-                // after `function`.
-                // Quoting a word that does not need it -- see
-                // `canonical_quoting`. The only rule here that rewrites
-                // a word rather than the space beside it, and it never
-                // touches one that has an expansion in it.
+                // Quoting a word that doesn't need it; see
+                // `canonical_quoting`. Never touches a word with an
+                // expansion in it.
                 Tok::Word(chunks, plain) => {
                     let span = span_of(item.unwrap());
                     if let Some(text) = sole_literal(chunks, *plain)
@@ -503,6 +379,15 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                         }
                     }
                 }
+                // `function foo { ... }` and `function foo() { ... }`
+                // become `foo() { ... }`. Only for a brace body, checked
+                // through to the `{`; `function foo` followed by any other
+                // body (valid, rare) is left alone.
+                //
+                // Deletes `function` and the gap after it, up to the name.
+                // The gap before `function` is resolved normally below.
+                // Sets `suppress_next_gap` so the name's gap isn't fixed
+                // twice (see `apply_fixes` in tool.rs).
                 Tok::KwFunction => {
                     let at = |off: usize| -> Option<&Tok> {
                         match real.get(i + off)? {
@@ -541,7 +426,7 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
             }
         }
 
-        // ---- Resolve the gap text for [prev_end, this_start) ----
+        // Resolve the gap text for [prev_end, this_start).
         let actual: String = chars[prev_end..this_start].iter().collect();
         let safe_to_format = actual.chars().all(|c| c.is_whitespace() || c == ';');
         if safe_to_format && !this_suppressed {
@@ -560,11 +445,8 @@ fn format_gaps(chars: &[char], real: &[&SpannedItem]) -> Vec<Diagnostic> {
                 } else if has_semi && newlines == 0 {
                     "; ".to_string()
                 } else if has_semi {
-                    // A ';' combined with a real line break in the same
-                    // gap is an unusual, out-of-scope style (ordinary
-                    // statement separation isn't part of what this
-                    // formatter reflows) -- left untouched rather than
-                    // guessed at.
+                    // A `;` together with a line break in one gap is left
+                    // as it is.
                     actual.clone()
                 } else if newlines == 0 {
                     if matches!(item, Some(SpannedItem::Comment(_))) { "  ".to_string() } else { " ".to_string() }
@@ -607,17 +489,12 @@ mod tests {
         chars.into_iter().collect()
     }
 
-    // Quoting a word that does not need quoting is noise; quoting one
-    // with double quotes when it holds nothing to expand says something
-    // that is not true about it.
     #[test]
     fn a_word_that_needs_no_quoting_loses_it() {
         assert_eq!(format_text("echo \"hello\"\n"), "echo hello\n");
         assert_eq!(format_text("echo 'hello'\n"), "echo hello\n");
         assert_eq!(format_text("echo \"--flag=value\"\n"), "echo --flag=value\n");
         assert_eq!(format_text("echo 'a.b/c:d@e'\n"), "echo a.b/c:d@e\n");
-        // `#` and `~` mean something only where a word begins, which is
-        // exactly where bash's own `printf %q` escapes them.
         assert_eq!(format_text("echo 'x#y'\n"), "echo x#y\n");
         assert_eq!(format_text("echo 'a:~/b'\n"), "echo a:~/b\n");
         assert_eq!(format_text("echo '#x'\n"), "echo '#x'\n");
@@ -629,36 +506,25 @@ mod tests {
         assert_eq!(format_text("echo \"hello world\"\n"), "echo 'hello world'\n");
         assert_eq!(format_text("echo \"a\\$b\"\n"), "echo 'a$b'\n");
         assert_eq!(format_text("echo \"\"\n"), "echo ''\n");
-        // Glob and brace metacharacters keep their quotes, and single
-        // quotes hold them just as literally -- which is what makes
-        // this safe in a `case` pattern and beside `[[ x == y ]]`.
+        // Glob and brace metacharacters keep their quotes; single quotes
+        // hold them just as literally.
         assert_eq!(format_text("echo \"*\"\n"), "echo '*'\n");
         assert_eq!(format_text("echo \"{a,b}\"\n"), "echo '{a,b}'\n");
         assert_eq!(format_text("case $x in \"a b\") echo \"y\";; esac\n"), "case $x in\n\t'a b')\n\t\techo y\n\t;;\nesac\n");
     }
 
-    // The cases where the quotes are load-bearing, or where rewriting
-    // them would be answering a bigger question than this rule asks.
     #[test]
     fn quoting_that_is_doing_something_is_left_alone() {
         // An expansion needs its double quotes.
         assert_eq!(format_text("echo \"$x\"\n"), "echo \"$x\"\n");
         assert_eq!(format_text("echo \"$(foo)\"\n"), "echo \"$(foo)\"\n");
-        // A word built from several differently-quoted pieces is left
-        // exactly as written: each piece is quoted the way it is for
-        // its own reason.
         let mixed = "echo \"$(foo)\"'\\n'a\"$(bar)\"\n";
         assert_eq!(format_text(mixed), mixed);
         assert_eq!(format_text("echo a\"b\"c\n"), "echo a\"b\"c\n");
         assert_eq!(format_text("a=\"b\"\n"), "a=\"b\"\n");
-        // A `'` inside would end the quote, and `'\''` is no
-        // improvement on what is already there.
         assert_eq!(format_text("echo \"it's\"\n"), "echo \"it's\"\n");
-        // `"a=b" cmd` runs a command called `a=b`; `a=b cmd` sets a
-        // variable. Anything assignment-shaped keeps its quotes.
         assert_eq!(format_text("echo \"a=b\"\n"), "echo 'a=b'\n");
         assert_eq!(format_text("\"a=b\" cmd\n"), "'a=b' cmd\n");
-        // `2>file` redirects fd 2 where `"2">file` writes the word.
         assert_eq!(format_text("echo \"2\"\n"), "echo '2'\n");
     }
 
@@ -670,25 +536,15 @@ mod tests {
         assert_eq!(format_text(&once), once, "formatting a formatted file changes nothing");
     }
 
-    // `arr= (a b)` is a syntax error in bash. The formatter used to
-    // write it -- the generic "a space between two items" rule does not
-    // know that these parentheses belong to the word in front of them
-    // -- and bish's own lexer is lenient enough about the space that
-    // nothing here noticed until the output was handed to bash.
+    // `arr= (a b)` is a syntax error in bash, so the parentheses of an
+    // array assignment take no gap.
     #[test]
     fn an_array_assignment_keeps_its_parentheses_attached() {
         assert_eq!(format_text("arr=(a b)\n"), "arr=(a b)\n");
         assert_eq!(format_text("arr+=(\"$y\")\n"), "arr+=(\"$y\")\n");
         assert_eq!(format_text("declare -a x=(1 2)\n"), "declare -a x=(1 2)\n");
-        // `arr= (a b)` is no longer reachable here: the parser rejects
-        // it now, the way bash always has (see
-        // try_array_literal_assignment), and the formatter does not
-        // rewrite what it cannot parse. The rule above is what stops
-        // this formatter from ever *writing* that spelling; a file an
-        // older version already damaged is now a syntax error the
-        // editor reports rather than one it silently repairs.
+        // The parser rejects `arr= (a b)`, so it can't be formatted at all.
         assert!(BashFormatter.check("arr= (a b)\n").is_err());
-        // A real subshell still gets its space.
         assert_eq!(format_text("echo hi\n(echo sub)\n"), "echo hi\n(echo sub)\n");
     }
 
@@ -724,11 +580,9 @@ mod tests {
 
     #[test]
     fn sequential_top_level_blocks_all_stay_at_depth_zero() {
-        // Regression: an opener (KwFor/KwCase/...) that falls through to
-        // the generic same-depth-as-before branch must use the depth
-        // from *before* it pushes its own block, not after -- otherwise
-        // every block following the first one at a given depth drifts
-        // one level too deep.
+        // An opener takes the depth from before it pushes its block;
+        // otherwise every later block at that depth drifts one level
+        // deeper.
         let src = "if true\nthen\nx\nfi\nfor i in a\ndo\ny\ndone\ncase i in\na)\nz\nesac\n";
         let expected = "if true; then\n\tx\nfi\nfor i in a; do\n\ty\ndone\ncase i in\n\ta)\n\t\tz\nesac\n";
         assert_eq!(format_text(src), expected);
@@ -770,9 +624,8 @@ mod tests {
         assert_eq!(format_text("foo()\n{\nx\n}\n"), "foo() {\n\tx\n}\n");
     }
 
-    // JS-style `NAME() { ... }` is the one canonical spelling this
-    // formatter enforces -- both of bash's other productions normalize
-    // to it, dropping `function` and synthesizing `()` when it's absent.
+    // `NAME() { ... }` is the one spelling: both other productions become
+    // it, dropping `function` and adding `()` when absent.
     #[test]
     fn function_keyword_spelling_without_parens_normalizes_to_name_parens_brace() {
         assert_eq!(format_text("function foo\n{\nx\n}\n"), "foo() {\n\tx\n}\n");
@@ -790,19 +643,15 @@ mod tests {
 
     #[test]
     fn function_keyword_spelling_normalizes_regardless_of_surrounding_whitespace() {
-        // Note: a newline right after `function` (before its own name)
-        // isn't valid bish syntax at all -- parse_function_kw doesn't
-        // skip terminators there -- so only extra *spaces* are exercised.
+        // A newline between `function` and the name isn't valid bish, so
+        // only extra spaces are tried.
         assert_eq!(format_text("function   foo   {\nx\n}\n"), "foo() {\n\tx\n}\n");
     }
 
     #[test]
     fn a_function_body_that_is_not_a_compound_command_is_a_syntax_error() {
-        // It always was one in bash -- a function body is a brace group,
-        // a subshell, a loop, an `if`, a `case`, `(( ))` or `[[ ]]`, and
-        // nothing else. bish used to read this as "a function whose body
-        // is `echo`", quietly losing the `hi`; the formatter's job here
-        // is only not to touch what it cannot parse.
+        // Not a function in bash either: a function body is a compound
+        // command. What the formatter can't parse it doesn't touch.
         assert!(BashFormatter.check("function foo echo hi\n").is_err());
         assert!(BashFormatter.check("foo() echo hi\n").is_err());
     }
@@ -834,13 +683,11 @@ mod tests {
 
     #[test]
     fn a_comment_before_then_is_not_joined_across() {
-        // Joining "; then" past the comment would put `then` inside the
-        // comment text -- must fall back to leaving `then` on its own
-        // line instead of corrupting the script.
+        // Joining `; then` past the comment would put `then` inside it, so
+        // `then` stays on its own line.
         let src = "if true # why\nthen\nx\nfi\n";
         let out = format_text(src);
         assert!(out.contains("true  # why\n\tthen"), "got: {out:?}");
-        // And the result must still parse the same as the input.
         assert!(BashFormatter.check(&out).unwrap().is_empty());
     }
 
