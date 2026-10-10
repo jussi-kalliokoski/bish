@@ -76,41 +76,30 @@ mod window;
 use std::io::{IsTerminal, Read};
 
 fn main() {
-    // As close to the bottom of the stack as this program has a place
-    // to stand -- everything below measures its own nesting against
-    // here. See stackguard's own doc comment.
+    // As near the bottom of the stack as this program can stand; everything
+    // measures its nesting from here (see stackguard).
     stackguard::note_base();
-    // Before anything can change one: which signals arrived already
-    // ignored decides which ones `trap` may touch for the rest of this
-    // process's life. See exec::IGNORED_AT_ENTRY.
+    // First: signals ignored on arrival can't be touched by `trap` for the
+    // process's life (see `exec::IGNORED_AT_ENTRY`).
     exec::record_signals_ignored_at_entry();
     let args: Vec<String> = std::env::args().collect();
 
-    // `bish tool <subcommand>` -- checked first, ahead of every other
-    // argv-based branch below (in particular the generic `args.len() >=
-    // 2` script-path one just after), since `tool` isn't a script name
-    // to try to open. See tool.rs's own doc comment for what lives here
-    // today and what's planned alongside it.
+    // `bish tool <subcommand>`, before the script-path branch, since `tool`
+    // isn't a script (see tool.rs).
     if args.get(1).map(String::as_str) == Some("tool") {
         std::process::exit(tool::run(&args[2..]));
     }
 
-    // `bish session <subcommand>` -- detachable sessions (see
-    // ../bish-detachable-sessions.md and
-    // ~/.claude/plans/melodic-sauteeing-boot.md). Same "checked ahead of
-    // the generic script-path branch" treatment as `tool` above, since
-    // `session` isn't a script name either. `--daemon <name>` is an
-    // internal bootstrap mode (`session::run_new` re-execs this same
-    // binary with it) -- not documented as user-facing here for that
-    // reason, though nothing stops a user from invoking it directly.
+    // `bish session <subcommand>`: detachable sessions, before the
+    // script-path branch too. `--daemon <name>` is the internal bootstrap
+    // `session::run_new` re-execs with.
     if args.get(1).map(String::as_str) == Some("session") {
         if !cfg!(feature = "sessions") {
             eprintln!("bish: detachable sessions are not part of this build");
             std::process::exit(2);
         }
         let code = match args.get(2).map(String::as_str) {
-            // `-A` is tmux's own spelling for "attach to it if it is
-            // already there, create it if it is not".
+            // `-A`: attach if it exists, create it otherwise.
             Some("new") => match (args.get(3).map(String::as_str), args.get(4)) {
                 (Some("-A" | "--attach"), Some(name)) => session::run_new(name, true),
                 (Some("-A" | "--attach"), None) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: bish session new [-A] <name>")),
@@ -161,20 +150,17 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // A child this shell re-exec'd takes its script out of the
-    // environment, and the variable goes away with it: it holds the
-    // parent's whole state, and anything that can still read it later --
-    // the script itself, or anything the child starts -- is one more
-    // place that state exists. See exec::REEXEC_SCRIPT for why it is not
-    // in argv.
+    // A re-exec'd child takes its script from the environment and removes
+    // it: it holds the parent's whole state, which the script or anything it
+    // starts could otherwise read. See `exec::REEXEC_SCRIPT`.
     if invocation.reexec {
         invocation.command = Some(std::env::var(exec::REEXEC_SCRIPT).unwrap_or_default());
-        // SAFETY: before any thread of this program has started, and
-        // before a Shell reads the environment into its own table.
+        // SAFETY: before any thread starts and before a `Shell` reads the
+        // environment.
         unsafe { std::env::remove_var(exec::REEXEC_SCRIPT) };
     }
-    // `login(1)`, and a terminal emulator imitating it, start a login
-    // shell by naming it `-bish` rather than passing `-l`.
+    // `login(1)` and terminal emulators imitating it start a login shell
+    // named `-bish` rather than passing `-l`.
     if args.first().is_some_and(|name| name.starts_with('-')) {
         invocation.login = true;
     }
@@ -190,16 +176,11 @@ fn main() {
     let mut shell = exec::Shell::new();
     shell.started_as_login = invocation.login;
     shell.login_shell = invocation.login;
-    // $SHLVL counts how deep this shell is inside other shells. bash
-    // reads whatever it inherited and adds one; a shell that does not
-    // is invisible to anything counting nesting, `exit`-on-last-level
-    // prompts included.
+    // `$SHLVL` counts shell nesting: inherited plus one, as bash does, for
+    // anything counting depth.
     let depth = shell.lookup_var("SHLVL").trim().parse::<i64>().unwrap_or(0);
-    // Set directly rather than by running `export SHLVL=N` as a script.
-    // Lexing, parsing and executing a statement to increment a counter
-    // cost 68us of a 355us startup, and every re-exec'd construct paid
-    // it before running a single character of what it was actually
-    // asked to do.
+    // Set directly rather than by running `export SHLVL=N`, which would
+    // lex, parse and execute a statement at every startup.
     shell.export_var("SHLVL", (depth + 1).to_string());
     for (flag, on) in &invocation.set_flags {
         shell.apply_shell_flag(*flag, *on);
@@ -209,8 +190,8 @@ fn main() {
     }
 
     if let Some(command) = &invocation.command {
-        // The last letter of `$-`: `c` here, `s` for a script read from
-        // stdin, `i` when interactive, and nothing for a named script.
+        // The last letter of `$-`: `c` here, `s` for a script on stdin, `i`
+        // when interactive, nothing for a named script.
         shell.invocation_flag = Some('c');
         let script_name = invocation.operands.first().cloned().unwrap_or_else(|| "bish".to_string());
         let positional = invocation.operands.get(1..).map(<[String]>::to_vec).unwrap_or_default();
@@ -227,8 +208,8 @@ fn main() {
         && let Some(path) = invocation.operands.first()
     {
         shell.set_script_args(path.clone(), invocation.operands[1..].to_vec());
-        // A named script has an outermost `main` call frame; `-c` text
-        // does not. See Shell::running_a_script.
+        // A named script has an outermost `main` frame; `-c` text doesn't
+        // (see `Shell::running_a_script`).
         shell.running_a_script = true;
         source_bash_env(&mut shell, &invocation);
         match std::fs::read_to_string(path) {
@@ -240,16 +221,15 @@ fn main() {
         }
     }
     if !invocation.operands.is_empty() {
-        // `-s` with arguments: they are the positional parameters, and
-        // the script itself comes from stdin.
+        // `-s` with arguments: they're the positional parameters, and the
+        // script comes from stdin.
         shell.set_script_args("bish".to_string(), invocation.operands.clone());
     }
 
     if invocation.interactive.unwrap_or_else(|| std::io::stdin().is_terminal()) {
         shell.invocation_flag = Some('i');
-        // Reachable by what runs in its panes -- see session::listen_here.
-        // A bish that cannot listen is still a shell, so a failure here
-        // only means nothing can ask it anything.
+        // Reachable from its panes (`session::listen_here`). A bish that
+        // can't listen is still a shell.
         if let Ok(path) = session::listen_here() {
             shell.export_var("BISH_SOCKET", path.to_string_lossy().into_owned());
         }
@@ -280,15 +260,15 @@ usage: bish [options] [script [args...]]
   --version      print the version and exit
   --help         print this and exit";
 
-// What the command line asked for. Everything here is bash's own
-// spelling; `--promoted` is bish's own (see repl::run).
+// What the command line asked for, in bash's spelling; `--promoted` is
+// bish's (see `repl::run`).
 #[derive(Default)]
 struct Invocation {
     command: Option<String>,
     operands: Vec<String>,
     read_stdin: bool,
-    // `None` means "decide from whether stdin is a terminal", which is
-    // what a shell with no `-i`/`-c`/script does.
+    // `None`: decide from whether stdin is a terminal, as a shell without
+    // `-i`, `-c` or a script does.
     interactive: Option<bool>,
     login: bool,
     norc: bool,
@@ -301,10 +281,6 @@ struct Invocation {
 }
 
 impl Invocation {
-    // Everything that is not `-c`, a script path, `tool` or
-    // `--promoted` used to be read as a *filename*, so `bish -lc 'echo'`
-    // -- how a terminal emulator starts a login shell -- failed with
-    // "-lc: No such file or directory", and `bish --version` did too.
     fn parse(args: &[String]) -> Result<Invocation, String> {
         let mut inv = Invocation::default();
         let mut i = 0;
@@ -320,21 +296,19 @@ impl Invocation {
                 "--login" => inv.login = true,
                 "--norc" | "--noprofile" => inv.norc = true,
                 "--promoted" => inv.promoted = true,
-                // A child this shell re-exec'd: its script is in the
-                // environment, not here. See exec::REEXEC_SCRIPT.
+                // A re-exec'd child: its script is in the environment (see
+                // `exec::REEXEC_SCRIPT`).
                 "--reexec" => inv.reexec = true,
                 _ if arg.starts_with("--") => return Err(format!("{arg}: unrecognized option")),
                 // A cluster of single-letter flags, either sense:
-                // `-euo pipefail`, `+x`. A bare `-` or `+` is an
-                // operand, not a flag.
+                // `-euo pipefail`, `+x`. A lone `-` or `+` is an operand.
                 _ if (arg.starts_with('-') || arg.starts_with('+')) && arg.len() > 1 => {
                     let on = arg.starts_with('-');
                     let mut letters = arg[1..].chars();
                     while let Some(c) = letters.next() {
                         match c {
-                            // `c` ends the cluster: what follows is the
-                            // command, which is why `-lc 'echo hi'`
-                            // works.
+                            // `c` ends the cluster, the command following,
+                            // so `-lc 'echo hi'` works.
                             'c' => {
                                 i += 1;
                                 inv.command = Some(args.get(i).cloned().ok_or("-c: option requires an argument")?);
@@ -358,9 +332,8 @@ impl Invocation {
                         }
                     }
                 }
-                // The first non-option word is the script, and
-                // everything after it belongs to the script rather than
-                // to this shell.
+                // The first non-option word is the script; everything after
+                // is the script's.
                 _ => break,
             }
             i += 1;
@@ -378,10 +351,7 @@ mod tests {
         Invocation::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("parses")
     }
 
-    // Everything except `-c`, a script path and two bish-only words
-    // used to be read as a *filename*, so `bish -lc 'echo hi'` -- how a
-    // terminal emulator starts a login shell -- failed with "-lc: No
-    // such file or directory".
+    // `bish -lc 'echo hi'` is how a terminal emulator starts a login shell.
     #[test]
     fn a_cluster_ending_in_c_takes_the_next_argument_as_the_command() {
         let inv = parse(&["-lc", "echo hi"]);
@@ -390,17 +360,13 @@ mod tests {
         assert_eq!(inv.interactive, Some(false), "-c is not interactive");
     }
 
-    // `bish -n script.sh` is a syntax check that runs nothing, and the
-    // whole of its plumbing is that the letter reaches
-    // `apply_shell_flag` like any other -- so this is the test that it
-    // is not swallowed on the way (`-s`, `-i`, `-l`, `-c` and `-o` all
-    // are, each for its own reason).
+    // `bish -n script.sh` checks syntax and runs nothing, so `n` must reach
+    // `apply_shell_flag` (`-s`, `-i`, `-l`, `-c` and `-o` are consumed here).
     #[test]
     fn n_reaches_the_shell_as_an_ordinary_flag() {
         assert_eq!(parse(&["-n", "s.sh"]).set_flags, vec![('n', true)]);
         assert_eq!(parse(&["-n", "s.sh"]).operands, vec!["s.sh".to_string()]);
-        // And in a cluster, where `c` ends it: `bish -nc 'echo hi'`
-        // parses the command and runs none of it.
+        // In a cluster, where `c` ends it: `bish -nc 'echo hi'` runs nothing.
         let inv = parse(&["-nc", "echo hi"]);
         assert_eq!(inv.set_flags, vec![('n', true)]);
         assert_eq!(inv.command.as_deref(), Some("echo hi"));
@@ -421,9 +387,8 @@ mod tests {
         assert_eq!(inv.operands, vec!["script.sh".to_string()]);
     }
 
-    // The first word that is not an option belongs to the script, and
-    // so does everything after it -- `bish s.sh -x` passes `-x` to the
-    // script, it does not turn on xtrace.
+    // The first non-option belongs to the script, and what follows:
+    // `bish s.sh -x` passes `-x` to the script.
     #[test]
     fn options_stop_at_the_first_operand() {
         let inv = parse(&["-e", "s.sh", "-x", "arg"]);
@@ -458,7 +423,7 @@ mod tests {
         assert!(parse(&["--help"]).print_help);
     }
 
-    // A lone `-` is an operand, the way it is to every other tool.
+    // A lone `-` is an operand, as for every tool.
     #[test]
     fn a_bare_dash_is_not_a_flag() {
         let inv = parse(&["-"]);
@@ -467,27 +432,13 @@ mod tests {
     }
 }
 
-// `$BASH_ENV` for a non-interactive shell, and the login profile for a
-// login one -- bash reads the first before running a script or `-c`
-// text, which is how a system-wide setup file reaches a script at all.
-/// `bish --promoted -c '<script>'`: runs the script the way a split or
-/// tabbed window runs one -- promoted, with output going to a pane's
-/// grid instead of fd 1 -- and prints what the pane ends up showing.
-///
-/// This exists for bashdiff's pane corpus. A pane is a genuinely
-/// different execution path: a pty per foreground external command,
-/// `ExecResult::Fg` handed back for something else to drive, and a
-/// vt100 grid where a pipe would otherwise be. Three separate bugs
-/// lived in it unnoticed -- a builtin pipeline stage writing past its
-/// pipe, `$(external)` coming back empty, and every command after an
-/// external one being dropped -- precisely because every corpus case
-/// ran the other way. Running the same script both ways, from outside,
-/// is what lets the corpus have an opinion about it.
-///
-/// The grid is deliberately far larger than any case needs: what
-/// scrolls off the top of a pane is gone, and a corpus case whose
-/// output was silently truncated would compare as a difference that
-/// has nothing to do with the shell.
+/// `bish --promoted -c '<script>'`: runs the script as a split window
+/// does, promoted, output to a pane's grid, and prints what the pane
+/// shows. For bashdiff's pane corpus: a pane is a different path (a pty
+/// per foreground external, `ExecResult::Fg` handed off, a vt100 grid
+/// for a pipe), and running the corpus both ways is how it gets checked.
+/// The grid is far larger than any case needs, since output scrolled off
+/// a pane is lost.
 fn run_source_in_a_pane(shell: &mut exec::Shell, src: &str) -> i32 {
     const ROWS: usize = 400;
     const COLS: usize = 400;
@@ -495,18 +446,13 @@ fn run_source_in_a_pane(shell: &mut exec::Shell, src: &str) -> i32 {
     shell.set_sink_grid(std::rc::Rc::clone(&screen));
     shell.mark_promoted();
     let status = run_source(shell, src);
-    // The last command of a line hands a pty-backed job off rather than
-    // waiting for it (see ExecResult::Fg). In a pane repl.rs drives it;
-    // here nothing else will, so it is drained now -- otherwise the
-    // grid is read before the command that filled it has finished.
+    // A line's last command hands a pty job off instead of waiting (see
+    // `ExecResult::Fg`); with no repl.rs here, it's drained now, before the
+    // grid is read.
     shell.settle_pending_fg();
-    // A backgrounded job writes into a pty of its own, which repl.rs
-    // empties into the grid on its idle tick. There is no such loop
-    // here, so the output would still be sitting in the pty when this
-    // exits -- which is a property of `-c`, not of panes, and would
-    // have the corpus reporting a difference a live pane does not have.
-    // Twice with a breath in between: a job that has only just been
-    // waited for may not have been scheduled to write yet.
+    // A background job writes to its own pty, which repl.rs empties on its
+    // idle tick; nothing does here, so it's drained, twice with a pause,
+    // since a just-reaped job may not have written yet.
     for _ in 0..2 {
         shell.drain_background_output();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -518,6 +464,8 @@ fn run_source_in_a_pane(shell: &mut exec::Shell, src: &str) -> i32 {
     status
 }
 
+// `$BASH_ENV` for a non-interactive shell, the login profile for a
+// login one, read before a script or `-c` text, as bash does.
 fn source_bash_env(shell: &mut exec::Shell, invocation: &Invocation) {
     if invocation.norc {
         return;
@@ -544,8 +492,8 @@ fn run_source(shell: &mut exec::Shell, src: &str) -> i32 {
         Ok(toks) => match parser::Parser::new(shell.expand_aliases(toks)).parse_program() {
             Ok(prog) => {
                 if let exec::ExecResult::Exit(code) = shell.run_program_of_source(&prog, src) {
-                    // The exit trap already ran at whichever site produced
-                    // this (see ExecResult::Exit's own doc comment).
+                    // The exit trap already ran where this came from (see
+                    // `ExecResult::Exit`).
                     return code;
                 }
                 shell.run_exit_trap();
