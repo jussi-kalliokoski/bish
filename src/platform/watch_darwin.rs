@@ -1,44 +1,34 @@
-//! Watching a directory with kqueue(2).
-//!
-//! The awkward one. kqueue reports on an open descriptor, and for a
-//! directory it says only that *something* in it changed -- never which
-//! name, which is the one thing inotify is asked for here. There is no
-//! second interface that does: FSEvents, the other macOS answer, is a
-//! per-volume log delivered to a callback on a run loop, needs
-//! CoreServices, and reports on a delay measured in seconds. kqueue is
-//! an ordinary descriptor that goes into a `PollSet` like every other
-//! thing bish waits on, which is the whole reason this is worth having.
+//! Watching a directory with kqueue(2). kqueue reports on an open
+//! descriptor, and for a directory says only that something changed,
+//! never which name. FSEvents is a per-volume log delivered to a
+//! run-loop callback through CoreServices, seconds late; kqueue is an
+//! ordinary descriptor that goes in a `PollSet` like everything else bish
+//! waits on.
 //!
 //! So each watch keeps a `DirSnapshot` of its directory, and an event
-//! makes it list the directory again and compare: that is where the
-//! names come from. The cost is a `read_dir` per event -- not per poll,
-//! and not per tick -- and above this nothing can tell the difference.
+//! rescans and compares to get the names: a `read_dir` per event, not per
+//! poll.
 //!
-//! A directory's own events are not enough on their own, either: one
-//! fires when an entry is added, removed or renamed, and *not* when a
-//! file already in it is written in place -- which is how most saves
-//! happen. So a file the caller named is watched as well, through a
-//! descriptor of its own, and an event on it means the same rescan. That
-//! descriptor follows the inode, which is exactly what the directory
-//! watch exists to get past; so after every rescan a named file whose
-//! inode has changed (a rename over it, a delete and recreate) gets a
-//! fresh descriptor, and one that has only just appeared gets its first.
+//! A directory's events fire when an entry is added, removed or renamed,
+//! not when a file in it is written in place, as most saves are. So a
+//! named file is watched through a descriptor of its own too, and an
+//! event on it means the same rescan. That descriptor follows the inode,
+//! so after each rescan a named file with a new inode (renamed over,
+//! deleted and recreated) gets a fresh one, and a newly appeared one its
+//! first.
 //!
-//! Two differences that are real and not papered over:
+//! Two real differences:
 //!
-//! - One open descriptor per watched directory and per named file in it,
-//!   where inotify has one for the whole set. Both callers in bish watch
-//!   one file at a time, so this is a handful of descriptors. A file in
-//!   a directory watched in its own right, and named by nobody, is
-//!   reported when it appears, goes or is replaced, but not when it is
-//!   written in place: watching every file in an arbitrary directory is
-//!   a descriptor per file, without bound.
-//! - Two writes inside one snapshot interval that leave the size,
-//!   inode and modification time identical are invisible here. bish's
-//!   own caller hashes the file before it says anything (see
-//!   `TextBuffer::changed_on_disk`), so the consequence is a notice that
-//!   is not shown, not a wrong one -- and `O_EVTONLY` plus APFS's
-//!   nanosecond timestamps make it a narrow window to begin with.
+//! - One descriptor per watched directory and per named file, where
+//!   inotify has one for all. bish watches one file at a time, so it's a
+//!   handful. An unnamed file in a watched directory is reported when it
+//!   appears, goes or is replaced, but not when written in place:
+//!   watching every file would be a descriptor each, without bound.
+//! - Two writes within one snapshot interval leaving size, inode and
+//!   mtime identical are invisible. bish's caller hashes the file before
+//!   saying anything (`TextBuffer::changed_on_disk`), so the result is a
+//!   missed notice, not a wrong one, and `O_EVTONLY` with APFS's nanosecond
+//!   timestamps makes the window narrow.
 
 use super::unix::{DirSnapshot, EntryChange, c_open};
 use super::{RawChange, RawEvent, WatchId};
@@ -55,9 +45,8 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-/// `struct kevent` as macOS lays it out on a 64-bit target: 32 bytes,
-/// `ident` and `data` pointer-wide, `udata` a pointer bish uses as a
-/// plain number.
+/// `struct kevent` on a 64-bit macOS target: 32 bytes, `ident` and `data`
+/// pointer-wide, `udata` a pointer bish uses as a number.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct KEvent {
@@ -75,8 +64,7 @@ struct TimeSpec {
     nanoseconds: i64,
 }
 
-// kqueue's own numbers, private here: they belong to a call this OS has
-// and Linux does not, so there is no counterpart for them to pair with.
+// kqueue's numbers, private: Linux has no counterpart to pair them with.
 const EVFILT_VNODE: i16 = -4;
 const EV_ADD: u16 = 0x0001;
 const EV_CLEAR: u16 = 0x0020;
@@ -92,21 +80,19 @@ const NOTE_REVOKE: u32 = 0x0000_0040;
 
 const WATCH_FFLAGS: u32 = NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE;
 
-// `open(2)`: a descriptor for being told about the file and nothing
-// else. It does not count as a reference that keeps a volume from being
-// unmounted, which an ordinary `O_RDONLY` on a directory would.
+// `open(2)` for events only. Unlike `O_RDONLY` on a directory, it doesn't
+// keep the volume from being unmounted.
 const O_EVTONLY: i32 = 0x8000;
 const O_CLOEXEC: i32 = 0x0100_0000;
 
-/// One watched directory: the descriptor kqueue reports on, and what the
-/// directory looked like last time anyone asked.
+/// One watched directory: the descriptor kqueue reports on, and how the
+/// directory looked last time.
 struct Watched {
     dir: PathBuf,
     fd: RawFd,
     seen: DirSnapshot,
-    /// The files in it someone named, each with the descriptor watching
-    /// it and the inode that descriptor is on -- `None` while the file
-    /// does not exist.
+    /// Its named files, each with its watching descriptor and that
+    /// descriptor's inode; `None` while the file doesn't exist.
     files: HashMap<OsString, Option<(RawFd, u64)>>,
 }
 
@@ -125,19 +111,15 @@ impl DirWatch {
         Ok(DirWatch { kq, watched: HashMap::new(), next: 1 })
     }
 
-    /// Readable exactly when there is at least one event waiting -- a
-    /// kqueue descriptor polls like any other.
+    /// Readable when at least one event waits; a kqueue polls like any fd.
     pub(crate) fn fd(&self) -> RawFd {
         self.kq
     }
 
-    /// Watches `dir`, giving back the same id for a directory already
-    /// watched -- inotify's own behaviour, which callers above rely on to
-    /// merge two files in one directory into one watch.
-    ///
-    /// `file` is the entry in it the caller is after, if any -- watched
-    /// on its own as well, since nothing about the directory changes
-    /// when that file is written in place.
+    /// Watches `dir`, returning the same id for a directory already watched,
+    /// as inotify does, which callers rely on to merge two files in one
+    /// directory. `file` is the entry the caller wants, watched separately,
+    /// since writing it in place changes nothing about the directory.
     pub(crate) fn add(&mut self, dir: &Path, file: Option<&OsStr>) -> io::Result<WatchId> {
         let id = match self.watched.iter().find(|(_, w)| w.dir == dir) {
             Some((id, _)) => *id,
@@ -167,8 +149,8 @@ impl DirWatch {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // EV_CLEAR, so an event is reported once rather than every time
-        // the queue is read until something resets it.
+        // `EV_CLEAR`, so an event is reported once, not on every read until
+        // reset.
         let change = KEvent { ident: fd as u64, filter: EVFILT_VNODE, flags: EV_ADD | EV_CLEAR, fflags: WATCH_FFLAGS, data: 0, udata: id as u64 };
         let registered = unsafe { kevent(self.kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if registered < 0 {
@@ -179,9 +161,8 @@ impl DirWatch {
         Ok(fd)
     }
 
-    /// Points each named file's descriptor at whatever is under that
-    /// name now: a fresh one for a file that appeared or was replaced,
-    /// none for one that is gone.
+    /// Points each named file's descriptor at what's under that name now:
+    /// new for a file that appeared or was replaced, none for one gone.
     fn refresh_files(&mut self, id: WatchId) {
         use std::os::unix::fs::MetadataExt;
         let Some(watched) = self.watched.get(&id) else { return };
@@ -207,16 +188,15 @@ impl DirWatch {
         }
     }
 
-    /// Closing the descriptor is what deregisters it: kqueue drops a
-    /// registration when its file closes.
+    /// Closing the descriptor deregisters it.
     pub(crate) fn remove(&mut self, watch: WatchId) {
         if let Some(gone) = self.watched.remove(&watch) {
             close_all(&gone);
         }
     }
 
-    /// Everything waiting, right now. Never blocks -- a zero timeout is
-    /// what makes `kevent` a poll.
+    /// Everything waiting now; never blocks, a zero timeout making `kevent`
+    /// a poll.
     pub(crate) fn drain(&mut self) -> Vec<RawEvent> {
         let mut out: Vec<RawEvent> = Vec::new();
         loop {
@@ -232,19 +212,17 @@ impl DirWatch {
                 }
                 let id = event.udata as WatchId;
                 let on_directory = self.watched.get(&id).is_some_and(|w| w.fd as u64 == event.ident);
-                // The directory itself is gone, so the registration is
-                // finished with it -- the same end inotify reports as
-                // `IN_IGNORED`. The same flags on a named file only mean
-                // that file went, which the rescan below reports.
+                // The directory is gone, so the registration is finished:
+                // inotify's `IN_IGNORED`. The same flags on a named file
+                // only mean the file went, which the rescan reports.
                 if on_directory && event.fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE) != 0 {
                     out.push(RawEvent { watch: id, name: None, change: RawChange::Dropped });
                     self.remove(id);
                     continue;
                 }
                 let Some(watched) = self.watched.get_mut(&id) else { continue };
-                // Where the names come from: kqueue said this directory
-                // changed, and comparing it with what it was says which
-                // entries did.
+                // Where the names come from: comparing the directory with
+                // what it was.
                 let now = DirSnapshot::of(&watched.dir);
                 for (name, change) in now.changes_since(&watched.seen) {
                     let change = match change {
