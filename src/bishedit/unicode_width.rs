@@ -1,29 +1,11 @@
-// Hand-rolled Unicode display-width table -- no external crate, same
-// spirit as glob.rs/regex.rs/csscolor.rs. How many terminal columns one
-// char actually occupies: 0 for a combining mark/zero-width joiner/
-// variation selector, 2 for an East-Asian-Wide/Fullwidth character (CJK
-// ideographs, Hangul syllables, most emoji, fullwidth forms), 1 for
-// everything else. This is deliberately the well-known "per-codepoint
-// width" model every terminal emulator and most terminal apps (tmux,
-// less, vim's own default) already use, at the single-char level --
-// `char_width` itself has no notion of a multi-codepoint sequence being
-// one cluster at all, and stays that way (real cursor motion needs a
-// char index either way, per-char, to stay addressable).
+// Display width: how many terminal columns a char takes. 0 for combining
+// marks, ZWJ and variation selectors, 2 for East Asian Wide and Fullwidth
+// characters (CJK, Hangul syllables, most emoji), 1 otherwise. `char_width`
+// is per codepoint, the model terminals use; `str_width` and the column
+// conversions are grapheme-aware (via `bishedit::grapheme`).
 //
-// `str_width` below *is* now grapheme-cluster-aware, via
-// `bishedit::grapheme` -- this used to be the one real gap this
-// comment flagged ("a ZWJ emoji family... measured char-by-char and
-// summed here rather than treated as one cluster... genuinely deferred
-// to a later pass"). Fixed: see `str_width`'s own doc comment.
-//
-// The range tables come from `unicode_tables`, which is generated from
-// the Unicode character database this machine already ships -- see
-// tools/gen-unicode-tables.pl. They used to be written here from
-// memory, as a "deliberately trimmed, high-confidence subset", which
-// was the one place in this codebase where correctness rested on
-// recalled data rather than something that had been read. It had
-// already produced one real bug: 0xE0100 sorted after 0x1F3FB, caught
-// only because a test asserted the tables were in order.
+// The ranges come from `unicode_tables`, generated from the system's
+// Unicode database (tools/gen-unicode-tables.pl).
 
 use super::unicode_tables::{WIDE, ZERO_WIDTH};
 
@@ -41,13 +23,9 @@ fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
         .is_ok()
 }
 
-// `\0` is the one control character worth a special case here (width
-// 0, matching wcwidth's own convention) -- every other control
-// character (`\t`, `\r`, raw ESC, ...) is 1, same as any other char:
-// callers with real control-character semantics to honor (tab stops,
-// escape-sequence parsing) already special-case those themselves
-// before ever reaching this, same as `editor::visible_len` already
-// does for SGR codes.
+// `\0` is 0, as in wcwidth. Other control characters are 1: callers that
+// give them meaning (tab stops, escape sequences) handle them before
+// this, as `editor::visible_len` does for SGR codes.
 pub fn char_width(c: char) -> usize {
     let c = c as u32;
     if c == 0 {
@@ -62,17 +40,10 @@ pub fn char_width(c: char) -> usize {
     1
 }
 
-// A grapheme cluster's own display width is its *first* char's width
-// alone, not the sum of every char in it -- everything else in the
-// cluster (combining marks, ZWJ, skin-tone modifiers, joined emoji)
-// renders *within* the space that first char already occupies, not
-// stacked additionally alongside it. Fixes the ZWJ-sequence gap this
-// module's own top doc comment used to flag: a family emoji (person +
-// ZWJ + person + ZWJ + child, each individually width-2) used to sum
-// to 6+ columns; it's one ~2-column glyph in any terminal that
-// understands ZWJ joining, matching real terminal behavior. Ordinary
-// text (every char its own single-char cluster) is unaffected -- this
-// reduces to the exact same per-char sum `char_width` always gave.
+// A cluster is as wide as its first char: the rest (combining marks,
+// ZWJ, skin tones, joined emoji) renders within that space. So a ZWJ
+// family is one 2-column glyph, not 8 columns. For ordinary text, every
+// char its own cluster, this is the plain per-char sum.
 pub fn str_width(s: &str) -> usize {
     let chars: Vec<char> = s.chars().collect();
     let mut width = 0;
@@ -84,19 +55,10 @@ pub fn str_width(s: &str) -> usize {
     width
 }
 
-// The display column a given char index within `chars` actually starts
-// at -- the sum of every earlier *cluster's* own width (its first
-// char's width, matching `str_width`'s own convention -- a multi-char
-// grapheme cluster occupies the space its first char would alone, not
-// each char's width stacked). `char_index` past the end of `chars` is
-// treated as "the column right after the last char" (the common case:
-// a cursor sitting one-past-the-end of a line), same as indexing a
-// line one past its last real column already means elsewhere in this
-// codebase. If `char_index` itself falls *inside* a cluster (shouldn't
-// happen once a caller's own cursor movement is grapheme-aware, but
-// handled defensively), this reports that cluster's own start column,
-// the same way a plain combining mark already contributes 0 extra
-// width of its own today.
+// The display column `char_index` starts at: the widths of the clusters
+// before it. Past the end is the column after the last char (a cursor at
+// end of line). An index inside a cluster gets the cluster's start column,
+// as a combining mark adds nothing.
 pub fn col_of(chars: &[char], char_index: usize) -> usize {
     let mut col = 0;
     let mut i = 0;
@@ -111,16 +73,10 @@ pub fn col_of(chars: &[char], char_index: usize) -> usize {
     col
 }
 
-// The inverse of `col_of`: the first char index whose own `col_of` is
-// `>= col` -- used to find "which character is the first one visible"
-// once the viewport has scrolled to some display column, not just some
-// char index. Never lands *inside* a wide char or a multi-char cluster
-// (there's no such thing as half a CJK glyph, or half a ZWJ emoji
-// sequence, rendered on screen): if `col` points into the second cell
-// of a cluster's own occupied span, that cluster's own first cell
-// would already be scrolled out of view, so this skips the *whole*
-// cluster and returns the next one's index instead of showing a
-// half-obscured glyph.
+// The inverse of `col_of`: the first char index whose column is `>= col`,
+// to find the first visible char after a horizontal scroll. Never inside
+// a cluster: if `col` is past a cluster's first cell, that cluster is
+// already partly scrolled off, so the next one's index is returned.
 pub fn char_at_col(chars: &[char], col: usize) -> usize {
     let mut acc = 0;
     let mut i = 0;
@@ -131,9 +87,8 @@ pub fn char_at_col(chars: &[char], col: usize) -> usize {
         let cluster_end = crate::bishedit::grapheme::next_boundary(chars, i);
         let w = char_width(chars[i]);
         if acc + w > col {
-            // `col` falls inside this cluster's own occupied span --
-            // skip it whole, don't just advance to its next char index
-            // (which could still be mid-cluster for a 3+ char one).
+            // Inside this cluster's span: skip it whole, since its next
+            // char index could still be mid-cluster.
             return cluster_end;
         }
         acc += w;
@@ -171,16 +126,14 @@ mod tests {
     #[test]
     fn combining_marks_are_zero_width() {
         assert_eq!(char_width('\u{0301}'), 0); // COMBINING ACUTE ACCENT
-        // "e" + combining acute accent visually reads as one column, not two.
+        // `e` plus a combining acute is one column.
         assert_eq!(str_width("e\u{0301}"), 1);
     }
 
     #[test]
     fn zwj_emoji_sequence_is_one_clusters_own_width_not_a_sum() {
-        // MAN + ZWJ + WOMAN + ZWJ + GIRL + ZWJ + BOY -- a "family" ZWJ
-        // sequence, 7 individually-Wide-or-zero-width chars. Naive
-        // per-char summing gives 8 (four Wide chars x2); this is one
-        // cluster, one glyph, 2 columns.
+        // A ZWJ family of seven chars, four of them Wide: summed naively 8,
+        // but one glyph of 2 columns.
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
         assert_eq!(str_width(family), 2);
     }
@@ -194,9 +147,7 @@ mod tests {
 
     #[test]
     fn ordinary_multi_char_text_still_sums_per_char_as_before() {
-        // Every char here is its own single-char cluster, so this must
-        // reduce to exactly the same result str_width already gave
-        // before it became cluster-aware.
+        // Single-char clusters only: the plain sum.
         assert_eq!(str_width("中文 hello"), 4 + 1 + 5);
     }
 
@@ -224,9 +175,8 @@ mod tests {
         let chars: Vec<char> = "a中b".chars().collect();
         assert_eq!(char_at_col(&chars, 0), 0); // "a" starts at column 0
         assert_eq!(char_at_col(&chars, 1), 1); // "中" starts at column 1
-        // Column 2 is the *second* cell of "中" -- "中" itself would
-        // already be half scrolled out of view there, so this skips
-        // past it and resolves to "b" instead of showing a half glyph.
+        // Column 2 is the second cell of `中`, which is then half scrolled
+        // off, so this resolves to `b`.
         assert_eq!(char_at_col(&chars, 2), 2);
         assert_eq!(char_at_col(&chars, 3), 2); // "b" starts at column 3
         assert_eq!(char_at_col(&chars, 4), 3); // past the end
@@ -244,15 +194,12 @@ mod tests {
 
     #[test]
     fn col_of_treats_a_zwj_cluster_as_its_first_chars_width_alone() {
-        // 'a' + MAN+ZWJ+WOMAN (3-char cluster, width 2) + 'b'
+        // `a`, MAN+ZWJ+WOMAN (3 chars, 2 columns), `b`.
         let chars: Vec<char> = "a\u{1F468}\u{200D}\u{1F469}b".chars().collect();
         assert_eq!(col_of(&chars, 0), 0);
         assert_eq!(col_of(&chars, 1), 1, "right after 'a'");
         assert_eq!(col_of(&chars, 4), 3, "right after the whole cluster: 1 (a) + 2 (cluster), not 1 + 8");
-        // Mid-cluster char indices (defensive -- shouldn't normally be
-        // queried once a caller's own cursor movement is cluster-aware)
-        // report the cluster's own start column, same as a plain
-        // combining mark already does.
+        // A mid-cluster index reports the cluster's start column.
         assert_eq!(col_of(&chars, 2), 1);
         assert_eq!(col_of(&chars, 3), 1);
     }
@@ -262,9 +209,8 @@ mod tests {
         let chars: Vec<char> = "a\u{1F468}\u{200D}\u{1F469}b".chars().collect();
         assert_eq!(char_at_col(&chars, 0), 0); // 'a'
         assert_eq!(char_at_col(&chars, 1), 1); // the cluster's own start
-        // Column 2 is the *second* cell of the cluster's own 2-column
-        // footprint -- must skip the entire 3-char cluster, not land on
-        // its second or third codepoint.
+        // Column 2 is the cluster's second cell, so the whole 3-char
+        // cluster is skipped.
         assert_eq!(char_at_col(&chars, 2), 4);
         assert_eq!(char_at_col(&chars, 3), 4); // 'b' starts at column 3
     }
@@ -274,55 +220,45 @@ mod tests {
         let chars: Vec<char> = "hi \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} bye".chars().collect();
         for i in 0..=chars.len() {
             let col = col_of(&chars, i);
-            // Only true cluster-start indices are expected to round-trip
-            // exactly (a mid-cluster index's own col_of reports its
-            // cluster's start, and char_at_col of *that* column
-            // correctly resolves back to the cluster's start, not the
-            // original mid-cluster index) -- assert the weaker, always-
-            // true invariant instead: char_at_col(col_of(i)) is always
-            // some valid cluster-start index at or before i.
+            // A mid-cluster index doesn't round-trip, so the invariant
+            // checked is that `char_at_col(col_of(i))` is a cluster start
+            // at or before `i`.
             let back = char_at_col(&chars, col);
             assert!(back <= i, "char_at_col(col_of({i})) = {back} should never overshoot past {i}");
         }
     }
-    // Characters the recalled tables had no room for. Each was wrong
-    // before, in the direction that puts a pane border in the wrong
-    // column or a cursor in the middle of a glyph.
+    // Each of these would put a pane border in the wrong column or a cursor
+    // inside a glyph if wrong.
     #[test]
     fn the_generated_table_covers_what_the_recalled_one_missed() {
-        // East_Asian_Width=Wide, and nowhere near the CJK blocks the
-        // old table listed.
+        // East_Asian_Width=Wide, far from the CJK blocks.
         assert_eq!(char_width('\u{231A}'), 2, "a watch is two columns wide");
         assert_eq!(char_width('\u{2B50}'), 2, "and so is a star");
         // Combining marks outside the Latin and Cyrillic blocks: Arabic,
-        // Thai and Hebrew all used to take a column each.
+        // Thai, Hebrew.
         for mark in ['\u{064B}', '\u{0E31}', '\u{05B0}'] {
             assert_eq!(char_width(mark), 0, "U+{:04X} is a combining mark", mark as u32);
         }
     }
 
-    // The one carve-out the generator makes: a soft hyphen is a format
-    // character, and every terminal gives it a column anyway.
+    // The generator's one carve-out: a soft hyphen is a format character, and
+    // terminals give it a column anyway.
     #[test]
     fn a_soft_hyphen_keeps_its_column() {
         assert_eq!(char_width('\u{00AD}'), 1);
     }
 
-    // A spacing mark takes a column, unlike the combining marks above
-    // -- which is exactly why grapheme segmentation needs its own rule
-    // for it rather than treating every mark as weightless.
+    // A spacing mark takes a column, unlike the combining marks above, which
+    // is why grapheme segmentation has its own rule for it.
     #[test]
     fn a_spacing_mark_is_not_weightless() {
         assert_eq!(char_width('\u{093F}'), 1, "devanagari vowel sign I");
         assert_eq!(str_width("कि"), 1, "but the cluster it belongs to is still one column");
     }
-    // The corpus pattern, applied to a table instead of a shell: run
-    // the generator again and check the committed tables still say what
-    // this machine's own Unicode database says. Skips when there is no
-    // perl to ask, exactly as the bash corpus skips when there is no
-    // bash -- and skips when the machine has moved to a newer Unicode
-    // than the tables were generated from, since that is a difference
-    // between two databases rather than a mistake in these.
+    // Runs the generator again and checks the committed tables still match
+    // this machine's Unicode database. Skips without perl, and when the
+    // machine's Unicode is newer than the tables', which is a difference
+    // between databases rather than a mistake.
     #[test]
     fn the_committed_tables_still_match_the_systems_own_unicode() {
         use crate::bishedit::unicode_tables as t;
@@ -362,9 +298,8 @@ mod tests {
         line.split('"').nth(1).expect("as a string literal").to_string()
     }
 
-    // Deliberately a small scanner rather than anything general: the
-    // input is one program's own output, and the only shape it has is
-    // `pub const NAME` followed by `(0x.., 0x..)` pairs up to the `];`.
+    // A small scanner: the input is the generator's output, `pub const NAME`
+    // followed by `(0x.., 0x..)` pairs up to `];`.
     fn parse_table(source: &str, name: &str) -> Vec<(u32, u32)> {
         let start = source.find(&format!("pub const {name}:")).unwrap_or_else(|| panic!("{name} is missing from the generator's output"));
         let body = &source[start..];
