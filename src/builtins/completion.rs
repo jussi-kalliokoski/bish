@@ -1,31 +1,20 @@
-// `compgen`, `complete` and `compopt`: programmable completion, the
-// half that lives in the shell rather than in the line editor.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
+// `compgen`, `complete` and `compopt`: programmable completion, the part
+// that lives in the shell rather than the line editor.
 
 use crate::compgen;
 use crate::exec::{Shell, sh_eprintln, sh_println};
 
-// compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action]
+// `compgen [-V varname] [-abcdefgjksuv] [-o option] [-A action]
 // [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat]
-// [-P prefix] [-S suffix] [--] [word] -- bash's own completion-
-// generator builtin, built on compgen.rs's shared spec parser/resolver
-// (see that module's own doc comment for the design and every
-// reverse-engineered semantic detail: which sources get filtered by
-// `word` and which don't, the exact -F/-C calling convention, `-o`'s
-// names being validated but otherwise inert).
+// [-P prefix] [-S suffix] [--] [word]`, on compgen.rs's shared spec
+// parser and resolver (see there for which sources `word` filters, the
+// `-F`/`-C` calling convention, and the inert `-o` names).
 //
-// `-V varname` is compgen's own option (not part of the shared spec
-// grammar, since `complete` has no equivalent) -- stripped out before
-// handing the rest to compgen::parse_spec_args.
+// `-V` is compgen's own, stripped before `compgen::parse_spec_args`.
 //
-// Exit status is success unless a source was actually requested and
-// it produced nothing
-// (confirmed against real bash: bare `compgen`/a lone trailing word
-// with no -A/-G/-W/-F/-C at all always exits 0 even though it prints
-// nothing, but e.g. `compgen -W "" -- x` -- a real source, zero
-// matches -- exits 1). Applies the same way whether or not -V
-// redirected the output into an array.
+// Succeeds unless a source was requested and produced nothing: bare
+// `compgen` exits 0, `compgen -W "" -- x` exits 1, as in bash, with or
+// without `-V`.
 pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
     let mut varname: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
@@ -49,14 +38,10 @@ pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
     };
     let word = positionals.last().cloned().unwrap_or_default();
     let had_source = spec.has_any_source();
-    // A nicer, specific diagnostic for the overwhelmingly common
-    // mistake (a typo'd function name) than the silent "just no
-    // candidates" compgen::run_external falls back to for any
-    // subprocess failure -- that tolerance exists for the interactive
-    // Tab-completion path, where a hard error would be disruptive, but
-    // this standalone builtin can and should still say what went
-    // wrong (confirmed against real bash: `compgen -F nosuchfunc`
-    // prints "function not found" and exits 1).
+    // A specific error for a misspelled function, as bash gives ("function
+    // not found", status 1). `compgen::run_external` stays quiet on failure
+    // because Tab completion shouldn't be interrupted; this builtin should
+    // say what went wrong.
     if let Some(name) = &spec.function
         && !sh.functions.contains_key(name)
     {
@@ -80,27 +65,15 @@ pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
     if empty && had_source { 1 } else { 0 }
 }
 
-// complete [-p|-r] [options] name... | complete -D [options] --
-// registers/lists/removes the completion specs bish's own interactive
-// Tab completion consults (see ShellCompletionProvider's own doc
-// comment on how) for a given command name, or the `-D` default spec
-// used when no exact name matches. Shares its entire option grammar
-// with `compgen` (compgen.rs's parse_spec_args) -- only `-p`/`-r`/`-D`
-// themselves, and taking one-or-more trailing NAMEs instead of a
-// single trailing word, are complete's own.
+// `complete [-p|-r] [options] name...` and `complete -D [options] --`:
+// registers, lists or removes the specs Tab completion consults (see
+// `ShellCompletionProvider`), or the `-D` default spec. Shares compgen's
+// option grammar (`compgen::parse_spec_args`); `-p`, `-r`, `-D` and the
+// trailing NAMEs are its own.
 //
-// `-p`/`-r` are detected as the very first argument (confirmed against
-// real bash: always used alone, never mixed with the rest of the
-// option grammar in practice) and take every remaining argument as a
-// literal NAME to print/remove -- no names at all means "every
-// registered spec" for both. The literal name "-D" in either list
-// targets the default spec instead of a real command name (confirmed:
-// `complete -p -D` prints the default spec's own line).
-//
-// Registration always fully replaces whatever spec a name already had
-// (confirmed: re-registering `cmd1` with just `-W x` drops its
-// previous -X/-P/-S/-o entirely) -- a plain HashMap::insert overwrite,
-// never a merge.
+// `-p`/`-r` come first and take every other argument as a NAME; with none,
+// they cover every spec. The name `-D` means the default spec, as in bash.
+// Registering replaces a name's spec entirely, never merging.
 pub(crate) fn run_complete(sh: &mut Shell, args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None => {
@@ -131,16 +104,11 @@ pub(crate) fn run_complete(sh: &mut Shell, args: &[String]) -> i32 {
     0
 }
 
-// compopt [-o option] [+o option] [name] -- adjusts a registered
-// spec's own stored `-o` list in place (add for `-o`, remove for
-// `+o`), leaving every other field untouched. Real bash's own compopt
-// with no `name` at all only makes sense called from inside an
-// in-progress completion function (adjusting *that* completion's
-// options); bish's completion generation never calls back into a
-// running compopt invocation that way, so -- matching real bash's own
-// behavior outside that context -- this always errors when no name is
-// given (confirmed: `compopt -o nospace` outside a completion function
-// prints "not currently executing completion function" and exits 1).
+// `compopt [-o option] [+o option] [name]`: adds or removes `-o` options
+// on a registered spec. Without `name`, bash adjusts the running
+// completion function's options; bish never runs one that way, so this
+// errors as bash does outside one ("not currently executing completion
+// function").
 pub(crate) fn run_compopt(sh: &mut Shell, args: &[String]) -> i32 {
     let mut adds: Vec<String> = Vec::new();
     let mut removes: Vec<String> = Vec::new();
