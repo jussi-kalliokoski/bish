@@ -1,15 +1,11 @@
-// Creating, renaming and deleting files, as a language server's edit asks
-// -- all of it, or none of it.
+// Creating, renaming and deleting files as a language server's edit
+// asks: all of it, or none of it.
 //
-// Two halves, so that every refusal comes before anything is touched:
-// `plan` works the operations out against the files as they will be at
-// each step and refuses what cannot be done, and `commit` carries a plan
-// out, taking back the steps it has already taken the moment one fails.
-//
-// A file an edit deletes is not deleted until `Done::finish`. It is
-// moved aside, next to where it was, so that taking a delete back is a
-// rename -- and the rest of the edit, its text, can still fail without
-// having lost the file.
+// `plan` works the operations out against the files as they'll be at
+// each step, refusing before anything is touched; `commit` carries a plan
+// out, taking back what it did when a step fails. A deleted file is moved
+// aside next to where it was until `Done::finish`, so taking a delete
+// back is a rename, and the edit's text can still fail without losing it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,8 +25,8 @@ enum Action {
     Delete(PathBuf),
 }
 
-// An action, with how many of the edit's text changes come before it --
-// see `lsp::WorkspaceEdit::operations`.
+// An action, with how many of the edit's text changes come before it
+// (see `lsp::WorkspaceEdit::operations`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Step {
     position: usize,
@@ -44,11 +40,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Where the file a text change names ends up once the plan has run:
-    /// followed through every rename that comes after the change, or
-    /// `None` when a delete after it takes the file away. Renames before
-    /// it are not followed -- a change after a rename names the file by
-    /// its new name already.
+    /// Where the file a text change names ends up after the plan: followed
+    /// through every later rename, or `None` when a later delete removes it.
+    /// Earlier renames aren't followed, since a change after a rename already
+    /// uses the new name.
     pub fn destination(&self, position: usize, path: &Path) -> Option<PathBuf> {
         let mut path = path.to_path_buf();
         for step in self.steps.iter().filter(|s| s.position > position) {
@@ -128,13 +123,10 @@ impl Model {
     }
 }
 
-/// Works `operations` out, in order, and refuses the first one that
-/// cannot be done -- before any of them is.
-///
-/// `unsaved` is every file open with changes nobody has saved. Deleting
-/// one, or a directory holding one, is refused: the edit would take away
-/// the file those changes were meant for. A rename earlier in the same
-/// edit is followed, so moving a file and then deleting it is caught too.
+/// Works `operations` out in order, refusing the first that can't be
+/// done before doing any. `unsaved` is every open file with unsaved
+/// changes; deleting one, or a directory holding one, is refused, earlier
+/// renames in the edit followed.
 pub fn plan(operations: &[(usize, Operation)], unsaved: &[PathBuf]) -> Result<Plan, String> {
     let mut model = Model::default();
     let mut unsaved = unsaved.to_vec();
@@ -291,9 +283,8 @@ impl Done {
     }
 }
 
-// A name next to `path`, in the same directory and so on the same file
-// system -- a rename there cannot fail for crossing one -- that nothing
-// else will be using.
+// A name next to `path` that nothing else uses, in the same directory
+// so a rename to it can't cross file systems.
 fn aside_for(path: &Path) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
