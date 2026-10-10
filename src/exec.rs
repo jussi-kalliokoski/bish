@@ -4935,6 +4935,10 @@ impl Shell {
         // inherited, they'd be wiped by the next repaint. Plain fds, not
         // `spawn_attached`, whose setsid would undo the process group
         // below.
+        // A backgrounded pipeline's own pty (see `background_pty`): the first
+        // stage reads it, the last writes it, and every stderr goes there.
+        // Plain fds, not `spawn_attached`, whose setsid would undo the
+        // process group below.
         let bg_pty = if background { self.background_pty() } else { None };
         let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
             let p = pty.as_ref()?;
@@ -7771,14 +7775,11 @@ impl Shell {
                         *slot = if cmd_str == "-" { None } else { Some(cmd_str.clone()) };
                         continue;
                     }
-                    // KILL and STOP first: they are real signals with
-                    // real numbers, deliberately absent from
-                    // SIGNAL_NAMES so that list can be trap's own
-                    // answer to "may I catch this?" (see its doc
-                    // comment). bash accepts and records a trap for
-                    // them silently, and it simply never fires; saying
-                    // so is more use than a status a script would have
-                    // to have expected.
+                    // KILL and STOP first: real signals left out of
+                    // SIGNAL_NAMES so it can answer "may I catch this?".
+                    // bash silently records a trap for them that never
+                    // fires; saying so is more useful than a status a
+                    // script would have to expect.
                     if crate::exec::UNCATCHABLE_SIGNALS.iter().any(|(n, num)| sig.strip_prefix("SIG").unwrap_or(sig) == *n || sig == &num.to_string())
                     {
                         sh_eprintln!(self, "bish: trap: {}: cannot trap", sig);
@@ -7793,12 +7794,9 @@ impl Shell {
                         }
                     };
                     // Ignored before bish started, so not ours to change
-                    // -- see `IGNORED_AT_ENTRY`. Silently, and with a
-                    // successful status, because that is what bash does:
-                    // the request is accepted and simply has no effect,
-                    // and a script that writes `trap ... INT` defensively
-                    // should not start failing because somebody upstream
-                    // was careful.
+                    // (see `IGNORED_AT_ENTRY`): accepted silently with no
+                    // effect, as bash does, so a defensive `trap ... INT`
+                    // doesn't start failing.
                     if ignored_at_entry(num) {
                         continue;
                     }
@@ -7828,28 +7826,22 @@ impl Shell {
             }
             "set" => return ExecResult::Status(crate::builtins::shell::run_set(self, &argv[1..])),
             "declare" | "typeset" => {
-                // array_literal_args is indexed into the *original* argv
-                // (which still has argv[0] == "declare"/"typeset"), so
-                // every position shifts back by one to line up with
-                // argv[1..].
+                // `array_literal_args` is indexed into the original argv,
+                // so positions shift back by one to match `argv[1..]`.
                 let shifted: Vec<_> =
                     array_literal_args.iter().filter_map(|(p, n, m, i)| p.checked_sub(1).map(|p2| (p2, n.clone(), *m, i.clone()))).collect();
                 return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &argv[1..], &shifted));
             }
-            // `readonly` is `declare -r`, the same way `export` is
-            // `declare -x` -- and for the same reason: run_declare is
-            // what knows about array literals, so the standalone
-            // version silently dropped the value of `readonly a=(1)`.
-            // The position bookkeeping is identical; see `export`.
+            // `readonly` is `declare -r`, as `export` is `declare -x`, so
+            // array literals (`readonly a=(1)`) keep their value. See
+            // `export` for the positions.
             "readonly" => {
                 let mut declare_args = vec!["-r".to_string()];
                 declare_args.extend(argv[1..].iter().cloned());
                 return ExecResult::Status(crate::builtins::vars::run_declare(self, &name, &declare_args, array_literal_args));
             }
-            // exec CMD [args...] replaces this process image entirely (no
-            // fork, no return on success) -- exactly what real bash does,
-            // and available here as safe std (CommandExt::exec wraps
-            // execvp, distinct from the fork() this shell avoids).
+            // `exec CMD [args...]` replaces this process
+            // (`CommandExt::exec`, an execvp, not a fork), as in bash.
             "exec" if !matches!(parse_exec_opts(&argv), ExecOpts::RedirectsOnly) => {
                 let opts = match parse_exec_opts(&argv) {
                     ExecOpts::Run(o) => o,
@@ -7865,9 +7857,9 @@ impl Shell {
                     sh_eprintln!(self, "bish: exec: restricted");
                     return ExecResult::Status(1);
                 }
-                // argv[0] as the new process will see it: `-a NAME`
-                // wins, `-l` prefixes a dash (what a login shell looks
-                // for), and otherwise it is the command word itself.
+                // argv[0] for the new process: `-a NAME`, or the command
+                // word with a leading dash under `-l`, which a login shell
+                // looks for.
                 let argv0 = {
                     let base = opts.arg0.clone().unwrap_or_else(|| argv[opts.first].clone());
                     if opts.login { format!("-{}", base) } else { base }
@@ -7880,22 +7872,12 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
-                // Inside a converted foreground subshell/command-
-                // substitution/proc-sub, or a window-pane's own virtual-
-                // child Shell (subshell_depth > 0 -- see new_virtual_
-                // child's own doc comment: it's incremented for either),
-                // a literal execve would replace the one real process
-                // every sibling session/construct shares, not just "this
-                // subshell" -- a real, severe regression from the old
-                // re-exec'd design, where this call really did only ever
-                // replace that subshell's own separate child process.
-                // Falls back to spawning CMD as a real, separate child
-                // instead, matching what a genuine forked subshell's own
-                // exec would actually replace; since real `exec` never
-                // returns control to the rest of this script either way,
-                // this unwinds via the same ExecResult::Exit run_in_
-                // child_shell already uses to stop just this child
-                // without touching the real process.
+                // Inside a converted subshell or substitution, or a pane's
+                // virtual-child Shell (`subshell_depth > 0`), an execve
+                // would replace the one process every session shares. So
+                // CMD runs as a separate child, as a forked subshell's exec
+                // would replace only that subshell, and this unwinds with
+                // `ExecResult::Exit` to end just this child.
                 if self.subshell_depth > 0 {
                     let mut command = self.command(prog);
                     set_command_arg0(&mut command, &argv0);
@@ -7911,8 +7893,8 @@ impl Shell {
                     self.note_external_spawn();
                     let status = match command.status() {
                         Ok(status) => exit_code_from_status(status),
-                        // Same "leave $? at whatever it already was"
-                        // behavior as the real top-level case just below.
+                        // `$?` stays as it was, as in the top-level case
+                        // below.
                         Err(e) => {
                             let text = match e.kind() == std::io::ErrorKind::NotFound {
                                 true => "not found".to_string(),
@@ -7931,34 +7913,25 @@ impl Shell {
                     command.env_clear();
                 }
                 command.args(rest);
-                // The redirects can't go through apply_fd_redirects'
-                // pre_exec hook -- CommandExt::exec below is a direct
-                // execve of *this* process, no fork, so there is no
-                // child to install a pre_exec closure into.
-                // Moot if the execve below succeeds -- there is no
-                // "after" to restore in a process that has been replaced
-                // -- but it does not always succeed, and a shell that
-                // carried on past a failed `exec prog >file` would carry
-                // on with the redirect still applied.
+                // Not through `apply_fd_redirects`' pre_exec: this execs
+                // this process itself, with no child. Recorded in case the
+                // execve fails, so the shell doesn't carry on with the
+                // redirect applied.
                 self.note_fd012_change();
                 if let Err(e) = apply_fds_to_self(redirs.actions) {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
                 let err = exec_replacing_process(&mut command);
-                // bash's own wording for this one is just "not found",
-                // shorter than the message anywhere else.
+                // bash's wording here is just "not found".
                 let text = match err.kind() == std::io::ErrorKind::NotFound {
                     true => "not found".to_string(),
                     false => os_message(&err),
                 };
                 sh_eprintln!(self, "bish: exec: {}: {}", prog, text);
-                // A non-interactive shell exits immediately when exec
-                // cannot run the command. An earlier comment here said
-                // bash 5.0.17 left `$?` at whatever it already was;
-                // bash 5.3 exits 127 for a name it could not find and
-                // 126 for one it found and could not run, the same two
-                // statuses an ordinary command word gets.
+                // A script exits when exec can't run the command: 127 for a
+                // name not found, 126 for one that couldn't run, as for an
+                // ordinary command word (bash 5.3).
                 let status = match err.kind() == std::io::ErrorKind::NotFound {
                     true => 127,
                     false => 126,
@@ -7966,14 +7939,11 @@ impl Shell {
                 self.run_exit_trap();
                 return ExecResult::Exit(status);
             }
-            // Bare `exec` (no command word): persistently applies its
-            // redirects -- numbered-fd (`exec 3>file`, `exec 3>&1`,
-            // `exec 3>&-`) and plain fd 0/1/2 (`exec > file`,
-            // `exec 2>>err.log`) alike -- to this shell's own process, so
-            // subsequently spawned commands inherit them. Covers idioms
-            // like `exec > logfile 2>&1` (whole-script output redirection)
-            // and the `exec 3>&1 1>logfile; cmd; exec 1>&3 3>&-` fd-
-            // juggling trick.
+            // Bare `exec`: applies its redirects to this process for good,
+            // numbered fds (`exec 3>file`, `exec 3>&-`) and 0-2
+            // (`exec > file`) alike, so later commands inherit them:
+            // `exec > logfile 2>&1`, or
+            // `exec 3>&1 1>logfile; cmd; exec 1>&3 3>&-`.
             "exec" => {
                 let redirs = match self.resolve_redirects(cmd) {
                     Ok(r) => r,
@@ -7982,8 +7952,8 @@ impl Shell {
                         return ExecResult::Status(1);
                     }
                 };
-                // The one thing that repoints this process's own fd
-                // 0/1/2 in place, so the one thing that has to say so.
+                // This repoints the process's own fds 0-2 in place, so it
+                // records that.
                 self.note_fd012_change();
                 let moved: Vec<i32> = redirs.actions.iter().map(FdAction::target).collect();
                 if let Err(e) = apply_fds_to_self(redirs.actions) {
@@ -8021,82 +7991,41 @@ impl Shell {
         let mut command = self.command(&name);
         command.args(&argv[1..]);
         command.current_dir(&self.cwd);
-        // Read back rather than expanded again: `apply_prefix_assigns`
-        // has already put each one in the shell, and expanding here too
-        // ran every `$( )` in an assignment a second time.
+        // Read back, not expanded again: `apply_prefix_assigns` already set
+        // them, and expanding here would run each `$( )` twice.
         for (k, _, _) in &cmd.assigns {
             let v = self.lookup_var(k);
             command.env(k, v);
         }
-        // A job spawned while promoted gets attached to a fresh pty
-        // instead of the real terminal's
-        // inherited fds -- see Job::pty_master's doc comment. Without
-        // this, its output would go straight onto whatever the real
-        // screen happens to show, which the compositor's next redraw
-        // (driven only by what's actually captured in the session's
-        // grid) would just silently overwrite -- confirmed as a real,
-        // easy-to-hit bug: *any* promoted foreground external command
-        // (most commands -- echo/pwd/ls/... aren't builtins) had its
-        // output vanish this way before this covered the foreground
-        // case too, not just background. Every other case (not
-        // promoted, or explicitly redirected) keeps today's inherited-
-        // stdio behavior exactly -- including a *non*-promoted
-        // foreground command, which gets M11's real-job-control
-        // tcsetpgrp/waitpid_untraced treatment further below instead;
-        // there's no compositor to interfere with there, so a pty would
-        // just be unnecessary overhead. Its own redirects are no
-        // obstacle: they are layered on top of the pty below, so a
-        // command that redirects one stream still shows the others in
-        // the pane.
-        // ...and only when this command's stdout would otherwise be the
-        // inherited terminal, which is the case the compositor paints
-        // over. If something has *already* said where the output goes --
-        // a `$( )` capture's own memfd, an enclosing `{ ... } > file` --
-        // then that is where it belongs, and handing the command a pty
-        // instead sends it somewhere nobody is reading. `x=$(date)` came
-        // back empty in every promoted session for exactly that reason:
-        // a single external command inside a capture took this path, and
-        // its output went to a pty rather than into the capture. The
-        // same predicate `spawn_stdout_stdio` uses to answer "where does
-        // this child's stdout go", asked here before deciding to
-        // override the answer.
+        // While promoted, a foreground external gets a fresh pty instead of
+        // the real terminal (see `Job::pty_master`): output written
+        // straight to the screen would be overwritten by the next redraw
+        // from the grid. Not promoted, it keeps the terminal and real job
+        // control. Its own redirects are layered over the pty, so the other
+        // streams still show in the pane. Only when its stdout would
+        // otherwise be the terminal: if a `$( )` capture or an enclosing
+        // `> file` already says where output goes, a pty would send it
+        // where nobody reads (`x=$(date)` came back empty).
         let stdout_already_spoken_for = self.stdio_override.as_ref().is_some_and(|o| o.borrow().stdout.is_some());
-        // ...and never inside an in-process pipeline stage, where all
-        // three descriptors are already spoken for by the pipeline
-        // itself. `pty::spawn_attached` hands a command a whole pty,
-        // stdin included, so `seq 1 2 | { echo start; cat; }` had the
-        // `cat` reading from a pty nothing would ever close instead of
-        // from the pipe -- a hang, where before it had merely been
-        // invisible. The stage's own fd 1 already points at the pane
-        // (see run_multi), so there is nothing a pty would add.
-        // PIPELINE_DRAIN being armed is exactly "this is a pipeline
-        // stage running in-process".
+        // Never in an in-process pipeline stage, whose descriptors the
+        // pipeline already set (`PIPELINE_DRAIN` armed means exactly that):
+        // a pty would replace the stage's stdin pipe, and `cat` would hang.
         let use_pty = self.is_promoted() && !stdout_already_spoken_for && !pipeline_drain_armed();
 
         if use_pty {
             if let Ok(p) = pty::open() {
-                // Size the pty to match this session's actual on-screen
-                // area *before* the child ever gets to query it -- see
-                // Shell::pty_size's own doc comment for why an unset
-                // pty otherwise renders a full-screen program tiny.
+                // Size the pty to the session's area before the child asks;
+                // see `pty_size`.
                 let (rows, cols) = self.pty_size();
                 let _ = p.resize(rows, cols);
                 let slave_path = p.slave_path.clone();
                 let _ = pty::attach_on_exec(&mut command, &slave_path);
-                // The pty first, then the descriptors something
-                // else already decided, then this command's own.
-                // `pre_exec` closures run in registration order, so
-                // each layer overwrites only the descriptors it
-                // names and leaves the rest on the pty.
-                //
-                // The middle layer is the one that is easy to miss:
-                // a redirect written on an enclosing construct
-                // (`{ ...; } 2>e`) is not among this command's own
-                // actions at all -- it arrives as a
-                // `stdio_override` that `spawn_stderr_stdio` would
-                // have applied, and the pty attach overwrites that.
-                // Without this, `2>e` captured nothing and the
-                // error went to the pane instead.
+                // The pty, then descriptors something else decided, then
+                // the command's own: pre_exec closures run in order, each
+                // overwriting only what it names. The middle layer is a
+                // redirect on an enclosing construct (`{ ...; } 2>e`),
+                // which arrives as a `stdio_override`, not among this
+                // command's actions; without it `2>e` captured nothing.
                 let mut actions = Vec::new();
                 if let Some(o) = self.stdio_override.as_ref()
                     && let Some(err) = o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok())
@@ -8165,16 +8094,13 @@ impl Shell {
                     }
                 };
             }
-            // pty::open() failing (fd exhaustion, etc.) shouldn't stop the
-            // job from running at all, just from being fg-renderable
-            // later -- fall through to the ordinary inherited-stdio path.
+            // If `pty::open` fails (fd exhaustion), the job still runs on
+            // inherited stdio; it just can't be rendered by `fg` later.
         }
 
-        // Reached only when at least one stream *was* redirected (that's
-        // what ruled out the pty path above). Backgrounded, the ones that
-        // weren't redirected still need somewhere to go that isn't the real
-        // screen -- see run_compound_redirected's own identical handling
-        // for why redirecting one stream says nothing about the others.
+        // Only reached with at least one stream redirected. Backgrounded, the
+        // others still need somewhere other than the real screen (see
+        // `run_compound_redirected`).
         let bg_pty = if background { self.background_pty() } else { None };
         let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
             let p = pty.as_ref()?;
@@ -8190,28 +8116,20 @@ impl Shell {
         command.stderr(bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stderr_stdio()));
         apply_fd_redirects(&mut command, redirs.actions);
 
-        // Real job control (M11), gated on `set -m` like fg/bg already are
-        // (see their own opt_monitor checks): give this single external
-        // command its own process group, seeded from its own (eventual)
-        // pid, so a signal the terminal driver generates -- Ctrl-C,
-        // Ctrl-Z -- targets only it, never bish. Set from *both* sides
-        // (here, in the child, before exec; and again from the parent
-        // right after spawn() returns below) to avoid the classic job-
-        // control race where either side might run first -- setpgid(pid,
-        // pid) is idempotent, so redundantly calling it twice is safe.
+        // Under `set -m`, this command gets its own process group from its
+        // pid, so Ctrl-C and Ctrl-Z from the terminal reach only it. Set in
+        // the child before exec and in the parent after spawn, avoiding the
+        // race; setpgid is idempotent.
         if self.opt_monitor {
             #[cfg(unix)]
             unsafe {
                 command.pre_exec(|| {
                     crate::platform::set_process_group(0, 0);
-                    // bish ignores SIGTTIN/SIGTTOU for itself (see
-                    // term::ignore_tty_signals), a disposition that
-                    // survives exec() the same way SIGINT's does (see
-                    // apply_fd_redirects' own comment on this) -- without
-                    // resetting them back to default here, a child later
-                    // moved to the background (`bg`) that tries to read
-                    // the terminal would silently ignore SIGTTIN instead
-                    // of correctly stopping.
+                    // bish ignores SIGTTIN/SIGTTOU
+                    // (`term::ignore_tty_signals`), and that survives exec
+                    // like SIGINT does (see `apply_fd_redirects`); reset,
+                    // or a job later `bg`'d would ignore SIGTTIN instead of
+                    // stopping on a read.
                     crate::platform::default_signal(crate::term::SIGTTIN);
                     crate::platform::default_signal(crate::term::SIGTTOU);
                     Ok(())
@@ -8236,10 +8154,9 @@ impl Shell {
                     self.push_job_full(vec![child], cmd_text, bg_pty.map(|p| p.master), pgid);
                     ExecResult::Status(0)
                 } else if self.opt_monitor {
-                    // Foreground, with real job control: hand the real
-                    // terminal to the child, wait watching for it to stop
-                    // (not just exit -- see waitpid_untraced), then
-                    // reclaim the terminal for bish either way.
+                    // Foreground with job control: give the child the
+                    // terminal, wait for it to exit or stop
+                    // (`waitpid_untraced`), then take the terminal back.
                     pty::tcsetpgrp(0, pid as i32).ok();
                     let outcome = waitpid_untraced(pid);
                     pty::tcsetpgrp(0, crate::platform::process_group()).ok();
@@ -8269,9 +8186,8 @@ impl Shell {
                                 });
                                 id
                             };
-                            // Bash convention: $? = 128+signum for a
-                            // foreground job the shell caught stopping,
-                            // same family as a signal-killed exit status.
+                            // As in bash, `$?` is 128+signal for a
+                            // foreground job that stopped.
                             sh_println!(self, "\n[{}]+  Stopped                 {}", id, cmd_text);
                             ExecResult::Status(148)
                         }
@@ -8302,37 +8218,19 @@ impl Shell {
         }
     }
 
-    // Every pipeline stage is a separate process by necessity (that's what
-    // makes piping possible at all), so compound-command stages self-exec
-    // just like Subshell already does -- this is actually the *correct*
-    // bash semantics too: piped stages always fork, even in real bash.
-    /// Whether this pipeline stage needs a shell to run it at all.
-    ///
-    /// Decided syntactically, without expanding anything: expansion has
-    /// side effects (a `$( )` in a stage's own words runs a command),
-    /// and doing it here would move those side effects earlier than the
-    /// stage they belong to. A first word that is a plain literal can be
-    /// checked against the builtin and function tables directly;
-    /// anything else -- a variable, a substitution, a glob -- is assumed
-    /// to need one, which is the safe direction to be wrong in, since
-    /// running an external command through a shell still works and the
-    /// reverse does not.
+    /// Whether this stage needs a shell, decided syntactically: expanding
+    /// would run a `$( )` before its stage. A literal first word is checked
+    /// against builtins and functions; anything else (a variable, a
+    /// substitution, a glob) is assumed to need one, the safe direction,
+    /// since an external through a shell still works.
     fn stage_needs_interpreter(&self, cmd: &parser::Command) -> bool {
         let parser::Command::Simple(sc) = cmd else { return true };
         let Some(first) = sc.words.first() else { return true };
         match first.chunks.as_slice() {
-            // A *quoted* name is the same name: `'wc' -l` runs wc, and
-            // quoting a builtin's own name does not stop it being
-            // recognised either (see run_single's first_word_literal,
-            // which has always matched both). Reading only the unquoted
-            // form meant a quoted external was classed as needing the
-            // interpreter and run as a coroutine stage -- and a
-            // pipeline of two such stages, one of them spawning a real
-            // process on the far end of its own pipe, hangs.
-            //
-            // Which is not a hypothetical: the serializer quotes every
-            // word, so this is the shape a re-exec'd construct arrives
-            // in.
+            // A quoted name is the same name (`'wc' -l` runs wc), as in
+            // `run_single`. The serializer quotes every word, so a
+            // re-exec'd construct arrives this way, and classing a quoted
+            // external as a shell stage could hang a pipeline.
             [crate::lexer::Chunk::Str(name)] | [crate::lexer::Chunk::LiteralStr(name, _)] => {
                 self.is_active_builtin(name) || self.functions.contains_key(name)
             }
@@ -8340,18 +8238,12 @@ impl Shell {
         }
     }
 
-    /// A pipeline with two or more stages that need a shell, run without
-    /// a single extra process.
-    ///
-    /// One shell stage can simply run here, between spawning the others
-    /// and waiting for them -- the real processes on the far ends of its
-    /// pipes are what keep it from deadlocking. Two cannot: each would
-    /// block on a pipe the other is on the far end of, and there is only
-    /// one thread. So they run as coroutines, and the scheduler hands
-    /// the thread to whichever one can move (see `scheduler`).
-    ///
-    /// Stages that are real commands are still real processes. They need
-    /// no help: the kernel runs them.
+    /// A pipeline with two or more stages needing a shell, without extra
+    /// processes. One shell stage can run inline between spawning the
+    /// others and waiting; two would each block on a pipe the other holds,
+    /// on one thread. So they run as coroutines, the scheduler giving the
+    /// thread to whichever can move (see `scheduler`). Real commands stay
+    /// real processes.
     fn run_multi_scheduled(&mut self, commands: &[parser::Command]) -> i32 {
         let n = commands.len();
         let is_shell_stage: Vec<bool> = commands.iter().map(|c| self.stage_needs_interpreter(c)).collect();
@@ -8362,12 +8254,9 @@ impl Shell {
         for i in 0..n.saturating_sub(1) {
             match make_pipe() {
                 Ok((read_end, write_end)) => {
-                    // Left blocking. A stage must not *actually* block
-                    // in the kernel -- it would take the thread and
-                    // every other stage with it -- but the flag that
-                    // prevents that is set only around this shell's own
-                    // reads and writes, by `briefly_nonblocking`, so
-                    // that a child spawned by a stage never inherits it.
+                    // Left blocking: `briefly_nonblocking` sets the flag
+                    // only around this shell's own reads and writes, so a
+                    // stage's children never inherit it.
                     write_ends[i] = Some(write_end);
                     read_ends[i + 1] = Some(read_end);
                 }
@@ -8378,10 +8267,8 @@ impl Shell {
             }
         }
 
-        // The same pane output the in-process path gets -- see
-        // run_multi. Two shell stages take this path instead of that
-        // one, and `{ echo a; } | { read x; cat; }` was as invisible in
-        // a pane as `ls | grep x` used to be.
+        // The same pane output the in-process path gets (see `run_multi`), so
+        // `{ echo a; } | { read x; cat; }` shows in a pane.
         let pane_pty = match self.is_promoted() && self.stdio_override.is_none() {
             true => self.background_pty(),
             false => None,
@@ -8450,94 +8337,67 @@ impl Shell {
                 continue;
             }
 
-            // A shell stage. Built and connected now, run later: every
-            // stage has to exist before any of them starts, because each
-            // blocks on a pipe another is on the far end of.
+            // A shell stage, built and connected now and run later: every
+            // stage must exist before any starts.
             //
-            // An ordinary virtual child with no redirect of its own:
-            // its pipes arrive as the real fd 0 and fd 1, installed by
-            // the scheduler for the duration of each of its turns. That
-            // is what a stage running as its own process gets, and it
-            // is what keeps `exec {fd}<&0`, an external command
-            // inheriting the rest of the input, and a builtin writing
-            // to fd 1 all behaving the way they already did.
-            // Where this stage's output goes, which is not the same
-            // question for the last stage as for the others.
-            //
-            // A stage with a pipe on its stdout wants `Real`: the
-            // scheduler points fd 1 at that pipe for the duration of
-            // each of its turns, and `Real` is what follows fd 1. That
-            // is what `new_virtual_child` already gives, and it is why
-            // a builtin stage writes into the pipe at all.
-            //
-            // The last stage has no pipe, and `Real` is then wrong: its
-            // output belongs wherever this shell's own goes -- a `$( )`
-            // capture, a pane's grid -- and fd 1 is neither. So it
-            // inherits the sink and stdio exactly the way any other
-            // unredirected child construct does. Without this,
-            // `x=$(printf 'a\nb\n' | { read v; echo "got=$v"; })` wrote
-            // "got=a" onto the terminal and left `x` empty.
+            // A stage with a pipe on its stdout keeps `Real`, since the
+            // scheduler points fd 1 at that pipe during each turn, as for a
+            // separate process, so builtins, `exec {fd}<&0` and inheriting
+            // externals behave as before. The last stage has no pipe, and
+            // its output belongs where this shell's goes (a `$( )` capture,
+            // a pane), so it inherits the sink and stdio like any
+            // unredirected child, or
+            // `x=$(printf 'a\nb\n' | { read v; echo $v; })` would print to
+            // the terminal.
             let mut child = match stdout_end.is_some() {
                 true => self.new_virtual_child(),
                 false => self.child_for_stdio(ChildStdio::default()),
             };
-            // A stage is a subshell, and so not the login shell -- see
-            // run_body_in_child_shell.
+            // A stage is a subshell, not the login shell; see
+            // `run_body_in_child_shell`.
             child.login_shell = false;
-            // ...and one bash forks, which leaves with its redirects
-            // where they are (see `run_exit_trap`).
+            // ...and one bash forks, keeping its redirects (see
+            // `run_exit_trap`).
             child.forked_subshell = true;
-            // No DEBUG trap inside this stage, in the two cases where
-            // bash has none either. A simple stage was already named
-            // and traced by `run_multi` before any stage started; a
-            // compound one is a subshell, which does not inherit the
-            // trap unless `set -T` says so. It matters more here than
-            // anywhere: a stage on this path runs as a coroutine with
-            // the pipe already installed as its stdout, so a trap
-            // firing inside one wrote its own output *into the pipe*
-            // and `echo a | { read v; echo "got $v"; }` answered
-            // `got [echo a]`.
+            // No DEBUG trap inside, where bash has none either: a simple
+            // stage was already traced by `run_multi`, and a compound one
+            // is a subshell that doesn't inherit it without `set -T`. Here
+            // a trap would write into the stage's pipe.
             if matches!(cmd, parser::Command::Simple(_)) || !self.opt_functrace {
                 child.debug_trap = None;
             }
             let body = cmd.clone();
             let code = Rc::clone(&codes[i]);
             let stage = move || {
-                // Armed here rather than by the caller: the watch is
-                // swapped per task by the scheduler, so this is the
-                // first moment this stage's own is the thread's.
+                // Armed here: the scheduler swaps the watch per task, so
+                // this is when this stage's is the thread's.
                 arm_broken_pipe();
                 let result = crate::builtins::shell::run_command(&mut child, &body, false);
                 if !matches!(result, ExecResult::Exit(_)) {
                     child.run_exit_trap();
                 }
-                // A stage whose reader left is dead the same way a
-                // separate process would have been, with the status
-                // SIGPIPE would have given it.
+                // A stage whose reader left dies as a separate process
+                // would, with SIGPIPE's status.
                 code.set(if disarm_broken_pipe() { 128 + 13 } else { result.status() });
             };
-            // Pipeline stages are run to completion by `Scheduler::run`
-            // before anything else happens, so cancellation never
-            // reaches them either way.
+            // `Scheduler::run` runs pipeline stages to completion first, so
+            // cancellation never reaches them.
             if let Err(e) = scheduler.add_with_fds(stage, stdin_end, stdout_end, true) {
                 sh_eprintln!(self, "bish: {}", e);
                 kill_all(children);
                 return 1;
             }
         }
-        // Every end this shell still holds is one the reader downstream
-        // would wait on for ever.
+        // Any end this shell still holds is one a reader would wait on
+        // forever.
         drop(read_ends);
         drop(write_ends);
 
-        // A shell stage with no pipe on its stdout is handed the
-        // shell's own fd 1 by `install_fds`, so pointing fd 1 and 2 at
-        // the pane for the duration of the run is what gives the last
-        // stage -- and anything it spawns -- somewhere visible to write.
-        // Armed as the drain too, so a coroutine whose write blocks
-        // empties the pty rather than parking on a descriptor that only
-        // this thread can relieve; the scheduler drains from its own
-        // idle path for the same reason.
+        // A stage without a pipe on stdout gets this shell's fd 1 from
+        // `install_fds`, so pointing fds 1 and 2 at the pane during the run
+        // gives the last stage, and what it spawns, somewhere visible.
+        // Armed as the drain too, so a blocked write empties the pty
+        // instead of parking.
         let saved_fds = save_fd012();
         let stage_slave = match &pane_pty {
             Some(p) => std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok(),
@@ -8619,73 +8479,32 @@ impl Shell {
             }
         }
         let mut never_started: Vec<(usize, i32)> = Vec::new();
-        // The previous stage's read end, kept as a `ChildStdout` rather
-        // than a `Stdio`: `lastpipe` needs its fd, and only ChildStdout
-        // still has one.
+        // The previous stage's read end, as an fd, since `lastpipe` needs
+        // one.
         let mut prev_stdout: Option<std::os::fd::OwnedFd> = None;
-        // Real job control isolation (see run_single's own identical
-        // pre_exec/setpgid pattern) for a *backgrounded* pipeline only --
-        // every stage joins the same process group, seeded from the
-        // first stage's own (eventual) pid, once it's known (`None`
-        // means "not seeded yet," i.e. this is that first stage). `kill
-        // %N`/`bg`'s own SIGCONT-to-process-group then reaches every
-        // stage at once, same as a real shell's own pipeline job.
-        // Deliberately gated on `background` too, not just opt_monitor
-        // (unlike run_single, which isolates a foreground command as
-        // well before separately reassigning the terminal's own
-        // foreground group to it): a *foreground* pipeline isn't given
-        // any of that tcsetpgrp/stop-handling machinery here, so
-        // isolating it into its own group without also doing that would
-        // just stop a foreground Ctrl-C from ever reaching it -- a
-        // regression today's "no isolation at all, inherits bish's own
-        // group" behavior doesn't have.
+        // For a backgrounded pipeline only, every stage joins one process
+        // group seeded from the first stage's pid (`None` until then), so
+        // `kill %N` and `bg` reach them all, as in `run_single`. Not for a
+        // foreground pipeline: without the `tcsetpgrp` and stop handling,
+        // isolating it would stop Ctrl-C from reaching it.
         let mut pgid: Option<i32> = None;
 
-        // `shopt -s lastpipe`: the *last* stage runs in this shell
-        // rather than in a child, so `seq 3 | while read l; do n=$l;
-        // done` leaves `n` set. bash gates it on job control being off
-        // (an interactive shell has to be able to name the stage as a
-        // job) and on the pipeline being in the foreground; this adds
-        // one more gate, that stdin is not already redirected by an
-        // enclosing converted construct, since the stage's stdin here
-        // is installed by dup2 onto the real fd 0.
+        // `shopt -s lastpipe`: the last stage runs in this shell, so
+        // `seq 3 | while read l; do n=$l; done` leaves `n` set. As in bash,
+        // only with job control off and in the foreground; also only when
+        // no enclosing construct redirects stdin, since the stage's stdin
+        // is dup2'd onto fd 0.
         let lastpipe = n > 1 && !background && !self.opt_monitor && self.stdio_override.is_none() && self.shopt_is_on("lastpipe");
 
-        // A backgrounded pipeline's own pty (see background_pty): the
-        // first stage reads from it, the last writes to it, and every
-        // stage's stderr goes there too -- inherited, any of that would
-        // land straight on the real screen for the compositor to wipe.
-        // Wired as plain fds rather than via spawn_attached, whose setsid
-        // would undo the process-group isolation set up just below (and
-        // which `kill %N`/`bg` need to reach every stage at once).
-        //
-        // The one stage that can run in this shell instead of as a
-        // separate process.
-        //
-        // A pipeline needs its stages to run *concurrently*, and that is
-        // the only reason each one is a process today. But when exactly
-        // one stage needs a shell, every other stage is a real command
-        // already running on the other end of a pipe -- so the
-        // concurrency is there, provided by them, and the shell stage
-        // can simply run here, after they are spawned and before they
-        // are waited for. It reads a pipe a real process is filling and
-        // writes one a real process is draining; neither can deadlock,
-        // because the other end is never this thread.
-        //
-        // Two or more shell stages would need two interpreters running
-        // at once, which is a different problem, and those still
-        // re-exec. `lastpipe` already claims the in-shell slot where it
-        // applies, and only one stage can have it: a second would run
-        // sequentially with the first, and whichever ran first would
-        // fill its pipe with nothing draining it.
-        // Two or more stages that need a shell: they cannot take turns
-        // by running one here between the others, because each would be
-        // waiting on a pipe the other is on the far end of. Those go to
-        // the scheduler, which is the only path that needs coroutines
-        // at all.
+        // Two or more stages needing a shell can't take turns inline, each
+        // waiting on a pipe the other holds, so they go to the scheduler.
         if !background && !lastpipe && n >= 2 && commands.iter().filter(|c| self.stage_needs_interpreter(c)).count() >= 2 {
             return self.run_multi_scheduled(commands);
         }
+        // The one stage that can run in this shell: when exactly one stage
+        // needs a shell, the others are real processes on the far ends of
+        // its pipes, so it can run inline after they start without
+        // deadlocking. `lastpipe` already claims that slot where it applies.
         let inproc_stage = if background || n < 2 || lastpipe {
             None
         } else {
@@ -8695,8 +8514,7 @@ impl Shell {
                 _ => None,
             }
         };
-        // Its stdin and stdout, once the loop below has worked out what
-        // they are.
+        // Its stdin and stdout, once the loop below works them out.
         let mut inproc_stdio: Option<(Option<std::os::fd::OwnedFd>, Option<std::os::fd::OwnedFd>)> = None;
 
         let bg_pty = if background { self.background_pty() } else { None };
@@ -8705,13 +8523,10 @@ impl Shell {
             std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
         };
 
-        // A foreground pipeline in a pane needs somewhere for its own
-        // output to go. Inherited means the real terminal underneath,
-        // which the compositor paints over -- so `ls | grep x` in a
-        // split window printed nothing, and never had. A pty rather
-        // than a pipe for the same reason a single external command
-        // gets one: the stages then see a terminal, exactly as they
-        // would have outside a pane.
+        // A foreground pipeline in a pane needs somewhere for its output:
+        // inherited, it goes to the terminal under the compositor, so
+        // `ls | grep x` showed nothing. A pty, as a single external gets,
+        // so the stages still see a terminal.
         let pane_pty = match !background && self.is_promoted() && self.stdio_override.is_none() {
             true => self.background_pty(),
             false => None,
@@ -8738,8 +8553,8 @@ impl Shell {
                 break;
             }
             if Some(i) == inproc_stage {
-                // Not spawned: its fds are recorded here and it runs
-                // below, once every other stage is already going.
+                // Not spawned: its fds are recorded and it runs below,
+                // after the others start.
                 let stdin_fd = prev_stdout.take();
                 let stdout_fd = if is_last {
                     None
@@ -8759,8 +8574,8 @@ impl Shell {
                 inproc_stdio = Some((stdin_fd, stdout_fd));
                 continue;
             }
-            // Only the first stage takes the pty as stdin -- every other
-            // one reads the previous stage's pipe, exactly as before.
+            // Only the first stage reads the pty; the rest read the
+            // previous pipe.
             let default_stdin = match prev_stdout.take() {
                 Some(prev) => stdio_from_owned(prev),
                 None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
@@ -8771,10 +8586,9 @@ impl Shell {
             };
             let mut default_stderr = bg_slave(&bg_pty).or_else(|| pane_slave(&pane_pty));
 
-            // What to call this stage if it will not start. Only a
-            // simple command has a name worth reporting; every other
-            // kind is re-exec'd as this shell, and a failure to spawn
-            // *that* is not a missing command.
+            // What to call this stage if it won't start: only a simple
+            // command has a name worth reporting; other kinds re-exec this
+            // shell.
             let mut stage_name: Option<String> = None;
             let mut command = match cmd {
                 parser::Command::Simple(sc) => {
@@ -8795,13 +8609,9 @@ impl Shell {
                             return 1;
                         }
                     };
-                    // Builtins and shell functions aren't real executables,
-                    // so they can't be Command::new'd directly. Route them
-                    // through the same self-exec trick used for compound
-                    // commands below, replaying the *already-expanded*
-                    // argv as single-quoted literals so the child doesn't
-                    // re-run any command substitution/glob/etc a second
-                    // time.
+                    // Builtins and functions aren't executables, so they
+                    // re-exec this shell with the already-expanded argv as
+                    // single-quoted literals, so nothing is expanded twice.
                     stage_name = Some(argv[0].clone());
                     let mut command = if self.is_active_builtin(&argv[0]) || self.functions.contains_key(&argv[0]) {
                         let exe = match std::env::current_exe() {
@@ -8828,29 +8638,19 @@ impl Shell {
                             AssignMode::Set => v,
                             AssignMode::Append => self.appended_value(k, &v),
                         };
-                        // Always `=`, and always the value that ends
-                        // up in the environment: bash traces a prefix
-                        // `p+=y` as `p=xy`, where a standalone `p+=y`
-                        // keeps its own operator. The two are different
-                        // things -- one is an assignment, the other is
-                        // part of a command -- and only the second is
-                        // reported as what the child will see.
+                        // Always `=` with the value the child sees: bash
+                        // traces a prefix `p+=y` as `p=xy`.
                         if self.opt_xtrace {
                             traced.push(format!("{}={}", k, xtrace_quote(&v)));
                         }
                         command.env(k, v);
                     }
-                    // Traced here, because a pipeline stage never goes
-                    // through `run_simple` -- it is spawned straight
-                    // from this loop, so `set -x; echo a | cat` traced
-                    // only the `echo` and the trace stopped describing
-                    // the pipeline at the first `|`. A prefix
-                    // assignment gets its own line first, as it does
-                    // there. The stage that runs *in* this shell is
-                    // skipped above and traces itself when it runs,
-                    // which is later than bash traces it -- see the
+                    // Traced here, since a stage never goes through
+                    // `run_simple`, so `set -x; echo a | cat` traces both
+                    // stages. The in-shell stage traces itself when it
+                    // runs, later than bash (the
                     // `xtrace-traces-a-stage-running-in-this-shell-last`
-                    // divergence.
+                    // divergence).
                     if self.opt_xtrace {
                         let ps4 = self.xtrace_prefix();
                         for line in &traced {
@@ -8898,10 +8698,8 @@ impl Shell {
             };
             command.current_dir(&self.cwd);
 
-            // Set from *both* sides (here, in the child; and again from
-            // the parent right after spawn() returns below) to avoid the
-            // classic job-control race -- same reasoning/idempotency as
-            // run_single's own identical pre_exec hook.
+            // Set in the child and in the parent after spawn, avoiding the
+            // race, as in `run_single`.
             if background && self.opt_monitor {
                 #[cfg(unix)]
                 let join_pgid = pgid;
@@ -8916,12 +8714,8 @@ impl Shell {
                 }
             }
 
-            // Every pipeline stage is a genuinely separate process (even
-            // a builtin/function stage runs as a re-exec'd bish -c
-            // script -- see the `other` arm above) whose own stdout, for
-            // the last stage, is inherited straight from the real
-            // terminal -- see ran_external_since_prompt's own doc
-            // comment.
+            // The last stage's stdout is the real terminal, so record it; see
+            // `ran_external_since_prompt`.
             if is_last {
                 self.note_external_spawn();
             }
@@ -8940,24 +8734,18 @@ impl Shell {
                     children.push((i, child));
                 }
                 Err(e) => {
-                    // A stage that will not start has *exited 127*; it
-                    // has not ended the pipeline. bash runs the rest --
-                    // `nosuchcmd | head -1` leaves `head` to read an
-                    // empty input and reports `(127 0)` with `$?` from
-                    // the last stage. Killing the others instead lost
-                    // all three answers at once: the message came out
-                    // as a raw `No such file or directory (os error
-                    // 2)`, `PIPESTATUS` was empty, and `$?` was 127
-                    // whichever stage had failed.
+                    // A stage that won't start exited 127; the pipeline
+                    // carries on, as in bash: `nosuchcmd | head -1` leaves
+                    // `head` reading empty input, giving PIPESTATUS
+                    // `(127 0)` and `$?` from the last stage.
                     let (msg, status) = match &stage_name {
                         Some(name) => spawn_failure(name, &e),
                         None => (format!("bish: {e}"), 127),
                     };
                     sh_eprintln!(self, "{}", msg);
                     never_started.push((i, status));
-                    // Nothing will ever write to the next stage's
-                    // input, and that is exactly what it should see:
-                    // end of input, immediately.
+                    // Nothing will write to the next stage's input, so it
+                    // sees end of input at once.
                     prev_stdout = None;
                     continue;
                 }
@@ -9032,36 +8820,24 @@ impl Shell {
             // Armed only around this: an `EPIPE` anywhere else is
             // still ignored, as it always was.
             arm_broken_pipe();
-            // The write end handed over as this stage's explicit
-            // stdout, not just dup2'd onto fd 1 above. fd 1 is enough
-            // for anything this stage *spawns*, but a builtin does not
-            // write to fd 1 -- it writes to the shell's own sink, which
-            // here is still the enclosing one: a `$( )` capture, or a
-            // pane's grid. So `echo hello | wc -c` had `echo` write
-            // straight past the pipe into the capture and `wc` read an
-            // empty one, giving `hello` where bash gives `6`. Handing
-            // the pipe over as a redirect is what makes the sink follow
-            // it, the same way `echo hello >file` already does.
+            // The write end is also this stage's explicit stdout, not just
+            // fd 1: a builtin writes to the shell's sink, still the
+            // enclosing `$( )` capture or pane, so `echo hello | wc -c`
+            // would bypass the pipe. As a redirect, the sink follows it, as
+            // for `echo hello >file`.
             let stdio = match stdout_fd.as_ref().and_then(|fd| fd.try_clone().ok()) {
                 Some(fd) => ChildStdio { stdout: Some(Capture::file(std::fs::File::from(fd))), ..ChildStdio::default() },
                 None => ChildStdio::default(),
             };
-            // Armed for the duration: this stage runs to completion
-            // inline, so nothing else is emptying the pane's pty while
-            // it writes into a pipe whose reader is filling that pty.
-            // See PIPELINE_DRAIN.
+            // Armed for the duration: this stage runs inline, so nothing
+            // else empties the pane's pty while it writes to a pipe whose
+            // reader fills that pty. See PIPELINE_DRAIN.
             PIPELINE_DRAIN.with(|d| *d.borrow_mut() = pane_output.take());
-            // No DEBUG trap for the duration. A simple stage was
-            // already traced above, with every other stage, before any
-            // of them started; a compound stage is a subshell, and a
-            // DEBUG trap is not inherited into one -- `{ echo g; } |
-            // cat` traces `cat` and nothing else in bash. Firing it in
-            // there was not only an extra line: the stage's output is
-            // the pipe, so `echo a | { read v; ... }` had `read` take
-            // the trap's own output as its input.
-            //
-            // `set -T` is the documented exception, and says a subshell
-            // does inherit it.
+            // No DEBUG trap meanwhile: a simple stage was traced above with
+            // the others, and a compound stage is a subshell that doesn't
+            // inherit it (`{ echo g; } | cat` traces only `cat` in bash).
+            // In here its output would go into the pipe. `set -T` is the
+            // exception.
             let hushed = match self.opt_functrace {
                 true => None,
                 false => self.debug_trap.take(),
@@ -9073,31 +8849,25 @@ impl Shell {
             pane_output = PIPELINE_DRAIN.with(|d| d.borrow_mut().take());
             let broken = disarm_broken_pipe();
             restore_fd012(saved);
-            // Dropped before anything is waited for: the stage
-            // downstream sees end-of-input when the last copy of this
-            // pipe's write end closes, and this shell is holding one.
+            // Dropped before waiting: downstream sees end of input when the
+            // last copy of this write end closes, and this shell holds one.
             drop(stdout_fd);
             drop(stdin_fd);
-            // No `pending_exit`: this stage is a subshell, so its own
-            // `exit` ends the stage rather than the shell running it --
-            // which is what `run_command_in_child_shell` has already
-            // turned the result into. That is the one thing `lastpipe`
-            // above must do differently, since its stage is not a
-            // subshell at all.
+            // No `pending_exit`: the stage is a subshell, so its `exit`
+            // ends the stage, as `run_command_in_child_shell` already made
+            // it. `lastpipe`'s stage, not a subshell, differs there.
             inproc_code = Some(if broken { 128 + 13 } else { result.status() });
         }
 
-        // By stage rather than in completion order: `PIPESTATUS` is
-        // positional, and a stage that ran in this shell never went
-        // through `children` at all.
+        // By stage, not completion order: PIPESTATUS is positional, and an
+        // in-shell stage never went through `children`.
         let mut codes: Vec<Option<i32>> = vec![None; n];
         for (stage, status) in never_started {
             codes[stage] = Some(status);
         }
         for (stage, mut c) in children {
-            // Drained while waiting rather than after: a stage that
-            // fills the pty stops until something reads it, and the
-            // only reader is this thread.
+            // Drained while waiting: a stage filling the pty stops until
+            // this thread reads it.
             let code = loop {
                 if let Some(output) = pane_output.as_mut() {
                     output.drain();
@@ -9106,8 +8876,7 @@ impl Shell {
                     Ok(Some(s)) => break exit_code_from_status(s),
                     Ok(None) => match pane_output.is_some() {
                         true => std::thread::sleep(std::time::Duration::from_millis(1)),
-                        // Nothing to keep flowing, so the ordinary
-                        // blocking wait is right.
+                        // Nothing to keep flowing: a blocking wait.
                         false => match c.wait() {
                             Ok(s) => break exit_code_from_status(s),
                             Err(e) => {
@@ -9124,8 +8893,7 @@ impl Shell {
             };
             codes[stage] = Some(code);
         }
-        // Every slave is closed now, so what is left in the master is
-        // all there will ever be.
+        // Every slave is closed, so what's in the master is all there is.
         if let Some(output) = pane_output.as_mut() {
             output.drain();
         }
@@ -9160,8 +8928,8 @@ impl Shell {
                     Ok(v) => s.push_str(&v.to_string()),
                     Err(e) => {
                         sh_eprintln!(self, "bish: {}: {}", raw, e);
-                        // Fatal, unlike the `(( ))` *command* -- see
-                        // expansion_failed.
+                        // Fatal, unlike the `(( ))` command; see
+                        // `expansion_failed`.
                         self.expansion_failed = true;
                     }
                 },
@@ -9227,24 +8995,14 @@ impl Shell {
         s
     }
 
-    // index "@"/"*" joins all elements (in index order) with a space (used
-    // outside the splitting-aware path, where "@" vs "*" can't be
-    // distinguished anyway); any other index is evaluated as an arithmetic
-    // expression (so `${arr[i+1]}` works) and looked up 0-based. A gap
-    // index (never set) reads back as empty, same as an unset scalar.
-    // Associative-array indices are literal (expandable) strings, not
-    // arithmetic expressions -- re-lex the raw index text and expand it,
-    // same as expand_raw (an index like `with space` re-lexes as more than
-    // one Word token; taking only the first would silently truncate it).
+    // An associative index is a string, expanded rather than evaluated. The
+    // raw text is relexed, since `with space` lexes as more than one word.
     pub(crate) fn expand_index_as_string(&mut self, index: &str) -> String {
         self.expand_raw(index)
     }
 
-    // Negative indices count back from the end: bash defines them as
-    // relative to one greater than the array's maximum set index, so -1 is
-    // the last (highest-index) element. Only meaningful for indexed arrays
-    // -- associative-array indices are plain string keys, never resolved
-    // here.
+    // A negative index counts back from one past the highest set index, so
+    // -1 is the last element, as bash defines it. Indexed arrays only.
     pub(crate) fn resolve_array_index(&self, name: &str, i: i64) -> Option<usize> {
         if i >= 0 {
             return Some(i as usize);
@@ -9254,15 +9012,15 @@ impl Shell {
         if resolved >= 0 { Some(resolved as usize) } else { None }
     }
 
-    // Every array accessor starts here: `declare -n r=m` makes `r` a
-    // name for `m`, and `${r[k]}` has to reach `m`'s element the same
-    // way `$r` reaches its value. Scalars were already redirected (see
-    // lookup_var/assign_var); arrays were not, so a nameref to one
-    // silently read as empty.
+    // Every array accessor starts here: through a nameref (`declare -n r=m`),
+    // `${r[k]}` reaches `m`'s element, as `$r` reaches its value.
     pub(crate) fn array_target(&self, name: &str) -> String {
         if self.nameref_names.contains(name) { self.resolve_nameref(name) } else { name.to_string() }
     }
 
+    // An element by index: `@`/`*` join every element in order with spaces;
+    // anything else is arithmetic (`${arr[i+1]}`), 0-based. An unset index
+    // reads empty.
     fn array_element(&mut self, name: &str, index: &str) -> String {
         let name = &self.array_target(name);
         if index == "@" || index == "*" {
@@ -9278,10 +9036,8 @@ impl Shell {
                 Some(idx) => self.arrays.get(name).and_then(|m| m.get(&idx)).cloned().unwrap_or_default(),
                 None => String::new(),
             },
-            // A subscript that will not evaluate is the same failure as
-            // a `$(( ))` that will not, and gets the same treatment:
-            // said out loud and fatal. Swallowed, `${a[1/0]}` was an
-            // empty string and the command carried on with it.
+            // A subscript that won't evaluate fails like a `$(( ))` that
+            // won't: reported and fatal.
             Err(e) => {
                 sh_eprintln!(self, "bish: {}: {}", index, e);
                 self.expansion_failed = true;
@@ -9290,9 +9046,7 @@ impl Shell {
         }
     }
 
-    // Array-element analog of var_is_set: is this specific index actually
-    // present in the (sparse) array, not just reading back empty because
-    // it was never set.
+    // Whether this index is present in the sparse array, not just empty.
     fn array_element_is_set(&mut self, name: &str, index: &str) -> bool {
         let name = &self.array_target(name);
         if index == "@" || index == "*" {
@@ -9327,8 +9081,7 @@ impl Shell {
         self.arrays.get(name).map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
-    // "@"/"*" counts only set elements (real bash arrays are sparse --
-    // `arr[10]=x` alone gives a length of 1, not 11).
+    // `@`/`*` count only set elements: `arr[10]=x` alone has length 1.
     fn array_length(&mut self, name: &str, index: &str) -> usize {
         let name = &self.array_target(name);
         if index == "@" || index == "*" {
@@ -9350,19 +9103,16 @@ impl Shell {
         }
     }
 
-    // `arr[i]=value`. Sets exactly that index -- no resizing/filling, since
-    // the array is a sparse map, matching bash (gaps stay genuinely unset).
-    // Returns the concrete indexed-array index actually written (None for
-    // an associative array, or on a bad-index error) -- used by
-    // apply_array_literal to know where a literal's own running
-    // "next index" counter should resume after an explicit `[i]=value`
-    // element.
-    // `declare 'a[0]=5'` reaches the same element assignment a bare
-    // `a[0]=5` does -- see run_declare, which is outside this module.
+    // `declare 'a[0]=5'` reaches the same element assignment as `a[0]=5`,
+    // from `run_declare` outside this module.
     pub(crate) fn array_set_index_public(&mut self, name: &str, index: &str, value: String) {
         self.array_set_index(name, index, value);
     }
 
+    // `arr[i]=value`: sets exactly that index in the sparse map, leaving
+    // gaps unset, as in bash. Returns the index written (`None` for an
+    // associative array or a bad index), so `apply_array_literal` knows
+    // where its running index resumes after an explicit `[i]=`.
     fn array_set_index(&mut self, name: &str, index: &str, value: String) -> Option<usize> {
         let name = &self.array_target(name);
         if self.name_is_readonly(name) {
