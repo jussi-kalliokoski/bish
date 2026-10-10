@@ -1,36 +1,28 @@
-// git pathspecs: the `--` arguments that limit a git command to part of
-// the tree, including the magic prefixes (`:(exclude)`, `:!`, `:/`,
+// git pathspecs: the arguments after `--` that limit a git command to
+// part of the tree, with the magic prefixes (`:(exclude)`, `:!`, `:/`,
 // `:(glob)`, `:(icase)`, `:(literal)`).
 //
-// Two glob dialects live here, which is the thing to understand about
-// pathspecs and the reason this reuses two different matchers rather
-// than one:
+// Two glob dialects, so two matchers:
 //
-//   - **By default a pathspec's `*` crosses `/`.** `git log '*.c'` finds
-//     `src/deep/a.c`, because git matches with fnmatch *without*
-//     `FNM_PATHNAME`. That is exactly what `glob::matches` already does,
-//     so the default mode is the shell glob this repo has had all along,
-//     handed the whole path.
-//   - **`:(glob)` turns on pathname semantics**, where `*` stops at a
-//     `/` and `**` is how you cross one. That is the gitignore dialect,
-//     so it reuses `gitignore::Pattern` -- anchored, since a pathspec is
-//     always relative to a known root rather than a name to look for at
-//     any depth.
+//   - By default `*` crosses `/`: `git log '*.c'` finds `src/deep/a.c`, as
+//     git uses fnmatch without `FNM_PATHNAME`. That's `glob::matches`,
+//     given the whole path.
+//   - `:(glob)` has pathname semantics: `*` stops at `/`, `**` crosses
+//     it. That's the gitignore dialect, so `gitignore::Pattern`, anchored,
+//     since a pathspec is relative to a known root.
 //
-// On top of either, git matches a pathspec that names a directory
-// against everything under it (`git log Documentation` covers
-// `Documentation/git.txt`).
+// Either way, a pathspec naming a directory covers everything under it
+// (`git log Documentation` covers `Documentation/git.txt`).
 #![allow(dead_code)]
 
 /// One pathspec: its magic, and the pattern the magic applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pathspec {
-    /// `:(exclude)`, `:!` or `:^`. A list is filtered by these *after*
-    /// the positive specs have chosen, never as a match of its own.
+    /// `:(exclude)`, `:!` or `:^`: applied as a filter after the positive
+    /// specs, never as a match.
     pub exclude: bool,
-    /// `:(top)` or `:/`: the pattern is relative to the repository root
-    /// rather than the current directory. Carried, not acted on -- only
-    /// the caller knows which root a path is already relative to.
+    /// `:(top)` or `:/`: relative to the repository root, not the current
+    /// directory. Carried, not acted on: only the caller knows the root.
     pub top: bool,
     /// `:(literal)`: no wildcards at all, the pattern is the name.
     pub literal: bool,
@@ -45,9 +37,8 @@ impl Pathspec {
     pub fn parse(spec: &str) -> Result<Pathspec, String> {
         let mut out = Pathspec { exclude: false, top: false, literal: false, icase: false, glob: false, pattern: String::new() };
         let Some(rest) = spec.strip_prefix(':') else {
-            // No leading colon: the whole thing is the pattern, magic and
-            // all -- which is why a file really named `:foo` needs
-            // `:(literal):foo`.
+            // No leading colon: the whole thing is the pattern, so a file
+            // named `:foo` needs `:(literal):foo`.
             out.pattern = spec.to_string();
             return Ok(out);
         };
@@ -62,9 +53,8 @@ impl Pathspec {
                     "icase" => out.icase = true,
                     "glob" => out.glob = true,
                     "exclude" => out.exclude = true,
-                    // Recognized, and refused rather than quietly
-                    // dropped: silently matching more than was asked for
-                    // is worse than saying no.
+                    // Recognized and refused: silently matching more than
+                    // asked is worse than saying no.
                     w if w.starts_with("attr:") => {
                         return Err(format!("Unimplemented pathspec magic 'attr' in '{spec}'"));
                     }
@@ -73,8 +63,8 @@ impl Pathspec {
             }
             &long[close + 1..]
         } else {
-            // Short form: a run of magic characters, optionally closed by
-            // a `:` so that the pattern can start with one of them.
+            // Short form: magic characters, optionally closed by `:` so the
+            // pattern can start with one.
             let mut chars = rest.char_indices();
             let mut end = rest.len();
             for (i, c) in chars.by_ref() {
@@ -94,8 +84,7 @@ impl Pathspec {
             }
             &rest[end..]
         };
-        // `:(literal)` and `:(glob)` say opposite things about the same
-        // characters, so asking for both is a mistake worth reporting.
+        // `:(literal)` and `:(glob)` contradict each other: an error.
         if out.literal && out.glob {
             return Err(format!("'literal' and 'glob' are incompatible in '{spec}'"));
         }
@@ -103,11 +92,10 @@ impl Pathspec {
         Ok(out)
     }
 
-    /// Whether this spec covers `path` -- `/`-separated and already
-    /// relative to whichever root `top` selected.
+    /// Whether this spec covers `path`, `/`-separated and relative to the
+    /// root `top` selected.
     pub fn matches(&self, path: &str) -> bool {
-        // An empty pattern is the whole tree: `:/` on its own, or a bare
-        // `:`, means "everything from here".
+        // An empty pattern is the whole tree: `:/` alone, or a bare `:`.
         if self.pattern.is_empty() {
             return true;
         }
@@ -115,8 +103,7 @@ impl Pathspec {
             true => (self.pattern.to_lowercase(), path.to_lowercase()),
             false => (self.pattern.clone(), path.to_string()),
         };
-        // Naming a directory covers everything under it, whichever
-        // dialect is in play.
+        // Naming a directory covers everything under it, in either dialect.
         if path.starts_with(&format!("{}/", pattern.trim_end_matches('/'))) && !crate::glob::has_meta(&pattern) {
             return true;
         }
@@ -124,8 +111,8 @@ impl Pathspec {
             return path == pattern;
         }
         if self.glob {
-            // Anchored, because a pathspec is a location: `:(glob)a/b`
-            // is `a/b` from the root, not a `b` inside any `a`.
+            // Anchored, as a pathspec is a location: `:(glob)a/b` is `a/b`
+            // from the root, not a `b` in any `a`.
             let anchored = if pattern.starts_with('/') { pattern.clone() } else { format!("/{pattern}") };
             return crate::gitignore::Pattern::parse(&anchored).is_some_and(|p| p.matches(&path, false));
         }
@@ -133,9 +120,8 @@ impl Pathspec {
     }
 }
 
-/// A whole `--` argument list. Exclusions are not alternatives to the
-/// positive specs -- they are a filter applied after them, which is why
-/// a list of nothing but `:!` specs still matches everything else.
+/// A whole `--` argument list. Exclusions filter after the positive
+/// specs, so a list of only `:!` specs matches everything else.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pathspecs {
     specs: Vec<Pathspec>,
@@ -156,8 +142,8 @@ impl Pathspecs {
 
     pub fn matches(&self, path: &str) -> bool {
         let (excludes, includes): (Vec<&Pathspec>, Vec<&Pathspec>) = self.specs.iter().partition(|s| s.exclude);
-        // No positive spec at all means the whole tree was asked for --
-        // `git log -- ':!docs'` is every path but docs, not no paths.
+        // No positive spec means the whole tree: `git log -- ':!docs'` is
+        // every path but docs.
         let included = includes.is_empty() || includes.iter().any(|s| s.matches(path));
         included && !excludes.iter().any(|s| s.matches(path))
     }
@@ -188,8 +174,7 @@ mod tests {
         assert_eq!(both.pattern, "docs");
     }
 
-    // The `:` terminator is what lets a pattern start with a magic
-    // character.
+    // The `:` terminator lets a pattern start with a magic character.
     #[test]
     fn a_colon_ends_short_magic() {
         assert_eq!(parse(":!:!literal").pattern, "!literal");
@@ -210,20 +195,18 @@ mod tests {
         assert!(Pathspec::parse(":(nonsense)x").is_err());
         assert!(Pathspec::parse(":(exclude").is_err());
         assert!(Pathspec::parse(":(literal,glob)x").is_err());
-        // Real magic this doesn't implement: refused, not silently
-        // widened into "match everything".
+        // Unimplemented magic is refused, not widened to match everything.
         assert!(Pathspec::parse(":(attr:binary)x").unwrap_err().contains("attr"));
     }
 
-    // The default dialect is fnmatch without FNM_PATHNAME, which is the
-    // shell glob this repo already had.
+    // By default, fnmatch without `FNM_PATHNAME`: the shell glob.
     #[test]
     fn by_default_a_star_crosses_a_slash() {
         assert!(parse("*.c").matches("a.c"));
         assert!(parse("*.c").matches("src/deep/a.c"));
     }
 
-    // ...and `:(glob)` is the other dialect entirely.
+    // `:(glob)` is the other dialect.
     #[test]
     fn glob_magic_stops_a_star_at_a_slash() {
         assert!(!parse(":(glob)*.c").matches("src/a.c"));
@@ -232,7 +215,7 @@ mod tests {
         assert!(parse(":(glob)src/**/a.c").matches("src/deep/a.c"));
     }
 
-    // A pathspec is a location, so `:(glob)b` must not find `a/b`.
+    // A pathspec is a location: `:(glob)b` doesn't find `a/b`.
     #[test]
     fn glob_magic_is_anchored_unlike_a_gitignore_pattern() {
         assert!(parse(":(glob)b").matches("b"));
@@ -266,7 +249,6 @@ mod tests {
         assert!(parse(":").matches("anything/at/all"));
     }
 
-    // Excludes filter, they don't select.
     #[test]
     fn a_list_of_only_exclusions_still_matches_everything_else() {
         let specs = Pathspecs::parse([":!docs"]).unwrap();
@@ -287,9 +269,8 @@ mod tests {
         assert!(Pathspecs::default().matches("anything"));
     }
 
-    // The same ground truth the gitignore module is held to: ask real
-    // git which paths a pathspec selects, and require the same set.
-    // Skipped when git isn't installed.
+    // Real git, asked which paths a pathspec selects, must agree, as for
+    // the gitignore module. Skipped without git.
     #[test]
     fn the_answers_agree_with_real_git() {
         if !crate::git::available() {
