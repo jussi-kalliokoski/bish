@@ -1,16 +1,10 @@
-// Block structure, CommonMark §4 plus GFM tables and task list items.
-//
-// The shape is the spec's own, and the reference implementation's: for
-// each line, first walk the open containers checking whether the line
-// continues each of them, then look for new block starts, then hand
-// whatever is left to the deepest open leaf. Blocks are finalized (and
-// their inline content parsed) when they close.
-//
-// The one thing worth knowing before reading: this cannot be done in a
-// single pass over characters, because block structure is decided by
-// lines and by lines that come *later* -- `foo\n===` is a heading, and
-// nothing about `foo` says so. That is why inline parsing (inline.rs) is
-// a separate pass over the text these blocks accumulate.
+// Block structure: CommonMark §4, GFM tables and task list items.
+// Shaped like the reference implementation: for each line, walk the open
+// containers checking whether it continues each, then look for new
+// block starts, then give what's left to the deepest open leaf. Blocks
+// are finalized, and their inlines parsed, when they close. Structure
+// depends on later lines (`foo\n===` is a heading), so inline parsing
+// (inline.rs) is a separate pass.
 
 use std::ops::Range;
 
@@ -39,11 +33,9 @@ enum Kind {
     Table { align: Vec<Align>, header: Vec<(String, usize)> },
 }
 
-// A block whose structure is settled but whose inline content has not
-// been parsed yet. That has to wait for the end of the document: a link
-// reference definition is visible to the whole document, including to
-// text *above* it, so no paragraph can be resolved until every
-// definition has been seen.
+// A block with settled structure whose inlines aren't parsed yet: a link
+// reference definition is visible to the whole document, text above it
+// included, so that waits for the end.
 enum Raw {
     Paragraph { content: Content, span: Range<usize> },
     Heading { level: u8, content: Content, marker: Range<usize>, span: Range<usize> },
@@ -94,15 +86,15 @@ fn resolve(raw: Raw, refs: &[LinkRef]) -> Block {
 struct Open {
     kind: Kind,
     children: Vec<Raw>,
-    // A list's own items, filled in as each Item block closes -- an
-    // item isn't a block, so it can't live in `children`.
+    // A list's items, filled as each Item closes; an item isn't a block, so
+    // it can't be in `children`.
     items: Vec<RawItem>,
     // Raw lines for a leaf block, each with its own source offset.
     lines: Vec<(String, usize)>,
     start: usize,
     end: usize,
-    // Whether this block can still take lines. A closed block is
-    // finalized into its parent's children.
+    // Whether this block can take lines; a closed one is finalized into its
+    // parent.
     open: bool,
 }
 
@@ -141,8 +133,7 @@ pub fn parse(input: &str) -> Document {
     parser.finish()
 }
 
-// Splits on '\n', keeping each line's own start offset, with '\r\n'
-// normalized away -- the only newline handling the rest of this needs.
+// Splits on `\n`, keeping each line's start, with `\r\n` normalized.
 fn split_lines(input: &str) -> Vec<Line> {
     let mut out = Vec::new();
     let mut chars = Vec::new();
@@ -179,24 +170,21 @@ struct Parser {
     next_nonspace_column: usize,
     indent: usize,
     blank: bool,
-    // Columns still owed by a tab that was consumed part-way -- a tab
-    // advances to the next multiple of four, so a container that eats
-    // two columns of it leaves two behind.
+    // Columns still owed by a partly consumed tab: a tab advances to the
+    // next multiple of four, so eating two columns of it leaves two.
     partial_tab: usize,
     all_matched: bool,
-    // Set when a line was entirely a marker -- an opening or closing
-    // code fence, a heading, a thematic break -- so phase 3 neither adds
-    // it as content nor counts it as the blank line it now looks like.
+    // Set when a line was all marker (a fence, a heading, a thematic
+    // break), so phase 3 neither adds it as content nor counts it as blank.
     consumed: bool,
 }
 
 const TAB_STOP: usize = 4;
 const CODE_INDENT: usize = 4;
 
-// How deeply containers (block quotes, lists, list items) may nest. A
-// list item is its own container inside its list, so a real nested list
-// costs two levels per visible level -- 128 is still far past anything
-// written on purpose.
+// How deep containers (quotes, lists, items) may nest. An item is a
+// container in its list, so a nested list costs two levels each; 128 is
+// still far past anything intended.
 const MAX_NESTING: usize = 128;
 
 impl Parser {
@@ -208,11 +196,9 @@ impl Parser {
         self.all_matched = true;
         self.consumed = false;
 
-        // Phase 1: how far down the open blocks does this line still
-        // belong? Two answers matter and they differ: the deepest block
-        // that matched, and the deepest *container* that did. A new
-        // block always closes the leaf it lands in, even a leaf the line
-        // would otherwise have continued.
+        // Phase 1: how far down the open blocks this line still belongs: the
+        // deepest matching block and the deepest matching container differ. A
+        // new block always closes the leaf it lands in.
         let mut last_index = 0;
         let mut container = 0;
         for i in 1..self.stack.len() {
@@ -227,14 +213,13 @@ impl Parser {
             }
         }
 
-        // Phase 2: new block starts, from the deepest matched container
-        // down.
+        // Phase 2: new block starts, from the deepest matched container down.
         let mut started_any = false;
         loop {
             self.find_next_nonspace();
             let tip = self.stack.len() - 1;
-            // Only a container may hold a new block -- and a paragraph,
-            // which some blocks are allowed to interrupt.
+            // Only a container may hold a new block, or a paragraph, which
+            // some blocks may interrupt.
             if !self.stack[tip].is_container() && !matches!(self.stack[tip].kind, Kind::Paragraph) {
                 break;
             }
@@ -251,16 +236,14 @@ impl Parser {
         self.find_next_nonspace();
         let line_end = self.line.start + self.line.chars.len();
         let tip = self.stack.len() - 1;
-        // Lazy continuation: a paragraph keeps going even on a line that
-        // left the block quote or list item it was in, which is what
-        // makes `> one\ntwo` one paragraph.
+        // Lazy continuation: a paragraph continues on a line that left its
+        // quote or item, so `> one\ntwo` is one paragraph.
         let lazy = !self.all_matched && !self.blank && !started_any && matches!(self.stack[tip].kind, Kind::Paragraph);
         if !lazy && !started_any && !self.all_matched {
             self.close_to(last_index);
         }
-        // A line that was entirely a marker (a fence either way, a
-        // heading, a break) is not also content, and is not the blank
-        // line it now looks like.
+        // A line that was all marker isn't content, nor the blank line it
+        // looks like.
         if self.consumed {
             for open in self.stack.iter_mut() {
                 open.end = line_end;
@@ -292,14 +275,13 @@ impl Parser {
         }
     }
 
-    // A blank line makes the enclosing list loose, and lets a list item
-    // that has content end.
+    // A blank line makes the enclosing list loose and lets an item with
+    // content end.
     fn note_blank_line(&mut self) {
-        // Only the innermost of each: a blank line after a whole nested
-        // list has nothing to say about the list outside it, and a blank
-        // line trailing the document must not loosen anything at all
-        // (which is why this records rather than acts -- see
-        // `push_block` and `start_list_item`).
+        // Only the innermost of each: a blank line after a nested list says
+        // nothing about the outer list, and one ending the document loosens
+        // nothing (hence recording, not acting; see `push_block` and
+        // `start_list_item`).
         if let Some(open) = self.stack.iter_mut().rev().find(|o| matches!(o.kind, Kind::Item { .. }))
             && let Kind::Item { saw_blank_child, .. } = &mut open.kind
         {
@@ -313,9 +295,8 @@ impl Parser {
     }
 
     fn rest_of_line(&self) -> String {
-        // A tab consumed part-way leaves its remaining columns as
-        // spaces, which is what makes indented code inside a list line
-        // up the way the source looks.
+        // A partly consumed tab leaves its remaining columns as spaces, so
+        // indented code in a list lines up as the source does.
         let mut out = " ".repeat(self.partial_tab);
         out.extend(self.line.chars[self.offset.min(self.line.chars.len())..].iter());
         out
@@ -391,8 +372,8 @@ impl Parser {
                 }
                 self.advance_next_nonspace();
                 self.advance_columns(1);
-                // "> " -- one optional space after the marker, which a
-                // tab satisfies too.
+                // `> `: one optional space after the marker, which a tab
+                // satisfies.
                 if matches!(self.line.chars.get(self.offset), Some(' ') | Some('\t')) {
                     self.advance_columns(1);
                 }
@@ -401,9 +382,8 @@ impl Parser {
             Kind::List { .. } => true,
             Kind::Item { indent, .. } => {
                 if self.blank {
-                    // A blank line continues an item that already has
-                    // content, and ends one that doesn't (`-` alone
-                    // followed by a blank line is an empty item).
+                    // A blank line continues an item with content and ends
+                    // one without (`-` then a blank line is an empty item).
                     if self.stack[index].children.is_empty() && index + 1 >= self.stack.len() {
                         return false;
                     }
@@ -426,33 +406,30 @@ impl Parser {
                     }
                     return self.blank;
                 }
-                // A closing fence is at least as long as the opening
-                // one, of the same character, and has nothing after it.
+                // A closing fence is at least as long as the opening, the
+                // same character, with nothing after it.
                 if self.indent < CODE_INDENT && self.peek() == Some(fence_char) {
                     let run = self.run_length(self.next_nonspace, fence_char);
                     let after = self.next_nonspace + run;
                     let tail_blank = self.line.chars[after..].iter().all(|c| c.is_whitespace());
                     if run >= fence_len && tail_blank {
-                        // Closed by phase 3, which is the only place
-                        // that may change the stack -- this walk is
-                        // still iterating over it.
+                        // Closed by phase 3, the only place the stack may
+                        // change; this walk is still iterating it.
                         self.stack[index].end = self.line.start + self.line.chars.len();
                         self.offset = self.line.chars.len();
                         self.consumed = true;
                         return false;
                     }
                 }
-                // Up to the fence's own indentation is stripped from
-                // each content line, so indented fenced code doesn't
-                // gain leading spaces.
+                // Up to the fence's indentation is stripped from each
+                // content line.
                 let strip = indent.min(self.indent);
                 self.advance_columns(strip);
                 true
             }
             Kind::Html { condition } => {
-                // Conditions 6 and 7 end at a blank line; 1-5 have
-                // already ended themselves by matching their end
-                // condition when the line was added.
+                // Conditions 6 and 7 end at a blank line; 1-5 ended
+                // themselves when their end condition was added.
                 if condition >= 6 && self.blank {
                     return false;
                 }
@@ -467,18 +444,16 @@ impl Parser {
     }
 }
 
-// New block starts, tried in the spec's own order. Returns `Some(true)`
-// when something opened, `Some(false)` when nothing did, and `None` when
-// the line is blank and there is nothing to try.
+// New block starts in the spec's order. `Some(true)` when something
+// opened, `Some(false)` when nothing did, `None` for a blank line.
 impl Parser {
     fn try_start(&mut self, container: usize, started_any: &mut bool) -> Option<bool> {
         if self.blank {
             return Some(false);
         }
         let indented = self.indent >= CODE_INDENT;
-        // "Interrupting a paragraph" means one that is actually still
-        // open: a paragraph whose own container the line already left is
-        // going to close regardless, so nothing interrupts it.
+        // "Interrupting a paragraph" means an open one: a paragraph whose
+        // container the line already left closes regardless.
         let in_paragraph = self.all_matched && matches!(self.stack[self.stack.len() - 1].kind, Kind::Paragraph);
         let last_matched = container;
 
@@ -522,10 +497,9 @@ impl Parser {
             self.open_leaf(Kind::Html { condition }, start);
             return Some(true);
         }
-        // A GFM table: the line under a paragraph's last line is a
-        // delimiter row with the same number of columns. Checked before
-        // the setext underline, since `---` is both -- the pipes are
-        // what tell them apart.
+        // A GFM table: a delimiter row with as many columns under a
+        // paragraph's last line. Before the setext underline, since `---` is
+        // both; the pipes tell them apart.
         if !indented
             && in_paragraph
             && let Some(align) = delimiter_row(&self.line.chars[self.next_nonspace..])
@@ -536,8 +510,8 @@ impl Parser {
             let columns_match =
                 self.stack[tip].lines.last().map(|(l, o)| split_row(&Content::from_line(l, *o), None).len() == align.len()).unwrap_or(false);
             if header_has_pipe && columns_match {
-                // The paragraph is taken *before* closing anything:
-                // close_unmatched would close the very block this needs.
+                // The paragraph is taken before closing anything:
+                // `close_unmatched` would close it.
                 let mut open = self.stack.pop().expect("a paragraph was open");
                 *started_any = true;
                 self.close_unmatched(last_matched, &mut true);
@@ -566,9 +540,8 @@ impl Parser {
             && in_paragraph
             && let Some(level) = self.setext_underline()
         {
-            // The paragraph's own accumulated lines become the heading
-            // -- taken before closing anything, since close_unmatched
-            // would close the very block this needs.
+            // The paragraph's lines become the heading, taken before
+            // `close_unmatched` would close it.
             let popped = self.stack.pop();
             *started_any = true;
             self.close_unmatched(last_matched, &mut true);
@@ -618,8 +591,8 @@ impl Parser {
         }
     }
 
-    // `# Heading ###` -- one to six hashes, a space (or end of line),
-    // and an optional closing run of hashes that isn't part of the text.
+    // `# Heading ###`: one to six hashes, a space or end of line, and an
+    // optional closing run of hashes that isn't text.
     fn atx_heading(&mut self) -> Option<(u8, Range<usize>, String, usize)> {
         let hashes = self.run_length(self.next_nonspace, '#');
         if hashes == 0 || hashes > 6 {
@@ -664,8 +637,8 @@ impl Parser {
         }
         let info_start = self.next_nonspace + len;
         let raw: String = self.line.chars[info_start..].iter().collect();
-        // A backtick fence's info string may not contain a backtick,
-        // which is what keeps `` `a` `` from opening a code block.
+        // A backtick fence's info string may not contain a backtick, so
+        // `` `a` `` isn't a code block.
         if c == '`' && raw.contains('`') {
             return None;
         }
@@ -712,8 +685,8 @@ struct ItemStart {
     marker_char: char,
     delim: char,
     marker: Range<usize>,
-    // How far content is indented from the line's own start, which is
-    // what every following line of the item has to match.
+    // How far content is indented from the line's start, which the item's
+    // following lines must match.
     indent: usize,
     task: Option<bool>,
 }
@@ -725,13 +698,13 @@ impl Parser {
         }
         let c = self.peek()?;
         let marker_start = self.next_nonspace;
-        // For an ordered list the marker character is the *delimiter*:
-        // `3.` and `4.` are the same list, while `3.` and `3)` are not.
+        // For an ordered list the marker is the delimiter: `3.` and `4.`
+        // are one list, `3.` and `3)` aren't.
         let (ordered, number, marker_char, delim, marker_len) = if matches!(c, '-' | '+' | '*') {
             (false, 1u64, c, ' ', 1)
         } else if c.is_ascii_digit() {
             let digits: String = self.line.chars[marker_start..].iter().take_while(|c| c.is_ascii_digit()).collect();
-            // At most nine digits, per the spec -- past that it's text.
+            // At most nine digits, per the spec; more is text.
             if digits.len() > 9 {
                 return None;
             }
@@ -749,9 +722,8 @@ impl Parser {
             Some(' ') | Some('\t') => {}
             _ => return None,
         }
-        // A list item may only interrupt a paragraph when it starts with
-        // 1 and isn't empty -- otherwise `I need 2. apples` would become
-        // a list.
+        // A list item may interrupt a paragraph only starting at 1 and
+        // non-empty, or `I need 2. apples` would be a list.
         if in_paragraph {
             let rest_blank = self.line.chars[after..].iter().all(|c| c.is_whitespace());
             if rest_blank || (ordered && number != 1) {
@@ -759,10 +731,9 @@ impl Parser {
             }
         }
 
-        // How far the content is indented: the marker, plus the spaces
-        // after it -- but a run of five or more (or a blank rest of
-        // line) counts as exactly one, so that the extra spaces belong
-        // to an indented code block inside the item instead.
+        // Content indent: the marker plus following spaces, but five or
+        // more (or a blank rest) count as one, so the rest belong to an
+        // indented code block in the item.
         let mut spaces = 0;
         let mut i = after;
         let mut col = self.next_nonspace_column + marker_len;
@@ -780,8 +751,7 @@ impl Parser {
         let padding = if rest_blank || spaces > CODE_INDENT { 1 } else { spaces };
         let indent = self.indent + marker_len + padding;
 
-        // GFM task list items: `- [x] done`, immediately after the
-        // marker.
+        // GFM task items: `- [x] done`, right after the marker.
         let content_at = after + if rest_blank || spaces > CODE_INDENT { 1.min(spaces) } else { spaces };
         let task = match self.line.chars.get(content_at..content_at + 3) {
             Some(['[', mark, ']']) if matches!(mark, ' ' | 'x' | 'X') => {
@@ -799,23 +769,22 @@ impl Parser {
         self.advance_next_nonspace();
         self.advance_columns(item.indent - self.indent);
 
-        // A matching list is continued rather than started again: same
-        // kind of marker means the same list.
+        // A matching list is continued: the same marker kind is the same
+        // list.
         let mut tip = self.stack.len() - 1;
         let same_list = match &self.stack[tip].kind {
             Kind::List { ordered, marker, delim, .. } => *ordered == item.ordered && *marker == item.marker_char && *delim == item.delim,
             _ => false,
         };
-        // A different marker means a different list, so the open one has
-        // to close -- otherwise the new list would nest inside it, which
-        // is what `- a` followed by `* b` must not produce.
+        // A different marker means a different list, so the open one closes;
+        // `- a` then `* b` mustn't nest.
         if !same_list && matches!(self.stack[tip].kind, Kind::List { .. }) {
             self.close_to(tip - 1);
             tip = self.stack.len() - 1;
         }
         if same_list {
-            // A blank line between two items is what makes a list loose
-            // -- and it only counts once another item actually follows.
+            // A blank line between items makes a list loose, once another
+            // item follows.
             let saw_blank = matches!(&self.stack[tip].kind, Kind::List { saw_blank: true, .. });
             if saw_blank && let Kind::List { tight, .. } = &mut self.stack[tip].kind {
                 *tight = false;
@@ -827,7 +796,7 @@ impl Parser {
             ));
         }
         self.stack.push(Open::new(Kind::Item { indent: item.indent, marker: item.marker.clone(), task: item.task, saw_blank_child: false }, start));
-        // The task marker itself is consumed, so it isn't also text.
+        // The task marker is consumed, so it isn't text.
         if item.task.is_some() {
             self.find_next_nonspace();
             self.advance_next_nonspace();
@@ -839,8 +808,7 @@ impl Parser {
     }
 }
 
-// The seven HTML block conditions, §4.6. The tag lists are the spec's
-// own, not a guess at what looks block-like.
+// The seven HTML block conditions, §4.6, with the spec's tag lists.
 const HTML_BLOCK_TAGS: &[&str] = &[
     "address",
     "article",
@@ -938,17 +906,16 @@ impl Parser {
                 return Some(6);
             }
         }
-        // Condition 7: a complete tag alone on the line. It may not
-        // interrupt a paragraph, which is what stops `<https://x>` and
-        // an inline `<em>` mid-sentence from becoming block HTML.
+        // Condition 7: a complete tag alone on a line. It can't interrupt a
+        // paragraph, so `<https://x>` and a mid-sentence `<em>` stay inline.
         if !in_paragraph && inline::is_complete_tag_line(&rest) {
             return Some(7);
         }
         None
     }
 
-    // Conditions 1-5 end on the line their end condition appears on,
-    // including the line that opened the block.
+    // Conditions 1-5 end on the line their end condition appears on, the
+    // opening line included.
     fn check_html_end(&mut self) {
         let tip = self.stack.len() - 1;
         let Kind::Html { condition } = self.stack[tip].kind else { return };
@@ -970,10 +937,9 @@ impl Parser {
 
 // Closing blocks, and turning them into the AST.
 impl Parser {
-    // A list holds *items* and nothing else, so any other block closes
-    // it first -- and closes an outer list too, for a nested one. Without
-    // this a `## heading` after a list would be pushed onto the list's
-    // own `children`, which nothing ever reads, and vanish.
+    // A list holds only items, so any other block closes it first, and an
+    // outer list too, or a `## heading` after a list would vanish into
+    // `children`.
     fn close_lists_for_block(&mut self) {
         while self.stack.len() > 1 && matches!(self.stack[self.stack.len() - 1].kind, Kind::List { .. }) {
             let target = self.stack.len() - 2;
@@ -981,23 +947,16 @@ impl Parser {
         }
     }
 
-    // Opening any block that is not a list or a list item.
-    // Whether another container may open here. The block parser itself
-    // is iterative -- containers live on `self.stack` -- but the tree it
-    // produces is walked recursively three times over: `resolve` turns
-    // `Raw` into `Block`, the renderer descends it, and dropping it
-    // descends it again. 50k nested `>` in a file overflowed the stack
-    // during `resolve`, which is a crash on *opening a document*, not on
-    // running anything.
-    //
-    // Bounding the depth at the one place depth is created makes all
-    // three walks safe at once. Past the limit the markers are simply
-    // text, which is what any reader would see in them anyway -- a
-    // document nested 128 deep is not one anybody is reading.
+    // Whether another container may open. The parser is iterative, but
+    // the tree is walked recursively three times (`resolve`, the renderer,
+    // drop), so 50k nested `>` would overflow the stack on opening a
+    // document. Bounding depth where it's created makes all three safe;
+    // past the limit the markers are text.
     fn can_nest(&self) -> bool {
         self.stack.len() < MAX_NESTING
     }
 
+    // Opens any block that isn't a list or list item.
     fn open_leaf(&mut self, kind: Kind, start: usize) {
         self.close_lists_for_block();
         self.stack.push(Open::new(kind, start));
@@ -1006,8 +965,8 @@ impl Parser {
     fn push_block(&mut self, block: Raw) {
         self.close_lists_for_block();
         let tip = self.stack.len() - 1;
-        // A blank line inside a list item, with content on both sides of
-        // it, is what makes the enclosing list loose.
+        // A blank line inside an item with content on both sides makes the
+        // list loose.
         if let Kind::Item { saw_blank_child, .. } = &self.stack[tip].kind
             && *saw_blank_child
             && !self.stack[tip].children.is_empty()
@@ -1029,8 +988,7 @@ impl Parser {
     fn close_to(&mut self, target: usize) {
         while self.stack.len() > target + 1 {
             let open = self.stack.pop().expect("the document block is never closed");
-            // An item becomes a ListItem on its parent list rather than
-            // a Block among its siblings.
+            // An item becomes a ListItem on its list, not a sibling Block.
             if let Kind::Item { marker, task, .. } = open.kind.clone() {
                 let item = RawItem { blocks: open.children, task, marker, span: open.start..open.end.max(open.start) };
                 let tip = self.stack.len() - 1;
@@ -1047,9 +1005,8 @@ impl Parser {
     fn finish(mut self) -> Document {
         self.close_to(0);
         let root = self.stack.pop().expect("the document block is never closed");
-        // The second pass: every link reference definition in the
-        // document is known by now, so `[text][ref]` resolves whether
-        // the definition came before it or after.
+        // The second pass: every link reference is known, so `[text][ref]`
+        // resolves wherever the definition was.
         let blocks = root.children.into_iter().map(|b| resolve(b, &self.link_refs)).collect();
         Document { blocks, link_refs: self.link_refs }
     }
@@ -1065,8 +1022,7 @@ impl Parser {
             Kind::Paragraph => {
                 let content = Content::from_lines(&open.lines);
                 // Link reference definitions come off the front of a
-                // paragraph, and a paragraph made of nothing else
-                // disappears entirely.
+                // paragraph; one made of nothing else disappears.
                 let consumed = self.take_link_refs(&content);
                 let content = content.slice_from(consumed);
                 if content.is_blank() {
@@ -1105,16 +1061,14 @@ impl Parser {
 }
 
 impl Parser {
-    // Link reference definitions (§4.7) come off the front of a
-    // paragraph, one after another, and are not content. Returns how
-    // many characters were consumed.
+    // Link reference definitions (§4.7) off the front of a paragraph, which
+    // are not content. Returns the characters consumed.
     fn take_link_refs(&mut self, content: &Content) -> usize {
         let mut at = 0;
         loop {
             let Some((label, dest, title, next)) = parse_link_ref(content, at) else { return at };
             let normalized = inline::normalize_label(&label);
-            // The first definition of a label wins; a later one is
-            // simply ignored.
+            // The first definition of a label wins.
             if !normalized.is_empty() && !self.link_refs.iter().any(|r| r.label == normalized) {
                 let span = content.source_offset(at).unwrap_or(0)..content.source_offset(next.saturating_sub(1)).map(|o| o + 1).unwrap_or(0);
                 self.link_refs.push(LinkRef { label: normalized, dest, title, span });
@@ -1166,9 +1120,9 @@ fn parse_link_ref(content: &Content, from: usize) -> Option<(String, String, Str
     }
     i = next;
 
-    // A title has to be on the same line as the destination or the next
-    // one, and if what follows it isn't a line end, there is no title
-    // *and* no definition -- so the whole thing is reconsidered without.
+    // A title is on the destination's line or the next, and if a line end
+    // doesn't follow it there's no title and no definition, so it's
+    // reconsidered without one.
     let after_dest = i;
     let mut title = String::new();
     if let Some(title_start) = skip_ws_one_newline_optional(chars, i)
@@ -1196,8 +1150,8 @@ fn skip_spaces(chars: &[char], mut i: usize) -> usize {
     i
 }
 
-// Whitespace including at most one newline -- the spec's own limit, so a
-// blank line ends the definition rather than continuing it.
+// Whitespace with at most one newline, the spec's limit, so a blank line
+// ends the definition.
 fn skip_ws_one_newline(chars: &[char], from: usize) -> Option<usize> {
     let mut i = skip_spaces(chars, from);
     if chars.get(i) == Some(&'\n') {
@@ -1279,9 +1233,9 @@ fn read_title(chars: &[char], start: usize) -> Option<(String, usize)> {
     None
 }
 
-// GFM tables: a row is split on unescaped `|`, with the optional leading
-// and trailing ones dropped, then padded or truncated to the header's
-// own column count -- the spec's rule, so a ragged row still lines up.
+// GFM tables: a row split on unescaped `|`, optional outer pipes
+// dropped, padded or truncated to the header's column count, so a
+// ragged row still lines up.
 fn split_row(content: &Content, columns: Option<usize>) -> Vec<Content> {
     let chars = &content.chars;
     let mut cells: Vec<(usize, usize)> = Vec::new();
@@ -1299,8 +1253,8 @@ fn split_row(content: &Content, columns: Option<usize>) -> Vec<Content> {
         }
     }
     cells.push((start, chars.len()));
-    // A leading `|` produces an empty first cell, and a trailing one an
-    // empty last cell; both are the delimiters, not content.
+    // A leading `|` makes an empty first cell and a trailing one an empty
+    // last: delimiters, not content.
     if cells.first().is_some_and(|(s, e)| content.chars[*s..*e].iter().all(|c| c.is_whitespace()))
         && chars.contains(&'|')
         && chars.iter().find(|c| !c.is_whitespace()) == Some(&'|')
@@ -1324,18 +1278,12 @@ fn split_row(content: &Content, columns: Option<usize>) -> Vec<Content> {
             while e > s && chars[e - 1].is_whitespace() {
                 e -= 1;
             }
-            // GFM's one table-level escape: `\|` is a literal pipe in a
-            // cell. The spec applies it here, before inline parsing --
-            // "including inside other inline spans" -- which is the
-            // whole point of it: a code span is the one place a pipe
-            // cannot be written any other way, and a backslash left in
-            // would be shown rather than consumed. Only `\|`; every
-            // other escape is the inline parser's business.
-            //
-            // A `|` inside a cell is always exactly this case. The scan
-            // above steps over a backslash and whatever follows it, so
-            // an unescaped `|` would have ended the cell, and a `\\`
-            // pairs with itself and leaves the `|` after it a delimiter.
+            // GFM's one table-level escape: `\|` is a literal pipe, applied
+            // before inline parsing, "including inside other inline spans",
+            // since a code span has no other way to hold one. Only `\|`;
+            // other escapes are inline. A `|` in a cell is always this
+            // case: the scan above steps over a backslash and what follows,
+            // so an unescaped `|` ends the cell and `\\` pairs with itself.
             let mut cell = Content { chars: Vec::new(), offsets: Vec::new() };
             let mut i = s;
             while i < e {
@@ -1350,8 +1298,8 @@ fn split_row(content: &Content, columns: Option<usize>) -> Vec<Content> {
             cell
         })
         .collect();
-    // `None` while counting the header's own columns; `Some` once that
-    // count is known and every row has to match it.
+    // `None` while counting the header's columns; `Some` once every row must
+    // match.
     if let Some(columns) = columns {
         out.truncate(columns.max(1));
         while out.len() < columns {
@@ -1389,8 +1337,7 @@ fn delimiter_row(chars: &[char]) -> Option<Vec<Align>> {
     (!align.is_empty()).then_some(align)
 }
 
-// Whether the character at `i` is preceded by an odd number of
-// backslashes, and so escaped.
+// Whether `i` is preceded by an odd number of backslashes.
 fn escaped_at(line: &str, i: usize) -> bool {
     let chars: Vec<char> = line.chars().collect();
     let mut n = 0;
