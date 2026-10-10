@@ -1,33 +1,19 @@
-// A linter for bash scripts, built the same way highlight.rs is: on top
-// of the real lexer (lexer::tokenize_spanned) rather than a parallel
-// implementation or the parser's own AST. The AST (parser.rs's Program/
-// Command/Word/...) carries no source spans at all -- threading them
-// through every variant (including the lazily-reparsed Subshell/Arith
-// raw-text ones) would be a much larger, more invasive change than this
-// feature needs. tokenize_spanned already gives a flat, char-offset-
-// spanned token/chunk stream (the same one highlight.rs already walks),
-// which is enough structure for every rule below: command-name/argument
-// position (mirroring highlight.rs's own CmdPos/WordRole), `[[ ... ]]`
-// nesting, and each word's own Chunk breakdown (already quote-aware --
-// Chunk::Var/VarExpand/etc all carry their own `quoted` flag from the
-// lexer, so nothing here has to re-derive that).
+// Linters: bash scripts, JSON and TOML.
 //
-// `Linter` is a small trait for the same reason `Highlighter` is one:
-// `BashLinter` is the only implementor today, but this is meant to be
-// the one shared core behind `bish tool check` (tool.rs), and later an
-// in-editor "show me the squiggles" feature and `bish tool lsp-server`
-// -- all three just want "text in, Diagnostics out," nothing CLI- or
-// editor-specific baked in here. `Fix` spans are char offsets into the
-// same text, so a caller can apply one with a plain slice-and-splice
-// (see tool.rs's own `apply_fixes`), no separate coordinate system to
-// convert.
+// The bash linter is built on `lexer::tokenize_spanned`, like highlight.rs,
+// because the AST carries no source spans. The token stream is enough for
+// every rule here: command and argument positions (as highlight.rs's
+// CmdPos/WordRole), `[[ ... ]]` nesting, and each word's chunks, which
+// already carry the lexer's `quoted` flag.
 //
-// Scope, deliberately: only rules that catch a real behavioral bug or
-// risk (unquoted expansions that can word-split/glob, a command
-// substitution's exit status getting masked by `local`/`declare`/...) --
-// nothing about formatting/style (indentation, brace placement, `[` vs
-// `[[`, backticks vs `$()`, ...), which is `bish tool format`'s future
-// job, not this one.
+// `Linter` is the core behind `bish tool check`, the editor's diagnostics
+// and `bish tool lsp-server`: text in, diagnostics out. `Fix` spans are
+// char offsets into the same text, applied by slicing (tool.rs's
+// `apply_fixes`).
+//
+// Only rules that catch a real bug or risk (unquoted expansions that can
+// split or glob, a substitution's status masked by `local`). Style is
+// `bish tool format`'s job.
 
 use crate::bishedit::highlight::resets_command_position;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
@@ -35,18 +21,11 @@ use crate::parser;
 use std::borrow::Cow;
 use std::ops::Range;
 
-// Declared least-severe-first, and `Ord` is derived for exactly that
-// reason: a gutter cell has room for one mark but a line can hold
-// several findings, so "which mark" is `.map(|d| d.severity).max()`.
-// Nothing here sorts diagnostics for *display* by severity (they stay
-// in source order, which is what a list keyed by line wants), so this
-// ordering has no other reader to disagree with.
-//
-// The four are LSP's four, in LSP's own meaning -- bish's own linter
-// only ever emits `Warning` (its scope is deliberately "a real
-// behavioral bug or risk," see this module's header), but a language
-// server speaks all four and its findings land in the same
-// `TextBuffer::diagnostics` these are rendered from.
+// Least severe first, so a gutter cell showing one mark for several
+// findings takes `.max()`. Diagnostics are listed in source order, so
+// nothing else depends on this order. LSP's four, in LSP's meaning: bish's
+// linter only emits `Warning`, but language-server findings land in the
+// same `TextBuffer::diagnostics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Hint,
@@ -55,16 +34,11 @@ pub enum Severity {
     Error,
 }
 
-// A single, self-contained text edit: replace `text[start..end]` (char
-// offsets, same convention as `Diagnostic`'s own span and highlight.rs's
-// `HighlightSpan`) with `replacement`. Deliberately just one range, not a
-// list -- a rule that needs to touch more than one place to fix an issue
-// (masked-return-value's own two-statement rewrite) still expresses that
-// as a single replacement spanning everything in between, rather than a
-// multi-edit patch; see `apply_fixes` in tool.rs for why that keeps
-// applying a batch of fixes from many diagnostics trivial (sort by
-// descending `start`, splice each in turn -- no dependency tracking
-// between edits needed).
+// One edit: replace `text[start..end]` (char offsets) with
+// `replacement`. A rule that touches two places (masked-return-value's
+// two-statement rewrite) uses one replacement spanning both, so applying
+// many fixes is sorting by descending `start` and splicing (see tool.rs's
+// `apply_fixes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fix {
     pub start: usize,
@@ -77,36 +51,24 @@ pub struct Diagnostic {
     pub start: usize,
     pub end: usize,
     pub severity: Severity,
-    // A short, stable, kebab-case identifier for the rule that produced
-    // this -- what a future suppression comment would key off of, not
-    // meant to change once a rule ships.
-    //
-    // `Cow` rather than the `&'static str` this was, because a language
-    // server's diagnostic code is a runtime string off the wire and
-    // these share one `Vec` with bish's own findings. Every rule in this
-    // file still writes a literal and still allocates nothing for it;
-    // only the borrowed-or-owned choice moved into the type.
+    // A short, stable kebab-case name for the rule, which a suppression
+    // comment would key on. `Cow` because a language server's code is a
+    // runtime string sharing this `Vec`; bish's own rules still use literals.
     pub code: Cow<'static, str>,
-    // Who found it -- `None` for bish's own linters (the overwhelming
-    // majority, and what a reader assumes when nothing says otherwise),
-    // `Some("rustc")` for a finding relayed from a language server. Kept
-    // separate from `code` rather than folded into it because the two
-    // namespaces are genuinely different: two servers can both emit an
-    // `E0308` and mean different things.
+    // Who found it: `None` for bish's own linters, `Some("rustc")` for a
+    // language server's. Separate from `code` because two servers can both
+    // say `E0308` and mean different things.
     pub source: Option<String>,
     pub message: String,
-    // `None` when the finding is real but there's no fix this engine
-    // trusts itself to make automatically (see masked_return_value's own
-    // doc comment for a concrete case: a fix is only offered when
-    // rewriting it can't change the script's behavior any other way).
+    // `None` when there's no fix that's safe to apply automatically (see
+    // `masked_return_value`).
     pub fix: Option<Fix>,
 }
 
 impl Diagnostic {
-    /// How this finding identifies itself in a list: its bare `code`
-    /// when bish found it, `source:code` when something else did. The
-    /// one place that formatting is decided, since both the CLI
-    /// (`bish tool check`) and the editor's diagnostics pane show it.
+    /// The finding's name in a list: `code` for bish's own, `source:code`
+    /// otherwise. Used by `bish tool check` and the editor's diagnostics
+    /// pane.
     pub fn label(&self) -> String {
         match &self.source {
             Some(source) => format!("{source}:{}", self.code),
@@ -141,26 +103,14 @@ pub trait Linter {
     fn check(&self, text: &str) -> Vec<Diagnostic>;
 }
 
-/// JSON and JSONC, from the tokenizer bish already has.
+/// JSON, from the tokenizer. Lexical, not structural: `json::tokens` marks
+/// each bad piece at its exact offset, which a gutter mark and an underline
+/// need. A structural error from `json::parse` has its position only in its
+/// message, so a mismatched brace is reported once, against the whole
+/// buffer, in the parser's words.
 ///
-/// Deliberately *lexical* rather than structural: `json::tokens` marks
-/// each bad piece with the exact offset it starts at, which is what a
-/// gutter marker and an underline need. `json::parse`'s own structural
-/// errors carry their position inside a message string rather than as
-/// data, so a mismatched brace is reported once, against the whole
-/// buffer, with the parser's own words -- which name the position even
-/// when this cannot point at it.
-///
-/// That covers what actually goes wrong in a hand-edited JSON file: an
-/// unterminated string, a bad escape, a stray word, a mismatched brace.
-///
-/// Plain `json` only, deliberately. **JSONC** is a highlighting language
-/// here and nothing more -- there is no JSONC parser, and the JSON
-/// tokenizer does not know a `//` comment from a syntax error, so
-/// linting one would light up every comment in a `tsconfig.json` with a
-/// finding that is wrong. **TOML** gets nothing for the same shape of
-/// reason: bish has a TOML *tokenizer* and no parser, so there is no
-/// failure to report. Neither is an oversight; both want a parser first.
+/// Not JSONC: the JSON tokenizer can't tell a `//` comment from an error,
+/// so every comment in a `tsconfig.json` would be flagged.
 pub struct JsonLinter;
 
 impl Linter for JsonLinter {
@@ -179,9 +129,8 @@ impl Linter for JsonLinter {
                 });
             }
         }
-        // Only when nothing lexical was found: a stray character already
-        // reported once above is what *caused* the parse to fail, and
-        // saying so twice helps nobody.
+        // Only when nothing lexical was found: a stray character reported
+        // above is what made the parse fail.
         if out.is_empty()
             && !text.trim().is_empty()
             && let Err(message) = crate::json::parse(text)
@@ -202,16 +151,9 @@ impl Linter for JsonLinter {
     }
 }
 
-/// TOML, from the parser in `toml.rs`.
-///
-/// Unlike JSON's, this one points at the mistake: `toml::ParseError`
-/// carries a char offset as *data* rather than baking a position into
-/// its message, so the gutter marker and the underline land on the
-/// thing that is wrong rather than on the whole buffer.
-///
-/// One finding, not a list: the parser stops at the first thing it
-/// cannot read, and everything after that is a guess about a document
-/// whose shape is already unknown.
+/// TOML, from toml.rs's parser. `toml::ParseError` carries a char offset,
+/// so the mark lands on the mistake. One finding: the parser stops at the
+/// first thing it can't read.
 pub struct TomlLinter;
 
 impl Linter for TomlLinter {
@@ -221,9 +163,7 @@ impl Linter for TomlLinter {
         let start = e.at.min(len.saturating_sub(1));
         vec![Diagnostic {
             start,
-            // Through to the end of the offending line, so there is
-            // something to underline even where the parser can only
-            // name a single position.
+            // To the end of the line, so there's something to underline.
             end: text.chars().skip(start).position(|c| c == '\n').map_or(len, |n| start + n).max(start + 1).min(len),
             severity: Severity::Error,
             code: Cow::Borrowed("toml-syntax"),
@@ -244,11 +184,8 @@ impl Linter for BashLinter {
     }
 }
 
-// Consumes the next raw_capture_spans entry, if any -- see highlight.rs's
-// own `next_span` (identical shape/reasoning: `.get()` rather than direct
-// indexing, since a lex error partway through can leave the token stream
-// and this list out of sync; see raw_capture_spans's own doc comment in
-// lexer.rs).
+// The next `raw_capture_spans` entry, if any; see highlight.rs's
+// `next_span`.
 fn next_span(raw_spans: &[Range<usize>], cursor: &mut usize) -> Option<Range<usize>> {
     let span = raw_spans.get(*cursor).cloned();
     if span.is_some() {
@@ -257,27 +194,15 @@ fn next_span(raw_spans: &[Range<usize>], cursor: &mut usize) -> Option<Range<usi
     span
 }
 
-// raw_capture_spans's own entry for an expansion chunk covers just its
-// *content*, excluding whatever delimiters that particular syntax form
-// used ($NAME's bare `$`; ${...}'s `${`/`}`; $(...)'s `$(`/`)`; a
-// backtick substitution's opening/closing `` ` ``) -- see lexer.rs's own
-// push_var/capture_balanced_parens/capture_backtick doc comments. Fine
-// for highlighting (which colors the identifier, not the sigil), but a
-// wrap-in-quotes fix needs the *whole* expansion, delimiters included, or
-// `"foo"` (quoting just the identifier span) would land as `$"foo"` --
-// a real, different piece of bash syntax (a locale-translated string),
-// not "$foo" quoted.
+// `raw_capture_spans` covers an expansion's content without its
+// delimiters (`$`, `${`/`}`, `$(`/`)`, backticks; see lexer.rs). A
+// wrap-in-quotes fix needs the whole expansion: quoting only `foo` in
+// `$foo` gives `$"foo"`, a locale-translated string.
 //
-// Chunk::Var is the only chunk kind that can be either form (`$foo` or
-// `${foo}`) -- every other expansion chunk this module cares about always
-// used braces (`${...}` syntax is required for an operator/index/`!`) or
-// is a substitution (`$(...)`/backtick), so which case applies is read
-// directly off the characters just outside `content` in the real source
-// text, not guessed from the chunk's own shape. Falls back to `content`
-// unchanged if surrounding text doesn't match any known delimiter pair
-// (shouldn't happen for anything actually produced by push_var/
-// capture_balanced_parens/capture_backtick, but degrading to "the fix
-// just doesn't add a sigil" is far better than an incorrect splice).
+// Only `Chunk::Var` can be either `$foo` or `${foo}`, so the form is read
+// off the characters around `content` in the source. If no known delimiter
+// pair matches, `content` is returned: a fix without the sigil beats a
+// wrong splice.
 fn expansion_source_span(chars: &[char], content: Range<usize>) -> Range<usize> {
     let before = |n: usize| content.start.checked_sub(n).and_then(|i| chars.get(i));
     if before(1) == Some(&'{') && before(2) == Some(&'$') {
@@ -302,12 +227,9 @@ fn char_slice(chars: &[char], range: Range<usize>) -> String {
     chars[range].iter().collect()
 }
 
-// `NAME=value` / `NAME+=value` -- reuses parser::word_as_assignment
-// directly (rather than re-deriving the identifier rule by hand) so this
-// always agrees with what the real parser treats as an assignment word.
-// Returns the name and how many *chars* of the word's own first chunk
-// are the "NAME=" / "NAME+=" prefix -- where the value part starts,
-// relative to the word's own span.
+// `NAME=value` or `NAME+=value`, via `parser::word_as_assignment` so it
+// agrees with the parser. Returns the name and the length in chars of the
+// `NAME=` prefix.
 fn assignment_prefix(chunks: &[Chunk]) -> Option<(String, usize)> {
     let w = parser::Word { chunks: chunks.to_vec(), globbable: false };
     let (name, mode, _value) = parser::word_as_assignment(&w)?;
@@ -325,26 +247,14 @@ fn word_contains_command_sub(chunks: &[Chunk]) -> bool {
 
 const DECLARE_KEYWORDS: &[&str] = &["local", "declare", "export", "readonly", "typeset"];
 
-// Peeks forward from `start` (the index in `items` right after a
-// local/declare/export/readonly/typeset command-name token) through this
-// one command's own argument words, to decide whether
-// masked_return_value's own fix can safely rewrite an assignment
-// argument into two statements: only when there's exactly one argument
-// word for the whole command (no flags, no siblings) and it's
-// assignment-shaped. Anything else -- a flag (`local -r x=$(cmd)`, where
-// splitting the assignment out would try to assign to an
-// already-readonly name), a second assignment, or a plain positional
-// argument -- is left as detect-only (`Diagnostic.fix: None`): there's no
-// single-edit rewrite that's still guaranteed to preserve the script's
-// behavior once siblings are in play. `readonly` itself is never
-// fixable, for the same reason as a `-r` flag: the whole point of
-// `readonly` is that a following plain assignment to the same name fails.
+// Whether `masked_return_value`'s fix can split this command's argument
+// into two statements: only when the command's one argument is an
+// assignment. A flag (`local -r x=$(cmd)` would then assign to a readonly
+// name), a second assignment or a positional argument leave it
+// detect-only. `readonly` is never fixable, for the same reason as `-r`.
 //
-// Read-only over `items`/`chunks` -- never touches the caller's own
-// `cursor`/raw_capture_spans (see lint_into's own doc comment for why
-// peeking ahead like this doesn't desync them: this only classifies
-// word *shapes*, it never needs a precise span, which is the only thing
-// raw_capture_spans/`cursor` are for).
+// Reads `items` without touching `cursor`: it only classifies word shapes
+// and needs no spans.
 fn declare_fixable(items: &[SpannedItem], start: usize, keyword: &str) -> bool {
     if keyword == "readonly" {
         return false;
@@ -368,26 +278,16 @@ fn declare_fixable(items: &[SpannedItem], start: usize, keyword: &str) -> bool {
     count == 1 && sole_is_assignment
 }
 
-// The whitespace-only run right after the most recent newline before
-// `pos` (or the start of `text` if there isn't one) -- what
-// masked_return_value's own fix reuses as the second statement's own
-// leading indentation, so the rewritten `NAME\n<indent>NAME=...` lands at
-// the same indentation as the `local`/`declare`/... line it split, rather
-// than always column 0.
+// The indentation of the line containing `pos`, which the split
+// statement reuses.
 fn line_indent(chars: &[char], pos: usize) -> String {
     let line_start = chars[..pos].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
     let indent_end = chars[line_start..pos].iter().position(|&c| !matches!(c, ' ' | '\t')).map(|i| line_start + i).unwrap_or(pos);
     char_slice(chars, line_start..indent_end)
 }
 
-// Which command-name/argument-position state a word is in -- mirrors
-// highlight.rs's own WordRole/CmdPos exactly (see that module's own doc
-// comments for the full reasoning); duplicated rather than shared
-// because the two walkers need different things from it (highlight.rs
-// wants it for command-validity/argument styling, this module wants it
-// to know which words are exempt from unquoted_expansion and which are a
-// masked_return_value candidate) and neither's own shape is likely to
-// stay identical as each grows its own rules.
+// The command or argument position of a word, as in highlight.rs. Kept
+// separate because the two walkers need different things from it.
 enum WordRole {
     AssignmentPrefix,
     CommandName,
@@ -416,35 +316,24 @@ fn resolve_role(cmd_pos: &mut CmdPos, chunks: &[Chunk]) -> WordRole {
     }
 }
 
-// The actual walk -- one flat pass over tokenize_spanned's own item
-// stream, recursing into $(...)/backtick/<(...)/>(...) raw text the same
-// way highlight.rs's highlight_into does (a fresh CmdPos/bracket depth/
-// case-subject state per recursion level, offsets translated back to the
-// outermost text's own coordinates). Heredoc bodies are deliberately
-// *not* recursed into -- same accepted, pre-existing gap highlight.rs's
-// own next_span doc comment documents for raw_capture_spans desyncing
-// inside a heredoc that itself contains an expansion; not a new problem
-// this module introduces, and not worth inheriting a known-desyncing
-// feature to chase.
+// One pass over the token stream, recursing into `$(...)`, backticks,
+// `<(...)` and `>(...)` like highlight.rs's `highlight_into`: fresh state
+// per level, offsets translated back to the outer text. Heredoc bodies
+// aren't recursed into, since `raw_capture_spans` can desync there (see
+// highlight.rs's `next_span`).
 fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
     let chars: Vec<char> = text.chars().collect();
     let res = lexer::tokenize_spanned(text);
     let mut cursor = 0usize;
     let mut cmd_pos = CmdPos::ExpectCommand;
     let mut bracket2_depth: u32 = 0;
-    // `case WORD in` -- WORD is expansion+quote-removed but never
-    // word-split (POSIX), so it's exempt from unquoted_expansion the
-    // same way [[ ... ]]'s own contents are. Set right after KwCase,
-    // consumed by the very next word (there's exactly one between `case`
-    // and `in` in valid syntax); KwIn also clears it defensively in case
-    // of malformed/in-progress input.
+    // `case WORD in`: WORD is never word-split (POSIX), so it's exempt like
+    // `[[ ... ]]`'s contents. Set after `case`, consumed by the next word,
+    // and cleared by `in` in case of half-typed input.
     let mut case_subject = false;
-    // Set fresh whenever a command-name word resolves to one of
-    // DECLARE_KEYWORDS -- (keyword, whether declare_fixable said this
-    // command's own sole argument can be safely split into two
-    // statements). Cleared implicitly the next time a command-name word
-    // resolves to anything else, same lifetime as CmdPos::InCommand's
-    // own `name`.
+    // Set when a command name is one of DECLARE_KEYWORDS: the keyword, and
+    // whether `declare_fixable` allows the split. Lives as long as the
+    // command.
     let mut declare_ctx: Option<(String, bool)> = None;
 
     for i in 0..res.items.len() {
@@ -466,10 +355,8 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
                 }
             }
             Tok::Arith(_raw) => {
-                // Matches highlight.rs's own Tok::Arith handling: one
-                // flat span, no recursion (different lexical rules than
-                // the shell grammar) -- consumed here only to keep
-                // `cursor` in lockstep with raw_capture_spans.
+                // Like highlight.rs's `Tok::Arith`: no recursion, consumed
+                // only to keep `cursor` in step.
                 next_span(&res.raw_capture_spans, &mut cursor);
             }
             Tok::Word(chunks, _) => {
@@ -495,10 +382,8 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
                         let word_end = offset + span.end;
                         let fix = (*fixable && *arg_index == 0).then(|| {
                             let indent = line_indent(&chars, span.start);
-                            // `op_text` (either "=" or "+=", read
-                            // straight from the source rather than
-                            // assumed) so an append-assignment isn't
-                            // silently rewritten into a plain one.
+                            // `=` or `+=`, read from the source, so an
+                            // append isn't rewritten into an assignment.
                             let op_text = char_slice(&chars, span.start + name.chars().count()..span.start + prefix_len);
                             let value_text = char_slice(&chars, span.start + prefix_len..span.end);
                             Fix { start: word_start, end: word_end, replacement: format!("{name}\n{indent}{name}{op_text}{value_text}") }
@@ -524,11 +409,10 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
     }
 }
 
-// Every expansion chunk in one word: recurses into $(...)/backtick/
-// process-substitution raw text regardless of `exempt` (nested content
-// always gets linted -- exempt only ever means "don't flag *this* word's
-// own splitting/globbing risk", never "skip its interior"), and flags an
-// unquoted, splitting-sensitive one when `!exempt`.
+// Every expansion chunk in one word. Substitutions are recursed into
+// whether or not the word is `exempt`, which only spares this word's own
+// splitting risk; an unquoted, splitting-sensitive expansion is flagged
+// unless `exempt`.
 fn lint_word_chunks(
     chunks: &[Chunk],
     offset: usize,
@@ -538,11 +422,8 @@ fn lint_word_chunks(
     exempt: bool,
     out: &mut Vec<Diagnostic>,
 ) {
-    // An all-plain word ([Chunk::Str(_)]) never got a raw_capture_spans
-    // entry at all (see that field's own doc comment) and has nothing an
-    // expansion-focused rule could ever flag -- skip it outright rather
-    // than falling into the chunk loop below and trying to consume an
-    // entry that was never pushed for it.
+    // A wholly plain word has no `raw_capture_spans` entry and nothing to
+    // flag.
     if let [Chunk::Str(_)] = chunks {
         return;
     }
@@ -553,11 +434,9 @@ fn lint_word_chunks(
                 next_span(raw_spans, cursor);
             }
             Chunk::ArrayLength { .. } => {
-                // ${#name}/${#arr[@]} -- always a plain non-negative
-                // integer, never contains whitespace/glob characters, so
-                // (like $#/$?/$$/$!/$- below) quoting it is a style
-                // choice, not a correctness one -- out of this rule's
-                // "non-cosmetic" scope.
+                // `${#name}` is always a non-negative integer, so quoting
+                // it is style, as for `$#`, `$?`, `$$`, `$!` and `$-`
+                // below.
                 next_span(raw_spans, cursor);
             }
             Chunk::Var { name, quoted, .. } | Chunk::Indirect { name, quoted } | Chunk::ArrayKeys { name, quoted } => {
@@ -589,10 +468,8 @@ fn lint_word_chunks(
                 }
             }
             Chunk::Arith { .. } => {
-                // Always safe unquoted -- an arithmetic result is always
-                // a plain integer -- and not recursed into, matching
-                // Tok::Arith's own treatment (different lexical rules
-                // than the shell grammar).
+                // An arithmetic result is always an integer, so safe
+                // unquoted, and not recursed into, like `Tok::Arith`.
                 next_span(raw_spans, cursor);
             }
             Chunk::ProcSubIn { raw } | Chunk::ProcSubOut { raw } => {
@@ -633,8 +510,7 @@ mod toml_linter_tests {
         let found = check(text);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].code, "toml-syntax");
-        // On the third line, not against the whole buffer -- which is
-        // the difference the parser carrying its position as data makes.
+        // On the third line, not the whole buffer.
         let line = text.chars().take(found[0].start).filter(|c| *c == '\n').count();
         assert_eq!(line, 2);
     }
@@ -651,8 +527,7 @@ mod toml_linter_tests {
         assert!(check("").is_empty());
     }
 
-    // One finding, not a list: everything after the first unreadable
-    // thing is a guess about a document whose shape is already unknown.
+    // One finding: after the first unreadable thing the shape is unknown.
     #[test]
     fn only_the_first_problem_is_reported() {
         assert_eq!(check("a = \nb = \nc = \n").len(), 1);
@@ -673,7 +548,6 @@ mod json_linter_tests {
         let found = check(text);
         assert_eq!(found.len(), 1);
         assert!(found[0].message.contains("tru"), "{}", found[0].message);
-        // Pointing at the bad word, not at the start of the file.
         assert_eq!(&text[found[0].start..found[0].end], "tru");
     }
 
@@ -684,9 +558,8 @@ mod json_linter_tests {
         assert!(found[0].message.contains("unterminated"), "{}", found[0].message);
     }
 
-    // A structural error has its position inside the parser's own
-    // message rather than as data, so it is reported once against the
-    // buffer -- with the parser's words, which do name the position.
+    // A structural error's position is only in the parser's message, so it's
+    // reported against the buffer, in the parser's words.
     #[test]
     fn a_structural_error_is_reported_once_with_the_parsers_own_words() {
         let found = check("{\"a\": 1,}");
@@ -695,8 +568,6 @@ mod json_linter_tests {
         assert!(found[0].message.contains("position"), "{}", found[0].message);
     }
 
-    // A stray character is what *caused* the parse to fail; saying so
-    // twice helps nobody.
     #[test]
     fn a_lexical_error_suppresses_the_structural_one() {
         assert!(check("{\"a\": @}").iter().all(|d| d.code == "json-syntax"));
@@ -777,9 +648,8 @@ mod tests {
 
     #[test]
     fn unquoted_var_in_single_bracket_test_is_still_flagged() {
-        // `[` is an ordinary command (test), not special syntax -- word
-        // splitting inside it is exactly the classic `[: unary operator
-        // expected` footgun when the variable is empty.
+        // `[` is a command, not syntax, so an empty `$foo` gives `[: unary
+        // operator expected`.
         let diags = check("[ $foo = bar ]");
         assert_eq!(codes(&diags), ["unquoted-expansion"]);
     }
@@ -803,9 +673,8 @@ mod tests {
 
     #[test]
     fn equals_shaped_word_as_an_ordinary_argument_is_still_flagged() {
-        // `make VAR=$val` -- bash never treats a non-leading, non-
-        // declare-argument word as a real assignment, so $val here is an
-        // ordinary word-splitting-sensitive expansion, unlike x=$foo.
+        // `make VAR=$val`: a non-leading word is never an assignment, so
+        // `$val` splits, unlike in `x=$foo`.
         let diags = check("make VAR=$val");
         assert_eq!(codes(&diags), ["unquoted-expansion"]);
     }
