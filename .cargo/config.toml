@@ -1,20 +1,9 @@
-# Packed relative relocations (DT_RELR) on Linux.
+# Packed relative relocations (DT_RELR): pointers in static data are
+# fixed up from a bitmap instead of one 24-byte relocation each, which
+# makes the binary noticeably smaller. Needs glibc 2.36 at runtime, but GNU
+# ld only packs when the glibc it links against supports it, so this never
+# raises the requirement above what the build already has.
 #
-# A position-independent binary needs one relocation per pointer stored
-# in its static data -- vtables, &str tables, constant slices -- and
-# bish has about 8,800 of them: 214 KiB of `.rela.dyn`, 24 bytes each.
-# RELR stores the same fix-ups as a bitmap, 7 KiB in all, taking the
-# release binary from 4.45 MB to 4.24 MB (-4.8%) with no code change and
-# no loss of address randomization.
-#
-# It needs glibc 2.36 to run, which costs nothing here: a binary linked
-# against the build machine's glibc already requires that glibc's
-# version (2.39 when this was measured). GNU ld only packs when the
-# libc it links against supports it, so building on an older system
-# simply does not.
-#
-# Only x86_64 for now, the one Linux target whose linker this was
-# checked with; the aarch64 and armv7 cross-builds would want the same
-# line once theirs is.
+# x86_64 only, the one Linux target this was checked on.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs"]
