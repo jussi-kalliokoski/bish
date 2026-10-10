@@ -1,38 +1,23 @@
-// `cd`, `pushd`, `popd`, `dirs`: where the shell is, and the stack of
-// where it has been.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
+// `cd`, `pushd`, `popd` and `dirs`.
 
 use crate::exec::{RESTRICTED, Shell, sh_eprintln, sh_println};
 
 pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
-    // `-P` resolves symlinks; `-L`, the default, keeps the route you
-    // took (see Shell::change_directory). The comment that used to sit
-    // here said this shell had "only ever had the logical behaviour"
-    // and that `-P` was therefore safe to ignore -- it was the other
-    // way round, and `-P` was the only behaviour there was.
-    //
-    // What is *not* ignored is a second operand: bash rejects that, and
-    // accepting it silently hid a typo'd path.
+    // `-P` resolves symlinks; `-L`, the default, keeps the path as
+    // given (see `Shell::change_directory`).
     let physical = args.iter().rposition(|a| a == "-P" || a == "-L").is_some_and(|i| args[i] == "-P");
     let operands: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "-L" | "-P" | "-@" | "-e")).collect();
     if operands.len() > 1 {
-        // 2, not 1: bash reserves 2 for a builtin's own usage error
-        // and 1 for the operation failing.
+        // bash's status for a usage error.
         sh_eprintln!(sh, "bish: cd: too many arguments");
         return 2;
     }
     let old = sh.cwd.to_string_lossy().into_owned();
     let target = if let Some(dir) = operands.first() {
         if dir.as_str() == "-" {
-            // The shell's own `OLDPWD`, not the process environment's.
-            // `cd` is the thing that *writes* OLDPWD, and it writes it
-            // to the shell (see Shell::chdir) -- reading it back out of
-            // `environ` found whatever this process was started with,
-            // so `cd -` went somewhere the shell had never been, and
-            // `unset OLDPWD` did not stop it. Same for HOME below,
-            // which is why `HOME=/x; cd` ignored the assignment while
-            // `echo ~` honoured it.
+            // The shell's OLDPWD and HOME, not the process environment's:
+            // `cd` writes OLDPWD to the shell, and `HOME=/x; cd` has to
+            // honour the assignment.
             if !sh.var_is_set("OLDPWD") {
                 sh_eprintln!(sh, "bish: cd: OLDPWD not set");
                 return 1;
@@ -53,19 +38,11 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
         }
     };
     let _ = old;
-    // `CDPATH`: a search path for `cd`, so `cd bish` from anywhere
-    // finds `~/src/bish`. Only for a plain relative name -- an
-    // absolute path, or one that already says `.`/`..`, means
-    // exactly where it says and is never searched for.
-    //
-    // A hit that did not come from the current directory prints
-    // where it landed, which is bash's own behaviour and not a
-    // courtesy: without it, `cd bish` silently putting you somewhere
-    // other than `./bish` would be the worst kind of surprise.
+    // `CDPATH` is searched only for a plain relative name. A directory
+    // found through it is printed, as bash does.
     let (target, from_cdpath) = sh.resolve_cdpath(target);
-    // `-P` asks for the destination rather than the route, which is
-    // what resolving it up front gives: the lexical normalisation
-    // inside `change_directory` then has nothing left to cancel.
+    // Resolved up front, so the lexical normalisation in
+    // `change_directory` has nothing left to undo.
     let resolved = match physical {
         true => std::fs::canonicalize(&target).unwrap_or_else(|_| std::path::PathBuf::from(&target)),
         false => std::path::PathBuf::from(&target),
@@ -89,11 +66,8 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
 }
 
 pub(crate) fn run_pushd(sh: &mut Shell, args: &[String]) -> i32 {
-    // `-n`: add to the stack without changing directory. bash's own
-    // flag, and the only way to describe a directory stack to a shell
-    // that does not have one yet -- which is what the preamble a
-    // re-exec'd construct is handed has to do (see
-    // `Shell::functions_preamble`).
+    // `-n` pushes without changing directory. `Shell::functions_preamble`
+    // uses it to rebuild the stack in a re-exec'd shell.
     if args.iter().any(|a| a == "-n") {
         let Some(dir) = args.iter().find(|a| !a.starts_with('-')) else {
             sh_eprintln!(sh, "bish: pushd: no other directory");
@@ -114,8 +88,7 @@ pub(crate) fn run_pushd(sh: &mut Shell, args: &[String]) -> i32 {
         },
     };
     if !args.iter().any(|a| !a.starts_with('-')) {
-        // Bare `pushd`: rotate -- cd into the current top-of-stack,
-        // then push the old cwd back onto the front, net-swapping them.
+        // Bare `pushd` swaps the cwd with the top of the stack.
         sh.dir_stack.remove(0);
     }
     let old_cwd = sh.cwd.to_string_lossy().into_owned();
