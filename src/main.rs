@@ -155,6 +155,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // A child this shell re-exec'd takes its script out of the
+    // environment, and the variable goes away with it: it holds the
+    // parent's whole state, and anything that can still read it later --
+    // the script itself, or anything the child starts -- is one more
+    // place that state exists. See exec::REEXEC_SCRIPT for why it is not
+    // in argv.
+    if invocation.reexec {
+        invocation.command = Some(std::env::var(exec::REEXEC_SCRIPT).unwrap_or_default());
+        // SAFETY: before any thread of this program has started, and
+        // before a Shell reads the environment into its own table.
+        unsafe { std::env::remove_var(exec::REEXEC_SCRIPT) };
+    }
     // `login(1)`, and a terminal emulator imitating it, start a login
     // shell by naming it `-bish` rather than passing `-l`.
     if args.first().is_some_and(|name| name.starts_with('-')) {
@@ -275,6 +287,7 @@ struct Invocation {
     login: bool,
     norc: bool,
     promoted: bool,
+    reexec: bool,
     print_version: bool,
     print_help: bool,
     set_flags: Vec<(char, bool)>,
@@ -301,6 +314,9 @@ impl Invocation {
                 "--login" => inv.login = true,
                 "--norc" | "--noprofile" => inv.norc = true,
                 "--promoted" => inv.promoted = true,
+                // A child this shell re-exec'd: its script is in the
+                // environment, not here. See exec::REEXEC_SCRIPT.
+                "--reexec" => inv.reexec = true,
                 _ if arg.starts_with("--") => return Err(format!("{arg}: unrecognized option")),
                 // A cluster of single-letter flags, either sense:
                 // `-euo pipefail`, `+x`. A bare `-` or `+` is an

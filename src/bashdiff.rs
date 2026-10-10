@@ -1852,6 +1852,38 @@ y
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // A shell's own state must not be readable by other users. bish
+    // re-execs for a backgrounded subshell, a coproc and some pipeline
+    // stages, and the child needs the parent's functions *and
+    // variables* to start from -- which used to be handed over in argv,
+    // where `/proc/<pid>/cmdline` (mode 0444) shows it to everybody on
+    // the machine. bash forks and keeps that state in memory nobody else
+    // has a name for, so the two shells should agree that nothing is
+    // visible.
+    //
+    // Linux-only by nature; elsewhere there is no /proc to look in and
+    // the test says nothing rather than pretending.
+    #[test]
+    fn a_backgrounded_subshell_does_not_publish_the_shells_variables() {
+        let Some(bish) = bish_binary() else { return };
+        if !std::path::Path::new("/proc/self/cmdline").exists() {
+            return;
+        }
+        // The shell starts a child, waits long enough for this test to
+        // be able to look, and reports what its own /proc entry shows.
+        let script = r#"SECRET=hunter2; ( sleep 0.4 ) & p=$!; sleep 0.1; tr '\0' '\n' < /proc/$p/cmdline | grep -c hunter2"#;
+        let dir = std::env::temp_dir().join(format!("bish-proc-leak-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = run_with_sighup_ignored(bish.as_os_str(), script, &dir);
+        // `grep -c` says 0 and exits 1, so the text is the whole answer.
+        assert_eq!(got.trim(), "0", "bish published its own variables in /proc: {got:?}");
+        if let Some(bash) = oracle_bash() {
+            assert_eq!(run_with_sighup_ignored(bash.as_os_str(), script, &dir).trim(), "0", "the control: bash must also show nothing");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `run_with`, with SIGHUP already ignored when the shell starts.
     ///
     /// The disposition is set in the child between fork and exec, which is

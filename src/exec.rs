@@ -3416,6 +3416,15 @@ impl Shell {
         command
     }
 
+    /// `reexec_command`, with the script the child is to run -- through
+    /// the environment rather than argv. See `REEXEC_SCRIPT` for why.
+    fn reexec_running(&self, program: impl AsRef<std::ffi::OsStr>, script: String) -> Command {
+        let mut command = self.reexec_command(program);
+        command.env(REEXEC_SCRIPT, script);
+        command.arg("--reexec");
+        command
+    }
+
     /// Every exported variable and its value, as a child should see it.
     ///
     /// Resolved with the same precedence a `$name` gets, so an exported
@@ -5926,8 +5935,8 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + raw;
-        let mut command = self.reexec_command(exe);
-        command.arg("-c").arg(script).current_dir(&self.cwd);
+        let mut command = self.reexec_running(exe, script);
+        command.current_dir(&self.cwd);
         // Attached to its own pty, for exactly the reason run_single's own
         // background spawn already is (see `use_pty` there): inherited
         // stdio writes straight onto whatever the real screen happens to
@@ -5984,8 +5993,7 @@ impl Shell {
             }
         };
         let script = self.functions_preamble() + &crate::serialize::serialize_command(body);
-        let mut command = self.reexec_command(exe);
-        command.arg("-c").arg(script);
+        let mut command = self.reexec_running(exe, script);
         command.current_dir(&self.cwd);
         command.stdin(Stdio::from(in_r));
         command.stdout(Stdio::from(out_w));
@@ -6152,8 +6160,7 @@ impl Shell {
         // have it apply them a second time -- and, for a compound, take
         // this same path again and spawn another child.
         let script = self.functions_preamble() + &crate::serialize::serialize_command_body(cmd);
-        let mut command = self.reexec_command(exe);
-        command.arg("-c").arg(script);
+        let mut command = self.reexec_running(exe, script);
         command.current_dir(&self.cwd);
         // Whichever of this job's own streams the redirects *didn't*
         // claim goes to a pty of its own, for the same reason run_multi's
@@ -10449,8 +10456,7 @@ impl Shell {
                         };
                         let script_line: String = argv.iter().map(|a| crate::serialize::quote_literal(a)).collect::<Vec<_>>().join(" ");
                         let script = self.functions_preamble() + &script_line;
-                        let mut command = self.reexec_command(exe);
-                        command.arg("-c").arg(script);
+                        let command = self.reexec_running(exe, script);
                         command
                     } else {
                         let mut command = self.command(&argv[0]);
@@ -10524,8 +10530,7 @@ impl Shell {
                         }
                     };
                     let script = self.functions_preamble() + &crate::serialize::serialize_command(other);
-                    let mut command = self.reexec_command(exe);
-                    command.arg("-c").arg(script);
+                    let mut command = self.reexec_running(exe, script);
                     command.stdin(default_stdin);
                     command.stdout(default_stdout);
                     command.stderr(default_stderr.take().unwrap_or_else(|| self.spawn_stderr_stdio()));
@@ -15494,6 +15499,25 @@ pub fn take_winch() -> bool {
 /// `env | grep BISH` in a background subshell shows nothing and an
 /// exported copy cannot leak on to a grandchild that is a *new* shell.
 const REEXEC_SHELL_PID: &str = "BISH_REEXEC_SHELL_PID";
+
+/// Where a re-exec'd child's script is handed over, instead of in argv.
+///
+/// It used to be `bish -c <script>`, and the script is the shell's whole
+/// state: `functions_preamble` writes out every function and every
+/// *variable*, exported or not, because that is what the child has to
+/// start from. `/proc/<pid>/cmdline` is mode 0444, so for as long as any
+/// backgrounded subshell, coproc or re-exec'd pipeline stage was alive,
+/// every local user could read every variable of the shell that started
+/// it -- measured: a `SECRET=hunter2` that was never exported came back
+/// out of `/proc` verbatim. bash keeps that state in forked memory,
+/// where no other uid has a name for it.
+///
+/// `/proc/<pid>/environ` is mode 0400 -- the owner and root, nobody
+/// else -- which is the whole reason this moved. `main` takes the script
+/// out of the environment and *removes the variable* before building a
+/// shell, so it reaches neither the script nor anything the child goes
+/// on to start.
+pub(crate) const REEXEC_SCRIPT: &str = "BISH_REEXEC_SCRIPT";
 
 /// The `$$` this process was told to report, if it was told one.
 fn inherited_shell_pid() -> Option<u32> {
