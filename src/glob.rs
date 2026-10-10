@@ -1,19 +1,16 @@
-// Shell-style filename glob matching: * ? [abc] [a-z] [!abc]/[^abc], plus
-// extglob patterns @(...) !(...) +(...) *(...) ?(...). Real bash gates
-// extglob behind `shopt -s extglob`; bish doesn't track shopt state yet, so
-// these are recognized unconditionally -- a strict superset of default
-// bash behavior that only diverges for scripts that use a literal pattern
-// like `!(foo)` as ordinary text without ever enabling extglob, which is
-// vanishingly rare in practice.
-// Shared by pathname expansion, `case` patterns, and `[[ ]]`'s `==`/`!=`.
+// Shell glob matching: `*`, `?`, `[abc]`, `[a-z]`, `[!abc]`/`[^abc]`, and
+// the extglob groups `@(...)`, `!(...)`, `+(...)`, `*(...)`, `?(...)`.
+// bash needs `shopt -s extglob` for those; bish always recognizes them,
+// which differs only for a script using `!(foo)` as literal text. Shared
+// by pathname expansion, `case` and `[[ ]]`'s `==`/`!=`.
 
 pub fn matches(pattern: &str, text: &str) -> bool {
     match_here(pattern.as_bytes(), text.as_bytes())
 }
 
-/// `matches`, optionally folding case -- what `shopt -s nocasematch`
-/// asks of `case` and of `[[ == ]]`. Folding both sides is the same
-/// thing `nocaseglob` does for pathnames (see `read_names`).
+/// `matches`, optionally folding case, for `shopt -s nocasematch` in
+/// `case` and `[[ == ]]`. Both sides are folded, as `nocaseglob` does for
+/// pathnames (see `read_names`).
 pub fn matches_with_case(pattern: &str, text: &str, fold_case: bool) -> bool {
     match fold_case {
         true => matches(&pattern.to_lowercase(), &text.to_lowercase()),
@@ -21,28 +18,18 @@ pub fn matches_with_case(pattern: &str, text: &str, fold_case: bool) -> bool {
     }
 }
 
-/// The same, but `*` and `?` never cross a `/` -- pathname semantics,
-/// what C's fnmatch spells `FNM_PATHNAME`.
-///
-/// This is the rule pathname expansion itself follows, and the one
-/// `GLOBIGNORE` is matched under: `*.o` drops `a.o` and leaves
-/// `sub/x.o` alone, because the pattern names one path component and
-/// the candidate has two. Confirmed against real bash, which was the
-/// opposite of what I first assumed.
+/// The same, but `*` and `?` never cross a `/`: pathname semantics, C's
+/// `FNM_PATHNAME`. Pathname expansion and `GLOBIGNORE` use it, so `*.o`
+/// drops `a.o` but not `sub/x.o`, as in bash.
 pub fn matches_path(pattern: &str, text: &str) -> bool {
     let (pat, txt): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), text.split('/').collect());
     pat.len() == txt.len() && pat.iter().zip(txt.iter()).all(|(p, t)| matches(p, t))
 }
 
-/// How many characters a pattern must match, when that is knowable --
-/// `None` when it contains a `*` or an extglob group, either of which
-/// can match any number.
-///
-/// Worth knowing because `${v//pat/repl}` otherwise has to try every
-/// possible end position for a match at every start, which is quadratic.
-/// A pattern with no `*` matches exactly this many characters or none,
-/// so there is one end to try rather than n -- and `${s//a/b}`,
-/// `${s//:/|}`, `${path//\//_}` are all of that shape.
+/// How many characters a pattern must match, or `None` with a `*` or an
+/// extglob group. `${v//pat/repl}` otherwise tries every end position at
+/// every start; a fixed width gives one end per start, the common shape
+/// (`${s//a/b}`, `${path//\//_}`).
 pub fn fixed_width(pattern: &str) -> Option<usize> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut width = 0usize;
@@ -50,17 +37,16 @@ pub fn fixed_width(pattern: &str) -> Option<usize> {
     while i < chars.len() {
         match chars[i] {
             '*' => return None,
-            // An extglob group repeats or alternates, so its width is
-            // not fixed -- and `?(...)`/`+(...)` can match nothing at
-            // all.
+            // An extglob group repeats or alternates, and `?(...)`/`+(...)`
+            // can match nothing.
             '@' | '!' | '+' | '?' if chars.get(i + 1) == Some(&'(') => return None,
             '\\' => {
                 i += 1;
                 width += 1;
             }
             '[' => {
-                // To the closing bracket, minding that `[]]` and `[^]]`
-                // put a literal `]` first where it cannot end the class.
+                // To the closing bracket; `[]]` and `[^]]` put a literal
+                // `]` first.
                 let mut j = i + 1;
                 if matches!(chars.get(j), Some('!') | Some('^')) {
                     j += 1;
@@ -69,26 +55,21 @@ pub fn fixed_width(pattern: &str) -> Option<usize> {
                     j += 1;
                 }
                 while j < chars.len() && chars[j] != ']' {
-                    // An escaped `]` is a member of the class, not its
-                    // end.
+                    // An escaped `]` is a member, not the end.
                     if chars[j] == '\\' && j + 1 < chars.len() {
                         j += 2;
                         continue;
                     }
-                    // `[:space:]`, `[.coll.]`, `[=equiv=]` -- each holds
-                    // a `]` that does not close the class around it.
-                    // Reading one as the end is how `[[:space:]]` came
-                    // out two characters wide instead of one, and made
-                    // the replacement match a space *and* whatever
-                    // followed it.
+                    // `[:space:]`, `[.coll.]`, `[=equiv=]` each hold a `]`
+                    // that doesn't close the class: `[[:space:]]` is one
+                    // character wide.
                     if chars[j] == '[' && matches!(chars.get(j + 1), Some(':') | Some('.') | Some('=')) {
                         let kind = chars[j + 1];
                         let mut k = j + 2;
                         while k + 1 < chars.len() && !(chars[k] == kind && chars[k + 1] == ']') {
                             k += 1;
                         }
-                        // Unterminated: leave `j` where it was and let
-                        // the ordinary scan below deal with it.
+                        // Unterminated: leave `j` for the scan below.
                         if k + 1 < chars.len() {
                             j = k + 1;
                         }
@@ -114,12 +95,10 @@ fn match_here(pat: &[u8], text: &[u8]) -> bool {
     if pat.is_empty() {
         return text.is_empty();
     }
-    // Backslash-escape: `\c` matches a literal `c`, whatever `c` is (even
-    // one of the metacharacters below). Needed so a pattern built from a
-    // partly-quoted word (see escape() and expand_glob_pattern in exec.rs)
-    // can represent "this piece is literal text" for the quoted chunks
-    // while unquoted chunks stay real glob syntax, mirroring how the same
-    // word is already handled for the `=~` regex operand.
+    // `\c` matches a literal `c`, even a metacharacter, so a pattern built
+    // from a partly quoted word (`escape`, `expand_glob_pattern` in exec.rs)
+    // keeps quoted chunks literal and unquoted ones as syntax, as for the
+    // `=~` operand.
     if pat[0] == b'\\' && pat.len() > 1 {
         return !text.is_empty() && text[0] == pat[1] && match_here(&pat[2..], &text[1..]);
     }
@@ -148,9 +127,9 @@ fn match_here(pat: &[u8], text: &[u8]) -> bool {
 }
 
 // Splits a `(alt1|alt2|...)` group (pat[0] == '(') into its top-level
-// pipe-separated alternatives, honoring nested groups. Returns
-// (alternatives, the group text including its parens, the pattern text
-// after the closing paren), or None if unterminated (no matching ')').
+// alternatives, nested groups respected. Returns the alternatives, the
+// group's text with its parens, and what follows; `None` if
+// unterminated.
 fn find_group(pat: &[u8]) -> Option<(Vec<&[u8]>, &[u8], &[u8])> {
     if pat.is_empty() || pat[0] != b'(' {
         return None;
@@ -218,16 +197,9 @@ fn match_extglob(prefix: u8, alts: &[&[u8]], group: &[u8], rest: &[u8], text: &[
     }
 }
 
-/// The ASCII members of a POSIX character class, as byte ranges.
-///
-/// `[[:space:]]` and friends, which are a *name inside* a bracket
-/// expression rather than a nested one: the `]` that closes `[:space:]`
-/// does not close the bracket around it. Both this crate's matchers
-/// scanned for the first `]`, so `[[:space:]]` read as the set
-/// `[:space:` followed by a literal `]`, and matched neither.
-///
-/// Ranges rather than a predicate so the regex engine, whose classes
-/// are already ranges, can use the same table.
+/// The ASCII members of a POSIX character class, as byte ranges. A
+/// `[:space:]` is a name inside a bracket expression, and its `]` doesn't
+/// close the bracket. Ranges, so the regex engine can share the table.
 pub(crate) fn posix_class_ranges(name: &[u8]) -> Option<&'static [(u8, u8)]> {
     Some(match name {
         b"alpha" => &[(b'A', b'Z'), (b'a', b'z')],
@@ -235,8 +207,7 @@ pub(crate) fn posix_class_ranges(name: &[u8]) -> Option<&'static [(u8, u8)]> {
         b"alnum" => &[(b'0', b'9'), (b'A', b'Z'), (b'a', b'z')],
         b"upper" => &[(b'A', b'Z')],
         b"lower" => &[(b'a', b'z')],
-        // Tab through carriage return is 0x09..0x0d -- and includes
-        // the vertical tab, which Rust's own `is_ascii_whitespace`
+        // 0x09..0x0d includes vertical tab, which `is_ascii_whitespace`
         // leaves out.
         b"space" => &[(0x09, 0x0d), (b' ', b' ')],
         b"blank" => &[(0x09, 0x09), (b' ', b' ')],
@@ -250,7 +221,7 @@ pub(crate) fn posix_class_ranges(name: &[u8]) -> Option<&'static [(u8, u8)]> {
 }
 
 /// The length of a `[:name:]` at the start of `pat`, brackets included,
-/// and the name itself.
+/// and the name.
 pub(crate) fn posix_class_at(pat: &[u8]) -> Option<(&[u8], usize)> {
     if pat.len() < 4 || pat[0] != b'[' || pat[1] != b':' {
         return None;
@@ -265,9 +236,9 @@ pub(crate) fn posix_class_at(pat: &[u8]) -> Option<(&[u8], usize)> {
     Some((&pat[2..i], i + 2))
 }
 
-// One member of a bracket expression, starting at `k`: `\c` is the literal
-// `c`, so an escaped `-`, `]`, `^` or `\` is an ordinary member rather than
-// the class's own syntax. Returns the character and the index after it.
+// One bracket-expression member at `k`: `\c` is a literal `c`, so an
+// escaped `-`, `]`, `^` or `\` is a member, not syntax. Returns the
+// character and the next index.
 fn class_member(class: &[u8], k: usize) -> (u8, usize) {
     match class[k] == b'\\' && k + 1 < class.len() {
         true => (class[k + 1], k + 2),
@@ -275,9 +246,8 @@ fn class_member(class: &[u8], k: usize) -> (u8, usize) {
     }
 }
 
-// pat[0] == b'['. Returns (did `c` match the class, remaining pattern after
-// the closing ']'), or None if the bracket expression is malformed (no
-// closing ']'), in which case '[' should be treated as a literal char.
+// `pat[0]` is `[`. Returns whether `c` matched and the pattern after the
+// closing `]`, or `None` with no closing `]`, when `[` is literal.
 pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
     let mut i = 1;
     let negate = i < pat.len() && (pat[i] == b'!' || pat[i] == b'^');
@@ -290,14 +260,12 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
         j += 1;
     }
     while j < pat.len() && pat[j] != b']' {
-        // An escaped `]` is a member, not the end: `[\]]` is a class
-        // holding a `]`.
+        // An escaped `]` is a member: `[\]]` holds a `]`.
         if pat[j] == b'\\' && j + 1 < pat.len() {
             j += 2;
             continue;
         }
-        // A `[:name:]` carries its own `]`, which is not this
-        // bracket's either.
+        // A `[:name:]`'s `]` isn't this bracket's either.
         if let Some((_, len)) = posix_class_at(&pat[j..]) {
             j += len;
             continue;
@@ -320,9 +288,8 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
             continue;
         }
         let (lo, next) = class_member(class, k);
-        // A range needs a bare `-` with a member on either side. An
-        // escaped one is just a hyphen in the set, which is what
-        // `[a\-z]` means (a, `-`, z) as against `[a-z]`.
+        // A range needs a bare `-` between two members; `[a\-z]` is a, `-`
+        // and z.
         if next < class.len() && class[next] == b'-' && next + 1 < class.len() {
             let (hi, after) = class_member(class, next + 1);
             if c >= lo && c <= hi {
@@ -342,13 +309,9 @@ pub(crate) fn match_class(pat: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
     Some((matched, &pat[j + 1..]))
 }
 
-/// Whether `s` is a pattern at all -- i.e. whether it has a
-/// metacharacter that is not escaped.
-///
-/// The escaping matters and used to be ignored. A word's quoted parts
-/// reach here through `escape`, so `printf '[%s]'` arrives as
-/// `\[%s\]`: it has a `[` in it, but not one that means anything, and
-/// reading it as a pattern makes the word vanish under `nullglob`.
+/// Whether `s` has an unescaped metacharacter. Quoted parts arrive
+/// escaped, so `printf '[%s]'` comes as `\[%s\]` and isn't a pattern,
+/// and doesn't vanish under `nullglob`.
 pub fn has_meta(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -371,29 +334,16 @@ pub fn has_meta(s: &str) -> bool {
     false
 }
 
-/// Where the bracket expression opened at `pat[0]` closes, if it closes
-/// at all -- the same scan `match_class` does, and it has to agree with
-/// it: a `[` with no `]` after it is not a pattern, it is the character
-/// `[`.
-///
-/// That agreement is worth a measurement. `has_meta` used to answer
-/// "yes, a pattern" for any `[`, and a word that *might* be a pattern
-/// gets a filesystem scan. So `[ $n -lt 300 ]` -- two words, `[` and
-/// `]` -- read the whole current directory twice per iteration:
-///
-///     cd /tmp                                  # ~8,000 entries
-///     while [ $n -lt 300 ]; do n=$((n+1)); done
-///     bash 3-13ms, bish 5.7-8.3s
-///
-/// The result was never wrong, since the scan matched nothing and the
-/// word fell back to its own text. It just cost 19-27ms each time.
+/// Where the bracket expression at `pat[0]` closes, if it does,
+/// agreeing with `match_class`: a `[` with no `]` is the character `[`.
+/// Otherwise `[ $n -lt 300 ]` would scan the directory for each `[` and
+/// `]` on every iteration.
 fn closing_bracket(pat: &[u8]) -> Option<usize> {
     let mut i = 1;
     if i < pat.len() && (pat[i] == b'!' || pat[i] == b'^') {
         i += 1;
     }
-    // A `]` in the first position is the literal character, not the
-    // terminator -- `[]]` matches a single `]`.
+    // A `]` first is literal: `[]]` matches `]`.
     if i < pat.len() && pat[i] == b']' {
         i += 1;
     }
@@ -407,25 +357,14 @@ fn closing_bracket(pat: &[u8]) -> Option<usize> {
     (i < pat.len()).then_some(i)
 }
 
-// Escapes every character match_here treats specially, so the result --
-// spliced into a larger pattern -- matches only the literal input text.
-// Used by expand_glob_pattern (exec.rs) to render a word's quoted/expanded
-// chunks as inert literal text within an otherwise-real glob pattern built
-// from the word's unquoted chunks, the same per-chunk approach already
-// used for `[[ =~ ]]`'s regex operand (see regex::escape).
-//
-// `]`, `^` and `-` are in the set because a quoted chunk can land *inside*
-// a bracket expression the surrounding unquoted chunks opened -- `[\^]`
-// arrives as `[` + a literal `^` + `]` -- where they are the class's own
-// syntax rather than match_here's. Escaping them outside a class costs
-// nothing, since `\c` is a literal `c` wherever it appears.
+// Escapes everything `match_here` treats specially, so the result
+// matches only the literal text. `expand_glob_pattern` (exec.rs) uses it
+// for a word's quoted chunks inside a pattern, as `regex::escape` serves
+// `=~`. `]`, `^` and `-` are included because a quoted chunk can land
+// inside a bracket expression (`[\^]`); escaping them elsewhere is
+// harmless.
 pub fn escape(s: &str) -> std::borrow::Cow<'_, str> {
-    // Borrowed when there is nothing to escape, which is the answer for
-    // most text: a quoted word is escaped on the way into a pattern
-    // whether or not it holds anything that needed it, so the common
-    // call is one that copies a string to change nothing about it. The
-    // return type is where that belongs -- a caller writing
-    // `push_str(&escape(x))` reads the same either way.
+    // Borrowed when there's nothing to escape, the usual case.
     match s.bytes().any(is_pattern_syntax) {
         false => std::borrow::Cow::Borrowed(s),
         true => {
@@ -441,22 +380,13 @@ pub fn escape(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// One list, so the "is there anything to do" test and the loop that
-/// does it cannot drift apart.
+/// One list, so the check and the loop agree.
 fn is_pattern_syntax(b: u8) -> bool {
     matches!(b, b'*' | b'?' | b'[' | b']' | b'\\' | b'@' | b'!' | b'+' | b'(' | b'^' | b'-')
 }
 
-// Expands a glob pattern against the filesystem. Only the final path
-// component may contain metacharacters -- `dir/*.txt` works, but metachars
-// in an intermediate directory segment don't. Returns None if there were no
-// matches (caller should fall back to the literal pattern text, bash's
-// default nullglob-off behavior).
-/// The `shopt` settings that change what a pattern matches.
-///
-/// Passed in rather than read here because `glob` has no shell to ask,
-/// and because `case` patterns and `[[ == ]]` deliberately do not take
-/// them -- `nocaseglob` and `dotglob` are about *pathnames*.
+/// The `shopt` settings that change pathname matching. Passed in, since
+/// `glob` has no shell; `case` and `[[ == ]]` don't take them.
 #[derive(Clone, Copy, Default)]
 pub struct Options {
     /// `shopt -s dotglob`: a leading `.` stops being special, so `*`
@@ -469,25 +399,13 @@ pub struct Options {
     pub globstar: bool,
 }
 
-/// Expands a glob pattern against the filesystem.
-///
-/// `None` means "this is not a pattern at all" -- no unescaped
-/// metacharacters -- and is a different answer from `Some(vec![])`,
-/// which means it is a pattern that matched nothing. Only the caller
-/// can decide what the second one means: left alone it is bash's
-/// default, `nullglob` drops the word, and `failglob` makes it an
-/// error.
-///
-/// Every path component may be a pattern, and `**` (with `globstar`)
-/// stands for any number of directories, none included.
-/// Expands `pattern`, resolving a relative one against `root` rather
-/// than against the process's own current directory.
-///
-/// `root` is the *shell's* cwd. The two are the same until two shells
-/// share a process and one of them runs `cd`, which is what an
-/// in-process pipeline stage is. Matches come back relative, as the
-/// script wrote them -- `root` decides what they are relative *to*, not
-/// what they look like.
+/// Expands `pattern` against the filesystem, a relative one against
+/// `root`, the shell's cwd (which differs from the process's for an
+/// in-process pipeline stage). Matches stay relative, as written. `None`
+/// means not a pattern; `Some(vec![])` is a pattern matching nothing,
+/// which the caller handles (as is, `nullglob`, `failglob`). Every
+/// component may be a pattern; with `globstar`, `**` is any number of
+/// directories, none included.
 pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option<Vec<String>> {
     if !has_meta(pattern) {
         return None;
@@ -502,19 +420,17 @@ pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option
         let mut next = Vec::new();
         for base in &candidates {
             match *component {
-                // `**` is any number of directories, including none --
-                // so `a/**/x` finds `a/x` as well as `a/b/c/x`. As the
-                // last component it also names the files it passed, so
-                // `**` on its own lists everything.
+                // `**` is any number of directories, none included:
+                // `a/**/x` finds `a/x` and `a/b/c/x`. Last, it also lists
+                // the files, so `**` alone lists everything.
                 "**" if options.globstar => {
                     for path in descend(base, !last, root) {
                         next.push(match (path.is_empty(), last) {
-                            // No directories at all. On the end that is
-                            // the base itself, which bash writes with
-                            // the separator the pattern had -- `a/**`
-                            // lists `a/`. In the middle the separator
-                            // belongs to whatever comes next, or
-                            // `a/**/x` would be `a//x`.
+                            // No directories. At the end that's the base,
+                            // written with the pattern's separator (`a/**`
+                            // lists `a/`); in the middle the separator
+                            // belongs to what follows, or `a/**/x` would
+                            // give `a//x`.
                             (true, true) => join(base, ""),
                             (true, false) => base.clone(),
                             _ => join(base, &path),
@@ -547,9 +463,8 @@ pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option
     Some(found)
 }
 
-// One component's worth of matching: the names in `base` that
-// `component` matches, or the component itself when it is not a
-// pattern (in which case only its existence matters).
+// The names in `base` that `component` matches, or the component
+// itself when it's not a pattern (then only its existence matters).
 fn read_names(base: &str, component: &str, options: Options, root: &std::path::Path) -> Vec<String> {
     let dir = root.join(base);
     if !has_meta(component) {
@@ -566,10 +481,9 @@ fn read_names(base: &str, component: &str, options: Options, root: &std::path::P
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| {
-            // A leading `.` has to be asked for by name -- unless
-            // `dotglob` says otherwise. `.` and `..` are never produced
-            // either way, which is what `globskipdots` defaults to and
-            // bash 5.2 made unconditional.
+            // A leading `.` must be named, unless `dotglob`. `.` and `..`
+            // are never produced, as `globskipdots` defaults and bash 5.2
+            // made unconditional.
             if name.starts_with('.') && !options.dotglob && !component.starts_with('.') {
                 return false;
             }
@@ -584,15 +498,10 @@ fn read_names(base: &str, component: &str, options: Options, root: &std::path::P
         .collect()
 }
 
-// What `**` stands for at `base`: the empty path (no directories at
-// all), and every path under it. Symlinks are named but never
-// descended into, which is bash's rule and the only thing between this
-// and a cycle -- `*/x` still goes through one, because that is the
-// component's own single step rather than this walk.
-//
-// `dirs_only` for a `**` that has something after it: whatever comes
-// next has to be looked up *inside*, and a file is not somewhere to
-// look.
+// What `**` stands for at `base`: the empty path and every path under
+// it. Symlinks are named but not descended, as in bash, which avoids
+// cycles. `dirs_only` when something follows `**`, since it's looked up
+// inside.
 fn descend(base: &str, dirs_only: bool, root: &std::path::Path) -> Vec<String> {
     let base = root.join(base);
     let mut out = vec![String::new()];
@@ -627,8 +536,8 @@ fn join(base: &str, rest: &str) -> String {
     }
 }
 
-// A component with no metacharacters may still carry backslashes from
-// `escape`; the name on disk is what they were escaping.
+// A component without metacharacters may still carry `escape`'s
+// backslashes; the name on disk is what they escaped.
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -645,29 +554,28 @@ fn unescape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // A quoted chunk can land inside a bracket expression the unquoted
-    // chunks around it opened, so the class's own syntax -- `]`, `^`,
-    // `-` -- has to be escapable there too.
+    // A quoted chunk can land inside a bracket expression, so `]`, `^` and
+    // `-` must be escapable there.
     #[test]
     fn a_bracket_expression_honours_backslash_escapes() {
         assert!(matches("[\\^]", "^"));
         assert!(!matches("[\\^]", "a"));
         assert!(matches("[\\]]", "]"));
         assert!(!matches("[\\]]", "a"));
-        // `[a\-z]` is the three characters a, `-` and z, not the range.
+        // `[a\-z]` is a, `-` and z, not a range.
         assert!(matches("[a\\-z]", "-"));
         assert!(matches("[a\\-z]", "a"));
         assert!(matches("[a\\-z]", "z"));
         assert!(!matches("[a\\-z]", "q"));
-        // ...where the unescaped spelling still is the range.
+        // Unescaped, it's the range.
         assert!(matches("[a-z]", "q"));
-        // A negated class still negates, and still escapes.
+        // A negated class still negates and escapes.
         assert!(!matches("[^\\^]", "^"));
         assert!(matches("[^\\^]", "a"));
     }
 
-    // Everything escape() emits has to be inert, including the three
-    // characters that are only special inside a bracket.
+    // Everything `escape` emits is inert, the three bracket-only
+    // characters included.
     #[test]
     fn escaped_text_matches_only_itself() {
         for s in ["a*b", "a?b", "a[b", "a]b", "a^b", "a-b", "a\\b", "a@(b", "[^a-z]"] {
@@ -676,8 +584,7 @@ mod tests {
         assert!(!matches(&escape("a*b"), "axb"));
     }
 
-    // Widths feed the replacement fast path, so an escaped `]` that does
-    // not close its class must not be read as the one that does.
+    // An escaped `]` isn't the class's end for the width either.
     #[test]
     fn escapes_do_not_confuse_the_fixed_width_scan() {
         assert_eq!(fixed_width("[\\]]"), Some(1));
@@ -688,9 +595,8 @@ mod tests {
         assert_eq!(fixed_width("*"), None);
     }
 
-    // The check that keeps `[ ... ]` off the filesystem. Every `true`
-    // here costs a directory scan at the call site, so the interesting
-    // assertions are the `false` ones.
+    // Each `true` costs a directory scan where it's called, so the `false`
+    // cases matter.
     #[test]
     fn a_bracket_is_a_pattern_only_when_it_closes() {
         assert!(has_meta("[ab]"), "a real class");
@@ -700,9 +606,7 @@ mod tests {
         assert!(has_meta("x[]]y"), "the same, mid-word");
         assert!(has_meta("a[b]c"), "mid-word");
 
-        // `[` and `]` are the two words of `[ $x -lt 1 ]`, and reading
-        // either as a pattern made every test in a loop read the whole
-        // directory. Neither is one.
+        // `[` and `]`, the words of `[ $x -lt 1 ]`, aren't patterns.
         assert!(!has_meta("["), "a lone open bracket");
         assert!(!has_meta("]"), "a lone close bracket");
         assert!(!has_meta("[abc"), "never closed");
@@ -712,9 +616,7 @@ mod tests {
         assert!(!has_meta("\\[a]"), "escaped, so not a pattern");
     }
 
-    // has_meta and match_class have to agree about where a class ends,
-    // or a word gets scanned for as a pattern and then matched as a
-    // literal (or the reverse).
+    // `has_meta` and `match_class` agree on where a class ends.
     #[test]
     fn has_meta_agrees_with_the_matcher_about_what_is_a_class() {
         for pat in ["[ab]", "[]]", "[!a]", "[", "]", "[abc", "[]"] {
