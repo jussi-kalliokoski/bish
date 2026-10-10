@@ -224,18 +224,6 @@ pub enum KeyOutcome {
 /// bishopts or an `.editorconfig` say otherwise (see
 /// `TextBuffer::shiftwidth`). The prompt's `LineBuffer` uses it as is: a
 /// command line has no file for an `.editorconfig` to be about.
-// The *default* width of one indent -- what a buffer starts with before
-// the `shiftwidth`/`tabstop` bishopts or a project's `.editorconfig`
-// have said anything (see `TextBuffer::shiftwidth`, and repl.rs's own
-// apply_shell_options/apply_editorconfig).
-//
-// A real `TextBuffer` reads its own width from itself now, so this is no
-// longer the rule everything obeys -- but it is still the one place the
-// number is written down, and `editor.rs`'s own single-line `LineBuffer`
-// still uses it directly: a shell prompt is not a file, has no path for
-// a `.editorconfig` to be about, and indenting one is a rare enough
-// gesture that giving it its own configurable width would be inventing
-// a setting nobody asked for.
 pub const INDENT_WIDTH: usize = 4;
 
 /// An operator awaiting a motion (`y{motion}`, `d{motion}`, `c{motion}`)
@@ -549,15 +537,6 @@ pub struct VimKeys {
     /// transcript records keys by label (`<BS>`), but for a search it's the
     /// pattern being edited, so it's rebuilt from here on every key. Like
     /// `insert_text_start`: what comes before belongs to the opening command.
-    // Where a pending search's pattern begins inside `current_input`.
-    //
-    // The transcript is appended to before a key is dispatched, so a
-    // search's own editing keys land in it as their labels -- `<BS>`
-    // rather than one character less. For a search the transcript *is*
-    // the pattern being edited, so it is rebuilt from this point on every
-    // keystroke instead. Same shape as `insert_text_start` below, and for
-    // the same reason: the keys before it belong to the command that
-    // opened this, and only what follows is the text.
     search_input_start: usize,
     /// How many copies of an open Insert excursion's text go in, and
     /// whether each copy after the first starts a new line: `3ihi<Esc>`,
@@ -2147,10 +2126,7 @@ mod tests {
         feed_all(vk, keys).pop().unwrap()
     }
 
-    // Resolving a key sequence and naming what it resolved to is
-    // exactly what `::bish map` does with a right-hand side, so these
-    // go through the real path rather than constructing outcomes by
-    // hand.
+    // Through the real path `::bish map` uses, not hand-built outcomes.
     fn describe_typed(text: &str) -> String {
         let keys = crate::keymap::parse_keys(text).expect("test key sequence should parse");
         let mut vk = VimKeys::new();
@@ -2162,8 +2138,7 @@ mod tests {
         assert_eq!(describe_typed("j"), "down");
         assert_eq!(describe_typed("<C-d>"), "half-page-down");
         assert_eq!(describe_typed("gg"), "goto-first-line");
-        // The count rides along, because it is part of what the mapping
-        // says -- `10j` and `j` are not the same mapping.
+        // The count is part of what the mapping says.
         assert_eq!(describe_typed("10j"), "down 10");
         assert_eq!(describe_typed("$"), "line-end");
     }
@@ -2179,8 +2154,6 @@ mod tests {
 
     #[test]
     fn a_parameterized_action_says_what_it_carries() {
-        // `find-char` without the character would not tell two mappings
-        // apart in a listing.
         assert_eq!(describe_typed("fx"), "find-char 'x'");
         assert_eq!(describe_typed("Tx"), "till-char-backward 'x'");
         assert_eq!(describe_typed("ma"), "set-mark 'a'");
@@ -2189,8 +2162,6 @@ mod tests {
 
     #[test]
     fn the_non_actions_are_named_so_a_refusal_can_say_which() {
-        // `::bish map` refuses a right-hand side ending on either rather
-        // than storing a mapping that does nothing.
         assert_eq!(describe_typed("d"), "(incomplete)");
         assert_eq!(describe_typed("g"), "(incomplete)");
         assert_eq!(describe_outcome(&KeyOutcome::None), "(unrecognized)");
@@ -2209,11 +2180,9 @@ mod tests {
 
     #[test]
     fn the_q_that_stops_a_recording_is_not_part_of_it() {
-        // Reading goes through `next_key`, which records every key it
-        // reads -- including the `q` the host is about to interpret as
-        // "stop". Left in, replaying the macro re-runs that `q`, starts
-        // a fresh recording, and the next keystroke disappears into it
-        // as a register name.
+        // `next_key` records every key, including the `q` the host reads as
+        // "stop". Left in, replaying re-runs it and the next key becomes a
+        // register name.
         let mut vk = VimKeys::new();
         vk.start_recording('a');
         for k in [Key::Char('x'), Key::Char('x'), Key::Char('q')] {
@@ -2318,7 +2287,7 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('3')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::None); // 'gx' isn't a thing
-        // the aborted count/prefix must not leak into the next command
+        // The aborted count and prefix don't leak into the next command.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -2327,9 +2296,9 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('f')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None));
-        // ';' repeats the same direction
+        // `;` repeats in the same direction.
         assert_eq!(vk.feed(Key::Char(';')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: true }, None));
-        // ',' repeats with direction flipped
+        // `,` repeats with the direction flipped.
         assert_eq!(vk.feed(Key::Char(',')), KeyOutcome::Motion(Motion::FindChar { ch: 'x', till: false, forward: false }, None));
     }
 
@@ -2417,7 +2386,7 @@ mod tests {
         assert_eq!(vk.jump_back((20, 0)), Some((10, 0)));
         assert_eq!(vk.jump_back((10, 0)), Some((0, 0)));
         assert_eq!(vk.jump_back((0, 0)), None); // exhausted
-        // and back the other way
+        // And back the other way.
         assert_eq!(vk.jump_forward((0, 0)), Some((10, 0)));
         assert_eq!(vk.jump_forward((10, 0)), Some((20, 0)));
         assert_eq!(vk.jump_forward((20, 0)), None); // exhausted
@@ -2439,8 +2408,8 @@ mod tests {
         // `r` on its own is still replace-a-character, not this.
         assert_eq!(vk.feed(Key::Char('r')), KeyOutcome::Pending);
         vk.feed(Key::Escape);
-        // The `g` family is crowded, and `d` is also the delete
-        // operator's own key -- so check the neighbours still work.
+        // The `g` family is crowded, and `d` is the delete operator, so
+        // check the neighbours.
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Motion(Motion::GotoFirstLine, None));
         // A bare `d` is still the delete operator, not this.
@@ -2448,9 +2417,8 @@ mod tests {
         vk.feed(Key::Escape);
     }
 
-    // The two neighbours of `gd` that had a free key. Each is its own
-    // request, so a `gy` that quietly emitted a plain definition lookup
-    // would look like it worked and answer the wrong question.
+    // Each is its own request: a `gy` sending a definition lookup would look
+    // like it worked.
     #[test]
     fn gy_and_gd_capital_ask_their_own_questions() {
         let mut vk = VimKeys::new();
@@ -2458,21 +2426,17 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::GotoDefinition(GotoKind::TypeDefinition));
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('D')), KeyOutcome::GotoDefinition(GotoKind::Declaration));
-        // Neither key lost what it already meant on its own: `y` is
-        // still the yank operator, `D` still deletes to end of line.
+        // `y` is still the yank operator and `D` still deletes to end of
+        // line.
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
         vk.feed(Key::Escape);
         assert!(matches!(vk.feed(Key::Char('D')), KeyOutcome::Operator { .. } | KeyOutcome::OperatorLines { .. }));
-        // And `gi` still resumes insert where it left off -- taking it
-        // for `textDocument/implementation` is a decision nobody has
-        // made yet.
+        // And `gi` still resumes insert.
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::LastInsertPos));
     }
 
-    // Each kind maps to its own request and says its own name -- the
-    // one place a copy-paste slip would silently send `gy` to the
-    // definition endpoint.
+    // Each kind maps to its own request and name.
     #[test]
     fn every_goto_kind_has_its_own_request_and_noun() {
         let kinds = [GotoKind::Definition, GotoKind::TypeDefinition, GotoKind::Implementation, GotoKind::Declaration];
@@ -2517,7 +2481,7 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('\''), Key::Char('^')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::Motion(Motion::GotoMarkLine('^'), None));
-        // `m^` isn't a thing -- aborts like any other invalid mark-set char
+        // `m^` isn't valid: aborts like any invalid mark name.
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('m')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('^')), KeyOutcome::None);
@@ -2604,15 +2568,14 @@ mod tests {
         );
         assert_eq!(last(&mut vk, &[Key::Char('['), Key::Char('z')]), KeyOutcome::Motion(Motion::FoldStart, None));
         assert_eq!(last(&mut vk, &[Key::Char(']'), Key::Char('z')]), KeyOutcome::Motion(Motion::FoldEnd, None));
-        // In Visual mode the selection is the target, so there is no
-        // motion to wait for.
+        // In Visual mode the selection is the target, so no motion is
+        // awaited.
         vk.begin_visual(RegisterShape::Line, (0, 0));
         assert_eq!(last(&mut vk, &[Key::Char('z'), Key::Char('f')]), KeyOutcome::Fold(FoldCmd::CreateFromSelection, None));
     }
 
-    // `:noh` is only safe to press because anything that searches again
-    // brings the highlight back -- `n` and `*` included, neither of
-    // which sets a *new* search.
+    // Any later search brings the highlight back after `:noh`, `n` and `*`
+    // included, which set no new search.
     #[test]
     fn a_suppressed_search_highlight_comes_back_on_the_next_search() {
         let mut vk = VimKeys::new();
@@ -2667,7 +2630,7 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Escape), KeyOutcome::None);
-        // back to a clean state afterward
+        // A clean state afterwards.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -2679,7 +2642,7 @@ mod tests {
         assert!(vk.is_search_pending());
         assert_eq!(vk.feed(Key::CtrlC), KeyOutcome::None);
         assert!(!vk.is_search_pending());
-        // back to a clean state afterward, same as Escape
+        // A clean state afterwards, as after Escape.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -2688,8 +2651,7 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
         assert!(vk.is_search_pending());
-        // Nothing typed yet -- Backspace here should exit search entirely,
-        // not silently re-arm an unchanged empty pattern forever.
+        // With nothing typed, Backspace leaves the search.
         assert_eq!(vk.feed(Key::Backspace), KeyOutcome::None);
         assert!(!vk.is_search_pending());
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
@@ -2700,11 +2662,11 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('/')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('x')), KeyOutcome::Pending);
-        // First Backspace just edits "x" down to an empty pattern --
-        // still pending, not yet a cancel.
+        // The first Backspace edits `x` down to an empty pattern, still
+        // pending.
         assert_eq!(vk.feed(Key::Backspace), KeyOutcome::Pending);
         assert!(vk.is_search_pending());
-        // Now that the pattern is empty, the *next* Backspace cancels.
+        // With the pattern empty, the next Backspace cancels.
         assert_eq!(vk.feed(Key::Backspace), KeyOutcome::None);
         assert!(!vk.is_search_pending());
     }
@@ -2714,7 +2676,7 @@ mod tests {
         let mut vk = VimKeys::new();
         assert!(!vk.is_search_pending());
         assert_eq!(vk.feed(Key::Char('2')), KeyOutcome::Pending);
-        // Mid-count is pending, but not a *search* pending.
+        // Mid-count is pending, but not a search.
         assert!(!vk.is_search_pending());
     }
 
@@ -2794,7 +2756,7 @@ mod tests {
         vk.feed(Key::Char('g'));
         assert_eq!(vk.pending_display(), "20g");
         vk.feed(Key::Char('g'));
-        // resolved into a motion -- nothing pending anymore
+        // Resolved into a motion, so nothing is pending.
         assert_eq!(vk.pending_display(), "");
     }
 
@@ -2806,16 +2768,13 @@ mod tests {
         vk.feed(Key::Char('0'));
         vk.feed(Key::Char('k'));
         assert_eq!(vk.last_motion_display(), "20k");
-        // stays until the next sequence starts resolving
+        // It stays until the next sequence starts.
         vk.feed(Key::Char('j'));
         assert_eq!(vk.last_motion_display(), "j");
     }
 
-    // The status line shows what has been typed toward the command in
-    // progress, and for a search that is the pattern itself -- which is
-    // the thing being edited. Backspace used to *extend* it with `<BS>`:
-    // the transcript is appended to before the key is dispatched, so the
-    // pattern lost its character and the display gained three.
+    // For a search, the status line shows the pattern being edited, so
+    // Backspace removes a character instead of adding `<BS>`.
     #[test]
     fn a_searchs_display_is_the_pattern_being_typed() {
         let mut vk = VimKeys::new();
@@ -2827,19 +2786,17 @@ mod tests {
         vk.feed(Key::Backspace);
         assert_eq!(vk.pending_display(), "/a", "backspace shortens the pattern rather than naming itself");
 
-        // A key the search ignores does not leave a mark either: it is
-        // deliberately not an abort (nobody wants a stray Ctrl-F to
-        // discard a half-typed pattern), so it must not be mistaken for
-        // part of the pattern.
+        // A key the search ignores (not an abort, so a stray Ctrl-F doesn't
+        // discard the pattern) leaves no mark either.
         vk.feed(Key::CtrlF);
         assert_eq!(vk.pending_display(), "/a");
 
-        // And what the search is *for* still matches the display.
+        // And the search uses what's displayed.
         vk.feed(Key::Char('c'));
         assert_eq!(vk.pending_display(), "/ac");
         assert_eq!(vk.feed(Key::Enter), KeyOutcome::Motion(Motion::SearchForward("ac".to_string()), None));
 
-        // A count before the search is part of what was typed, and stays.
+        // A count before the search stays in the display.
         let mut counted = VimKeys::new();
         counted.feed(Key::Char('3'));
         counted.feed(Key::Char('?'));
@@ -2912,10 +2869,9 @@ mod tests {
     fn window_leader_unrecognized_continuation_aborts() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::CtrlW), KeyOutcome::Pending);
-        // `?` is not a window command and is not likely to become one;
-        // this test used to use `x`, which then became swap-pane.
+        // `?` isn't a window command.
         assert_eq!(vk.feed(Key::Char('?')), KeyOutcome::None);
-        // aborted cleanly -- next key starts fresh
+        // Aborted cleanly; the next key starts fresh.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -2993,7 +2949,7 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('3')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::Before));
-        // and doesn't leak into whatever comes next either
+        // And it doesn't leak into what follows.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -3011,7 +2967,7 @@ mod tests {
         let text: Vec<char> = "hello".chars().collect();
         assert_eq!(apply_insert_cmd(&text, 2, InsertCmd::Before), (text.clone(), 2));
         assert_eq!(apply_insert_cmd(&text, 2, InsertCmd::After), (text.clone(), 3));
-        // After at the very end clamps rather than running past it
+        // `After` at the very end clamps.
         assert_eq!(apply_insert_cmd(&text, 5, InsertCmd::After), (text.clone(), 5));
     }
 
@@ -3028,7 +2984,7 @@ mod tests {
         let (result, cursor) = apply_insert_cmd(&text, 1, InsertCmd::SubstituteChar);
         assert_eq!(result.iter().collect::<String>(), "hllo");
         assert_eq!(cursor, 1);
-        // at the end, nothing to remove -- cursor stays put, text unchanged
+        // At the end there's nothing to remove: cursor and text stay.
         let (result, cursor) = apply_insert_cmd(&text, 5, InsertCmd::SubstituteChar);
         assert_eq!(result.iter().collect::<String>(), "hello");
         assert_eq!(cursor, 5);
@@ -3053,7 +3009,7 @@ mod tests {
     #[test]
     fn apply_insert_cmd_clamps_an_out_of_range_cursor() {
         let text: Vec<char> = "hi".chars().collect();
-        // cursor well past the end of a short line shouldn't panic
+        // A cursor far past the end of a short line doesn't panic.
         let (result, cursor) = apply_insert_cmd(&text, 99, InsertCmd::SubstituteChar);
         assert_eq!(result.iter().collect::<String>(), "hi");
         assert_eq!(cursor, 2);
@@ -3086,8 +3042,7 @@ mod tests {
 
     #[test]
     fn operator_through_a_sub_prefix_motion() {
-        // y then f then x -- the 'f' sub-prefix must stay armed as an
-        // operator target, not get treated as its own bare motion.
+        // `y`, `f`, `x`: the `f` prefix stays an operator target.
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('f')), KeyOutcome::Pending);
@@ -3123,10 +3078,9 @@ mod tests {
     fn operator_invalid_continuation_aborts_and_does_not_leak() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
-        // 'q' isn't a motion (or a text-object prefix) -- cancels the
-        // pending operator entirely.
+        // `q` isn't a motion or object prefix, so the operator is cancelled.
         assert_eq!(vk.feed(Key::Char('q')), KeyOutcome::None);
-        // and the next key starts completely fresh
+        // And the next key starts fresh.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
@@ -3134,11 +3088,8 @@ mod tests {
     fn operator_i_a_prefix_invalid_continuation_aborts_and_does_not_leak() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
-        // 'i' while an operator is armed is a text-object prefix now, not
-        // an immediate abort -- see the dedicated `text_object_*` tests
-        // for the valid continuations. An unrecognized object character
-        // still aborts the whole thing, same as any other invalid
-        // operator continuation.
+        // `i` with an operator armed is a text-object prefix; an unknown
+        // object character then aborts the whole thing.
         assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('q')), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
@@ -3146,15 +3097,9 @@ mod tests {
 
     #[test]
     fn operator_on_a_non_motion_target_still_resolves_but_is_inert_downstream() {
-        // Ctrl-D is a real, successfully-resolving Motion (HalfPageDown) as
-        // far as vimkeys.rs is concerned -- vimkeys.rs has no dependency on
-        // motion::motion_shape's classification, so it still wraps this
-        // into an Operator. motion::motion_range is what actually rejects
-        // Ctrl-D as an invalid operator target (see its own
-        // motion_range_returns_none_for_non_motion_targets test), making
-        // this behaviorally a no-op downstream regardless -- no register
-        // write, no cursor move -- without vimkeys.rs needing to know
-        // motion.rs's own classification rules.
+        // Ctrl-D resolves as a motion here, so it becomes an Operator;
+        // `motion::motion_range` rejects it later (see
+        // `motion_range_returns_none_for_non_motion_targets`).
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('y')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::CtrlD), KeyOutcome::Operator(Op::Yank, Motion::HalfPageDown, None, None));
@@ -3177,7 +3122,7 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
-        // and it doesn't leak into a later put that never asked for one
+        // And it doesn't leak into a later put.
         assert_eq!(vk.feed(Key::Char('p')), KeyOutcome::Put { before: false, count: None, register: None });
     }
 
@@ -3377,9 +3322,7 @@ mod tests {
 
     #[test]
     fn delete_on_a_non_motion_target_still_resolves_but_is_inert_downstream() {
-        // Same reasoning as the equivalent yank test: vimkeys.rs doesn't
-        // consult motion::motion_shape, so this still becomes an
-        // Operator -- motion::motion_range is what actually rejects it.
+        // As for yank: an Operator here, rejected by `motion_range`.
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('d')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::CtrlD), KeyOutcome::Operator(Op::Delete, Motion::HalfPageDown, None, None));
@@ -3395,8 +3338,7 @@ mod tests {
 
     #[test]
     fn text_object_only_recognized_while_an_operator_is_armed() {
-        // Bare 'i'/'a' at a fresh dispatch point still mean insert-entry --
-        // the text-object meaning only kicks in once an operator is armed.
+        // Bare `i`/`a` at a fresh dispatch point still enter insert.
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(InsertCmd::Before));
         let mut vk = VimKeys::new();
@@ -3423,11 +3365,11 @@ mod tests {
 
     #[test]
     fn text_object_count_combines_on_either_side() {
-        // count before the operator...
+        // Count before the operator...
         let mut vk = VimKeys::new();
         let keys = [Key::Char('2'), Key::Char('c'), Key::Char('i'), Key::Char('w')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None));
-        // ...and between the operator and the object prefix -- same result.
+        // ...or between the operator and the object prefix: the same result.
         let mut vk = VimKeys::new();
         let keys = [Key::Char('c'), Key::Char('2'), Key::Char('i'), Key::Char('w')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::Operator(Op::Change, Motion::TextObject(TextObjectKind::Word, false), Some(2), None));
@@ -3544,30 +3486,25 @@ mod tests {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::EnterVisual(RegisterShape::Char));
         vk.begin_visual(RegisterShape::Char, (2, 3));
-        // A caller's own begin_visual call is what actually arms
-        // `self.visual` -- feed() alone never does (see EnterVisual's own
-        // doc comment) -- so this exercises the real "already in Visual,
-        // v/V pressed again" case a live caller would hit.
+        // Only `begin_visual` arms Visual mode, so this is the real "`v`
+        // pressed again in Visual" case.
         assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('V')), KeyOutcome::None);
-        // Still in Visual mode -- an ignored `v`/`V` doesn't cancel it.
+        // Still in Visual mode: the ignored `v` doesn't cancel it.
         assert!(vk.is_visual());
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (2, 3))));
     }
 
-    // Ctrl+T asks for the opener from a pane's Normal mode, the way it
-    // already does at the prompt -- the gesture should not depend on
-    // which of the two you happen to be looking at.
+    // Ctrl+T opens the opener from a pane's Normal mode, as at the prompt.
     #[test]
     fn ctrl_t_asks_for_the_opener_and_takes_no_count() {
         let mut vk = VimKeys::new();
         assert_eq!(vk.feed(Key::CtrlT), KeyOutcome::Opener);
-        // A count typed before it is spent, not carried: there is no
-        // "third opener" to ask for.
+        // A count before it is dropped; there's no third opener.
         assert_eq!(vk.feed(Key::Char('3')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::CtrlT), KeyOutcome::Opener);
         assert_eq!(vk.take_count(), None);
-        // And it leaves no half-typed command behind it.
+        // And no half-typed command is left behind.
         assert_eq!(vk.feed(Key::Char('j')), KeyOutcome::Motion(Motion::Down, None));
     }
 
@@ -3589,7 +3526,7 @@ mod tests {
     #[test]
     fn gv_reselects_the_last_visual_selection() {
         let mut vk = VimKeys::new();
-        // Before any Visual selection has ever ended, gv is a no-op.
+        // Before any Visual selection has ended, `gv` does nothing.
         assert_eq!(vk.feed(Key::Char('g')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('v')), KeyOutcome::ReselectVisual);
         assert_eq!(vk.last_visual(), None);
@@ -3607,12 +3544,12 @@ mod tests {
         assert_eq!(vk.feed(Key::Char('"')), KeyOutcome::Pending);
         assert_eq!(vk.feed(Key::Char('a')), KeyOutcome::Pending);
         assert_eq!(vk.take_pending_register(), Some('a'));
-        // Consumed -- a second take sees nothing left.
+        // Consumed: a second take finds nothing.
         assert_eq!(vk.take_pending_register(), None);
     }
 
-    // `o`/`O` in Visual mode are the one place these two keys do not
-    // open a line -- see `emit_open_line`'s own note.
+    // `o`/`O` in Visual mode swap ends rather than open a line (see
+    // `emit_open_line`).
     #[test]
     fn o_and_big_o_swap_the_visual_ends_rather_than_opening_a_line() {
         for key in [Key::Char('o'), Key::Char('O')] {
@@ -3631,16 +3568,14 @@ mod tests {
         vk.set_visual_anchor((4, 5));
         assert_eq!(vk.visual_anchor(), Some((RegisterShape::Char, (4, 5))));
         assert!(vk.is_visual());
-        // Nothing to move when there is no selection, and it must not
-        // invent one.
+        // With no selection there's nothing to move, and none is invented.
         let mut vk = VimKeys::new();
         vk.set_visual_anchor((4, 5));
         assert_eq!(vk.visual_anchor(), None);
     }
 
-    /// Drives `.` the way a host does: feed the keys, then serve
-    /// whatever `.` queued back out through `next_key` and feed those
-    /// too, collecting what each resolved to.
+    /// Drives `.` as a host does: feed the keys, then serve and feed what `.`
+    /// queued, collecting each outcome.
     fn feed_then_repeat(keys: &[Key]) -> Vec<KeyOutcome> {
         let mut vk = VimKeys::new();
         for k in keys {
@@ -3657,22 +3592,21 @@ mod tests {
     #[test]
     fn dot_replays_the_last_change_and_ignores_everything_that_is_not_one() {
         assert_eq!(feed_then_repeat(&[Key::Char('x')]), vec![KeyOutcome::DeleteCharForward { count: None, register: None }]);
-        // `dd` leaves through the double-tap shortcut and `dw` only
-        // becomes an operator in the armed-operator block at the very
-        // bottom of `feed` -- both have to be recorded anyway.
+        // `dd` leaves through the doubled-key shortcut and `dw` becomes an
+        // operator only at the end of `feed`; both are recorded.
         assert_eq!(feed_then_repeat(&[Key::Char('d'), Key::Char('d')]), vec![KeyOutcome::Pending, KeyOutcome::OperatorLines(Op::Delete, None, None)]);
         assert_eq!(
             feed_then_repeat(&[Key::Char('d'), Key::Char('w')]),
             vec![KeyOutcome::Pending, KeyOutcome::Operator(Op::Delete, Motion::WordForward, None, None)]
         );
-        // A motion is not a change, and neither is a yank or an undo --
-        // `.` after any of them repeats the change before it.
+        // A motion, a yank and an undo aren't changes: `.` after them repeats
+        // the change before.
         for after in [&[Key::Char('w')][..], &[Key::Char('y'), Key::Char('y')][..], &[Key::Char('u')][..]] {
             let mut keys = vec![Key::Char('x')];
             keys.extend_from_slice(after);
             assert_eq!(feed_then_repeat(&keys), vec![KeyOutcome::DeleteCharForward { count: None, register: None }], "after {after:?}");
         }
-        // Nothing changed yet, so there is nothing to repeat.
+        // Nothing changed, nothing to repeat.
         assert!(feed_then_repeat(&[Key::Char('w')]).is_empty());
     }
 
@@ -3680,8 +3614,8 @@ mod tests {
     fn dot_replays_the_text_typed_during_an_insert_excursion_too() {
         let mut vk = VimKeys::new();
         assert!(matches!(vk.feed(Key::Char('i')), KeyOutcome::EnterInsert(_)));
-        // What the host's own Insert-mode loop does: read through the
-        // same seam until the escape comes back.
+        // As the host's Insert loop does: read through the same seam until
+        // the escape.
         let typed = [Key::Char('h'), Key::Char('i'), Key::Escape];
         let mut feed_from = typed.iter().copied();
         while let Some(key) = vk.next_mapped_key("insert", || Ok(feed_from.next())).unwrap() {
@@ -3697,9 +3631,9 @@ mod tests {
         assert_eq!(replayed, vec![Key::Char('i'), Key::Char('h'), Key::Char('i'), Key::Escape]);
     }
 
-    // Drives one Insert-mode excursion the way a host does -- `opening`
-    // fed as Normal-mode keys, `typed` read through the insert seam until
-    // an escape comes back -- and returns what the host got to insert.
+    // One Insert excursion as a host drives it: `opening` as Normal-mode
+    // keys, `typed` read through the insert seam until an escape. Returns
+    // what the host inserted.
     fn excursion(vk: &mut VimKeys, opening: &str, typed: &str) -> Vec<Key> {
         for c in opening.chars() {
             vk.feed(Key::Char(c));
@@ -3897,9 +3831,8 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('g'), Key::Char('+')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::UndoSeq { forward: true, count: None });
-        // Count typed before the leading `g` -- `self.count` survives
-        // entering Pending::G untouched, same as gJ/gu{motion}'s own count
-        // handling.
+        // A count before the `g` survives `Pending::G`, as for `gJ` and
+        // `gu{motion}`.
         let mut vk = VimKeys::new();
         let keys = [Key::Char('4'), Key::Char('g'), Key::Char('-')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::UndoSeq { forward: false, count: Some(4) });
@@ -3970,16 +3903,15 @@ mod tests {
         let mut vk = VimKeys::new();
         let keys = [Key::Char('y'), Key::Char('s'), Key::Char('i'), Key::Char('w'), Key::Char(' ')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
-        // The aborted sequence must not leak into the next command.
+        // The aborted sequence doesn't leak into the next command.
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
     }
 
     #[test]
     fn ys_invalid_motion_aborts_and_does_not_leak() {
         let mut vk = VimKeys::new();
-        // 'q' isn't a motion (or a text-object prefix) -- same invalid
-        // continuation `operator_invalid_continuation_aborts_and_does_
-        // not_leak` already exercises for a plain operator.
+        // `q` isn't a motion or object prefix (as in
+        // `operator_invalid_continuation_aborts_and_does_not_leak`).
         let keys = [Key::Char('y'), Key::Char('s'), Key::Char('q')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::None);
         assert_eq!(vk.feed(Key::Char('w')), KeyOutcome::Motion(Motion::WordForward, None));
@@ -4063,10 +3995,8 @@ mod tests {
 
     #[test]
     fn ys_register_prefix_is_dropped_not_carried_through() {
-        // Unlike y{motion}, ys/yss never write a register -- a `"x`
-        // prefix in front of one is simply irrelevant, matching vim's own
-        // "register prefix in front of something that doesn't use one is
-        // silently ignored" rule.
+        // `ys`/`yss` write no register, so a `"x` prefix is ignored, as vim
+        // ignores one before a command that doesn't use it.
         let mut vk = VimKeys::new();
         let keys = [Key::Char('"'), Key::Char('a'), Key::Char('y'), Key::Char('s'), Key::Char('s'), Key::Char(')')];
         assert_eq!(last(&mut vk, &keys), KeyOutcome::AddSurround { target: SurroundTarget::Line(None), ch: ')' });
@@ -4083,9 +4013,8 @@ mod tests {
         vk.record_key(Key::Char('k'));
         vk.stop_recording();
         assert_eq!(vk.is_recording(), None);
-        // Nothing to replay it with yet at this layer (queue_macro_replay
-        // is exercised separately below) -- this just confirms the
-        // recorded keys actually landed in `macros`.
+        // Only checks that the keys landed in `macros`; replay is tested
+        // below.
         assert!(vk.queue_macro_replay('a', 1));
         assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('j')));
         assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('k')));
@@ -4117,7 +4046,7 @@ mod tests {
             assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('x')));
         }
         assert_eq!(vk.next_key(|| Ok(None)).unwrap(), None);
-        // `@@` replays whatever `@` last targeted.
+        // `@@` replays what `@` last used.
         assert!(vk.queue_macro_replay('@', 1));
         assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('x')));
     }
@@ -4140,9 +4069,8 @@ mod tests {
         vk.stop_recording();
         assert!(vk.queue_macro_replay('a', 1));
 
-        // Recording a *second* macro while the first's replay is queued:
-        // the replayed 'x' must not land in this new recording, only a
-        // real read would.
+        // Recording a second macro while the first's replay is queued:
+        // replayed keys aren't recorded, only real reads.
         vk.start_recording('b');
         assert_eq!(vk.next_key(|| Ok(Some(Key::Char('Q')))).unwrap(), Some(Key::Char('x')));
         vk.stop_recording();
@@ -4153,9 +4081,8 @@ mod tests {
 
     #[test]
     fn next_key_records_a_nested_macro_invocation_literally_not_its_expansion() {
-        // Recording 'a' as: type '@', type 'b' (replays 'b', literally
-        // just those two keystrokes recorded into 'a' -- not whatever
-        // 'b' itself expands to, matching real vim).
+        // Recording `a` as `@`, `b`: those two keys are recorded, not `b`'s
+        // expansion, as in vim.
         let mut vk = VimKeys::new();
         vk.start_recording('b');
         vk.record_key(Key::Char('z'));
@@ -4165,7 +4092,7 @@ mod tests {
         vk.record_key(Key::Char('@'));
         vk.record_key(Key::Char('b'));
         assert!(vk.queue_macro_replay('b', 1));
-        // Draining 'b's expansion here must not touch 'a's recording.
+        // Draining `b`'s expansion doesn't touch `a`'s recording.
         assert_eq!(vk.next_key(|| Ok(None)).unwrap(), Some(Key::Char('z')));
         vk.stop_recording();
 
