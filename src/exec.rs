@@ -14305,26 +14305,16 @@ pub fn bishopt_values(name: &str) -> &'static [&'static str] {
     }
 }
 
-// The `::bish` namespace's own vocabulary, for Tab completion
-// (bishedit::completion::bish_candidates).
-//
-// Here rather than in bishedit for the same reason `bishopt_names` is:
-// these subcommands are dispatched a few hundred lines above in
-// `run_bish`/`run_lsp`/`run_hl`, and a hand-copied list in another
-// module would advertise subcommands that do not exist and hide ones
-// that do. `every_bish_subcommand_is_dispatched` is what keeps the two
-// honest about each other.
-//
-// Only the canonical spellings. The aliases (`win`, `list`, `remove`,
-// `prev`) are all understood, but a completion list is a menu, and a
-// menu should show one name per thing -- the same call
-// `bishopt_candidates` already makes about `-s`/`--set`.
+// The `::bish` subcommands, for completion
+// (`bishedit::completion::bish_candidates`). Here, beside their
+// dispatch, so they can't drift; `every_bish_subcommand_is_dispatched`
+// checks. Canonical spellings only: a menu shows one name per thing,
+// though aliases (`win`, `list`, `remove`, `prev`) work.
 pub fn bish_subcommands() -> &'static [&'static str] {
     &["theme", "window", "hook", "hl", "lsp"]
 }
 
-// The second level: what follows `::bish <sub>`. Empty for a
-// subcommand that takes something other than a fixed word.
+// What follows `::bish <sub>`; empty where it isn't a fixed word.
 pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
     match sub {
         "theme" => crate::builtins::bish::THEME_SUBCOMMANDS,
@@ -14337,34 +14327,22 @@ pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
     }
 }
 
-// The flags `::bish lsp add` takes, in the spelling its own usage line
-// uses. `=`-terminated because each takes a value, and the completion
-// menu offering `--lang=` rather than `--lang` puts the cursor where
-// the next thing to type goes.
+// `::bish lsp add`'s flags, each ending in `=` since it takes a value,
+// so completion leaves the cursor where the value goes.
 pub fn lsp_add_flags() -> &'static [&'static str] {
     &["--lang=", "--root=", "--root-cmd=", "--apply-edits=", "--setting="]
 }
 
-// The values `--apply-edits=` accepts -- the one flag there with a
-// fixed set, the same rule `bishopt_values` follows.
+// The values `--apply-edits=` accepts, its one fixed set.
 pub fn lsp_apply_edits_values() -> &'static [&'static str] {
     &["scoped", "never", "always"]
 }
 
-// One line about each bishopt, for `bishopt --describe` and the
-// `:help options` page.
-//
-// A parallel table rather than a third field on KNOWN_BISHOPTS: adding
-// one would touch every consumer of that tuple for a string only two
-// call sites read. The obvious risk of a parallel table is drift -- an
-// option nobody wrote a line for -- and that is what
-// `every_bishopt_is_described` removes, by failing the moment the two
-// lists disagree.
-//
-// One sentence each, saying what the option *does* rather than
-// restating its name. The type, default and legal range come from
-// KNOWN_BISHOPTS and are printed alongside, so none of that is repeated
-// here.
+// One sentence per bishopt, for `bishopt --describe` and
+// `:help options`, saying what it does; type, default and range come
+// from `KNOWN_BISHOPTS`. A parallel table, since a third tuple field
+// would touch every consumer; `every_bishopt_is_described` keeps them
+// in step.
 const BISHOPT_HELP: &[(&str, &str)] = &[
     ("theme", "The active theme: a `::bish theme` declaration or one bish ships. `::bish theme list` names them."),
     ("ui_col_directory", "Interface colour: directories in the file browser."),
@@ -14423,14 +14401,9 @@ const BISHOPT_HELP: &[(&str, &str)] = &[
     ("fileformat", "Line endings to write: `unix`, `dos`, `mac`. Empty keeps whatever the file had."),
 ];
 
-// Best-effort terminal color-capability detection via the same
-// environment variables most terminal-aware CLI tools already check --
-// no terminfo database dependency. COLORTERM=truecolor/24bit is the de
-// facto signal modern terminal emulators set for full 24-bit support;
-// TERM containing "256color" is the traditional signal for an indexed
-// 256-color palette; TERM=dumb means "assume nothing, not even the
-// basic 16"; anything else assumes the basic 16 ANSI colors, safe even
-// for a terminal from decades ago.
+// The terminal's color support from the environment, without
+// terminfo: `COLORTERM=truecolor`/`24bit` is 24-bit, a `TERM` with
+// `256color` is 256, `TERM=dumb` is none, anything else the basic 16.
 fn detect_color_support() -> crate::csscolor::ColorSupport {
     use crate::csscolor::ColorSupport;
     if matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor") | Ok("24bit")) {
@@ -14448,11 +14421,8 @@ fn is_known_builtin(name: &str) -> bool {
     KNOWN_BUILTINS.contains(&name)
 }
 
-/// Where `name` is found, searching `path_var` -- which is the *shell's*
-/// `PATH`, handed in rather than read from the process environment.
-///
-/// The two are the same until a script assigns `PATH`, and a shell
-/// variable's home is the shell.
+/// Where `name` is found in `path_var`, the shell's `PATH`, which differs
+/// from the process's once a script assigns it.
 pub(crate) fn resolve_in_path(name: &str, path_var: &str) -> Option<String> {
     if name.contains('/') {
         return if std::path::Path::new(name).is_file() { Some(name.to_string()) } else { None };
@@ -14480,15 +14450,10 @@ pub(crate) fn resolve_in_path(name: &str, path_var: &str) -> Option<String> {
     None
 }
 
-/// `base` and `target` joined and then normalised *textually* -- `.`
-/// dropped, `..` cancelling the component in front of it -- without
-/// asking the filesystem anything.
-///
-/// This is what makes a shell's `cd` remember the route rather than the
-/// destination. `a/link/..` is `a` here, where the kernel would answer
-/// with the parent of whatever `link` points at; both are defensible
-/// and a shell picks the first, which is why `cd -P` exists to ask for
-/// the other.
+/// `base` and `target` joined and normalised as text (`.` dropped, `..`
+/// cancelling the component before it), without the filesystem. This is
+/// how `cd` remembers the route: `a/link/..` is `a`, where the kernel
+/// would give `link`'s target's parent. `cd -P` asks for that.
 fn logical_path(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
     let joined = if target.is_absolute() { target.to_path_buf() } else { base.join(target) };
@@ -14497,8 +14462,7 @@ fn logical_path(base: &std::path::Path, target: &std::path::Path) -> std::path::
         match component {
             Component::Prefix(_) | Component::RootDir => parts.clear(),
             Component::CurDir => {}
-            // At the root there is nothing above to go to, and bash
-            // leaves `/..` as `/`.
+            // `/..` is `/`.
             Component::ParentDir => {
                 parts.pop();
             }
@@ -14528,28 +14492,18 @@ pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
     }
 }
 
-/// A plain `pipe(2)`, as two owned fds.
-///
-/// `Stdio::piped()` cannot serve here: it hands the read end back only
-/// as a spawned child's `ChildStdout`, and the stage on the writing end
-/// of this one is not a child -- it is this shell.
+/// A plain `pipe(2)` as two owned fds. `Stdio::piped()` only hands the
+/// read end back as a child's `ChildStdout`, and the writer here is this
+/// shell.
 fn make_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    // Close-on-exec, and it is load-bearing rather than hygiene. Both ends
-    // are held by this shell while the *other* stages are spawned, so
-    // without it every one of them inherits the write end -- and a
-    // reader downstream then waits forever for an end-of-input that
-    // cannot arrive, because a process that never writes is holding the
-    // pipe open. `echo x | cat` printed its `x` and hung.
-    //
-    // The two places this shell does want them inherited both go
-    // through `dup2`, which clears the flag on the new descriptor: the
-    // read end onto a spawned stage's fd 0, and the write end onto fd 1
-    // for the stage running here.
+    // Close-on-exec, or every stage spawned meanwhile would inherit the
+    // write end and a reader downstream would never see end of input
+    // (`echo x | cat` would hang). Where an end is meant to be inherited it
+    // goes through `dup2`, which clears the flag.
     crate::platform::pipe_cloexec()
 }
 
-/// `make_pipe`, for the scheduler's own tests: they need a real pipe
-/// with the same close-on-exec treatment, and this is where that lives.
+/// `make_pipe` for the scheduler's tests.
 #[cfg(test)]
 pub(crate) fn make_pipe_for_test() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     make_pipe()
@@ -14562,13 +14516,8 @@ fn kill_all(children: Vec<(usize, std::process::Child)>) {
     }
 }
 
-// Shared by write_command_error and unset's readonly-variable diagnostic:
-// writes to `target`'s file (append) if set, else falls back to the
-// session's own sink (still real stderr today, see OutputSink's doc
-// comment). A free function, not a Shell method, so it takes the sink
-// explicitly rather than through self.sink_err/sh_eprintln! -- both of
-// its callers already have a `&Shell`/`&mut Shell` in scope to pass
-// `.sink` from.
+// Writes a diagnostic to `target`'s file (appending) if set, else to
+// `sink`. For `write_command_error` and `unset`'s readonly error.
 pub(crate) fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputSink) {
     match target {
         Some(path) => {
@@ -14583,31 +14532,15 @@ pub(crate) fn write_diagnostic(target: &Option<String>, msg: &str, sink: OutputS
     }
 }
 
-// new_virtual_child's real callers now: repl.rs's window/pane-split code,
-// and Shell::run_in_child_shell (every foreground subshell/command-
-// substitution/proc-sub). This is still useful as a headless, no-
-// rendering/REPL-needed exercise of the primitive itself. `cargo test`
-// needs no external crate, matching the zero-dependency stance elsewhere.
-// Every process the shell starts on a script's behalf must inherit that
-// shell's environment, which means going through `Shell::command`. This
-// is what makes that true rather than customary.
+// Every process the shell starts for a script must inherit its
+// environment, which means going through `Shell::command`. A
+// `Command::new` that skips it gives a child a stale environment and
+// no error, so this reads the source and fails on any other.
 //
-// A `Command::new` that skips the helper produces a child with a stale
-// environment and no complaint from anyone -- the failure is a wrong
-// value somewhere downstream, not a crash, which is the worst shape a
-// mistake can have. So the rule is checked rather than remembered: this
-// reads the crate's own source and fails on any occurrence outside the
-// list below.
-//
-// The list is keyed by count as well as by file, so *adding* a spawn to
-// a file that already has one trips it too. An entry is a claim that
-// those spawns are bish's own tooling rather than the script's, and it
-// has to be argued for in the `why` column.
-//
-// Test modules are not counted: a test that spawns something is not the
-// shell starting a process for a script. Everything from the first
-// `#[cfg(test)]` in a file onwards is skipped, which is where this
-// codebase puts them.
+// `ALLOWED` counts per file, so adding a spawn to a listed file fails
+// too; each entry says why its spawns are bish's own tooling. Test
+// modules don't count: everything from a file's first `#[cfg(test)]` is
+// skipped.
 #[cfg(test)]
 mod spawn_guard {
     /// `(file, how many, why it is not a shell spawn)`.
@@ -14658,13 +14591,10 @@ mod spawn_guard {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("a source file is readable");
-                // A file that is nothing but test support (`#![cfg(test)]`
-                // at the top of it, as `gittest.rs` and `tempdir.rs` are)
-                // is a test module like any other, all of it.
-                // (Its first line that is neither blank nor a comment:
-                // `//!` prose comes first in those files, and this test's
-                // own mention of the attribute a few lines up must not
-                // count as one.)
+                // A file that is all test support (`#![cfg(test)]`, as
+                // `gittest.rs` and `tempdir.rs` are) counts as a test
+                // module. The attribute is looked for on its first line
+                // that is neither blank nor a comment.
                 let opens_the_file = source.lines().find(|l| {
                     let l = l.trim();
                     !l.is_empty() && !l.starts_with("//")
@@ -14672,8 +14602,6 @@ mod spawn_guard {
                 if opens_the_file == Some("#![cfg(test)]") {
                     continue;
                 }
-                // Everything from the first test module onwards is not
-                // the shell starting anything.
                 let body = match source.find("\n#[cfg(test)]\n") {
                     Some(cut) => &source[..cut],
                     None => &source[..],
@@ -14715,18 +14643,12 @@ mod spawn_guard {
 mod replacement_tests {
     use super::{ReplaceAnchor, expands_to_itself, glob_replace};
 
-    /// The shortcut is a claim about the lexer, so it is checked against
-    /// the lexer rather than argued about.
-    ///
-    /// For every operand shape below: if `expands_to_itself` says the
-    /// text is its own expansion, then all three slow paths -- the plain
-    /// one, the pattern one that preserves quoting, and the replacement
-    /// one that preserves `&` -- must hand back exactly the input. A
-    /// byte the predicate wrongly waved through would show up here.
+    /// For every operand below that `expands_to_itself` accepts, the three
+    /// slow paths (plain, pattern, replacement) must return it unchanged.
     #[test]
     fn the_shortcut_agrees_with_the_lexer() {
         let operands = [
-            // what real scripts write
+            // What scripts write.
             "",
             ":",
             "/",
@@ -14739,7 +14661,7 @@ mod replacement_tests {
             "\t",
             "\n",
             "a b c",
-            // glob syntax, which is not expansion syntax
+            // Glob syntax, which isn't expansion syntax.
             "*",
             "?",
             "[a-z]",
@@ -14751,7 +14673,7 @@ mod replacement_tests {
             "!(x)",
             "+(y)",
             "?(z)",
-            // punctuation that means something somewhere else
+            // Punctuation that matters elsewhere.
             "&",
             "&&",
             "#",
@@ -14781,12 +14703,12 @@ mod replacement_tests {
             "{a,b}",
             "a-b",
             "1..3",
-            // non-ASCII
+            // Non-ASCII.
             "\u{e4}\u{f6}",
             "\u{1f600}",
             "caf\u{e9}",
             "a\u{300}b",
-            // and the ones the guard must refuse
+            // And what it must refuse.
             "$v",
             "${v}",
             "$(cmd)",
@@ -14814,8 +14736,6 @@ mod replacement_tests {
         }
     }
 
-    /// ...and it refuses what it has to, or it is costing everyone the
-    /// lexer for nothing.
     #[test]
     fn the_shortcut_refuses_only_what_it_has_to() {
         for raw in ["$v", "${v}", "$(echo x)", "`echo x`", "'q'", "\"q\"", "\\*", "~"] {
@@ -14826,11 +14746,9 @@ mod replacement_tests {
         }
     }
 
-    // Reachable only through extglob, which bash has off by default and
-    // bish cannot turn off, so the bashdiff corpus cannot ask for it:
-    // `@()` matches the empty string at every position, and the
-    // character each empty match steps over has to be copied through
-    // rather than eaten. Checked against `bash -O extglob`.
+    // Only reachable through extglob, which bash has off and bish can't
+    // turn off, so bashdiff can't cover it. Checked against
+    // `bash -O extglob`.
     #[test]
     fn an_empty_match_copies_the_character_it_steps_over() {
         assert_eq!(glob_replace("abc", "@()", "Z", true, ReplaceAnchor::None), "ZaZbZc");
@@ -14838,8 +14756,6 @@ mod replacement_tests {
         assert_eq!(glob_replace("abc", "@()", "Z", false, ReplaceAnchor::None), "Zabc");
     }
 
-    // The walk ends when a match reaches the end of the string, so a
-    // pattern that swallows the rest cannot then match empty after it.
     #[test]
     fn a_match_reaching_the_end_ends_the_walk() {
         assert_eq!(glob_replace("abc", "*", "Z", true, ReplaceAnchor::None), "Z");
@@ -14847,8 +14763,6 @@ mod replacement_tests {
         assert_eq!(glob_replace("abab", "a", "Z", true, ReplaceAnchor::None), "ZbZb");
     }
 
-    // An empty *pattern* is the other case: it matches nothing at all
-    // unanchored, but both anchors still fire.
     #[test]
     fn an_empty_pattern_matches_nothing_unanchored() {
         assert_eq!(glob_replace("abc", "", "Z", true, ReplaceAnchor::None), "abc");
@@ -14857,9 +14771,6 @@ mod replacement_tests {
         assert_eq!(glob_replace("abc", "", "Z", false, ReplaceAnchor::End), "abcZ");
     }
 
-    // The fixed-width fast path knows how many characters the pattern
-    // takes; when that is more than the string has, there is nothing to
-    // try. Slicing it out anyway panicked.
     #[test]
     fn a_pattern_wider_than_the_string_does_not_match() {
         assert_eq!(glob_replace("ab", "abc", "Z", true, ReplaceAnchor::None), "ab");
@@ -14871,13 +14782,7 @@ mod replacement_tests {
 
 #[cfg(test)]
 mod tests {
-    // The property the whole cwd change is for: a path a script names
-    // resolves against the *shell's* directory, and the process's is
-    // not consulted. Indistinguishable in a single shell -- the two are
-    // kept in step -- so this sets them apart deliberately, which is
-    // the state two interleaved pipeline stages are permanently in.
-    // Pinned to UTC so the expected strings do not depend on where this
-    // runs -- the same `TZ`+`tzset` trick git.rs's own date test uses.
+    // In UTC, so the expected strings don't depend on where this runs.
     fn utc_printf(format: &str, args: &[&str]) -> String {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("TZ").ok();
@@ -14894,9 +14799,6 @@ mod tests {
         out
     }
 
-    // `trap`'s listing is what a script reads its own traps back out of,
-    // and bash puts an inherited ignore in it among the traps set here
-    // rather than at either end.
     #[test]
     fn the_trap_listing_interleaves_inherited_ignores_with_traps_by_signal_number() {
         let number = |name: &str| super::signal_number(name).expect("a signal every platform names");
@@ -14905,29 +14807,23 @@ mod tests {
         traps.insert(usr1, TrapAction::Run("echo t".to_string()));
         traps.insert(int, TrapAction::Ignore);
 
-        // HUP is 1, INT is 2, USR1 is well above both: the inherited one
-        // is not appended, it takes its place in the order.
+        // HUP is 1, INT 2, USR1 above both: the inherited one takes its place
+        // in the order.
         let listing = super::trap_signal_listing(&traps, &[hup]);
         assert_eq!(
             listing,
             vec![(hup, TrapAction::Ignore), (int, TrapAction::Ignore), (usr1, TrapAction::Run("echo t".to_string()))],
             "by signal number, inherited ignore included"
         );
-        // Nothing inherited is the ordinary case, and the one every unit
-        // test here is in.
+        // Nothing inherited, as in every unit test here.
         assert_eq!(super::trap_signal_listing(&traps, &[]).len(), 2);
-        // A signal cannot be both: `trap` refuses to record one for a
-        // signal ignored at entry, so there is no second entry to drop
-        // -- but if that ever changed, the trap is what is reported.
+        // `trap` refuses to record a signal ignored at entry, but if both
+        // ever happened, the trap is what's reported.
         let listing = super::trap_signal_listing(&traps, &[int, usr1]);
         assert_eq!(listing, vec![(int, TrapAction::Ignore), (usr1, TrapAction::Run("echo t".to_string()))]);
     }
 
-    // `command -p` has to find a standard utility against a fixed safe
-    // path, not the caller's PATH -- that is the whole reason the flag
-    // exists, and it was being parsed and then ignored for resolution.
-    // Uses `ls`, which is external (a builtin would be found whatever
-    // PATH said and prove nothing).
+    // An external `ls`, since a builtin is found whatever `PATH` says.
     #[test]
     fn command_dash_p_resolves_against_a_standard_path() {
         if crate::exec::resolve_in_path("ls", "/usr/bin:/bin").is_none() {
@@ -14940,18 +14836,14 @@ mod tests {
             sh.run_source_here(line, "<test>");
             out.borrow().clone()
         };
-        // A broken PATH: `-p` finds `ls` anyway and runs it (exit 0).
         assert_eq!(run("PATH=/nonexistent command -p ls / >/dev/null; echo rc=$?"), "rc=0\n");
-        // Without `-p`, the broken PATH stands and `ls` is not found.
         assert_eq!(run("PATH=/nonexistent command ls / >/dev/null 2>&1; echo rc=$?"), "rc=127\n");
     }
 
     #[test]
     fn a_disabled_builtin_is_not_a_builtin_to_anything_that_asks() {
-        // The dispatch already ran the external; everything that
-        // *classifies* a name had to agree, or `type` called it a
-        // builtin while `/usr/bin/echo` was what ran. Checked against
-        // real bash, which reports the external for all of these.
+        // Everything that classifies a name must agree with what runs:
+        // `/usr/bin/echo`. bash reports the external for all of these.
         let mut sh = Shell::new();
         assert!(sh.is_active_builtin("echo"));
         crate::builtins::shell::run_enable(&mut sh, &["-n".to_string(), "echo".to_string()]);
@@ -14963,8 +14855,7 @@ mod tests {
 
     #[test]
     fn type_t_prints_the_kind_and_nothing_else() {
-        // `[ "$(type -t x)" = function ]` is how a script asks, and a
-        // sentence fails that test however true it reads.
+        // `[ "$(type -t x)" = function ]` is how a script asks.
         let mut sh = Shell::new();
         let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         sh.set_sink_capture(out.clone());
@@ -14972,18 +14863,15 @@ mod tests {
         let text = out.borrow().clone();
         assert!(text.contains("function"), "{text:?}");
         assert!(text.contains("builtin"), "{text:?}");
-        // A name it does not know says nothing at all -- the empty
-        // answer is the answer.
+        // An unknown name gets an empty answer.
         assert!(!text.contains("not found"), "{text:?}");
     }
 
     #[test]
     fn funcname_bash_source_and_bash_lineno_describe_the_stack() {
-        // Checked against real bash on this exact pair of files. The
-        // sourced library is the point: BASH_SOURCE names where each
-        // function is *defined*, BASH_LINENO the line in the file one
-        // level out where it was called, and those stop being the same
-        // file the moment anything is sourced.
+        // `BASH_SOURCE` names where each function is defined, `BASH_LINENO`
+        // the line one level out where it was called; the sourced library
+        // makes those different files. Checked against bash with these files.
         let dir = std::env::temp_dir().join(format!("bish-funcname-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let lib = dir.join("lib.sh");
@@ -14994,10 +14882,8 @@ mod tests {
 
         let mut sh = Shell::new();
         sh.set_script_args(main.display().to_string(), Vec::new());
-        // This test *is* the "running a script file" case, which is
-        // what puts the outermost `main` frame on the stack -- `bish -c`
-        // has no such frame, and neither does `bash -c`. See
-        // Shell::running_a_script.
+        // Running a script file puts the outer `main` frame on the stack;
+        // `bish -c` doesn't (see `Shell::running_a_script`).
         sh.running_a_script = true;
         sh.run_source_here(&std::fs::read_to_string(&main).unwrap(), &main.display().to_string());
 
@@ -15007,43 +14893,37 @@ mod tests {
             Some(format!("{} {} {}", lib.display(), lib.display(), main.display()).as_str()),
             "where each function is defined, not where it was called"
         );
-        // `inner` is called on line 7 of the library, `outer` on line 2
-        // of the script, and 0 stands for the script itself.
+        // `inner` is called on line 7 of the library, `outer` on line 2 of
+        // the script; 0 is the script.
         assert_eq!(sh.debug_peek_var("l").as_deref(), Some("7 2 0"));
-        // Outside every function bash has no FUNCNAME at all, so a
-        // script testing ${FUNCNAME[0]} sees nothing rather than "main".
+        // Outside every function bash has no `FUNCNAME`, not "main".
         assert_eq!(sh.debug_peek_var("top").as_deref(), Some(""));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn caller_walks_out_through_the_calls_that_got_here() {
-        // Checked line-for-line against real bash on the same script.
+        // Checked line for line against bash on the same script.
         let dir = std::env::temp_dir().join(format!("bish-caller-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("c.sh");
         std::fs::write(&script, "a() {\n  r0=$(caller 0)\n  r1=$(caller 1)\n  r2=$(caller 2)\n  rb=$(caller)\n}\nb() {\n  a\n}\nb\n").unwrap();
         let mut sh = Shell::new();
         let src = script.display().to_string();
-        // Run as a script rather than via `source`: `caller` reports the
-        // file a frame's line is in, and `source` does not update
-        // `script_name`, so a sourced file still reports the outer one.
-        // Noted rather than fixed here -- it is bash's `BASH_SOURCE`
-        // that bish has none of, and that is its own work.
+        // Run as a script, not sourced: `caller` reports the file a frame's
+        // line is in, and `source` doesn't update `script_name`.
         sh.set_script_args(src.clone(), Vec::new());
         sh.run_source_here(&std::fs::read_to_string(&script).unwrap(), &src);
-        // The innermost call: the line it is on, the function that line
-        // is in, and the file.
+        // The innermost call: its line, the function it's in, the file.
         assert_eq!(sh.debug_peek_var("r0").as_deref(), Some(format!("8 b {src}").as_str()));
-        // ...then the call to *that* function. Nothing called `b`, and
-        // bash names that `main`.
+        // Then the call to that function; nothing called `b`, and bash names
+        // that `main`.
         assert_eq!(sh.debug_peek_var("r1").as_deref(), Some(format!("10 main {src}").as_str()));
-        // Past the top is empty, which is what stops `while caller $i`.
+        // Past the top is empty, which ends `while caller $i`.
         assert_eq!(sh.debug_peek_var("r2").as_deref(), Some(""));
-        // Bare `caller` is the short form: no function name.
+        // Bare `caller` leaves out the function name.
         assert_eq!(sh.debug_peek_var("rb").as_deref(), Some(format!("8 {src}").as_str()));
 
-        // Outside any function there is nothing to report.
         let mut sh = Shell::new();
         assert_eq!(crate::builtins::shell::run_caller(&mut sh, &[]), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -15058,19 +14938,17 @@ mod tests {
         assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["echo".to_string()]), 0);
         assert!(!sh.disabled_builtins.contains("echo"));
 
-        // A name that is not a builtin is an error, and does not become
-        // one by being named.
+        // Naming an unknown builtin is an error.
         assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["-n".to_string(), "nosuch".to_string()]), 1);
         assert!(!sh.disabled_builtins.contains("nosuch"));
-        // Dynamic loading is refused by name rather than ignored.
+        // Dynamic loading is refused by name.
         assert_eq!(crate::builtins::shell::run_enable(&mut sh, &["-f".to_string(), "mod".to_string()]), 2);
     }
 
     #[test]
     fn every_builtin_is_described_and_every_description_is_a_builtin() {
-        // The two tables have to agree, and neither is derived from the
-        // other -- so adding a builtin without a line here fails the
-        // build rather than quietly listing a blank one.
+        // Neither table is derived from the other, so they're checked against
+        // each other.
         use std::collections::HashSet;
         let known: HashSet<&str> = KNOWN_BUILTINS.iter().copied().collect();
         let described: HashSet<&str> = BUILTIN_HELP.iter().map(|(n, _)| *n).collect();
@@ -15080,7 +14958,7 @@ mod tests {
         extra.sort_unstable();
         assert!(missing.is_empty(), "builtins with no help line: {missing:?}");
         assert!(extra.is_empty(), "help lines for things that are not builtins: {extra:?}");
-        // One line each, and short enough to read in a list of sixty.
+        // One short line each.
         for (name, summary) in BUILTIN_HELP {
             assert!(!summary.contains('\n'), "{name}: one line");
             assert!(summary.len() <= 72, "{name}: {} chars is too long for an index", summary.len());
@@ -15090,12 +14968,8 @@ mod tests {
 
     #[test]
     fn globignore_drops_matches_under_pathname_rules() {
-        // Checked against real bash. The second case is the one that
-        // matters: `*.o` leaves `sub/x.o` alone, because `*` does not
-        // cross a `/` here -- the opposite of what "matched against the
-        // filename" first suggests.
-        // `cd` moves the real process, so this holds the same lock every
-        // other cwd-touching test here holds, and puts it back.
+        // Checked against bash; `*.o` leaves `sub/x.o` because `*` doesn't
+        // cross `/`. Holds `CWD_LOCK`, since `cd` moves the process.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("bish-globignore-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -15111,8 +14985,7 @@ mod tests {
         assert_eq!(run("GLOBIGNORE='*.o'; r=$(echo *)"), "a.c sub");
         assert_eq!(run("GLOBIGNORE='*.o'; r=$(echo sub/*)"), "sub/x.o sub/y.c", "* does not cross a /");
         assert_eq!(run("GLOBIGNORE='sub/*.o'; r=$(echo sub/*)"), "sub/y.c");
-        // Everything ignored means the pattern matched nothing, and
-        // nullglob-off leaves an unmatched pattern as its own text.
+        // All ignored means nothing matched, so the pattern stays as text.
         assert_eq!(run("GLOBIGNORE='*'; r=$(echo *)"), "*");
         restore_cwd();
         std::fs::remove_dir_all(&dir).ok();
@@ -15120,17 +14993,15 @@ mod tests {
 
     #[test]
     fn ifs_starts_out_set_to_the_default_the_way_bash_does() {
-        // Not cosmetic. The standard way to change IFS for a moment is
-        // `old=$IFS; IFS=,; ...; IFS=$old`, and with IFS merely unset
-        // that captured the empty string and restored it as "split on
-        // nothing" -- so everything after it stopped splitting at all.
+        // `old=$IFS; IFS=,; ...; IFS=$old` is how IFS is changed for a
+        // moment; with IFS reading as empty when unset, the restore would
+        // turn splitting off.
         let mut sh = Shell::new();
         sh.run_source_here("old=$IFS; IFS=,; IFS=$old; s=\"a b c\"; set -- $s; n=$#", "<test>");
         assert_eq!(sh.debug_peek_var("n").as_deref(), Some("3"), "splitting survives a save/restore");
         assert_eq!(sh.debug_peek_var("IFS").as_deref(), Some(" \t\n"));
 
-        // The two states that must stay distinguishable: empty means
-        // "do not split", and unset still means the default.
+        // Empty means no splitting; unset still means the default.
         let mut sh = Shell::new();
         sh.run_source_here("IFS=; s=\"a b c\"; set -- $s; n=$#", "<test>");
         assert_eq!(sh.debug_peek_var("n").as_deref(), Some("1"), "IFS= disables splitting");
@@ -15142,25 +15013,21 @@ mod tests {
 
     #[test]
     fn a_prefix_assignment_reaches_a_builtin_and_then_goes_away() {
-        // `IFS=: read a b` used to split on the old IFS: the assignment
-        // was passed as *environment*, which only an external command
-        // ever sees, and a builtin reads the shell's own variables.
-        // Checked against real bash, which gives x/y and leaves IFS
+        // `IFS=: read a b` splits on `:`: a builtin reads the shell's
+        // variables, not the environment. bash gives x/y and leaves IFS
         // alone.
         let mut sh = Shell::new();
         sh.run_source_here("IFS=: read a b <<< \"x:y\"", "<test>");
         assert_eq!(sh.debug_peek_var("a").as_deref(), Some("x"));
         assert_eq!(sh.debug_peek_var("b").as_deref(), Some("y"));
 
-        // Gone afterwards, and restored to what it was rather than to
-        // empty -- an assignment that outlived its command would be a
-        // worse bug than the one being fixed.
+        // Restored afterwards to its old value, not to empty.
         let mut sh = Shell::new();
         sh.run_source_here("FOO=original; FOO=temp true; echo done", "<test>");
         assert_eq!(sh.debug_peek_var("FOO").as_deref(), Some("original"));
 
-        // A name that was unset comes back unset, not set-to-empty:
-        // `${X-default}` and `set -u` both tell the difference.
+        // An unset name comes back unset: `${X-default}` and `set -u` can
+        // tell.
         let mut sh = Shell::new();
         sh.run_source_here("NEVER_SET=temp true; echo hi", "<test>");
         assert_eq!(sh.debug_peek_var("NEVER_SET"), Option::None);
@@ -15168,55 +15035,40 @@ mod tests {
 
     #[test]
     fn printf_formats_a_timestamp_the_way_bash_does() {
-        // Checked against real bash with the same inputs.
+        // Checked against bash with the same inputs.
         assert_eq!(utc_printf("%(%Y-%m-%d)T", &["0"]), "1970-01-01");
         assert_eq!(utc_printf("%(%F %T)T", &["1000000000"]), "2001-09-09 01:46:40");
-        // `%s` is the one directive a broken-down time cannot answer on
-        // its own, so the timestamp is threaded through for it.
+        // `%s` needs the timestamp itself, not just the broken-down time.
         assert_eq!(utc_printf("%(%s)T", &["1234567890"]), "1234567890");
-        // Directives the PS1 escapes never needed.
         assert_eq!(utc_printf("%(%R|%D|%u|%w|%C)T", &["1000000000"]), "01:46|09/09/01|7|0|20");
         assert_eq!(utc_printf("%(%z)T", &["0"]), "+0000");
     }
 
     #[test]
     fn a_malformed_time_conversion_is_printed_back_rather_than_swallowed() {
-        // bash calls this an invalid time format and warns; either way
-        // the text has to come out, and the escapes in it still count --
-        // they never reached the escape handling at the top of the loop.
+        // bash warns about an invalid time format; either way the text comes
+        // out, escapes processed.
         assert_eq!(utc_printf("no-time %(unterminated\n", &[]), "no-time %(unterminated\n");
         assert_eq!(utc_printf("%(%F)X", &["0"]), "%(%F)");
     }
 
-    // `change_directory` moves the real process, so these must not run
-    // beside anything else that reads or sets the cwd -- same shared-
-    // mutex fix, and the same poisoned-lock recovery, as session.rs's
-    // own ENV_LOCK.
-    // Held by every test that moves the process's directory -- and by
-    // every test that *depends* on it, which is the half that is easy
-    // to forget. A spawn carries the shell's cwd, so a test that runs
-    // an external command while a cwd-moving test is between its own
-    // `cd` and its cleanup spawns into a directory that is about to
-    // stop existing, and fails with a "No such file or directory" that
-    // names the program rather than the directory.
+    // Held by every test that moves the process's directory, and every
+    // test that depends on it: a spawn carries the shell's cwd, so a spawn
+    // while another test is between its `cd` and cleanup can land in a
+    // directory about to vanish.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // Where a cwd-moving test puts the process back. Not "wherever it
-    // was when this test started": another test that does not take
-    // CWD_LOCK may have left the process inside a temp directory it
-    // then deleted, and restoring *that* fails. The crate root is
-    // always there while the tests are running.
+    // Where a cwd-moving test puts the process back: the crate root, not
+    // where it started, since a test that doesn't take `CWD_LOCK` may have
+    // left it in a deleted temp directory.
     fn restore_cwd() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         std::env::set_current_dir(root).expect("the crate root is a real directory");
     }
 
-    // The bug this pins was found by driving the file browser through a
-    // real pty: Ctrl-Y moved the shell correctly, and then `cd -` went
-    // somewhere else entirely. `sync_real_state_in` reapplies the
-    // session's env snapshot before every command, so an `OLDPWD`
-    // written only to the real environment -- which is all a change made
-    // *outside* a command can do -- lasted exactly until the next one.
+    // `OLDPWD` set by a `cd` from outside a command (the file browser's
+    // Ctrl-Y) must survive `sync_real_state_in` reapplying the session's
+    // environment, or `cd -` goes elsewhere.
     #[test]
     fn changing_directory_updates_the_session_snapshot_not_just_the_environment() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -15232,18 +15084,14 @@ mod tests {
         shell.change_directory(&inner_real).expect("the inner directory is real too");
 
         assert_eq!(shell.cwd, inner_real);
-        // Asserted through the shell rather than through
-        // `std::env::var`: the real environment is process-global, and
-        // any other test running a shell concurrently reapplies its own
-        // snapshot over it (CWD_LOCK only serialises the tests that
-        // know to take it). What the bug was actually about is whether
-        // *this session* still knows where it was, which is what
-        // `lookup_var` and `env_snapshot` answer.
+        // Checked through the shell, not `std::env::var`: other tests running
+        // concurrently reapply their own snapshots over the process
+        // environment.
         assert_eq!(shell.lookup_var("PWD"), inner_real.to_string_lossy());
         assert_eq!(shell.lookup_var("OLDPWD"), root_real.to_string_lossy());
 
-        // The part that was broken: after the session restores its own
-        // remembered environment, `cd -` still has somewhere to go.
+        // After the session restores its environment, `cd -` still has
+        // somewhere to go.
         shell.sync_real_state_in();
         assert_eq!(
             shell.env_snapshot.get("OLDPWD").map(String::as_str),
@@ -15257,9 +15105,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // Restricted mode refuses at the write path, so nothing that can
-    // move the shell -- including the file browser -- can route around
-    // it.
+    // Restricted mode refuses at the write path, so nothing that moves the
+    // shell, the file browser included, gets around it.
     #[test]
     fn a_restricted_shell_refuses_to_change_directory_at_all() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -15274,11 +15121,9 @@ mod tests {
 
     use super::*;
 
-    // The property the whole cwd change is for: a path a script names
-    // resolves against the *shell's* directory, and the process's is
-    // not consulted. Indistinguishable in a single shell -- the two are
-    // kept in step -- so this sets them apart deliberately, which is
-    // the state two interleaved pipeline stages are permanently in.
+    // A path a script names resolves against the shell's directory, not
+    // the process's. They're kept in step in a single shell, so this sets
+    // them apart, as two interleaved pipeline stages are.
     #[test]
     fn a_path_resolves_against_the_shells_cwd_not_the_processs() {
         let dir = std::env::temp_dir().join(format!("bish-cwd-{}", std::process::id()));
@@ -15286,8 +15131,7 @@ mod tests {
         std::fs::write(dir.join("elsewhere/target.txt"), b"found me").unwrap();
 
         let mut shell = Shell::new();
-        // The shell is told it lives in `elsewhere`; the process is not,
-        // and is never told.
+        // The shell is told it's in `elsewhere`; the process never is.
         shell.cwd = dir.join("elsewhere");
         let process_cwd_before = std::env::current_dir().ok();
 
@@ -15310,9 +15154,6 @@ mod tests {
 
         let mut child = parent.new_virtual_child();
 
-        // Independent snapshot: the child inherits a copy of the parent's
-        // vars/cwd at creation time, but the two evolve independently
-        // afterward.
         assert!(child.arrays.contains_key("x"), "child should inherit a snapshot of the parent's arrays");
         child.arrays.insert("y".to_string(), std::collections::BTreeMap::from([(0, "child".to_string())]));
         assert!(!parent.arrays.contains_key("y"), "parent must not see the child's later mutations");
@@ -15320,30 +15161,23 @@ mod tests {
         child.cwd = std::path::PathBuf::from("/child/only");
         assert_ne!(parent.cwd, child.cwd, "cwd must diverge independently per session");
 
-        // Shared: a job pushed from the child is immediately visible from
-        // the parent, and vice versa -- same underlying JobTable, not a
-        // copy.
+        // Shared: a job pushed from either is visible from the other.
         let real_child = Command::new("true").spawn().expect("spawn true");
         child.push_job(vec![real_child], "true &".to_string());
         assert_eq!(parent.jobs.borrow().jobs.len(), 1, "parent must see the job the child backgrounded");
         assert_eq!(child.jobs.borrow().jobs.len(), 1);
 
-        // Shared: promotion flipped from one session is visible from the
-        // other -- it's a whole-terminal concept, not per-session.
+        // Shared: promotion is about the whole terminal.
         assert!(!parent.is_promoted());
         child.promoted.set(true);
         assert!(parent.is_promoted(), "promotion must be visible from every session sharing this root");
 
-        // Reap the spawned process so the test doesn't leak it.
         parent.jobs.borrow_mut().jobs[0].wait();
     }
 
-    // Records every (line, depth) DebugHook::on_statement was called with,
-    // always returning Continue -- enough to prove the hook fires for
-    // every top-level statement, at every nesting depth, including inside
-    // a converted foreground subshell/command-substitution (which is a
-    // genuinely separate Shell, only reachable here because new_
-    // virtual_child shares debug_hook via Rc::clone).
+    // Records each (line, depth) `DebugHook::on_statement` sees, to show
+    // the hook fires at every depth, inside an in-process subshell or
+    // substitution too (a separate `Shell` sharing `debug_hook`).
     struct RecordingHook {
         calls: Vec<(usize, DebugDepth)>,
     }
@@ -15364,17 +15198,13 @@ mod tests {
         shell.run_source_here("echo top\n(echo inside_subshell)\nx=$(echo inside_cmd_sub)\n", "<test>");
 
         let calls = hook.borrow().calls.clone();
-        // 5 calls: the 3 real top-level statements, *plus* one more for
-        // each of the two constructs' own single statement running inside
-        // its converted (in-process, but genuinely separate Shell) child.
+        // The 3 top-level statements, plus one inside each of the two
+        // constructs.
         assert_eq!(calls.len(), 5, "{:?}", calls);
         assert_eq!(calls[0], (1, DebugDepth { subshell_depth: 0, call_depth: 0 }), "echo top");
         assert_eq!(calls[1], (2, DebugDepth { subshell_depth: 0, call_depth: 0 }), "the subshell statement itself");
-        // Known, accepted limitation (see plan.md): a subshell/command-
-        // substitution's raw captured text is re-lexed from a bare
-        // String with no memory of its own starting file line, so its
-        // own statement(s) report a line number relative to that capture
-        // (always starting back at 1), not the real absolute file line.
+        // A subshell's text is re-lexed from a string with no starting line,
+        // so its statements report lines relative to it, from 1.
         assert_eq!(calls[2], (1, DebugDepth { subshell_depth: 1, call_depth: 0 }), "echo inside_subshell (relative line)");
         assert_eq!(calls[3], (3, DebugDepth { subshell_depth: 0, call_depth: 0 }), "the x=$(...) assignment itself");
         assert_eq!(calls[4], (1, DebugDepth { subshell_depth: 1, call_depth: 0 }), "echo inside_cmd_sub (relative line)");
@@ -15398,20 +15228,12 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "one\n", "should stop after the first statement, never reaching the third");
     }
 
-    // The `command` builtin has its own separate external-process spawn
-    // path (distinct from run_single's), which used to always default to
-    // Stdio::inherit() -- invisible to a converted foreground subshell/
-    // command-substitution's own capture (run_in_child_shell's own
-    // stdio_override), so a real command's real output would land
-    // straight on the real terminal instead of being captured. Caught via
-    // a real shell script (`mise`'s own bash activation shadows itself
-    // with a `mise()` function that reaches the real binary via
-    // `command "$__MISE_EXE" ...`, so every `$(mise ...)` from inside its
-    // own hooks went straight through this path).
+    // `command` has its own spawn path, which must honour a substitution's
+    // capture. `mise`'s bash activation runs every `$(mise ...)` through
+    // `command "$__MISE_EXE"`.
     #[test]
     fn command_builtin_honors_an_enclosing_command_substitution_capture() {
-        // Spawns a real program, so it needs the process's directory to
-        // stay put -- see CWD_LOCK.
+        // Spawns a program, so the directory must stay put (`CWD_LOCK`).
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut shell = Shell::new();
         let buf = capture_output(&mut shell);
@@ -15419,18 +15241,10 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "got:captured\n");
     }
 
-    // `exec CMD` inside a converted foreground subshell/command-
-    // substitution used to call a literal execve, replacing the one real
-    // process the whole interactive shell (every window/pane) shares --
-    // now falls back to spawning CMD as a real, separate child instead,
-    // same as a real forked subshell's own exec would actually replace.
-    // Uses /bin/true (no output) rather than asserting on what it prints:
-    // a *spawned external process's* own stdout goes straight to a real
-    // fd, bypassing capture_output's OutputSink::Capture entirely (that
-    // only intercepts this Shell's own builtin writes) -- exactly the
-    // distinction exec_cmd_inside_a_command_substitution_is_captured
-    // just below exists to cover instead, via the real capture mechanism
-    // command substitution actually uses.
+    // `exec CMD` inside an in-process subshell or substitution spawns CMD
+    // rather than replacing the process every window shares. `/bin/true`,
+    // because an external's stdout bypasses `capture_output`; the test below
+    // covers output through the substitution's capture.
     #[test]
     fn exec_cmd_inside_a_subshell_does_not_kill_the_real_process() {
         let mut shell = Shell::new();
@@ -15439,40 +15253,35 @@ mod tests {
         assert_eq!(buf.borrow().as_str(), "still alive: 0\n");
     }
 
-    // The editor's `:[range]!cmd`. The point of these is the *external*
-    // command: `sort` is the whole reason the filter exists, and an
-    // external's stdout goes to a real descriptor that `OutputSink::
-    // Capture` never sees -- which is what the sibling test above is
-    // about, and why this uses `$( )`'s machinery instead.
+    // The editor's `:[range]!cmd`. The point is an external like `sort`,
+    // whose stdout bypasses `OutputSink::Capture`, so this uses `$( )`'s
+    // machinery.
     #[test]
     fn filter_through_command_feeds_stdin_and_captures_an_externals_stdout() {
         let mut shell = Shell::new();
         let (out, err, status) = shell.filter_through_command("sort", "c\na\nb\n").unwrap();
         assert_eq!((out.as_str(), err.as_str(), status), ("a\nb\nc\n", "", 0));
 
-        // A builtin works through the same door.
+        // A builtin works too.
         let (out, _, _) = shell.filter_through_command("cat", "x\ny\n").unwrap();
         assert_eq!(out, "x\ny\n");
 
-        // The trailing newline is kept, unlike `$( )` -- it is what ends
-        // the last line of a buffer.
+        // The trailing newline is kept, unlike `$( )`: it ends the buffer's
+        // last line.
         let (out, _, _) = shell.filter_through_command("cat", "one\n").unwrap();
         assert_eq!(out, "one\n");
 
-        // A non-zero status comes back rather than being swallowed --
-        // vim replaces the range either way, so the caller needs it.
+        // A non-zero status is returned: vim replaces the range either way.
         let (out, _, status) = shell.filter_through_command("false", "a\n").unwrap();
         assert_eq!(out, "");
         assert_ne!(status, 0);
 
-        // stderr is kept apart from stdout, so a command's complaint
-        // cannot end up spliced into the buffer between its own lines.
+        // stderr stays apart, so a complaint can't land in the buffer.
         let (out, err, _) = shell.filter_through_command("cat; echo trouble >&2", "a\n").unwrap();
         assert_eq!(out, "a\n");
         assert_eq!(err, "trouble\n");
 
-        // Arguments, pipelines and quoting all work: this is a real
-        // shell command line, not an argv.
+        // A real command line: arguments, pipelines and quoting.
         let (out, _, _) = shell.filter_through_command("sort -r | head -n 2", "a\nb\nc\n").unwrap();
         assert_eq!(out, "c\nb\n");
     }
@@ -15484,24 +15293,6 @@ mod tests {
         shell.run_source_here(r#"x=$(exec /bin/echo captured); echo "got:$x""#, "<test>");
         assert_eq!(buf.borrow().as_str(), "got:captured\n");
     }
-
-    // Bare `exec > file` (no command word -- a persistent, no-fork
-    // redirect of *this shell's own* fd 0/1/2, applied via a real dup2 on
-    // the real process) used to leak past the subshell it ran in: since
-    // it's no longer a real separate process, nothing undid the real fd
-    // 1 repoint once the subshell finished, so *everything* printed
-    // afterward -- even in the enclosing real shell -- silently kept
-    // going into that file too. save_fd012/restore_fd012 (run_in_child_
-    // shell) now save and restore the real fd 0/1/2 around the whole
-    // call, the same way cwd/env/umask already were. Deliberately not a
-    // Rust unit test here: verifying it needs a real fd 1 (OutputSink::
-    // Real / an external process's inherited stdio, neither of which
-    // capture_output's OutputSink::Capture touches), and manipulating
-    // the real fd 1 mid-test would risk corrupting whichever *other*
-    // test happens to be writing to its own stdout in parallel in this
-    // same test binary. Confirmed manually instead: `(exec > file; echo
-    // hi); echo after` at a real prompt -- "after" reaches the real
-    // terminal, only "hi" lands in the file.
 
     fn strs(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
@@ -15557,10 +15348,7 @@ mod tests {
         assert_eq!(shell.abbrs, vec![Abbr::new("gco", "git checkout")]);
     }
 
-    // The trailing-integer-run spelling for placeholder order is gone
-    // -- order lives in the expansion now, as `$1`/`$2` -- so trailing
-    // integers are plain expansion words again, with nothing to
-    // disambiguate.
+    // Order lives in `$1`/`$2` now, so trailing integers are plain words.
     #[test]
     fn abbr_add_keeps_trailing_integers_as_expansion_words() {
         let mut shell = Shell::new();
@@ -15581,27 +15369,19 @@ mod tests {
 
     #[test]
     fn a_background_jobs_output_is_routed_to_the_grid_that_spawned_it() {
-        // Regression: a `cmd &` wrote straight to the real terminal --
-        // painting over whatever the pane was showing, then being wiped
-        // by the next repaint, since the session's grid never saw a byte
-        // of it -- or, for the pty-attached case, never appeared at all
-        // because nothing drained the far end. Both now land in the grid
-        // of the session that started the job.
+        // A `cmd &`'s output lands in the grid of the session that started
+        // it, for the plain and the pty-attached case.
         let mut shell = Shell::new();
         let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
-        // In this order, matching repl.rs's own ensure_promoted:
-        // promote_if_needed writes the alternate-screen switch through
-        // the sink, and that switch belongs to the *real* terminal, not
-        // to this grid -- with the grid installed first it would land in
-        // the grid instead and leave it stuck on its own alternate
-        // buffer, which is exactly the state the drain skips.
+        // In `ensure_promoted`'s order: `promote_if_needed` writes the
+        // alternate-screen switch through the sink, and it belongs to the
+        // real terminal, not the grid.
         shell.promote_if_needed();
         shell.set_sink_grid(screen.clone());
         assert!(!screen.borrow().using_alternate, "the session's grid is never the one promotion switches");
         shell.run_source_here("sh -c 'echo from-a-background-job' &\n", "<test>");
-        // The child writes as soon as it can; drain until it shows up
-        // rather than racing it (the real caller does this every idle
-        // tick).
+        // Drain until the output arrives rather than racing the child, as the
+        // idle tick does.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let row0 = loop {
             shell.drain_background_output();
@@ -15616,12 +15396,8 @@ mod tests {
 
     #[test]
     fn a_redirected_background_job_still_records_the_grid_for_its_other_stream() {
-        // Regression: a command with its own output redirect runs under a
-        // `Builtin` sink for its duration, so reading `self.sink`
-        // directly at push time found no grid and the stream that
-        // *wasn't* redirected stayed invisible -- `cmd >file &` losing
-        // every line of stderr. sink_grid looks through that sink to the
-        // real one underneath.
+        // `cmd >file &` runs under a `Builtin` sink, so `sink_grid` must look
+        // through it to the grid, or the unredirected stderr would be lost.
         let mut shell = Shell::new();
         let screen = Rc::new(RefCell::new(crate::vt100::Screen::new(6, 40)));
         shell.set_sink_grid(screen.clone());
