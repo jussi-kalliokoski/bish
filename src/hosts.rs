@@ -1,28 +1,18 @@
-// The hosts this machine knows about, from the three places that know:
-// `~/.ssh/config`, `~/.ssh/known_hosts`, and `/etc/hosts`.
+// The hosts this machine knows, from `~/.ssh/config`,
+// `~/.ssh/known_hosts` and `/etc/hosts`: what can follow `ssh`, as one
+// deduplicated list. Each reader is a pure function of a string, so
+// hashed entries, `[host]:port` and `Include` are tested without a
+// filesystem.
 //
-// One module rather than three because they answer one question -- "what
-// can I type after `ssh`?" -- and a consumer wants the union, not three
-// separate lists it has to merge itself. The formats have nothing in
-// common beyond being line-oriented, so each gets its own reader; what
-// they share is the shape of the answer.
-//
-// Every reader takes a string and each is pure, so the interesting
-// cases -- a hashed known_hosts entry, a `[host]:port`, an `Include`
-// that fans out -- are tested without touching a filesystem.
-//
-// **Patterns are never offered.** An `ssh_config` `Host *.internal` or a
-// `known_hosts` wildcard entry is a rule about hosts, not a host: it is
-// not something you can type after `ssh` and reach anything, so
-// suggesting it would be suggesting a thing that does not work.
+// Patterns are never offered: `Host *.internal` or a wildcard
+// `known_hosts` entry is a rule, not a host you can reach.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Every host worth offering, deduplicated and in a stable order.
-/// Silent about anything it cannot read: a missing `~/.ssh/config` is
-/// the normal case, not an error.
+/// Every host worth offering, deduplicated, in a stable order. Silent
+/// about what it can't read: a missing `~/.ssh/config` is normal.
 pub fn known() -> Vec<String> {
     let mut out = BTreeSet::new();
     if let Some(home) = home() {
@@ -43,9 +33,8 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-// How deep an `Include` chain is followed. ssh itself has no documented
-// limit; this one exists so a config that includes itself stops rather
-// than recursing forever.
+// How deep `Include` chains are followed. ssh documents no limit; this
+// stops a config that includes itself.
 const MAX_INCLUDE_DEPTH: usize = 8;
 
 fn from_ssh_config_file(path: &Path, depth: usize) -> Vec<String> {
@@ -54,10 +43,7 @@ fn from_ssh_config_file(path: &Path, depth: usize) -> Vec<String> {
     if depth >= MAX_INCLUDE_DEPTH {
         return out;
     }
-    // `Include` is followed because it is how a real `~/.ssh/config`
-    // is usually organized now -- a one-line file whose only content is
-    // `Include config.d/*` is common enough that not following it would
-    // mean finding nothing on many machines.
+    // `Include` is followed: many configs are just `Include config.d/*`.
     for pattern in ssh_config_includes(&text) {
         for included in resolve_include(&pattern, path) {
             out.extend(from_ssh_config_file(&included, depth + 1));
@@ -82,25 +68,21 @@ fn resolve_include(pattern: &str, from: &Path) -> Vec<PathBuf> {
     };
     match crate::glob::expand(&expanded, crate::glob::Options::default(), std::path::Path::new(".")) {
         Some(paths) => paths.into_iter().map(PathBuf::from).collect(),
-        // No matches, or no metacharacters to expand: the literal path,
-        // which simply may not exist.
+        // No matches or no metacharacters: the literal path, which may not
+        // exist.
         None => vec![PathBuf::from(expanded)],
     }
 }
 
-/// `Host` aliases and `HostName` values out of an ssh config.
-///
-/// Both, because both are things you can type: the alias is what the
-/// config exists to give you, and the real name behind it is what you
-/// reach for when you are on a machine whose config doesn't have the
-/// alias.
+/// `Host` aliases and `HostName` values from an ssh config: the alias is
+/// what the config gives you, and the real name is what you type on a
+/// machine without that config.
 pub fn from_ssh_config(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (keyword, value) in ssh_config_lines(text) {
         match keyword.as_str() {
-            // `Host` takes a list of patterns; `HostName` takes one
-            // name, which may itself hold `%h`-style tokens that only
-            // mean something after substitution.
+            // `Host` takes a list of patterns; `HostName` one name, which
+            // may hold `%h`-style tokens.
             "host" => out.extend(value.split_whitespace().filter(|w| is_plain_host(w)).map(str::to_string)),
             "hostname" => out.extend(value.split_whitespace().take(1).filter(|w| is_plain_host(w)).map(str::to_string)),
             _ => {}
@@ -117,8 +99,8 @@ fn ssh_config_includes(text: &str) -> Vec<String> {
         .collect()
 }
 
-// `Keyword value`, `Keyword=value`, or either with leading whitespace.
-// Keywords are case-insensitive, which is why they come back folded.
+// `Keyword value` or `Keyword=value`, maybe indented. Keywords are
+// case-insensitive, so they come back folded.
 fn ssh_config_lines(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -135,12 +117,9 @@ fn ssh_config_lines(text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The host names out of a `known_hosts` file.
-///
-/// Skips what cannot be offered: a hashed entry (`|1|...`), whose whole
-/// point is that the name is not recoverable from it, and a `@revoked`
-/// key, whose host is one you specifically should not be one Tab away
-/// from connecting to.
+/// The host names in a `known_hosts` file, skipping hashed entries
+/// (`|1|...`), whose names can't be recovered, and `@revoked` keys, whose
+/// hosts shouldn't be one Tab away.
 pub fn from_known_hosts(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -154,8 +133,8 @@ pub fn from_known_hosts(text: &str) -> Vec<String> {
             continue;
         }
         if first.starts_with('@') {
-            // `@cert-authority` and anything else marker-shaped: the
-            // host list is the next field.
+            // `@cert-authority` and other markers: the host list is the
+            // next field.
             first = fields.next().unwrap_or_default();
         }
         if first.starts_with('|') {
@@ -166,9 +145,8 @@ pub fn from_known_hosts(text: &str) -> Vec<String> {
     out
 }
 
-// One entry from a known_hosts host list. `[host]:port` is the form a
-// non-default port takes; the port is dropped, since what a caller
-// wants is a name to type.
+// One entry from a known_hosts host list. `[host]:port` is a
+// non-default port, dropped: callers want a name.
 fn known_host_name(entry: &str) -> Option<String> {
     let name = match entry.strip_prefix('[') {
         Some(rest) => rest.split(']').next()?,
@@ -177,7 +155,7 @@ fn known_host_name(entry: &str) -> Option<String> {
     is_plain_host(name).then(|| name.to_string())
 }
 
-/// The names out of an `/etc/hosts` file: every field after the address.
+/// The names in an `/etc/hosts` file: every field after the address.
 pub fn from_etc_hosts(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -187,8 +165,7 @@ pub fn from_etc_hosts(text: &str) -> Vec<String> {
     out
 }
 
-// Whether this is a name you could actually type, rather than a pattern
-// or a negation that only means something as a rule.
+// Whether this is a name you could type, not a pattern or a negation.
 fn is_plain_host(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with('!')
@@ -213,15 +190,11 @@ Host db
         assert_eq!(from_ssh_config(text), vec!["web", "prod", "web-1.example.com", "db", "10.0.0.5"]);
     }
 
-    // `Keyword=value` is as legal as `Keyword value`, and keywords are
-    // case-insensitive.
     #[test]
     fn ssh_config_accepts_equals_and_any_casing() {
         assert_eq!(from_ssh_config("host=web\nHOSTNAME = web.example.com\n"), vec!["web", "web.example.com"]);
     }
 
-    // A pattern is a rule about hosts, not a host: typing it after `ssh`
-    // reaches nothing.
     #[test]
     fn ssh_config_never_offers_a_pattern_or_a_negation() {
         let text = "Host *\n  ForwardAgent yes\nHost *.internal !secret real\n  HostName %h.example.com\n";
@@ -239,7 +212,6 @@ Host db
         assert_eq!(from_known_hosts(text), vec!["web.example.com", "10.0.0.4", "db.example.com"]);
     }
 
-    // The port form, and the marker forms.
     #[test]
     fn known_hosts_understands_bracketed_ports_and_markers() {
         assert_eq!(from_known_hosts("[web.example.com]:2222 ssh-rsa AAAA\n"), vec!["web.example.com"]);
@@ -247,8 +219,6 @@ Host db
         assert_eq!(from_known_hosts("@cert-authority real.example.com ssh-rsa AAAA\n"), vec!["real.example.com"]);
     }
 
-    // A hashed entry exists so the name *isn't* recoverable, and a
-    // revoked key names a host you should not be one Tab from reaching.
     #[test]
     fn known_hosts_skips_hashed_and_revoked_entries() {
         assert_eq!(from_known_hosts("|1|F1E1+abc=|9xyz= ssh-rsa AAAA\n"), Vec::<String>::new());
@@ -275,8 +245,7 @@ Host db
         }
     }
 
-    // The reader that follows `Include`, exercised against real files
-    // since resolving one is entirely about paths.
+    // Against real files, since resolving an `Include` is about paths.
     #[test]
     fn an_included_config_is_read_too() {
         let dir = std::env::temp_dir().join(format!("bish-hosts-include-{}", std::process::id()));
@@ -291,7 +260,6 @@ Host db
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A config that includes itself stops instead of recursing forever.
     #[test]
     fn a_self_including_config_terminates() {
         let dir = std::env::temp_dir().join(format!("bish-hosts-cycle-{}", std::process::id()));
