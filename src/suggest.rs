@@ -1,26 +1,17 @@
-// "did you mean ...?" -- the one thing to say when a name is nearly
-// right.
+// "Did you mean ...?" for a name that's nearly right.
 //
-// Optimal string alignment distance rather than plain Levenshtein: it
-// counts a transposition as one edit instead of two, and a
-// transposition is the single most common way a name gets mistyped.
-// The difference decides whether the feature works at all on short
-// names. `ecoh` is one transposition from `echo` but two plain
-// Levenshtein edits, and any threshold loose enough to catch a distance
-// of two on a four-letter word suggests `exec` for `set` as well.
+// Optimal string alignment distance, not plain Levenshtein: a
+// transposition, the most common typo, counts as one edit. On short
+// names that decides whether it works at all: `ecoh` is one edit from
+// `echo` but two in Levenshtein, and a threshold allowing two on a
+// four-letter word suggests `exec` for `set`.
 //
-// The threshold is a third of the typed word's length, rounded down and
-// never below one -- so a four-letter name allows one edit, a
-// nine-letter name allows three, and nothing is ever suggested for a
-// name that shares almost nothing with what was typed. `readonly` is
-// eight characters and tolerates two, which covers a doubled or dropped
-// letter plus a slip; it does not stretch to `read`.
+// The threshold is a third of the typed word's length, at least one: one
+// edit for four letters, three for nine. `readonly` tolerates two, which
+// doesn't stretch to `read`.
 
-/// The closest of `candidates` to `word`, if any of them is close
-/// enough to be worth naming.
-///
-/// Ties go to the earliest candidate, so a caller that lists its
-/// options in a meaningful order gets that order honoured.
+/// The closest of `candidates` to `word`, if close enough to name. Ties
+/// go to the earliest, so a caller's ordering is honoured.
 pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let limit = (word.chars().count() / 3).max(1);
     if word.chars().count() < 3 {
@@ -28,9 +19,8 @@ pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a s
     }
     candidates
         .into_iter()
-        // Never the word itself. A name that is a builtin somewhere and
-        // not reachable where it was typed failed with "did you mean
-        // 'win'?" -- the one suggestion guaranteed not to help.
+        // Never the word itself: a name that's a builtin elsewhere but not
+        // where it was typed got "did you mean 'win'?".
         .filter(|candidate| !candidate.is_empty() && *candidate != word)
         .map(|candidate| (distance(word, candidate), candidate))
         .filter(|(d, _)| *d <= limit)
@@ -38,23 +28,14 @@ pub(crate) fn nearest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a s
         .map(|(_, candidate)| candidate)
 }
 
-/// `nearest`, already worded and ready to append to an error.
+/// The bash builtins this shell answers differently, and what to use
+/// instead. Not stubs: a `bind` that did nothing would report success
+/// for keybindings not in effect. The editor isn't readline; its keymap
+/// is `::bish map`.
 ///
-/// Empty when nothing is close, so a message can carry it
-/// unconditionally: `format!("unknown subcommand '{name}'{}", suggest::did_you_mean(name, OPTIONS))`.
-/// The bash builtins this shell answers differently, and what to reach
-/// for instead.
-///
-/// Not stubs. A `bind` that parsed its arguments and did nothing would
-/// report success for keybindings that are not in effect, which is
-/// worse than saying so: this shell's editor is not readline, and its
-/// keymap is `::bish map`. Saying where to go turns a dead end into a
-/// signpost without pretending the command ran.
-///
-/// `win` and `window` are builtins on the editor's colon line and
-/// nowhere else, on purpose (see their arm in exec.rs) -- so typed at a
-/// prompt they are not found, and what is worth saying is the spelling
-/// that works there.
+/// `win` and `window` exist only on the editor's colon line (see their arm
+/// in exec.rs), so at a prompt the useful answer is the spelling that
+/// works there.
 const INSTEAD: &[(&str, &str)] = &[
     ("bind", "this shell's keymap is `::bish map`"),
     ("win", "outside the editor's colon line it is `::bish window`"),
@@ -68,6 +49,9 @@ pub(crate) fn instead_of(word: &str) -> String {
     }
 }
 
+/// `nearest`, worded to append to an error. Empty when nothing is close, so
+/// a message can always carry it:
+/// `format!("unknown subcommand '{name}'{}", suggest::did_you_mean(name, OPTIONS))`.
 pub(crate) fn did_you_mean<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
     match nearest(word, candidates) {
         Some(candidate) => format!(" -- did you mean '{candidate}'?"),
@@ -76,13 +60,9 @@ pub(crate) fn did_you_mean<'a>(word: &str, candidates: impl IntoIterator<Item = 
 }
 
 /// Optimal string alignment distance: insertions, deletions,
-/// substitutions and transpositions of adjacent characters, one edit
-/// each.
-///
-/// Two rows rather than a full matrix would be the usual trim, but this
-/// needs three -- the transposition case reaches back two rows -- and
-/// the names being compared are short enough that the whole matrix is a
-/// few hundred bytes anyway.
+/// substitutions and adjacent transpositions, one edit each. The full
+/// matrix, as the transposition case reaches back two rows and the names
+/// are short.
 pub(crate) fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -100,7 +80,7 @@ pub(crate) fn distance(a: &str, b: &str) -> usize {
         for j in 1..=b.len() {
             let substitution = usize::from(a[i - 1] != b[j - 1]);
             d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + substitution);
-            // `ab` -> `ba` is one edit, not two.
+            // `ab` to `ba` is one edit, not two.
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
             }
@@ -113,9 +93,8 @@ pub(crate) fn distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::{did_you_mean, distance, nearest};
 
-    // A word that is itself one of the candidates is not a near miss of
-    // it. `win` is a builtin on the editor's colon line only, and typed
-    // at a prompt it was not found -- and then offered back as the fix.
+    // A word that is one of the candidates isn't a near miss of it: `win`,
+    // not found at a prompt, was offered back as the fix.
     #[test]
     fn a_word_is_never_suggested_to_itself() {
         assert_eq!(did_you_mean("win", ["win", "wait"]), "", "nothing else is close enough to say");
@@ -130,8 +109,8 @@ mod tests {
         assert_eq!(distance("eccho", "echo"), 1, "a doubled letter");
         assert_eq!(distance("edho", "echo"), 1, "a slipped key");
         assert_eq!(distance("", "echo"), 4);
-        // Unrelated words stay far apart, which is what the threshold
-        // in `nearest` reads to decide there is nothing to say.
+        // Unrelated words stay far apart, which `nearest`'s threshold relies
+        // on.
         assert_eq!(distance("set", "exec"), 3);
         assert_eq!(distance("restart", "reset"), 3);
     }
@@ -142,11 +121,11 @@ mod tests {
         assert_eq!(nearest("lps", options), Some("lsp"));
         assert_eq!(nearest("windo", options), Some("window"));
         assert_eq!(nearest("wnidow", options), Some("window"));
-        // Different words, not misspelled ones.
+        // Different words, not misspellings.
         assert_eq!(nearest("restart", options), None);
         assert_eq!(nearest("zzz", options), None);
-        // Nothing is guessed from one or two characters: every short
-        // word is a near miss for something.
+        // Nothing is guessed from one or two characters: every short word is
+        // near something.
         assert_eq!(nearest("hl", options), None);
         assert_eq!(nearest("x", options), None);
     }
@@ -157,16 +136,12 @@ mod tests {
         assert_eq!(did_you_mean("zzz", ["lsp"]), "");
     }
 
-    // The property that matters: a builtin typed with one slip of the
-    // finger should resolve back to it. Measured over every builtin
-    // rather than over the handful I would have thought of -- each name
-    // with one letter dropped, one doubled, and each adjacent pair
-    // swapped.
+    // A builtin typed with one slip should resolve back to it, measured over
+    // every builtin: each with a letter dropped, one doubled, each adjacent
+    // pair swapped.
     //
-    // Not 100%, and it cannot be: `tet` is one edit from both `test`
-    // and `let`, and a two-letter builtin has no distinctive shape left
-    // once a letter goes. The bar is that a slip is almost always
-    // recoverable, not always.
+    // Not 100%, nor can it be: `tet` is one edit from `test` and `let`, and
+    // a two-letter builtin has no shape left once a letter goes.
     #[test]
     fn nearly_every_single_slip_finds_its_way_back() {
         let builtins = crate::exec::KNOWN_BUILTINS;
@@ -188,7 +163,7 @@ mod tests {
                 typos.push(swapped.iter().collect());
             }
             for typo in typos {
-                // A "typo" that is itself a builtin is not one.
+                // A "typo" that is itself a builtin isn't one.
                 if typo.is_empty() || builtins.contains(&typo.as_str()) {
                     continue;
                 }
@@ -200,18 +175,13 @@ mod tests {
         assert!(right * 100 >= total * 95, "only {right} of {total} slips found their way back");
     }
 
-    // The other side of it: a real program that simply is not installed
-    // should not be answered with a builtin that happens to be spelled
-    // a bit like it. Names taken off this machine's own `/usr/bin`,
-    // pinned here rather than read from it so the test says the same
-    // thing everywhere.
+    // A real program that isn't installed shouldn't be answered with a
+    // builtin spelled like it. Names from a `/usr/bin`, pinned so the test
+    // says the same everywhere.
     //
-    // Measured across all 2,758 of them, 37 do draw a suggestion. That
-    // is the price of the feature rather than a bug in it: `sed` is one
-    // edit from `set` and `head` is one from `read`, and nothing can
-    // tell those apart from a real slip of the finger. It only shows at
-    // all when the program is missing, where a wrong guess costs a line
-    // under an error that was already going to be printed.
+    // Of 2,758, 37 draw a suggestion (`sed` is one edit from `set`, `head`
+    // from `read`), indistinguishable from typos. It shows only when the
+    // program is missing, as a line under an error printed anyway.
     #[test]
     fn a_real_program_name_is_rarely_mistaken_for_a_builtin() {
         let builtins = crate::exec::KNOWN_BUILTINS;
