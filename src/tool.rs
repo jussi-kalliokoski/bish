@@ -1,26 +1,16 @@
-// `bish tool <subcommand>` -- a small namespace for standalone,
-// non-interactive tooling built on top of the same bash-language
-// machinery the shell/editor already have, reached via `bish tool ...`
-// on the real command line (see main.rs's own dispatch, which routes
-// here *before* its ordinary `-c`/script-path handling, since `tool`
-// isn't a script to run). `check` and `format` are the first two
-// subcommands; `lsp-server` is next (see bishedit::lint's own doc
-// comment for why the actual rule engines live there/in
-// bishedit::format instead of here -- this module is just the CLI
-// wrapper around them).
+// `bish tool <subcommand>`: standalone tooling on the shell's and
+// editor's bash machinery. main.rs routes here before its `-c` and
+// script handling. The rule engines live in `bishedit::lint` and
+// `bishedit::format`; this is the command-line wrapper.
 use crate::bishedit::format::BashFormatter;
 use crate::bishedit::lint::{BashLinter, Diagnostic, Fix, Linter};
 use std::io::{self, Read, Write};
 
-// Used both for the "expected:" line and for the "did you mean" beside
-// it, so the two cannot disagree about what exists.
+// Used for both the "expected:" line and "did you mean", so they agree.
 //
-// `mcp-server` is deliberately absent while it settles: it dispatches
-// below and works, but it is not listed, not suggested and not
-// described, because listing something is a promise that its shape will
-// hold. A hidden entry point can be changed or withdrawn without
-// breaking anyone who was told about it -- and the only thing using it
-// so far is a script somebody wrote against it on purpose.
+// `mcp-server` is left out while it settles: it works, but listing it
+// would promise its shape will hold, and an unlisted entry point can
+// still change.
 const SUBCOMMANDS: &[&str] = &["check", "format", "lsp-server", "debug", "edit", "keys"];
 
 pub fn run(args: &[String]) -> i32 {
@@ -28,7 +18,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("check") => run_check(&args[1..]),
         Some("format") => run_format(&args[1..]),
         Some("lsp-server") => crate::lspserver::run(&args[1..]),
-        // Unlisted on purpose -- see SUBCOMMANDS.
+        // Unlisted on purpose; see `SUBCOMMANDS`.
         Some("mcp-server") => crate::mcp::run(&args[1..]),
         Some("debug") => run_debug(&args[1..]),
         Some("edit") => run_edit(&args[1..]),
@@ -47,19 +37,11 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-// `bish tool keys` -- the editor's key bindings, answered by the editor
-// rather than described alongside it.
-//
-// There are two questions and they are both hard to ask today. Forward:
-// "what does `D` do?" -- answerable only by defining a throwaway
-// mapping to it and listing the mappings. Backward: "which key deletes
-// to end of line?" -- not answerable at all, and the written help does
-// not mention `D`.
-//
-// Both come out of `keymap::key_index`, which asks
-// `vimkeys::describe_key_sequence` about every candidate sequence, so
-// nothing here can go stale: a binding that exists is listed, and one
-// that does not, is not.
+// `bish tool keys`: the editor's key bindings, answered by the editor.
+// Both directions: what `D` does, and which key deletes to end of line.
+// Built by `keymap::key_index`, which asks
+// `vimkeys::describe_key_sequence` about every candidate, so it can't go
+// stale.
 fn run_keys(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => {
@@ -110,12 +92,9 @@ fn run_keys(args: &[String]) -> i32 {
     }
 }
 
-// Tab-separated, so the output is as usable from a script as it is to
-// read -- the same shape `::bish map`'s own listing has.
-//
-// Written through a locked handle rather than `println!` because this
-// is output somebody will pipe into `grep` or `head`, and `println!`
-// panics on the EPIPE that follows when the reader stops early.
+// Tab-separated, for scripts as well as reading, like `::bish map`'s
+// listing. Through a locked handle, as `println!` panics on the EPIPE
+// when a `grep` or `head` reader stops early.
 fn print_index(rows: &[(String, String)]) {
     use std::io::Write;
     let stdout = std::io::stdout();
@@ -127,11 +106,9 @@ fn print_index(rows: &[(String, String)]) {
     }
 }
 
-// `bish tool debug <script>` -- unlike check/format, this isn't a
-// one-shot, non-interactive pass: it launches a real interactive raw-
-// mode session, same real windowed editor `bish tool edit` uses
-// (repl::run_edit_debug -- a thin wrapper that immediately attaches a
-// debug session, see debugger.rs's own top-of-file doc comment).
+// `bish tool debug <script>`: an interactive session in the windowed
+// editor with a debug session attached (`repl::run_edit_debug`; see
+// debugger.rs).
 fn run_debug(args: &[String]) -> i32 {
     match args.first() {
         Some(path) => crate::repl::run_edit_debug(path),
@@ -142,14 +119,9 @@ fn run_debug(args: &[String]) -> i32 {
     }
 }
 
-// `bish tool edit <file>...` -- also a real interactive session, not a
-// one-shot pass, but unlike `debug` it reuses the real windowed editor
-// machinery directly (repl::run_edit) rather than re-deriving a subset
-// of it: there's no debugger-shaped state (breakpoints, run/step
-// control) to bolt on here, just "open these files in the real editor,
-// without the multi-window/tab-bar chrome around it." Argument parsing
-// is the `e` builtin's own (fileeditor::parse_edit_args), so the command
-// line and the builtin can't drift apart.
+// `bish tool edit <file>...`: the windowed editor (`repl::run_edit`)
+// without the window and tab chrome. Arguments are parsed as the `e`
+// builtin parses them (`fileeditor::parse_edit_args`).
 fn run_edit(args: &[String]) -> i32 {
     if args.is_empty() {
         eprintln!("usage: bish tool edit [--hex] [--readonly] FILE...");
@@ -237,10 +209,8 @@ fn check_file(path: &str, fix: bool) -> i32 {
     let diagnostics = BashLinter.check(&text);
     if fix {
         let (fixed, applied, remaining) = apply_fixes(&text, &diagnostics);
-        // Only rewrite the file when something actually changed --
-        // touching every scanned file's mtime even when there was
-        // nothing to fix would be a surprising side effect of a plain
-        // `--fix` run over a directory of already-clean scripts.
+        // Rewritten only if something changed, so `--fix` over clean scripts
+        // leaves their mtimes alone.
         if applied > 0 {
             if let Err(e) = std::fs::write(path, &fixed) {
                 eprintln!("bish tool check: {path}: error writing fix: {e}");
@@ -341,8 +311,7 @@ fn format_file(path: &str, check_only: bool) -> i32 {
         if diagnostics.is_empty() { 0 } else { 1 }
     } else {
         let (fixed, applied, remaining) = apply_fixes(&text, &diagnostics);
-        // Same "don't touch mtime for nothing" reasoning as check_file's
-        // own --fix path.
+        // Only if something changed, as in `check_file`.
         if applied > 0
             && let Err(e) = std::fs::write(path, &fixed)
         {
@@ -354,22 +323,14 @@ fn format_file(path: &str, check_only: bool) -> i32 {
     }
 }
 
-// Applies every diagnostic's own fix (skipping the ones with none) in
-// one pass and returns (fixed_text, applied_count, remaining_diagnostics
-// -- everything left over, whether it had no fix at all or the fix just
-// wasn't applied). Sorted by descending `start` before splicing: earlier
-// edits then never need their own offsets adjusted for a later one that
-// already happened, since every edit still to come sits entirely before
-// the point already spliced. Fixes are assumed non-overlapping (true for
-// both of today's rules -- see unquoted_expansion/masked_return_value's
-// own doc comments) but a defensive check still skips any fix whose span
-// overlaps one already applied, rather than risk a corrupted splice.
+// Applies every diagnostic's fix in one pass, returning the fixed text,
+// how many applied, and the diagnostics left (no fix, or not applied).
+// Applied by descending `start`, so no edit shifts one still to come.
+// A fix overlapping one already applied is skipped rather than risk a
+// corrupted splice.
 fn apply_fixes<'a>(text: &str, diagnostics: &'a [Diagnostic]) -> (String, usize, Vec<&'a Diagnostic>) {
-    // Indexed alongside each Fix so a fix skipped for overlapping one
-    // already applied (the defensive case -- see this function's own
-    // doc comment) still surfaces in `remaining` via its own Diagnostic,
-    // instead of silently vanishing from every report just because it
-    // *had* a fix that didn't end up applying.
+    // Indexed with each fix, so one skipped for overlap still shows in
+    // `remaining` via its diagnostic.
     let mut candidates: Vec<(usize, &Fix)> = diagnostics.iter().enumerate().filter_map(|(i, d)| d.fix.as_ref().map(|f| (i, f))).collect();
     crate::sort::sort_by_key(&mut candidates, |(_, f)| std::cmp::Reverse(f.start));
 
@@ -398,11 +359,8 @@ fn report_remaining<'a>(path: &str, text: &str, diagnostics: impl Iterator<Item 
     }
 }
 
-// 1-based (line, column), matching every other compiler/linter's own
-// convention -- computed by scanning rather than kept alongside each
-// Diagnostic, since this is the only place in the whole check/--fix path
-// that ever needs it (bishedit::lint's own char-offset spans are what
-// both --fix's splicing and a future editor/LSP consumer actually want).
+// 1-based (line, column), as compilers report, computed here since
+// only this path needs it; lint spans are char offsets.
 fn line_col(chars: &[char], offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut col = 1;
@@ -452,11 +410,8 @@ mod tests {
 
     #[test]
     fn apply_fixes_skips_a_fix_overlapping_one_already_applied() {
-        // Defensive only -- today's rules never actually produce
-        // overlapping fixes (see apply_fixes's own doc comment) -- this
-        // just confirms a corrupted splice can't happen if that ever
-        // changes: the earlier (higher-start) fix wins, the overlapping
-        // one is left in `remaining` untouched.
+        // Overlapping fixes: the earlier-applied (higher start) wins and the
+        // other stays in `remaining`.
         let text = "abcdef";
         let diags = vec![
             diag(2, 5, Some(Fix { start: 2, end: 5, replacement: "X".to_string() })),
