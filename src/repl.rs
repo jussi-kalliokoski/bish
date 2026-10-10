@@ -41,250 +41,150 @@ use crate::window::{
     resize_focused_pane, resize_split_child_to, set_child_weight_to_fraction,
 };
 
-// One virtual shell session -- either the original process's own session
-// (the root, id 0) or one created by `window new` (via Shell::
-// new_virtual_child). Each has its own insert-mode multi-line
-// continuation buffer, its own History (a persistent, independently-
-// diverging chain -- see History's own doc comment for why forking one
-// per session, rather than sharing one with a per-session cutoff index,
-// is what actually keeps sibling panes' commands from leaking into each
-// other's Up/Down browsing), and its own VT100 grid: before promotion
-// the grid sits empty and unused (the session's Shell writes straight to
-// the real terminal); after promotion every session's output is
-// captured into its own grid (see apply_window_action), so switching
-// `window`s can redraw whatever that window last drew instead of
-// showing stale/real-terminal content.
+// One shell session: the root (id 0) or one made by `window new`
+// (`Shell::new_virtual_child`). Each has its own continuation buffer, its
+// own `History` (a forked persistent chain, so sibling panes' commands
+// don't appear in each other's Up/Down), and its own VT100 grid, unused
+// before promotion (output goes to the terminal) and capturing output
+// after (`apply_window_action`), so switching windows redraws what each
+// last drew.
 struct SessionState {
     shell: Shell,
-    /// The real language-server table. Shared by every session in the
-    /// process (`Rc::clone` when one is created from another), and
-    /// installed into `shell` as an opaque `exec::ServiceTable` so
-    /// `::bish lsp status`/`log`/`restart` work without exec.rs ever
-    /// naming a language-server type. Both handles point at the same
-    /// `RefCell`; this is the one with the real API on it.
+    /// The language-server table, shared by every session, and installed in
+    /// `shell` as an opaque `exec::ServiceTable` so `::bish lsp` works
+    /// without exec.rs naming a server type. Both handles share one
+    /// `RefCell`; this one has the real API.
     lsp: Rc<RefCell<lspclient::Table>>,
-    /// Project roots already worked out by a `--root-cmd`, keyed by the
-    /// directory the question was asked from.
-    ///
-    /// Memoised because `server_target` runs on every idle tick, and a
-    /// root command is a real process -- `cargo metadata` takes the
-    /// better part of a second on a cold cache. Resolved once when a
-    /// document is opened, and read back from here afterwards.
+    /// Project roots found by a `--root-cmd`, keyed by the directory asked
+    /// from. Memoized because `server_target` runs every idle tick and a root
+    /// command is a real process (`cargo metadata` takes most of a second
+    /// cold).
     lsp_roots: HashMap<PathBuf, PathBuf>,
-    /// Semantic-token requests already sent and not yet collected,
-    /// keyed by document uri: `(request id, the buffer version it was
-    /// asked about)`.
-    ///
-    /// Unlike every other language-server question, this one is asked
-    /// without waiting for the answer -- nobody is standing in front of
-    /// it, and a bounded wait on the idle path would be a stall on every
-    /// keystroke's worth of quiet. So the request goes out, the id is
-    /// parked here, and whichever later idle tick finds the reply
-    /// applies it.
+    /// Semantic-token requests sent and not yet collected, by uri:
+    /// (request id, buffer version). Asked without waiting, since a bounded
+    /// wait on the idle path would stall every quiet moment; a later idle
+    /// tick applies the reply.
     lsp_semantic: HashMap<String, (i64, u64)>,
-    /// The buffer version whose tokens are currently painted, per uri --
-    /// what makes "nothing has changed, do not ask again" cheap.
+    /// The buffer version whose tokens are painted, per uri, so an unchanged
+    /// buffer isn't asked about again.
     lsp_semantic_applied: HashMap<String, u64>,
-    /// The in-flight `documentHighlight`, and the (version, row, col)
-    /// it asked about. One at a time and one across all documents,
-    /// because only the buffer being driven has a cursor.
+    /// The in-flight `documentHighlight` and the (version, row, col) asked
+    /// about: one at a time across documents, as only the driven buffer has a
+    /// cursor.
     lsp_highlight: Option<(i64, u64, usize, usize)>,
-    /// The (version, row, col) whose occurrences are currently marked,
-    /// so a cursor sitting still costs a tuple comparison per tick
-    /// rather than a request.
+    /// The (version, row, col) whose occurrences are marked, so a still
+    /// cursor costs a comparison per tick, not a request.
     lsp_highlight_applied: Option<(u64, usize, usize)>,
-    /// The in-flight `inlayHint`, and the (version, first line, last
-    /// line) it asked about. Like the highlight above: one at a time,
-    /// because only the buffer being driven has a viewport.
+    /// The in-flight `inlayHint` and the (version, first line, last line)
+    /// asked about: one at a time, as only the driven buffer has a viewport.
     lsp_inlay: Option<(i64, u64, usize, usize)>,
-    /// The (version, first line, last line) whose hints are currently
-    /// drawn -- so scrolling asks again and sitting still does not.
+    /// The (version, first line, last line) whose hints are drawn, so
+    /// scrolling asks again and sitting still doesn't.
     lsp_inlay_applied: Option<(u64, usize, usize)>,
     buffer: String,
-    // Whether `buffer` is off the record -- see leading_space_suppresses
-    // _history. Decided on the first line of a fresh command and left
-    // alone by every continuation line, so a multi-line command begun
-    // with a leading space stays unrecorded in full.
+    // Whether `buffer` is off the record
+    // (`leading_space_suppresses_history`), decided on a command's first
+    // line and kept through continuations, so a multi-line command begun
+    // with a space stays unrecorded.
     buffer_unrecorded: bool,
-    // Behind an `Rc<RefCell<_>>` so the shell can reach it: the
-    // `history` builtin lives in exec.rs, which has no idea what a
-    // session is, and talks to this through `exec::HistoryAccess` --
-    // the same shape `ServiceTable` already established for language
-    // servers. Both handles point at the same list.
+    // Shared with the shell: the `history` builtin in exec.rs knows nothing
+    // of sessions and reaches this through `exec::HistoryAccess`, as for
+    // `ServiceTable`.
     history: Rc<RefCell<History>>,
     screen: Rc<RefCell<vt100::Screen>>,
-    // Set once EOF has already warned this session about stopped jobs
-    // (see the ReadOutcome::Eof handler) without actually exiting --
-    // cleared the moment a real command runs, so a *second*, immediate
-    // Ctrl-D confirms the exit the same way real bash's "There are
-    // stopped jobs." + a second EOF does, while typing anything else
-    // first re-arms the warning.
+    // Set once EOF has warned about stopped jobs without exiting, cleared
+    // when a command runs, so a second Ctrl-D right away exits, as bash's
+    // "There are stopped jobs." does, and typing anything first re-arms it.
     warned_stopped_jobs: bool,
-    // Browser-style directory history for Alt+Left/Right (see
-    // push_dir_history and the ReadOutcome::DirNav handler): every
-    // directory this session's cwd has actually changed to (detected by
-    // diffing Shell::cwd before/after a command runs -- catches `cd`
-    // however it was invoked, not just a literal `cd` command), with
-    // dir_history_index marking "where we are" in that list. Seeded with
-    // the session's starting directory so Alt+Left works immediately,
-    // before any `cd` at all.
+    // Directory history for Alt+Left/Right (`push_dir_history`,
+    // `ReadOutcome::DirNav`): every directory this session's cwd changed to,
+    // found by comparing `Shell::cwd` around each command so any `cd`
+    // counts, with `dir_history_index` marking the position. Seeded with the
+    // starting directory.
     dir_history: Vec<std::path::PathBuf>,
     dir_history_index: usize,
-    // Every command mode has actually run in this session (successfully
-    // parsed and executed, regardless of its own exit status -- a
-    // command_mode_violation/syntax error never reaches here, matching
-    // how `history` itself only ever records something that parsed),
-    // across every separate ':' invocation -- see run_command_mode's own
-    // doc comment for why this outlives any one invocation. Viewed via
-    // Ctrl-L (render_command_transcript), both while composing a command
-    // mode line and, once one's just run, from normal mode's own
-    // pending-overlay state (run_normal_mode_navigation).
+    // Every command command mode ran in this session (parsed and executed,
+    // whatever its status), across invocations (see `run_command_mode`),
+    // shown by Ctrl-L (`render_command_transcript`) while composing or from
+    // Normal mode's pending overlay.
     command_transcript: Vec<TranscriptEntry>,
 }
 
-// A window: a set of panes (only ever more than one after `window
-// split`/`vsplit`) arranged by `layout`, with `focused_pane` marking
-// which one currently receives input and drives the prompt/job-loop --
-// everything that used to read/write a window's single `stack` now goes
-// through `stack()`/`stack_mut()`, which always resolve to the focused
-// pane's stack, so the bulk of the surrounding machinery (job driving,
-// EOF handling, `window fg`, close) needed no conceptual changes, only
-// this one indirection. Since the same SessionId can legally be the top
-// of more than one pane's stack at once (across windows via `window
-// fg`, or now within one window too), a session is only ever dropped
-// from `sessions` once no pane anywhere references it, at any depth --
-// see close_orphaned_sessions.
-/// Everything the window manager keeps for as long as the shell runs.
-///
-/// This is not a design so much as an observation: these eighteen
-/// values were already created together at the top of `run` and already
-/// passed together everywhere, and `run_normal_mode_navigation` took
-/// twenty parameters of which sixteen were these. That is what
-/// thirty-one `#[allow(clippy::too_many_arguments)]` in one file looks
-/// like from the inside, and it is why threading one more value through
-/// -- `current_window`, when panes learned to be clicked -- meant
-/// editing a dozen unrelated signatures.
-///
-/// What is *not* here is as deliberate: anything that belongs to one
-/// call rather than to the session (`session_id`, `edit_frame_id`,
-/// `rect`, `start: NavStart`) stays a parameter. A function's own
-/// arguments should say what that call is about; `App` is the part that
-/// is the same for every call.
-///
-/// The small, cohesive helpers keep their narrow signatures --
-/// `sync_semantic_tokens(&mut app.sessions, session_id, buf)` says more
-/// than the same call taking the whole world would, and a disjoint
-/// field borrow is exactly what makes that spelling work.
+/// Everything the window manager keeps while the shell runs: the values
+/// created together in `run` and passed together everywhere. Anything
+/// belonging to one call (`session_id`, `edit_frame_id`, `rect`, `start`)
+/// stays a parameter, so a function's arguments say what that call is
+/// about. Small helpers keep narrow signatures
+/// (`sync_semantic_tokens(&mut app.sessions, session_id, buf)`), which
+/// disjoint field borrows allow.
 struct App {
     sessions: HashMap<SessionId, SessionState>,
-    // Commands to run as if they had been typed at a prompt and
-    // submitted -- `::bish window split <cmd>`, `window new <cmd>`, and
-    // every line of a `window restore` script.
-    //
-    // Fed back in at the read that would otherwise have waited for a
-    // keystroke (see `run`'s own arm for this) rather than run
-    // directly, which is what makes them ordinary commands: history
-    // expansion, multi-line accumulation, job control and the window
-    // actions themselves all come along for free, and an interactive
-    // program gets the same drive loop it would have had if someone had
-    // sat down and typed it.
-    //
-    // On the app rather than on a session, which matters as soon as
-    // there is more than one line: a queued `window split` moves focus
-    // to the pane it just made, and the *next* line belongs there --
-    // that is exactly what "split, then cd into it" means in a layout
-    // script. A per-session queue would leave the rest of the script
-    // stranded on the session that started it.
+    // Commands to run as if typed and submitted: `::bish window split <cmd>`,
+    // `window new <cmd>`, and each line of a `window restore` script. Fed in
+    // at the read that would wait for a keystroke (see `run`), so history
+    // expansion, multi-line input, job control and window actions all apply.
+    // On the app, not a session: a queued `window split` moves focus to the
+    // new pane, and the next line belongs there.
     pending_input: std::collections::VecDeque<String>,
     windows: Vec<WindowEntry>,
     current_window: usize,
     next_session_id: SessionId,
     next_window_id: u32,
-    // Owns every currently-fg'd job, keyed by the id a Frame::Job on
-    // some window's stack points to -- see Frame's doc comment for why
-    // a job isn't stored directly in the stack itself.
+    // Every fg'd job, by the id a `Frame::Job` points to (see `Frame` for why
+    // jobs aren't in the stack).
     job_frames: HashMap<JobFrameId, exec::FgJob>,
     next_job_frame_id: JobFrameId,
-    // Same idea as job_frames, for `e`'s own detachable editor sessions
-    // (Frame::Edit) -- see Frame's own doc comment.
-    //
-    // While one is being driven it is *not* in here: `run_edit_frame`
-    // takes it out first and puts it back on the way out, so what this
-    // map holds during an edit is exactly every *other* open buffer --
-    // which is to say, exactly the files a cross-file edit must not
-    // write behind the user's back. See `rename_via_server`, which
-    // depends on that.
+    // `e`'s detachable editor sessions (`Frame::Edit`), likewise. The one
+    // being driven isn't here: `run_edit_frame` takes it out and puts it
+    // back, so during an edit this holds every other open buffer, the files
+    // a cross-file edit mustn't write behind the user's back
+    // (`rename_via_server`).
     edit_frames: HashMap<EditFrameId, fileeditor::EditSession>,
-    // `gd` into another file makes a frame of its own, and this is the
-    // counter those ids come from.
+    // Where ids for frames made by `gd` into another file come from.
     next_edit_frame_id: EditFrameId,
-    // `e --hex`'s own equivalent of edit_frames -- see Frame::Hex.
+    // `e --hex`'s frames (`Frame::Hex`).
     hex_frames: HashMap<HexFrameId, hexedit::HexSession>,
     next_hex_frame_id: HexFrameId,
-    // Same idea again, for `:dbg`'s own attached sessions
-    // (Frame::DebugRun) -- see Frame's own doc comment.
+    // `:dbg`'s attached sessions (`Frame::DebugRun`).
     debug_frames: HashMap<EditFrameId, debugger::DebugSession>,
-    // `gr`'s answers, keyed like `debug_frames` -- see Frame::Locations.
+    // `gr`'s answers, keyed like `debug_frames` (`Frame::Locations`).
     location_lists: HashMap<EditFrameId, LocationList>,
     cmd_history: History,
-    /// The last `:s` that ran, with its pattern and flags already
-    /// resolved -- what `:s//repl/` and the `&` flag reach back for.
+    /// The last `:s`, pattern and flags resolved: what `:s//repl/` and the
+    /// `&` flag reach back for.
     last_substitute: Option<LastSubstitute>,
-    // The whole-shell register table (yank/put/<C-r>) -- one instance,
-    // shared globally across every window/pane/session, matching both
-    // vim (registers are global to the editor instance, not per-buffer)
-    // and tmux (paste buffers are global to the server, not per-pane).
-    // See bishedit::registers::Registers' own doc comment.
+    // The register table (yank, put, `<C-r>`), one for the whole shell, as
+    // vim's registers are global (see `Registers`).
     registers: Registers,
-    // Flips true (and stays true) the first time any window-family
-    // command promotes the terminal -- see apply_window_action. Every
-    // session's sink is Real until then, matching today's plain
-    // behavior exactly when `:`/`window` are never invoked.
+    // True from the first time a window command promotes the terminal
+    // (`apply_window_action`); until then every sink is Real.
     sinks_are_grid: bool,
-    // Watches the file behind whichever buffer is being looked at, so
-    // the editor can say that it changed underneath -- a formatter, a
-    // branch switch, another pane. It always could say so at `:w`
-    // (E13), but a detachable session can hold a buffer open for days,
-    // and a warning that arrives only when you try to save arrives
-    // after you have already typed into the wrong text.
-    //
-    // One watcher for the whole app rather than one per buffer: an
-    // inotify descriptor is a kernel object and the event loop has to
-    // wait on it, so having exactly one of each is the cheap
-    // arrangement. `None` on a system that would not give us one, which
-    // costs the warning and nothing else.
+    // Watches the file behind the buffer being viewed, so the editor can
+    // say it changed underneath (a formatter, a branch switch, another
+    // pane): a session can hold a buffer for days, and `:w`'s E13 would come
+    // after typing into stale text. One watcher for the app: an inotify
+    // descriptor is a kernel object the loop waits on. `None` where the
+    // system won't give one, losing only the warning.
     file_watcher: Option<crate::watch::Watcher>,
-    /// Debug sessions driven over the Debug Adapter Protocol, keyed the
-    /// same way `debug_frames` keys the bish-script ones. A buffer has
-    /// at most one of either.
+    /// Debug sessions over the Debug Adapter Protocol, keyed as
+    /// `debug_frames`; a buffer has at most one of either.
     dap_frames: HashMap<EditFrameId, DapFrame>,
-    /// What the editor is currently showing, for anything asking from
-    /// outside this process.
-    ///
-    /// It has to be a *snapshot* rather than a lookup, because the
-    /// buffer being edited is not in `edit_frames` while it is being
-    /// edited -- `run_edit_frame` takes it out and hands it to the
-    /// navigation loop, so `edit_frames` holds every buffer except the
-    /// one that matters. The navigation loop, which does hold it,
-    /// publishes here on its idle tick; `service_background_jobs` reads
-    /// it and needs nothing else.
+    /// What the editor shows, for anything asking from outside. A snapshot,
+    /// because the buffer being edited isn't in `edit_frames` while edited;
+    /// the navigation loop, which holds it, publishes here each idle tick,
+    /// and `service_background_jobs` reads it.
     focus: Option<mcp::FileState>,
-    /// Proposed versions of files waiting for somebody to go through
-    /// them, each with the client that asked -- which is waiting on the
-    /// answer, and gets it once the review is decided.
-    ///
-    /// Queued rather than opened on the tick they arrive: that tick can
-    /// be inside any loop in this file, most of which could not redraw
-    /// what the review covered. The prompt and the editor's Normal mode
-    /// open them, being the two that can (see `open_pending_reviews`).
+    /// Proposed file versions waiting for review, each with the waiting
+    /// client. Queued rather than opened on arrival, since that tick can be
+    /// inside a loop that couldn't redraw; the prompt and Normal mode open
+    /// them (`open_pending_reviews`).
     pending_reviews: Vec<(mcp::ReviewRequest, session::Caller)>,
     term_rows: usize,
     term_cols: usize,
 }
 
 impl App {
-    // The focused window's own entry, which nearly every caller wants
-    // before it wants anything else.
+    // The focused window's entry, which nearly every caller wants first.
     fn window(&self) -> &WindowEntry {
         &self.windows[self.current_window]
     }
@@ -293,13 +193,10 @@ impl App {
         &mut self.windows[self.current_window]
     }
 
-    // Registers are the one part of `App` a call regularly needs
-    // *beside* the rest of it: `editor::read_line` and
-    // `fileeditor::run_insert_mode` both take `&mut Registers` and an
-    // idle hook that reaches back into the shell, and those are two
-    // mutable borrows of the same `App`. Lending the field out and
-    // putting it back is what keeps it from having to live outside
-    // `App` and be threaded separately again.
+    // Registers are the part of `App` a call needs beside the rest:
+    // `editor::read_line` and `fileeditor::run_insert_mode` take
+    // `&mut Registers` and an idle hook reaching into the shell, two mutable
+    // borrows of `App`. Lending the field out and back keeps it in `App`.
     fn with_registers<T>(&mut self, body: impl FnOnce(&mut App, &mut Registers) -> T) -> T {
         let mut registers = std::mem::take(&mut self.registers);
         let out = body(self, &mut registers);
@@ -307,20 +204,16 @@ impl App {
         out
     }
 
-    // The focused pane's own rectangle. Not the whole screen: a pager,
-    // the browser and the hex view all paint inside their own pane and
-    // leave the neighbours alone.
+    // The focused pane's rectangle, not the screen: a pager, the browser and
+    // the hex view paint inside their pane.
     fn focused_pane_rect(&self) -> Rect {
         let window = self.window();
         pane_rect(window, window.focused_pane, self.term_rows, self.term_cols)
     }
 }
 
-// Queries the real terminal's size via the same TIOCGWINSZ ioctl pty.rs
-// uses for pty slaves -- it works identically on any tty fd, including
-// our own controlling terminal (fd 0). Falls back to a conservative
-// default if the query fails (e.g. stdin somehow isn't a tty by the time
-// this runs, which main.rs already guards against before calling here).
+// The terminal's size via `TIOCGWINSZ` on fd 0, with a conservative
+// fallback if the query fails.
 fn query_term_size() -> (usize, usize) {
     match pty::get_size(0) {
         Ok(ws) if ws.rows > 0 && ws.cols > 0 => (ws.rows as usize, ws.cols as usize),
@@ -328,25 +221,13 @@ fn query_term_size() -> (usize, usize) {
     }
 }
 
-// The one real exec::take_winch() consumer -- called from
-// service_background_jobs, which every blocking inner loop's own
-// on_idle already calls unconditionally (run_normal_mode_navigation,
-// fileeditor::run_insert_mode, run_diagnostics_frame, run_command_mode,
-// drive_fg_job), so a resize is noticed within one idle-poll tick no
-// matter which of those is currently blocking on input, not just once
-// that loop happens to return control back to run's own outer loop
-// (which calls this exact same function directly, for the same reason,
-// at its own top). Requeries the real size and, if it actually changed,
-// resizes every session's own screen to match (pane rects/hit-testing/
-// rendering everywhere then see the fresh size immediately) and every
-// still-*background*-running job's own pty to match its session's
-// (already-resized) screen -- a real terminal multiplexer propagates a
-// resize straight through to whatever's running, not just the pane
-// you're currently looking at. The currently fg'd job (if any) isn't
-// found here: run_fg_job_frame already took it out of job_frames before
-// driving it, so drive_fg_job catches that one's pty up itself, reacting
-// to this same screen resize (see its own doc comment) rather than
-// polling WINCH a second time.
+// The one `exec::take_winch()` consumer, called from
+// `service_background_jobs`, which every blocking loop's `on_idle` calls,
+// so a resize is noticed within a tick whichever loop blocks (and from
+// `run`'s loop directly). When the size changed, resizes every session's
+// screen and every background job's pty to match, as a multiplexer
+// does. The fg'd job isn't in `job_frames` while driven; `drive_fg_job`
+// resizes it from the screen.
 fn poll_and_apply_resize(app: &mut App) -> bool {
     use std::os::fd::AsRawFd;
     if !exec::take_winch() {
@@ -361,9 +242,8 @@ fn poll_and_apply_resize(app: &mut App) -> bool {
     for s in app.sessions.values() {
         s.screen.borrow_mut().resize(content_rows(app.term_rows), app.term_cols);
     }
-    // Read out of the pane tree first, because resizing one reaches
-    // into `sessions` and `job_frames` both, and the walk itself is
-    // already holding `windows`.
+    // Read from the pane tree first: resizing reaches into `sessions` and
+    // `job_frames`, and the walk holds `windows`.
     let running: Vec<(JobFrameId, SessionId)> = app
         .windows
         .iter()
@@ -385,13 +265,9 @@ fn poll_and_apply_resize(app: &mut App) -> bool {
     true
 }
 
-// True if `sid` is reachable from some (window, stack-depth) pair other
-// than the exact top frame of `windows[current_window]` -- i.e. whether
-// that one reference is the *only* thing keeping the session alive. Used
-// by the EOF handler to decide whether closing this one reference would
-// actually orphan the session (and so should run its exit trap) or just
-// drop one of several still-live references to it (see WindowEntry's
-// doc comment on why the same session can appear more than once).
+// Whether `sid` is reachable from any (window, depth) besides the focused
+// window's top frame: whether closing that reference would orphan the
+// session (running its exit trap) or drop one of several.
 fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, sid: SessionId) -> bool {
     for (i, w) in windows.iter().enumerate() {
         for pane in &w.panes {
@@ -413,20 +289,11 @@ fn session_referenced_elsewhere(windows: &[WindowEntry], current_window: usize, 
     false
 }
 
-// Runs $HOME/.config/bish/config.bash, if present, in the shell's own
-// top-level scope before the interactive prompt starts -- matching
-// bash's own ~/.bashrc: vars/functions/aliases it sets persist into the
-// session that follows (Shell::run_source_here, shared with `source`/`.`
-// -- see its own doc comment for why this needs that exact "run in
-// place" semantics rather than a subprocess). Only for an interactive
-// shell, not `-c`/a script path/piped stdin -- same as bash not
-// sourcing ~/.bashrc for a non-interactive run. A missing file is the
-// common case, not an error, so it is silently skipped; a real read
-// failure or a syntax error inside it is reported (through the shell's
-// own stderr sink, same as any other script error) but does not stop
-// the shell from reaching its prompt -- config.bash is just this entry
-// point; anything else the user wants loaded, they `source` themselves
-// from inside it.
+// Runs `$HOME/.config/bish/config.bash`, if present, in the shell's
+// top-level scope before the prompt, like bash's `~/.bashrc`: what it
+// sets persists (`Shell::run_source_here`, as `source` uses). Interactive
+// shells only. A missing file is skipped; a read failure or syntax error
+// is reported on the shell's stderr, and the prompt still comes up.
 fn load_config(shell: &mut Shell) {
     let Some(home) = std::env::var_os("HOME") else { return };
     let path = std::path::PathBuf::from(home).join(".config/bish/config.bash");
@@ -437,62 +304,38 @@ fn load_config(shell: &mut Shell) {
     }
 }
 
-/// `load_config` with the text already in hand -- which is what makes
-/// it testable without moving `$HOME` out from under the process.
+/// `load_config` with the text in hand, testable without moving `$HOME`.
 fn load_config_source(shell: &mut Shell, src: &str, name: &str) {
     shell.run_source_here(src, name);
-    // Everything config.bash just set has to be captured into this
-    // shell's own remembered environment, or the very first
-    // `sync_real_state_in` wipes it.
-    //
-    // That snapshot is taken in `Shell::new`, which runs *before* this
-    // -- and `sync_real_state_in` (which every command goes through, so
-    // sibling windows cannot clobber each other's variables) removes
-    // every real env var the snapshot does not have. So a plain
-    // `MYVAR=x` in config.bash survived exactly until the first command
-    // ran. Aliases and functions live on the `Shell` and were never
-    // affected, which is what made this look like config.bash working.
+    // Capture what config.bash set into the shell's remembered environment:
+    // the snapshot was taken in `Shell::new`, before this, and the first
+    // `sync_real_state_in` removes every variable it lacks.
     shell.sync_real_state_out();
 }
 
 pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
-    // First, before anything else this function sets up: the config is
-    // allowed to change what the rest of it starts with.
-    //
-    // Here rather than in each caller, and that is the point. It used
-    // to be main.rs's job, done just before the one call to this it
-    // knew about -- and the session daemon, which starts an interactive
-    // shell by another route entirely, never did it. A detachable
-    // session therefore had no theme, no abbreviations and no aliases,
-    // and looked for all the world like a config that had stopped
-    // working. Every way into the interactive shell goes through here,
-    // so this is the one place it cannot be forgotten from.
-    // Before the rc, not after: the rc is a file an interactive shell is
-    // reading. See Shell::mark_interactive.
+    // Before the rc, which an interactive shell reads (see
+    // `Shell::mark_interactive`). The config loads here, in `run`, so every
+    // way into the interactive shell, the session daemon included, gets it.
     shell.mark_interactive();
     if load_rc {
         load_config(&mut shell);
     }
-    // The shell itself must survive Ctrl-C (bash's own top-level
-    // interactive behavior); a foreground child still dies/interrupts
-    // normally since exec() resets a *caught* signal like this back to
-    // default. See term::ignore_sigint's doc comment.
+    // The shell survives Ctrl-C, as bash's interactive top level does; a
+    // foreground child still gets it (see `term::ignore_sigint`).
     term::ignore_sigint();
-    // Borrowed, and given back at the end of this function: the title
-    // the terminal had before bish started is the terminal's own.
+    // Borrowed and restored at the end: the terminal's previous title is
+    // its own.
     term::push_window_title();
     exec::install_winch_handler();
-    // This loop *is* the window manager, so `::bish window`'s
-    // action-producing subcommands mean something at its prompts -- see
-    // Shell::windows_available.
+    // This loop is the window manager, so `::bish window`'s actions mean
+    // something at its prompts (`Shell::windows_available`).
     shell.windows_available = true;
-    // Real bash enables job control automatically for an interactive
-    // shell -- see Shell::enable_monitor_mode's own doc comment.
+    // bash enables job control for an interactive shell (see
+    // `Shell::enable_monitor_mode`).
     shell.enable_monitor_mode();
-    // ...and expands aliases, which it also does only when interactive.
-    // Set here rather than defaulted on in the registry so a script run
-    // by `bish script.sh` still sees bash's own answer: off unless it
-    // says `shopt -s expand_aliases` itself.
+    // And expands aliases, again only when interactive; a script still
+    // needs `shopt -s expand_aliases`, as in bash.
     shell.enable_shopt("expand_aliases");
 
     let history_size = shell.bishopt_int("history_size").max(0) as usize;
@@ -527,9 +370,8 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             command_transcript: Vec::new(),
         },
     );
-    // Everything the window manager keeps for as long as this loop runs
-    // -- see `App`. Bound as a `&mut` right away so that every call
-    // below spells it the same way the callees do.
+    // Everything the window manager keeps (see `App`), bound as `&mut` so
+    // calls below spell it as the callees do.
     let app = &mut App {
         sessions,
         pending_input: std::collections::VecDeque::new(),
@@ -556,126 +398,88 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         term_rows,
         term_cols,
     };
-    // Set only when run_normal_mode_navigation returns text/cursor to
-    // resume editing with (see its own doc comment) -- consumed by the
-    // very next editor::read_line call below, then left None again for
-    // every ordinary iteration.
+    // Set when `run_normal_mode_navigation` returns text and a cursor to
+    // resume editing with, consumed by the next `read_line`.
     let mut pending_initial: Option<(String, usize)> = None;
 
-    // `bish --promoted`: same one-time transition ensure_promoted performs
-    // for the first window-family command a session runs, just done here
-    // instead so the very first prompt already has the compositor's tab
-    // bar/alt-screen up -- there's only ever the one root session at this
-    // point, so this is safe to call before the main loop even starts.
-    // The explicit compositor_redraw right after is what every other
-    // ensure_promoted call site also does (see apply_window_action) --
-    // without it, the tab bar wouldn't actually be drawn until the user's
-    // first keystroke or a resize.
+    // `bish --promoted`: the transition `ensure_promoted` makes on the first
+    // window command, done here so the first prompt already has the tab bar
+    // and alternate screen; safe before the loop, with only the root
+    // session. The `compositor_redraw` draws the tab bar at once.
     if start_promoted {
         ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
         compositor_redraw(app);
     }
 
     loop {
-        // Covers the gap between one read_line call ending and the next
-        // beginning; a resize arriving *during* one is handled inside it,
-        // by the same poll_and_apply_resize reached through every
-        // blocking loop's own on_idle hook (see service_background_jobs),
-        // so it lands within a poll tick rather than waiting for the next
-        // keystroke. This comment used to claim the opposite, from before
-        // that idle hook existed.
+        // Between one `read_line` and the next. A resize during one is
+        // handled inside it, through every blocking loop's `on_idle`
+        // (`service_background_jobs`), within a tick.
         poll_and_apply_resize(app);
 
         let session_id = app.windows[app.current_window].owning_session();
 
-        // The focused window's top frame is a running job (M10c): it was
-        // either just pushed by the fg_pending branch below, or -- the
-        // new case this milestone adds -- the user switched back to a
-        // window they'd earlier detached from (drive_fg_job's
-        // FgOutcome::Detached) while it kept running in the background.
-        // Either way, drive it the same way.
+        // The focused window's top frame is a running job: just pushed by the
+        // `fg_pending` branch below, or a window detached from earlier
+        // (`FgOutcome::Detached`) that kept running. Drive it either way.
         if let Frame::Job(job_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_fg_job_frame(app, job_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Same idea, for a window whose top frame is a still-detached
-        // `Frame::Edit` -- either just pushed by the pending_edit
-        // handling below, or the user switched back to a window they'd
-        // earlier detached an `e` session from.
+        // The same for a detached `Frame::Edit`, just pushed or returned to.
         if let Frame::Edit(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_edit_frame(app, edit_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Same idea again, for `e --hex`'s own byte-buffer frame -- see
-        // Frame::Hex, and run_hex_frame for why it can't simply reuse
-        // run_edit_frame.
+        // The same for `e --hex`'s frame (`Frame::Hex`; see `run_hex_frame`
+        // for why it can't reuse `run_edit_frame`).
         if let Frame::Hex(hex_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_hex_frame(app, hex_frame_id, session_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Same idea again, for the `:diag`-created diagnostics sibling
-        // pane (see split_diagnostics_pane) -- reached whenever the user
-        // navigates focus onto it (<C-w>j, or clicking its own
-        // collapsed title bar).
+        // The same for `:diag`'s diagnostics pane (`split_diagnostics_pane`),
+        // when focus moves onto it (`<C-w>j`, a click on its title bar).
         if let Frame::Diagnostics(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_diagnostics_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Same idea again, for the `gr`-created location list (see
-        // split_locations_pane) -- reached whenever focus lands on it,
-        // by <C-w>j or by clicking its collapsed title bar.
+        // The same for `gr`'s location list (`split_locations_pane`).
         if let Frame::Locations(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_locations_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Same idea again, for the `:dbg`-created debug-run sibling pane
-        // (see split_debug_run_pane) -- reached whenever the user
-        // navigates focus onto it directly while nothing is actually
-        // running (a real run takes over the terminal itself -- see
-        // run_debug_run_frame's own doc comment).
+        // The same for `:dbg`'s debug-run pane (`split_debug_run_pane`), when
+        // focused while nothing runs; a real run takes the terminal (see
+        // `run_debug_run_frame`).
         if let Frame::DebugRun(edit_frame_id) = *app.windows[app.current_window].stack().last().unwrap() {
             run_debug_run_frame(app, app.windows[app.current_window].focused_pane, edit_frame_id);
             let _ = io::stdout().flush();
             continue;
         }
 
-        // Real (un-promoted) case only: OutputSink::Grid's own vt100
-        // emulator already tracks its cursor precisely, and
-        // compositor_redraw always repaints from that real state, so
-        // this can't come up there -- see Shell::take_needs_newline's
-        // own doc comment for what this is fixing (a builtin's output
-        // that doesn't end in "\n" -- `printf foo`, `echo -n foo` --
-        // otherwise gets silently erased by this same row's own
-        // next-prompt redraw, which assumes it already owns whatever's
-        // on this row). If an *external* command ran instead (or as part
-        // of the same line -- `printf foo; ls`), take_needs_newline
-        // can't know whether its own, unobserved output left the cursor
-        // mid-row too, so fall back to actually asking the terminal (a
-        // real DSR round-trip, more expensive, which is why this isn't
-        // done unconditionally on every prompt -- see
-        // Shell::take_ran_external's own doc comment). A query that
-        // fails/times out (`None`) is treated as "assume no newline
-        // needed," the same as before this existed, rather than risking
-        // a stall.
+        // Unpromoted only: a grid tracks its cursor, and redraws use it. A
+        // builtin's output without a trailing newline (`printf foo`) would
+        // be erased by the next prompt redraw (see
+        // `Shell::take_needs_newline`). After an external command, whose
+        // output this can't see, the terminal is asked with a DSR round
+        // trip (`Shell::take_ran_external`), too costly for every prompt; a
+        // failed or timed-out query assumes no newline, rather than stall.
         if !app.sinks_are_grid {
             let shell = &app.sessions[&session_id].shell;
             let ran_external = shell.take_ran_external();
-            // Always drained, even when about to be superseded by the
-            // DSR query below -- otherwise a stale `true` left over from
-            // a builtin earlier in the same line (`printf foo; ls`) would
-            // leak into some *later*, unrelated prompt draw once
-            // ran_external stops being true, wrongly inserting a
-            // newline that real terminal state no longer calls for.
+            // Always drained, even when the DSR query below supersedes it,
+            // or a stale `true` from an earlier builtin would add a newline
+            // at a later, unrelated prompt.
             let builtin_needs_newline = shell.take_needs_newline();
             let needs_newline = if ran_external { term::query_cursor_column().is_some_and(|col| col != 1) } else { builtin_needs_newline };
             if needs_newline {
@@ -683,74 +487,49 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 let _ = io::stdout().flush();
             }
         }
-        // Before the prompt is built, not after: the whole point of
-        // `PROMPT_COMMAND` is to change what the prompt then says. Only
-        // for a *primary* prompt -- bash does not run it before a
-        // continuation line either.
+        // Before the prompt is built: `PROMPT_COMMAND` exists to change it.
+        // Only for a primary prompt, as in bash.
         if app.sessions.get(&session_id).is_some_and(|s| s.buffer.is_empty())
             && let Some(session) = app.sessions.get_mut(&session_id)
         {
             session.shell.run_prompt_command();
         }
         let (col_origin, width) = focused_col_origin(&app.windows[app.current_window], app.sinks_are_grid, app.term_rows, app.term_cols);
-        // Once per prompt: an unsplit window draws itself without the
-        // compositor, so `compositor_redraw`'s own sync never fires here
-        // -- and a `cd` between two prompts is exactly what a title is
-        // for.
+        // Once per prompt: an unsplit window draws without the compositor, so
+        // its title sync doesn't run, and a `cd` is what a title is for.
         sync_terminal_title(app);
         let prompt_str = {
             let session = &app.sessions[&session_id];
             if session.buffer.is_empty() { prompt::render(&session.shell, width) } else { prompt::continuation() }
         };
-        // What the second and later lines of a paste get drawn under --
-        // they are continuation lines, whatever the line this read
-        // started on was.
+        // What a paste's later lines are drawn under: they're continuation
+        // lines.
         let continuation_str = prompt::continuation();
-        // A standalone snapshot, not a live borrow: on_idle below needs
-        // its own mutable borrow of `app.sessions` (to service other
-        // app.windows' jobs), which would conflict with holding this
-        // session's own History borrowed for the whole call otherwise.
-        // Nothing recorded elsewhere during this one read_line call
-        // needs to be visible mid-browse anyway (see History's own doc
-        // comment on what a clone/fork actually shares).
+        // A snapshot, not a borrow: `on_idle` below borrows `app.sessions`
+        // mutably to service other windows' jobs. Nothing recorded meanwhile
+        // needs to appear mid-browse; a clone is O(1) (see `History`).
         let session_history = app.sessions[&session_id].history.borrow().clone();
-        // Same "standalone snapshot, not a live borrow" reasoning as
-        // session_history just above -- on_idle's own &mut app.sessions borrow
-        // below would conflict with borrowing app.sessions[&session_id].shell's
-        // own cwd/functions directly as same-call arguments. Function
-        // *names* only, not bodies -- cheap to clone, and all the
-        // command-validity check needs (see HighlightContext's own doc
-        // comment on why aliases are deliberately not included here too).
+        // A snapshot for the same reason: `on_idle`'s borrow would conflict
+        // with borrowing the shell's cwd and functions as arguments. Function
+        // names only, all the command-validity check needs.
         let cwd_snapshot = app.sessions[&session_id].shell.cwd.clone();
-        // Same owned-snapshot pattern, and read per prompt rather than
-        // once per shell: a per-directory hook (mise, direnv) rewrites
-        // PATH on every `cd`, and the command-validity check has to see
-        // what the *session* has, not what the process inherited -- see
-        // HighlightContext::path.
+        // Read per prompt, not per shell: a per-directory hook (mise, direnv)
+        // rewrites PATH on every `cd`, and the validity check must see the
+        // session's PATH (`HighlightContext::path`).
         let path_snapshot = app.sessions[&session_id].shell.raw_var_lookup("PATH");
         let known_functions: HashSet<String> = app.sessions[&session_id].shell.function_names().map(String::from).collect();
-        // Same owned-snapshot pattern as cwd_snapshot/known_functions --
-        // read_line's own abbrs param needs this session's current table
-        // by the time expand_abbr_at_cursor runs, not a live borrow held
-        // for the whole call (which would conflict with on_idle's own
-        // &mut app.sessions borrow below, same reasoning as session_history).
-        // Narrowed to the abbreviations that target this context's own
-        // language while we're at it: a shell prompt *is* bash, which is
-        // also `abbr`'s own default, so an abbreviation written without a
-        // thought about languages is still live exactly here.
+        // A snapshot too, of this session's abbreviations for this
+        // language: a shell prompt is bash, `abbr`'s default, so an
+        // abbreviation written without a language is live here.
         let abbrs_snapshot = snippet::for_language(&app.sessions[&session_id].shell.abbrs, snippet::DEFAULT_LANG);
-        // Same owned-snapshot pattern again -- this redraw's live
-        // `::bish hl` colours, resolved once up front rather than
-        // re-querying the shell per span. See syntax_color_overrides'
-        // own doc comment.
+        // This redraw's `::bish hl` colours, resolved once (see
+        // `syntax_color_overrides`).
         let color_overrides = syntax_color_overrides(&app.sessions[&session_id].shell);
-        // Read per redraw for the same reason the colours are: `bishopt
-        // --set hyperlinks off` should take effect on the next keystroke,
-        // not the next shell.
+        // Per redraw, so `bishopt --set hyperlinks off` applies at the next
+        // key.
         let hyperlinks = app.sessions[&session_id].shell.bishopt_bool("hyperlinks");
-        // Read per redraw for the same reason: `bishopt --set mouse off`
-        // should hand the terminal's own selection back on the next
-        // prompt, not the next shell.
+        // Per redraw, so `bishopt --set mouse off` hands selection back to
+        // the terminal at the next prompt.
         let mouse = app.sessions[&session_id].shell.bishopt_bool("mouse");
         let highlight_ctx = HighlightContext {
             cwd: Some(cwd_snapshot.as_path()),
@@ -758,29 +537,23 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             path: Some(&path_snapshot),
             color_overrides: Some(&color_overrides),
             hyperlinks,
-            // The shell prompt is the shell's whole vocabulary -- the
-            // editor's colon commands are the colon line's own.
+            // The prompt's vocabulary is the shell's; colon commands are
+            // the colon line's.
             line_commands: None,
         };
-        // Same owned-snapshot pattern as cwd_snapshot/known_functions above
-        // -- registered `complete NAME` specs, the contextual shell data
-        // (aliases, PATH commands, jobs, ...) evaluating one needs, and a
-        // functions/vars preamble for any -F/-C spec (which runs via
-        // subprocess, so this snapshot is all it needs -- see compgen.rs's
-        // own doc comment). One PATH scan per prompt (inside
-        // action_context), not per keystroke -- same cost class as
-        // known_functions/abbrs_snapshot just above.
+        // Registered `complete NAME` specs, the shell data they need
+        // (aliases, PATH commands, jobs), and a preamble for `-F`/`-C`
+        // specs, which run in a subprocess (compgen.rs). One PATH scan per
+        // prompt, not per key.
         let completions_snapshot = app.sessions[&session_id].shell.completions_snapshot();
         let default_completion_snapshot = app.sessions[&session_id].shell.default_completion_snapshot();
         let action_ctx_snapshot = app.sessions[&session_id].shell.action_context();
         let preamble_snapshot = app.sessions[&session_id].shell.functions_preamble();
-        // Same owned-snapshot pattern as highlight_ctx just above -- built
-        // from the exact same locals, not re-snapshotted.
+        // Built from the same locals as `highlight_ctx`.
         let shell_completion = completion::ShellCompletionProvider {
             honor_gitignore: app.sessions[&session_id].shell.bishopt_bool("gitignore"),
-            // Read per prompt, like every other snapshot here: `FIGNORE`
-            // is an ordinary variable and `force_fignore` an ordinary
-            // shopt, so both can change between one command and the next.
+            // Per prompt: `FIGNORE` and `force_fignore` can change between
+            // commands.
             fignore: app.sessions[&session_id].shell.fignore_suffixes(),
             force_fignore: app.sessions[&session_id].shell.shopt_is_on("force_fignore"),
             cwd: Some(cwd_snapshot.as_path()),
@@ -791,52 +564,36 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             functions_preamble: Some(&preamble_snapshot),
             hl_names: app.sessions[&session_id].shell.hl_colors().into_iter().map(|(name, _)| name).collect(),
         };
-        // Same pattern again -- session_history is already the exact
-        // snapshot the suggestions engine itself needs (see History's
-        // own doc comment on why a clone here is cheap: an O(1) Rc-clone
-        // of its own tail, not a copy).
+        // `session_history` is the snapshot the suggestions engine needs.
         let shell_suggestion = suggestion::HistorySuggestionProvider { history: &session_history, cwd: Some(cwd_snapshot.as_path()) };
-        // `= 3*(2+7)` previews its own answer instead of guessing at
-        // history. Variables resolve through the real process
-        // environment, which is where this shell keeps its plain ones
-        // (see `sync_real_state_in`); anything unset reads as 0, exactly
-        // as shell arithmetic does everywhere else.
+        // `= 3*(2+7)` previews its answer instead of a history suggestion.
+        // Variables are read from the process environment; unset reads as 0,
+        // as in shell arithmetic.
         let arith_suggestion = suggestion::ArithSuggestionProvider {
             inner: &shell_suggestion,
             vars: &|name| std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0),
         };
-        // Relative-cursor-row menu tricks are only safe on a single real
-        // terminal -- a promoted/split-pane session risks spilling the
-        // extra row into a neighboring pane or the tab bar. Grid/promoted
-        // mode gets its own, absolute-positioned path instead (see
-        // redraw_with_completion_row's own doc comment and
-        // completion_menu_rows).
+        // Relative-cursor menu tricks are only safe on a single real
+        // terminal; in a promoted pane the extra row could spill into a
+        // neighbour or the tab bar, so grid mode positions absolutely (see
+        // `redraw_with_completion_row`, `completion_menu_rows`).
         let cursor_row = app.sessions[&session_id].screen.borrow().cursor().0;
         let row_origin = completion_menu_rows(&app.windows[app.current_window], app.sinks_are_grid, cursor_row, app.term_rows, app.term_cols);
         let menu_capable = !app.sinks_are_grid || row_origin.is_some();
 
-        // Ctrl-E's own live search input draws at the shared global
-        // status row using this exact snapshot -- a plain `(usize,
-        // usize)` copy taken before `on_idle` below gets its own `&mut`
-        // borrow of the same `app.term_rows`/`app.term_cols` (see read_line's
-        // own doc comment on this param for why a snapshot, not a live
-        // reference, is the right trade here).
+        // Ctrl-E's live search draws on the global status row with this copy,
+        // taken before `on_idle` borrows `app.term_rows`/`app.term_cols` (see
+        // `read_line`).
         let global_row_size = Some((app.term_rows, app.term_cols));
-        // Read before the call: the idle hook below borrows the whole
-        // `app`, so an argument that reads a field of it has to have
-        // been read already.
+        // Read before the call: the idle hook below borrows all of `app`.
         let promoted = app.sinks_are_grid;
-        // A command handed to this session by `window split <cmd>` /
-        // `window new <cmd>` stands in for the read that would
-        // otherwise have waited for a keystroke -- see
-        // App::pending_input for why it arrives as an ordinary Line
-        // rather than being run directly.
+        // A command given to this session by `window split <cmd>` or
+        // `window new <cmd>` stands in for the read (see `App::pending_input`
+        // for why it arrives as an ordinary Line).
         let injected = app.pending_input.pop_front();
         let outcome = match injected {
-            // No echo of the prompt and the command here: the ordinary
-            // Line path already writes both into this session's grid on
-            // its way to running it, so a pane opened this way reads
-            // exactly like one where somebody typed it.
+            // No echo here: the Line path writes the prompt and command
+            // into the grid on its way, so the pane reads as if typed.
             Some(line) => Ok(ReadOutcome::Line(line)),
             None => app.with_registers(|app, registers| {
                 editor::read_line(
@@ -856,18 +613,14 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     registers,
                     &abbrs_snapshot,
                     global_row_size,
-                    // Repaints the panes when something arrived underneath this
-                    // prompt (a background job's output, a session client
-                    // reattaching) and tells read_line to put its own prompt line
-                    // back on top -- neither half can do the other's, which is
-                    // why the signal is threaded through rather than either side
-                    // just redrawing everything.
+                    // Repaints the panes when something arrived beneath
+                    // this prompt (a background job's output, a client
+                    // reattaching) and tells `read_line` to redraw its line
+                    // on top; neither half can do the other's.
                     &mut || {
                         let mut changed = service_background_jobs(app);
-                        // A review a client is waiting on opens here, at an
-                        // idle prompt -- see `pending_reviews`. Afterwards is
-                        // a repaint, which this closure already knows how to
-                        // ask for.
+                        // A review a client waits on opens here, at an idle
+                        // prompt (see `pending_reviews`); then a repaint.
                         changed |= open_pending_reviews(app);
                         if changed && app.sinks_are_grid {
                             compositor_redraw(app);
@@ -875,30 +628,20 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                         changed
                     },
                     prompt_claims_mouse(mouse, promoted),
-                    // The shell prompt is not one of the modes `::bish map`
-                    // knows -- an inert table keeps it behaving exactly as it
-                    // did before there were any mappings, and nothing can have
-                    // queued keys for it.
+                    // The shell prompt isn't a mode `::bish map` knows: an
+                    // empty table, and nothing can have queued keys for it.
                     Vec::new(),
                     Vec::new(),
                 )
             }),
         };
         match outcome {
-            // A paste's finished lines, and nothing run. They go into
-            // the same continuation buffer a typed multi-line command
-            // uses -- so the whole paste is one history entry and one
-            // execution when it finally goes -- and the line the paste
-            // ended in the middle of goes back to the prompt with the
-            // cursor where it left off.
-            //
-            // History expansion is deliberately not applied to any of
-            // them. It is a property of the start of a fresh command
-            // (see the Line arm below), and every line here is text
-            // that arrived at once: a `!` in the middle of a pasted
-            // script is a negation or a filename far more often than it
-            // is a designator, and the paste is still sitting at the
-            // prompt to be edited if it was meant as one.
+            // A paste's complete lines, run nothing: they go into the
+            // continuation buffer, so the paste is one history entry and
+            // one execution, and the partial last line returns to the
+            // prompt with the cursor where it was. No history expansion:
+            // that belongs to the start of a typed command, and a `!` in
+            // pasted script is usually a negation or a filename.
             Ok(ReadOutcome::Pasted { lines, rest, cursor }) => {
                 let session = app.sessions.get_mut(&session_id).unwrap();
                 session.warned_stopped_jobs = false;
@@ -907,10 +650,8 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                         session.buffer_unrecorded = starts_off_the_record(line);
                     }
                     if app.sinks_are_grid {
-                        // The same feed a submitted line gets, for the
-                        // same reason -- see the Line arm's own comment
-                        // on why the grid needs this and the real
-                        // screen does not.
+                        // The same feed a submitted line gets (see the Line
+                        // arm).
                         let shown = if i == 0 { &prompt_str } else { &continuation_str };
                         let highlighted = highlight::render_line(line, highlight_ctx);
                         let echoed = format!("\r\x1b[K{}{}\r\n", shown, highlighted);
@@ -924,29 +665,22 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 pending_initial = Some((rest, cursor));
             }
             Ok(ReadOutcome::Eof) => {
-                // Whether closing *this* (window, top-frame) reference
-                // would leave the session with no reference anywhere
-                // (any window's stack, any depth) -- since `window fg`
-                // lets the same session be the top of more than one
-                // window's stack, or sit buried under another frame,
-                // EOF closing just one of those references shouldn't
-                // fire the exit trap for a session that's still alive
-                // and reachable elsewhere.
+                // Whether closing this (window, top frame) reference leaves
+                // the session unreferenced anywhere: `window fg` can put
+                // one session atop several stacks or buried under a frame,
+                // and closing one reference shouldn't fire the exit trap of
+                // a session still reachable.
                 let will_orphan = !session_referenced_elsewhere(&app.windows, app.current_window, session_id);
                 let is_final_exit = will_orphan
                     && app.windows.len() == 1
                     && app.windows[app.current_window].panes.len() == 1
                     && app.windows[app.current_window].stack().len() == 1;
-                // Real bash refuses a plain Ctrl-D exit the first time
-                // there's a stopped job ("There are stopped jobs."),
-                // requiring a second immediate EOF to actually confirm
-                // -- see Shell::has_stopped_jobs and
-                // SessionState::warned_stopped_jobs' own doc comments.
-                // Scoped to the genuine "about to exit the whole
-                // process" case: closing one window/frame among several
-                // doesn't lose track of any job (the table's shared
-                // across every session -- see the `jobs` field comment
-                // in exec.rs), so there's nothing to warn about there.
+                // bash refuses the first Ctrl-D exit with a stopped job
+                // ("There are stopped jobs."), and a second immediate EOF
+                // confirms (see `Shell::has_stopped_jobs`,
+                // `warned_stopped_jobs`). Only when exiting the process:
+                // the job table is shared, so closing one window loses no
+                // job.
                 if is_final_exit {
                     let session = app.sessions.get_mut(&session_id).unwrap();
                     if session.buffer.is_empty() && session.shell.has_stopped_jobs() && !session.warned_stopped_jobs {
@@ -967,76 +701,45 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     session.shell.run_exit_trap();
                 }
                 if is_final_exit {
-                    // Last window, last frame anywhere: really exit.
-                    // Restore the normal screen buffer if promotion ever
-                    // switched us to the alternate one -- exiting every
-                    // active session is currently the only way out of
-                    // promoted mode.
+                    // The last frame of the last window: exit, leaving the
+                    // alternate screen if promotion entered it.
                     if session.shell.is_promoted() {
-                        // Direct, not session.shell.sink_out: this is a
-                        // whole-terminal action (leaving the alternate
-                        // screen buffer), the same category as
-                        // compositor_redraw/apply_window_action's messages
-                        // below -- always meant for the real screen, never
-                        // a session's own captured output.
+                        // Straight to the terminal, not a session's sink:
+                        // leaving the alternate screen is a whole-terminal
+                        // action.
                         print!("\x1b[?1049l");
                         let _ = io::stdout().flush();
                     }
                     break;
                 }
-                // Otherwise: EOF on a window's top frame pops/closes it,
-                // same as `window close` would.
+                // Otherwise EOF closes the window's top frame, as
+                // `window close` does.
                 apply_window_action(app, WindowAction::Close);
             }
-            // ctrl_l_reports is now `app.sinks_are_grid` for this call: at
-            // the plain, unwindowed prompt (app.sinks_are_grid false) it's
-            // still false, so Ctrl-L keeps meaning "clear the real
-            // screen" exactly as before, handled inside read_line itself
-            // -- this arm is unreachable there, same as it always was.
-            // Once windowed/promoted, read_line's own raw "\x1b[H\x1b[2J"
-            // clear would instead wipe the compositor's own frame -- pane
-            // borders, tab bar and all -- with nothing ever repainting it
-            // afterward, so it's reported here instead. The actual
-            // clearing has to happen on the *session's own* grid (`\x1b[H
-            // \x1b[2J` fed into it, exactly what erase_in_display(2) does
-            // for a real terminal -- see vt100.rs's own doc comment: mode
-            // 2 clears the live grid only, scrollback untouched, matching
-            // real Ctrl-L never discarding scroll-back history), not the
-            // real terminal directly -- a plain compositor_redraw() alone
-            // just repaints this pane's *current* content unchanged, which
-            // reads as "Ctrl-L does nothing." Clearing resets this
-            // session's own cursor to (0, 0) too, which is what then
-            // makes the *next* redraw show the live prompt back at the
-            // top of the pane -- compositor_redraw's own doc comment
-            // (self-healing full redraw) and render_compositor_frame's
-            // cursor positioning (always the focused pane's own screen
-            // cursor) both already key off exactly this field, so nothing
-            // else needs to change for either the unsplit or split case.
+            // Reported only when promoted (`ctrl_l_reports` is
+            // `app.sinks_are_grid`); unpromoted, `read_line` clears the
+            // real screen itself. Promoted, a raw clear would wipe the
+            // compositor's frame with nothing to repaint it, and repainting
+            // alone changes nothing. So the session's grid is cleared
+            // (`\x1b[H\x1b[2J`, which in vt100.rs clears the live grid and
+            // keeps scrollback, as a real Ctrl-L does), resetting its
+            // cursor to (0, 0), so the next redraw shows the prompt at the
+            // pane's top.
             Ok(ReadOutcome::CtrlL) => {
                 if app.sinks_are_grid {
                     app.sessions.get_mut(&session_id).unwrap().screen.borrow_mut().feed(b"\x1b[H\x1b[2J");
                     compositor_redraw(app);
                 }
             }
-            // A qualifying left click while typing at the plain prompt --
-            // see ReadOutcome::Mouse's own doc comment for why read_line
-            // hands this straight back up rather than acting on it
-            // itself. Nothing to click on before the first promotion
-            // (see ensure_promoted's own doc comment: no tab bar, no
-            // multi-pane layout, just this one pane's whole own row) --
-            // and a miss, or a click on the already-focused tab/pane,
-            // both just resume typing exactly where it left off via
-            // `pending_initial`, the same resume mechanism NormalMode's
-            // own NavExit::Resume handling already uses below. A genuine
-            // target change freezes this session's own in-progress text
-            // into its grid first (freeze_input_with_text, not the plain
-            // freeze_focused_idle_prompt -- SessionState.buffer never
-            // mirrors read_line's own in-progress keystrokes) before
-            // switching, so nothing typed so far is lost; the *next*
-            // loop iteration's own read_line call then starts fresh for
-            // whatever session is now focused, not resuming this text
-            // there (switching panes/tabs must never relocate what was
-            // being typed into a different pane's own prompt).
+            // A left click at the prompt, handed back by `read_line` (see
+            // `ReadOutcome::Mouse`). Before promotion there's nothing to
+            // click. A miss, or a click on the focused tab or pane, resumes
+            // typing through `pending_initial`. A real change freezes the
+            // typed text into this session's grid
+            // (`freeze_input_with_text`; `SessionState.buffer` doesn't
+            // mirror `read_line`'s keystrokes) and switches; the next
+            // `read_line` starts fresh in the focused session, never moving
+            // typed text to another pane.
             Ok(ReadOutcome::Mouse { event, text, cursor }) => {
                 let target = if app.sinks_are_grid { hit_test_click(app, event) } else { None };
                 match target {
@@ -1047,16 +750,13 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     }
                     Some(ClickTarget::Pane(pane_id)) if pane_id != app.windows[app.current_window].focused_pane => {
                         freeze_input_with_text(app.sessions.get_mut(&session_id).unwrap(), &text);
-                        // Going to a pane is how you get a minimized one back.
+                        // Going to a pane is how a minimized one comes back.
                         restore_if_minimized(&mut app.windows[app.current_window], pane_id);
                         app.windows[app.current_window].focused_pane = pane_id;
                         compositor_redraw(app);
                     }
                     Some(ClickTarget::Divider(divider)) => {
-                        // Resume the prompt afterwards with exactly what
-                        // was typed -- a resize is not a reason to lose
-                        // it, any more than clicking the pane it's
-                        // already in would be.
+                        // Resume the prompt with what was typed.
                         pending_initial = Some((text, cursor));
                         drag_divider(app, &divider);
                     }
@@ -1065,37 +765,21 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             }
             Ok(ReadOutcome::Interrupted { text }) => {
                 let session = app.sessions.get_mut(&session_id).unwrap();
-                // editor::read_line's own Key::CtrlC arm prints a bare
-                // "^C\r\n" with no awareness of pane boundaries or the
-                // tab bar -- on a pane's own last row this can land on
-                // (or scroll into) the tab bar's row. compositor_redraw
-                // is a full, absolutely-positioned repaint of every pane
-                // plus the tab bar, so it's fully self-healing regardless
-                // of what state that bare print left the real terminal
-                // in -- same reasoning DirNav just below already applies.
-                //
-                // But self-healing from the *grid*, which read_line's
-                // prompt has never been written into: repainting it
-                // blanked the very line Ctrl-C had just echoed onto and
-                // the prompt above it, and the fresh prompt then drew
-                // over the top -- one blank frame in between, which is
-                // the flash. So the line is recorded into the grid
-                // first, exactly as it looked, the same way a submitted
-                // command already is (see the Line handler's own echo).
-                // That also leaves the `^C` in the scrollback rather than
-                // wiping it a frame later, which is where bash leaves it.
-                // Fed before `buffer.clear()` below: it picks the
-                // continuation prompt over the primary one off that same
-                // buffer, and what was on screen was whichever one this
-                // line was actually read with.
+                // `read_line`'s Ctrl-C prints a bare "^C\r\n", which on a
+                // pane's last row can land on the tab bar.
+                // `compositor_redraw` repaints everything, but from the
+                // grid, where the prompt never was, which would blank the
+                // line and flash. So the line is recorded into the grid
+                // first, as a submitted command is, which also leaves `^C`
+                // in the scrollback, as bash does. Fed before
+                // `buffer.clear()`, which decides whether it was a
+                // continuation prompt.
                 if app.sinks_are_grid {
                     freeze_interrupted_line(session, &text);
                 }
-                // Ctrl-C abandons whatever multi-line construct was
-                // pending, same as bash, and starts fresh at a new prompt.
+                // Ctrl-C abandons a pending multi-line construct, as in bash.
                 session.buffer.clear();
-                // Same re-arming as a real Line -- Ctrl-C isn't an
-                // immediate repeated Ctrl-D either.
+                // Re-arms the stopped-jobs warning, as a Line does.
                 session.warned_stopped_jobs = false;
                 if app.sinks_are_grid {
                     compositor_redraw(app);
@@ -1105,28 +789,22 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 let session = app.sessions.get_mut(&session_id).unwrap();
                 session.warned_stopped_jobs = false;
                 navigate_dir(session, kind);
-                // Same reasoning as Ctrl-C's own freeze just above: the
-                // prompt on screen has never been in the grid, so
-                // repainting from it would blank that row and let the
-                // redrawn prompt flash back in. DirNav only fires at an
-                // empty buffer (see its own doc comment), and the prompt
-                // this writes is already the post-`cd` one -- the same
-                // text read_line is about to draw -- so the repaint has
-                // nothing left to change.
+                // As for Ctrl-C: the prompt was never in the grid, so it's
+                // written there before the repaint. DirNav fires only at an
+                // empty buffer, and this writes the post-`cd` prompt
+                // `read_line` is about to draw.
                 if app.sinks_are_grid {
                     freeze_idle_prompt(session);
                     compositor_redraw(app);
                 }
             }
             Ok(ReadOutcome::Opener { text, cursor }) => {
-                // The opener paints inside one pane's rectangle, which
-                // only means anything once the compositor owns the
-                // screen -- the same reason normal mode promotes below.
+                // The opener paints in one pane's rect, which needs the
+                // compositor, as Normal mode does.
                 ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                 match run_opener(app) {
                     Some((target, destination)) => act_on_opener_choice(app, target, destination, Some(&text)),
-                    // Put away without picking anything: the line is
-                    // handed back exactly as it was, down to the cursor.
+                    // Put away without a pick: the line comes back as it was.
                     None => {
                         pending_initial = Some((text, cursor));
                         if app.sinks_are_grid {
@@ -1140,52 +818,30 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 match run_normal_mode_navigation(app, session_id, None, NavStart::Prompt { text, cursor, wheel }, None) {
                     Ok((NavExit::Resume(t, c), _)) => {
                         pending_initial = Some((t, c));
-                        // Resuming straight back into ordinary prompt
-                        // typing -- read_line's own redraw only ever
-                        // touches its own prompt line, and
-                        // compositor_redraw only ever paints the panes
-                        // and the tab bar, so the global mode-line row
-                        // this excursion was using (render_normal_mode_
-                        // frame/render_global_status_row) belongs to
-                        // neither and would sit there stale: a
-                        // "-- NORMAL --  i or :q to return to the
-                        // prompt" still telling you how to leave a mode
-                        // you already left. Erased explicitly, and
-                        // *before* the repaint so the repaint's own
-                        // closing cursor placement is what the prompt
-                        // then draws against -- the same ordering, for
-                        // the same reason, as run_edit_frame's own exit.
+                        // Back to typing: the global mode-line row this
+                        // excursion used belongs to neither `read_line` nor
+                        // `compositor_redraw`, so it's erased explicitly,
+                        // before the repaint, whose closing cursor
+                        // placement the prompt draws against (as
+                        // `run_edit_frame` does on exit).
                         print!("{}", erase_global_status_row(app.term_rows));
                         if app.sinks_are_grid {
                             compositor_redraw(app);
                         }
                     }
-                    // The mode line has to go here too, not just on the
-                    // Resume arm above: `<C-w>s` from normal mode leaves
-                    // through *this* one, and whatever it hands focus to
-                    // (a fresh pane's shell prompt, most often) has
-                    // nothing of its own to draw on that row -- so a
-                    // "-- NORMAL --  i or :q to return to the prompt"
-                    // sat there telling you how to leave a mode you were
-                    // no longer in. A frame that does own that row (an
-                    // editor, a hex view) redraws it immediately.
-                    // `OpenAt` is folded in here rather than handled:
-                    // it comes only from `gd`, which needs a language
-                    // server, which needs a file -- and the buffer this
-                    // call drives is the *prompt line*, which has no
-                    // path for `server_target` to resolve. So it cannot
-                    // arrive, and treating it as an ordinary detach is
-                    // the harmless reading if it ever somehow does.
+                    // The mode line goes here too: `<C-w>s` from Normal
+                    // mode leaves through this arm, and what gets focus
+                    // (usually a new pane's prompt) has nothing to draw on
+                    // that row; a frame owning it redraws it. `OpenAt`
+                    // comes only from `gd`, which needs a file, and this
+                    // buffer is the prompt line, so it can't arrive;
+                    // treated as a detach if it does.
                     Ok((NavExit::Detached | NavExit::Quit | NavExit::OpenAt { .. }, _)) => {
                         pending_initial = None;
                         print!("{}", erase_global_status_row(app.term_rows));
-                        // Then repaint, exactly as the Resume arm does
-                        // and for the same reason: the erase leaves the
-                        // real cursor parked on that row, and the prompt
-                        // drawn next positions itself by column only --
-                        // the repaint's own closing cursor placement has
-                        // to be the last word or the prompt lands on the
-                        // status row instead of in its pane.
+                        // Then repaint, as in the Resume arm: the erase
+                        // leaves the cursor on that row, and the prompt
+                        // positions by column only.
                         if app.sinks_are_grid {
                             compositor_redraw(app);
                         }
@@ -1203,24 +859,16 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                 let mut edit_pending = false;
                 {
                     let session = app.sessions.get_mut(&session_id).unwrap();
-                    // Any real input -- even a blank Enter -- re-arms the
-                    // stopped-jobs exit warning: only an *immediate*
-                    // second Ctrl-D, with nothing typed in between,
-                    // should confirm the exit (see the Eof handler).
+                    // Any input, even a blank Enter, re-arms the
+                    // stopped-jobs warning: only an immediate second Ctrl-D
+                    // exits.
                     session.warned_stopped_jobs = false;
 
-                    // History expansion (!!, !-n, !n, !$, !/prefix,
-                    // !?text -- see history::expand's own doc comment)
-                    // only applies to the first line of a fresh command,
-                    // never a continuation line -- a heredoc body or a
-                    // backslash-continued line could legitimately
-                    // contain a literal `!`, and there's no "start of
-                    // command" to anchor the leading-bang/child-shell
-                    // case to partway through one anyway.
-                    // Same gate history expansion uses just below, and
-                    // for the same reason: this is a property of the
-                    // start of a command, and there is no such thing
-                    // partway through one.
+                    // Only for a command's first line. History expansion
+                    // (`!!`, `!-n`, `!n`, `!$`, `!/prefix`, `!?text`; see
+                    // `history::expand`) and the off-the-record check
+                    // belong to the start of a command: a heredoc body or
+                    // continued line may hold a literal `!`.
                     if session.buffer.is_empty() {
                         session.buffer_unrecorded = starts_off_the_record(&line);
                     }
@@ -1242,37 +890,16 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     };
                     let session = app.sessions.get_mut(&session_id).unwrap();
 
-                    // Feed the prompt-and-what-was-typed into the grid
-                    // itself, not just the real terminal -- editor::
-                    // read_line only ever draws it directly to the real
-                    // screen, never through the sink, so without this a
-                    // promoted session's next compositor_redraw (a full
-                    // clear-and-redraw-from-the-grid -- see that
-                    // function's own doc comment) wipes it the instant
-                    // any command finishes, even though the command's
-                    // own output now renders fine (M11b). This is what
-                    // actually makes a promoted window read as a normal
-                    // scrolling terminal -- prompt, command, output,
-                    // next prompt -- instead of only ever showing the
-                    // most recent command's output. Echoes the *expanded*
-                    // line (post history::expand), matching bash's own
-                    // behavior of showing what a `!!`/`!n`/etc actually
-                    // resolved to, not the literal designator typed.
-                    // Leading "\r\x1b[K": this pane's grid may already
-                    // hold an *idle* prompt on this exact row -- fed in
-                    // by freeze_idle_prompt the last time this pane lost
-                    // focus (see its own doc comment), with the grid's
-                    // cursor left sitting right after it. Without
-                    // returning to this row's start and clearing first,
-                    // this feed would land right after that stale
-                    // prompt instead of overwriting it, showing two
-                    // prompts back to back the first time a command runs
-                    // in a pane that's regained focus. Safe here in a
-                    // way it wouldn't be for the real terminal (see
-                    // editor::read_line's col_origin/width): this grid
-                    // is one pane's own private, independently-sized
-                    // Screen, never shared with another pane's content
-                    // the way one real terminal row can be.
+                    // Feed the prompt and the typed line into the grid:
+                    // `read_line` draws them only on the real screen, so a
+                    // promoted session's next `compositor_redraw` would
+                    // wipe them, leaving only output. With this a pane
+                    // reads like a terminal: prompt, command, output. The
+                    // expanded line is echoed, as bash shows what `!!`
+                    // became. The leading `\r\x1b[K` overwrites an idle
+                    // prompt `freeze_idle_prompt` left on this row when the
+                    // pane lost focus; safe, as the grid is this pane's
+                    // own.
                     if app.sinks_are_grid {
                         let highlighted = highlight::render_line(&line, highlight_ctx);
                         let echoed = format!("\r\x1b[K{}{}\r\n", prompt_str, highlighted);
@@ -1292,53 +919,36 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     match Lexer::new(&session.buffer).tokenize() {
                         Ok(toks) => match Parser::new(session.shell.expand_aliases(toks)).parse_program() {
                             Ok(prog) => {
-                                // Snapshotted before recording (not just
-                                // before running) so record() can tag this
-                                // entry with the directory it's about to
-                                // run in, for the suggestions engine's
-                                // directory/sequence heuristic -- also
-                                // still used below exactly as before, to
-                                // detect a directory change regardless of
-                                // how it happened (a literal `cd`, a
-                                // function that cd's, whatever) rather
-                                // than only hooking the `cd` builtin
-                                // itself.
+                                // Before recording, so `record` tags the
+                                // entry with where it runs, for the
+                                // suggestion engine; also used below to
+                                // notice any directory change, however it
+                                // happened.
                                 let cwd_before = session.shell.cwd.clone();
-                                // Recorded regardless of the exit status
-                                // the command ends up with -- bash and
-                                // fish both record what was typed, not
-                                // what succeeded. Unless it was typed
-                                // with a leading space, which is the one
-                                // way to ask for the opposite (see
-                                // starts_off_the_record).
+                                // Recorded whatever its status, as bash
+                                // records what was typed, unless typed with
+                                // a leading space (see
+                                // `starts_off_the_record`).
                                 if !session.buffer_unrecorded {
                                     session.history.borrow_mut().record(&session.buffer, Some(&cwd_before));
                                 }
-                                // Before the command runs, and after
-                                // history has it -- a hook that times or
-                                // logs a command wants the same line
-                                // history kept, not a rewritten one.
+                                // Before running and after history has it:
+                                // a hook timing or logging wants the line
+                                // history kept.
                                 let submitted = session.buffer.clone();
                                 run_shell_hooks(&mut app.sessions, session_id, "shell:exec:pre", &submitted);
                                 let session = app.sessions.get_mut(&session_id).unwrap();
-                                // Every session sharing this one real
-                                // process (see new_virtual_child's own
-                                // doc comment on why "window new"/pane
-                                // splits do) needs its own variables/umask
-                                // restored onto the real process before
-                                // it runs anything, and captured back
-                                // right after -- otherwise a sibling
-                                // session's own last command silently
-                                // leaks in (or gets clobbered). Cheap and
-                                // idempotent when this session was
-                                // already the one last synced in.
+                                // Sessions sharing this process (see
+                                // `new_virtual_child`) have their variables
+                                // and umask applied before running and
+                                // captured after, or a sibling's last
+                                // command would leak in. Cheap when this
+                                // session was already synced.
                                 session.shell.sync_real_state_in();
                                 // What a peer asking about the editor is
-                                // told if it asks while this line runs:
-                                // the state as it is now, which is how it
-                                // stays -- nothing drives the editor until
-                                // `run_program` returns. See
-                                // `session::service_while_busy`.
+                                // told during this line: the state now,
+                                // unchanged until `run_program` returns
+                                // (`session::service_while_busy`).
                                 let state = editor_state(app);
                                 session::answer_while_busy(Some(Box::new(move |question: &[u8]| mcp::answer_from_state(&state, question))));
                                 let session = app.sessions.get_mut(&session_id).unwrap();
@@ -1349,17 +959,15 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                                     push_dir_history(session, session.shell.cwd.clone());
                                 }
                                 let moved_to = (session.shell.cwd != cwd_before).then(|| session.shell.cwd.to_string_lossy().into_owned());
-                                // Before `cwd:change`: this one is about
-                                // the command that just ended, and a
-                                // directory change is a consequence of
-                                // it.
+                                // Before `cwd:change`: this is about the
+                                // command that ended, and a directory
+                                // change follows from it.
                                 run_shell_hooks(&mut app.sessions, session_id, "shell:exec:post", &submitted);
                                 let session = app.sessions.get_mut(&session_id).unwrap();
                                 session.buffer.clear();
-                                // After the command, and after the
-                                // session's own state is synced back:
-                                // a hook asking where it is should get
-                                // the answer the next prompt will show.
+                                // After the command and the state sync, so
+                                // a hook asking where it is gets what the
+                                // next prompt shows.
                                 if let Some(moved_to) = moved_to {
                                     run_shell_hooks(&mut app.sessions, session_id, "shell:cwd:change", &moved_to);
                                 }
@@ -1367,20 +975,13 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                                     ExecResult::Window(action) => window_action = Some(action),
                                     ExecResult::Fg => fg_pending = true,
                                     ExecResult::Edit => edit_pending = true,
-                                    // The exit trap already ran at whichever
-                                    // site produced this (see ExecResult::
-                                    // Exit's own doc comment) -- matches
-                                    // this codebase's prior behavior, where
-                                    // `exit`/`set -e`/`set -u` called
-                                    // std::process::exit directly and
-                                    // unconditionally killed the whole
-                                    // process, regardless of which
-                                    // session/pane triggered it.
+                                    // The exit trap already ran where this
+                                    // came from (see `ExecResult::Exit`); any
+                                    // session's `exit` ends the process.
                                     ExecResult::Exit(code) => {
                                         session::stop_listening();
-                                        // The terminal's own title, given back:
-                                        // this path never reaches the end of
-                                        // `run`.
+                                        // The terminal's title, restored: this
+                                        // path never reaches the end of `run`.
                                         term::pop_window_title();
                                         std::process::exit(code)
                                     }
@@ -1406,14 +1007,11 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                     apply_window_action(app, action);
                 } else if fg_pending {
                     // A pty-attached background job was fg'd (see
-                    // ExecResult::Fg's doc comment in exec.rs). Push it
-                    // as a real Frame::Job on the focused window's own
-                    // stack -- see Frame's doc comment for why a Job
-                    // frame holds an id into `app.job_frames` rather than
-                    // the FgJob itself -- then drive it via the same
-                    // run_fg_job_frame the main loop's own top uses to
-                    // re-enter a job left running in a window the user
-                    // switched back to (M10c).
+                    // `ExecResult::Fg`). Pushed as a `Frame::Job` on the
+                    // focused stack (the frame holds an id into
+                    // `app.job_frames`; see `Frame`) and driven by
+                    // `run_fg_job_frame`, as the loop's top does for a job
+                    // returned to.
                     let fg_job =
                         app.sessions.get_mut(&session_id).unwrap().shell.take_pending_fg().expect("ExecResult::Fg implies a job was stashed");
                     let job_frame_id = app.next_job_frame_id;
@@ -1423,26 +1021,19 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
 
                     run_fg_job_frame(app, job_frame_id, session_id);
                 } else if edit_pending {
-                    // `e [file]` -- see ExecResult::Edit's own doc
-                    // comment. ensure_promoted first, unconditionally:
-                    // unlike a job (which only gets a pty, and so needs
-                    // repl.rs's own compositor rendering, once already
-                    // promoted -- see exec.rs's own `use_pty` gate), `e`
-                    // always renders through the compositor/pane-rect
-                    // system from the start, one code path, no separate
-                    // "plain unpromoted real terminal" branch to
-                    // maintain -- same reasoning Ctrl+G's own
-                    // normal-mode navigation already established.
+                    // `e [file]` (see `ExecResult::Edit`). Promoted first,
+                    // always: unlike a job, which only needs the compositor
+                    // once promoted, `e` always renders through the
+                    // compositor and pane rects, one code path.
                     ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
                     let args = app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                     let opened = match fileeditor::parse_edit_args(&args) {
                         Ok(targets) => {
-                            // A directory argument turns into whatever is
-                            // picked out of it, before anything opens.
+                            // A directory argument becomes what's picked
+                            // from it, before anything opens.
                             let targets = expand_browse_targets(app, targets, true, session_id);
-                            // Read only now: browsing blocks on real
-                            // input, so the terminal can have been
-                            // resized since this command was typed.
+                            // Read now: browsing waits on input, and the
+                            // terminal may have been resized.
                             let rect = pane_rect(
                                 &app.windows[app.current_window],
                                 app.windows[app.current_window].focused_pane,
@@ -1457,33 +1048,24 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
                         }
                     };
                     if opened.is_empty() {
-                        // Nothing opened at all (a bad flag, or every
-                        // named file failed) -- the pane keeps showing
-                        // its shell, with whatever was sunk above now
-                        // part of it.
+                        // Nothing opened (a bad flag, or every file
+                        // failed): the pane keeps its shell, with the
+                        // messages in it.
                         compositor_redraw(app);
                     }
-                    // Pushed back-to-front so the *first* file named is
-                    // the one actually on top -- `e a b` opens both, with
-                    // `a` in front and `b` revealed once it's closed,
-                    // matching `vim a b`'s own argument order. Nothing is
-                    // driven from here: this loop's own top already
-                    // dispatches on whatever frame kind a pane's stack
-                    // ends up with (Edit or Hex), which is also what
-                    // hands control to the next file down once the one in
-                    // front is closed.
+                    // Pushed back to front so the first file named is on
+                    // top: `e a b` shows `a`, then `b` once it's closed, as
+                    // `vim a b` does. Not driven here: the loop's top
+                    // dispatches on the frame kind, which also hands
+                    // control to the next file when one closes.
                     for frame in opened.iter().rev() {
                         app.windows[app.current_window].stack_mut().push(*frame);
                     }
                 } else if app.sinks_are_grid {
-                    // The common case once promoted: a normal command ran
-                    // in the focused session and its output (if any)
-                    // landed in that session's grid via its sink -- make
-                    // it visible. Nothing streams live mid-command outside
-                    // of a poll-driven `fg` (the branch above -- this is
-                    // every *other* command); the redraw happens once the
-                    // command has fully finished, same as every other
-                    // redraw trigger here.
+                    // Once promoted, the usual case: a command ran and its
+                    // output went to the session's grid, so show it. Only
+                    // `fg` streams live; this redraws once the command
+                    // finished.
                     compositor_redraw(app);
                 }
             }
@@ -1494,37 +1076,19 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         }
         let _ = io::stdout().flush();
     }
-    // The protocol's own goodbye to every language server on the way
-    // out. `Server`'s `Drop` would kill them anyway -- an orphaned
-    // rust-analyzer indexing a workspace forever is a real problem, not
-    // a tidiness one -- but a server told to shut down gets to write
-    // out whatever cache it keeps, which is the difference between a
-    // fast and a slow start next time.
+    // The protocol's goodbye to every language server. `Drop` would kill
+    // them anyway (an orphaned rust-analyzer indexes forever), but a server
+    // told to shut down writes its cache, for a faster next start.
     if let Some(lsp) = app.sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().shutdown_all();
     }
     term::pop_window_title();
 }
 
-// `e DIR` -- a directory argument isn't a buffer to open, it's a place
-// to *pick* buffers from, so it's replaced here (before anything opens)
-// by one target per path chosen in the browser, each inheriting the
-// directory argument's own flags: `e --hex dumps/` browses `dumps/` and
-// opens everything picked there as hex. A directory picked *inside* the
-// browser (Tab selects one, unlike Enter, which descends into it) means
-// the same thing and is browsed in turn -- see the worklist below.
-//
-// Runs before any frame is pushed, so the browser draws over the pane's
-// ordinary shell content and hands it straight to whatever opens next.
-// Cancelling (Esc/`q`) contributes nothing -- `e some-dir/`, then
-// changing your mind, opens nothing rather than falling back to an
-// arbitrary file. A non-directory target passes through untouched, which
-// is every ordinary `e file.sh`.
-// What a failed `:w`/`:wq`/`:x` says. A read-only buffer gets vim's own
+// What a failed `:w`, `:wq` or `:x` says. A read-only buffer gets vim's
 // E45 rather than E212's "can't open file for writing", which would be
-// both wrong (nothing was opened) and unhelpful -- and it points at the
-// thing that does work, since read-only stops this file being
-// overwritten, not the text being written elsewhere (TextBuffer::save).
+// wrong (nothing was opened); read-only stops overwriting this file,
+// not writing the text elsewhere (`TextBuffer::save`).
 fn write_error(tb: &TextBuffer, e: &io::Error) -> String {
     if e.kind() == io::ErrorKind::PermissionDenied && tb.is_readonly() {
         return "bish: E45: 'readonly' option is set (:w FILE writes it elsewhere)".to_string();
@@ -1532,29 +1096,29 @@ fn write_error(tb: &TextBuffer, e: &io::Error) -> String {
     format!("bish: E212: Can't open file for writing: {e}")
 }
 
+// `e DIR`: a directory is a place to pick buffers from, so it's replaced,
+// before anything opens, by one target per path chosen in the browser,
+// each with the directory argument's flags (`e --hex dumps/` opens the
+// picks as hex). A directory picked with Tab is browsed in turn. Esc or
+// `q` contributes nothing. A non-directory passes through.
 fn expand_browse_targets(
     app: &mut App,
     targets: Vec<fileeditor::EditTarget>,
-    // Whether the browser may hand the shell a new working directory.
-    // False for `bish tool edit`, which is a one-shot command line with
-    // no session that outlives it -- see browser::Outcome.
+    // Whether the browser may change the shell's directory: not for
+    // `bish tool edit`, a one-shot command (see `browser::Outcome`).
     can_change_directory: bool,
     session_id: SessionId,
 ) -> Vec<fileeditor::EditTarget> {
-    // Only pay for the cwd lookup (and the stat below) when there's
-    // actually something to resolve.
+    // Only look up the cwd (and stat) when there's something to resolve.
     if targets.iter().all(|t| t.path.is_none()) {
         return targets;
     }
     let cwd = app.sessions[&session_id].shell.cwd.clone();
     let mut out = Vec::new();
-    // A worklist rather than a plain pass, so a directory *picked in the
-    // browser* means exactly what a directory *named on the command line*
-    // means: pick from it. That keeps the rule to one sentence and means
-    // every argument eventually resolves to real files or to nothing --
-    // no path ends up handed to the editor as a buffer it can't open.
-    // Expansions go back on the front, so `e a.sh dir/ b.sh` keeps
-    // whatever came out of `dir/` between the two files.
+    // A worklist, so a directory picked in the browser means what one named
+    // on the command line does: pick from it, until every argument is files
+    // or nothing. Expansions go back on the front, so `e a.sh dir/ b.sh`
+    // keeps `dir/`'s files between the two.
     let mut queue: std::collections::VecDeque<fileeditor::EditTarget> = targets.into();
     while let Some(target) = queue.pop_front() {
         let Some(path) = target.path.clone() else {
@@ -1562,26 +1126,17 @@ fn expand_browse_targets(
             continue;
         };
         let start = browser::resolve_start(&cwd, Some(&path));
-        // A zip is browsed like a directory, and a directory inside one
-        // is too (archive::is_browsable) -- that's what makes `e
-        // some.zip` show what's in it rather than open the archive's own
-        // bytes as text.
-        //
-        // Except under `--hex`, which asks for exactly those bytes: a
-        // directory has none to show, so it still browses, but an
-        // archive does, and looking at a zip's own structure is a real
-        // reason to type `e --hex`.
+        // A zip, and a directory inside one, is browsed like a directory
+        // (`archive::is_browsable`), so `e some.zip` shows its contents.
+        // Except with `--hex`, which wants the archive's bytes; a directory
+        // has none, so it still browses.
         let browsable = start.is_dir() || (!target.hex && archive::is_browsable(&start.to_string_lossy()));
         if !browsable {
             out.push(target);
             continue;
         }
-        // The pane's own global chrome (the tab bar) is drawn by the
-        // compositor, and `e` reaching here can be the very command that
-        // promoted this session -- in which case nothing has painted it
-        // yet and the browser would sit on an otherwise blank alternate
-        // screen. Every other ensure_promoted call site pairs the two for
-        // the same reason.
+        // `e` may be what promoted this session, with nothing painted yet, so
+        // the tab bar is drawn first, as at every `ensure_promoted`.
         if app.sinks_are_grid {
             compositor_redraw(app);
         }
@@ -1598,9 +1153,8 @@ fn expand_browse_targets(
                     queue.push_front(fileeditor::EditTarget { path: Some(picked.display().to_string()), ..target.clone() });
                 }
             }
-            // Ctrl-Y: the browse produced no files to open, it moved the
-            // shell instead. Enforced by Shell::change_directory, which
-            // is also what refuses under `set -r`.
+            // Ctrl-Y: no files, the shell moved instead, through
+            // `Shell::change_directory`, which refuses under `set -r`.
             Ok(BrowseOutcome::ChangeDirectory(dir)) => {
                 let shell = &mut app.sessions.get_mut(&session_id).unwrap().shell;
                 if let Err(e) = shell.change_directory(&dir) {
@@ -1616,18 +1170,11 @@ fn expand_browse_targets(
     out
 }
 
-// Opens every target `e` was given, in order, returning the frame ids
-// that actually came up -- shared by the `e` builtin's own handling in
-// `run()` and by `bish tool edit`'s bootstrap below, so the two open
-// files identically. Pushing those ids onto a pane's frame stack (and
-// deciding which to drive) is the caller's job: the two differ there,
-// and only there.
-//
-// A target that fails to open is reported and skipped rather than
-// abandoning the whole command -- `e a.sh missing-dir/b.sh` opening what
-// it can is both what vim does and the more useful half of the outcome.
-// The message goes to the owning session's own output, so it's still
-// there underneath once every editor frame this opened is closed again.
+// Opens every target `e` was given, in order, returning the frames that
+// came up; shared by the `e` builtin and `bish tool edit`, which differ
+// only in what they push and drive. A target that fails is reported and
+// skipped, as vim does; the message goes to the session's output, under
+// the editor frames.
 fn open_edit_targets(app: &mut App, targets: &[fileeditor::EditTarget], session_id: SessionId, rect: Rect) -> Vec<Frame> {
     let mut opened = Vec::new();
     for target in targets {
@@ -1643,17 +1190,14 @@ fn open_edit_targets(app: &mut App, targets: &[fileeditor::EditTarget], session_
     opened
 }
 
-// The `--hex` fork: the same target either becomes a `Frame::Edit` over
-// a `TextBuffer` or a `Frame::Hex` over a `HexBuffer`. Split out from
-// open_edit_targets so `bish tool edit`'s own bootstrap -- which reports
-// a failure differently (see run_edit_impl) -- can reuse the fork
-// without reusing the reporting.
+// The `--hex` fork: a target becomes a `Frame::Edit` over a `TextBuffer`
+// or a `Frame::Hex`. Separate so `bish tool edit` reuses it with its own
+// failure reporting (`run_edit_impl`).
 fn open_one_edit_target(app: &mut App, target: &fileeditor::EditTarget, rect: Rect) -> io::Result<Frame> {
     if target.hex {
-        // A member inside an archive has no path the hex editor could
-        // open, so its bytes are handed over directly -- and read-only
-        // for the same reason the text editor's are (see
-        // fileeditor::compressed_text).
+        // An archive member has no path for the hex editor, so its bytes are
+        // passed directly, read-only like the text editor's
+        // (`fileeditor::compressed_text`).
         if let Some(path) = target.path.as_deref()
             && let Some(bytes) = fileeditor::compressed_bytes(path)
         {
@@ -1671,8 +1215,8 @@ fn open_one_edit_target(app: &mut App, target: &fileeditor::EditTarget, rect: Re
         return Ok(Frame::Hex(id));
     }
     let mut session = fileeditor::EditSession::open(target.path.as_deref(), normal_mode_content_rows(rect))?;
-    // `--readonly` can only ever add the restriction: EditSession::open
-    // already set it for compressed content, which isn't writable at all.
+    // `--readonly` only adds the restriction; compressed content is
+    // already read-only.
     if target.readonly {
         session.buffer.set_readonly(true);
     }
@@ -1682,35 +1226,14 @@ fn open_one_edit_target(app: &mut App, target: &fileeditor::EditTarget, rect: Re
     Ok(Frame::Edit(id))
 }
 
-// `bish tool edit FILE` -- a minimal, single-session, single-window
-// bootstrap that goes straight into a Frame::Edit, skipping the tab
-// bar/window-switching chrome `run()`'s own full multi-session
-// compositor loop exists for entirely (there's exactly one pane here,
-// never split, so nothing to multiplex). Reuses run_edit_frame
-// completely unchanged -- everything below it (Insert mode, every
-// operator, `:w`/`:wq`/`:git`/`:diag`, ...) is the exact same real
-// editor `e` drives, not a re-derived subset the way debugger.rs's own
-// standalone read-only view is (that one deliberately reimplements only
-// a small, non-mutating slice of Normal mode -- there'd be nothing left
-// to reuse by re-deriving the *entire* editor here instead of just
-// bootstrapping the real one).
-//
-// `ensure_promoted` is called directly (not `compositor_redraw`
-// alongside it, the way `run()`'s own startup and every real `e`
-// invocation do) -- it's what actually switches the terminal to the
-// alternate screen buffer (vim/less-style clean takeover, restored on
-// exit) via `Shell::promote_if_needed`; `render_editor_frame` (what
-// actually paints the file content) always writes straight to the real
-// terminal itself regardless of promotion, so the only thing skipping
-// `compositor_redraw` loses is the tab bar -- exactly the "without
-// windows" point of this entry point. If the user still explicitly
-// invokes a window-family command (`<C-w>`/`:split`/`window new`) from
-// inside it, that isn't specially blocked (no flag threaded through
-// run_edit_frame/run_normal_mode_navigation for it -- see debugger.rs's
-// own doc comment on why avoiding that kind of change to shared code is
-// deliberate); run_edit_frame simply returns once focus genuinely
-// leaves this one pane, and this function treats that exactly like a
-// real quit -- there's no second window/pane here for it to drive.
+// `bish tool edit FILE`: one session, one window, straight into a
+// `Frame::Edit`, without the tab bar and window switching `run()` has.
+// `run_edit_frame` is reused unchanged, so it's the same editor `e`
+// drives. `ensure_promoted` switches to the alternate screen;
+// `render_editor_frame` paints directly, so skipping `compositor_redraw`
+// loses only the tab bar. A window command (`<C-w>`, `:split`) isn't
+// blocked: `run_edit_frame` returns when focus leaves the pane, and this
+// treats that as a quit.
 pub fn run_edit(args: &[String]) -> i32 {
     match fileeditor::parse_edit_args(args) {
         Ok(targets) => run_edit_impl(&targets, false),
@@ -1721,28 +1244,21 @@ pub fn run_edit(args: &[String]) -> i32 {
     }
 }
 
-// `bish tool debug FILE`'s own thin wrapper -- reuses this same minimal
-// single-session/single-window bootstrap to open FILE, then immediately
-// attaches a debug session to it, exactly what a bare `:dbg` does inside
-// the real windowed editor. See debugger.rs's own top-of-file doc
-// comment for the rest of the shape (a real, read-only source pane plus
-// a real DebugRun sibling).
+// `bish tool debug FILE`: opens FILE as `run_edit` does and attaches a
+// debug session, as `:dbg` does (see debugger.rs).
 pub fn run_edit_debug(path: &str) -> i32 {
     run_edit_impl(&[fileeditor::EditTarget { path: Some(path.to_string()), ..Default::default() }], true)
 }
 
-// `attach_debug` only ever comes with exactly one target (see
-// run_edit_debug just above) -- it attaches to the *first* one opened,
-// which is that same file.
+// `attach_debug` comes with exactly one target, and attaches to it.
 fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 {
     let mut shell = exec::Shell::new();
     shell.enable_monitor_mode();
     let root_cwd = shell.cwd.clone();
 
     let history_size = shell.bishopt_int("history_size").max(0) as usize;
-    // Hoisted above the SessionState literal below: `shell` is moved
-    // into its first field, so the bound cannot be read from it by the
-    // time `history:` is evaluated.
+    // Before the `SessionState` literal, which moves `shell` into its first
+    // field before `history:` is evaluated.
     let edit_history = Rc::new(RefCell::new(History::load(".bish_history", history_size)));
     let (term_rows, term_cols) = query_term_size();
 
@@ -1772,9 +1288,8 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             command_transcript: Vec::new(),
         },
     );
-    // The same state the interactive shell keeps -- see `App`. `bish
-    // tool edit` is a one-session, one-window shell that happens to
-    // start inside the editor, not a separate kind of program.
+    // The interactive shell's state (see `App`): `bish tool edit` is a
+    // one-session shell that starts in the editor.
     let app = &mut App {
         sessions,
         pending_input: std::collections::VecDeque::new(),
@@ -1804,31 +1319,24 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
 
     ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
 
-    // `bish tool edit some-dir/` browses it, exactly as the builtin does
-    // -- see expand_browse_targets. `rect` is read after that, since
-    // browsing blocks on real input and the terminal can be resized
-    // while it does.
+    // `bish tool edit some-dir/` browses it, as the builtin does; `rect` is
+    // read afterwards, since browsing waits on input.
     let targets = expand_browse_targets(
         app,
         targets.to_vec(),
-        // `bish tool edit` exits when the editor closes, so there is no
-        // shell left for a directory change to mean anything to.
+        // `bish tool edit` exits with the editor, so no directory change.
         false,
         0,
     );
     let rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
-    // Unlike the `e` builtin (see open_edit_targets, which reports a bad
-    // target and opens the rest), a failure here aborts the whole
-    // invocation: this is a one-shot command line, so a path that can't
-    // be opened is a usage error worth an exit status, not a note that
-    // scrolls past in a session that keeps running.
+    // Unlike the `e` builtin, a failure aborts: a one-shot command line's
+    // bad path is a usage error deserving an exit status.
     let mut opened: Vec<Frame> = Vec::new();
     for target in &targets {
         match open_one_edit_target(app, target, rect) {
             Ok(frame) => opened.push(frame),
             Err(e) => {
-                // Leaving promotion behind here too: promote_if_needed already
-                // switched to the alternate screen before this could fail.
+                // Leave the alternate screen `promote_if_needed` entered.
                 print!("\x1b[?1049l");
                 let _ = io::stdout().flush();
                 eprintln!("bish: {}: {}", target.path.as_deref().unwrap_or("<unnamed>"), e);
@@ -1939,48 +1447,31 @@ fn handle_command_mode(
     outcome
 }
 
-// Drives whatever job is behind `job_frame_id` -- freshly pushed by the
-// main loop's fg_pending handling, or already sitting there from an
-// earlier detach (M10c) -- via drive_fg_job, and handles however that
-// ends: the job exiting pops the frame and records its status, same as
-// M10b; the user detaching again just re-inserts the (untouched, still
-// running) job back into job_frames and drops straight into command mode
-// for this same window, so `window next`/`previous` can move away from
-// it without ever having to touch the job itself.
+// Drives the job behind `job_frame_id`, just pushed or left from a
+// detach, through `drive_fg_job`, and handles the ending: an exit pops
+// the frame and records the status; a detach puts the still-running job
+// back in `job_frames` and enters Normal mode for this window, so
+// `window next`/`previous` can leave it.
 fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: SessionId) {
-    // Taken out of app.job_frames (rather than borrowed via get_mut) so the
-    // on_idle closure below can freely borrow app.job_frames itself to
-    // service every *other* window's job -- see service_background_jobs.
+    // Taken out of `app.job_frames` so `on_idle` can borrow the map to
+    // service other windows' jobs (`service_background_jobs`).
     let mut job = app.job_frames.remove(&job_frame_id).expect("Frame::Job always has a live app.job_frames entry");
     let focused_screen = app.sessions[&session_id].screen.clone();
     let mut tab_bar = tab_bar_line(app);
     sync_terminal_title(app);
     let mut layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
-    // Persists across every drive_fg_job call in this loop (reset to None
-    // -- forcing the next redraw back to a full repaint -- only on
-    // FgOutcome::Resized below, alongside layout/tab_bar's own
-    // re-snapshot) so a quiet job's later output keeps diffing against
-    // what's actually already on screen instead of re-clearing every
-    // time. See render_compositor_frame_diff's own doc comment.
+    // Kept across `drive_fg_job` calls, so a quiet job's output diffs
+    // against what's on screen (`render_compositor_frame_diff`); reset only
+    // on `FgOutcome::Resized`, forcing a full repaint.
     let mut frame_cache: Option<TerminalFrame> = None;
-    // Loops rather than returning straight after one call: a qualifying
-    // click that turns out to be for the job itself, not bish's own UI
-    // chrome (FgOutcome::MouseClick's own doc comment), or a resize
-    // (FgOutcome::Resized's own doc comment), gets handled in place and
-    // this keeps driving the very same job -- every other outcome still
-    // returns straight out of this function, same as before this loop
-    // existed.
+    // A loop: a click meant for the job (`FgOutcome::MouseClick`) or a
+    // resize (`FgOutcome::Resized`) is handled in place and the same job
+    // driven on; any other outcome returns.
     loop {
-        // A plain owned copy, not `&mut app.term_rows` itself: the `redraw`
-        // closure below and the `on_idle` closure both close over state
-        // for this same drive_fg_job call, and on_idle needs `&mut app.term_rows`
-        // as a genuine `&mut usize` (to drive service_background_jobs's
-        // own resize handling) -- capturing it a second time here, even
-        // just to read it, would conflict with that. A resize that lands
-        // mid-drive is caught by drive_fg_job itself instead (see its
-        // own doc comment) and only takes effect for *this* closure once
-        // the FgOutcome::Resized arm below re-snapshots and loops back
-        // around, at most one drive_fg_job iteration later.
+        // A copy, not `&mut app.term_rows`: `on_idle` needs that as a real
+        // `&mut usize` for resizing, and capturing it here too would
+        // conflict. A resize mid-drive is caught by `drive_fg_job`, and
+        // this copy is renewed by the `Resized` arm.
         let redraw_rows = app.term_rows;
         let redraw_cols = app.term_cols;
         let outcome = drive_fg_job(
@@ -1996,9 +1487,8 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                 app.windows[app.current_window].stack_mut().pop();
                 let session = app.sessions.get_mut(&session_id).unwrap();
                 session.shell.last_status = status;
-                // The job is over, so a `<( )` that was feeding it can
-                // be torn down now -- it was deliberately left alone
-                // while the job ran. See Shell::drain_proc_subs.
+                // The job is over, so a `<( )` feeding it can be torn down
+                // (`Shell::drain_proc_subs`).
                 session.shell.finished_foreground_job();
                 if app.sinks_are_grid {
                     compositor_redraw(app);
@@ -2007,39 +1497,24 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
             }
             FgOutcome::Detached => {
                 app.job_frames.insert(job_frame_id, job);
-                // Normal mode, not command mode directly -- matches what the
-                // detach key already does from a genuinely idle prompt (see
-                // editor::ReadOutcome::NormalMode), rather than a second,
-                // inconsistent "Ctrl+G sometimes means normal mode,
-                // sometimes means command mode" behavior depending on what
-                // happened to be running. `:` still reaches command mode from
-                // here (run_normal_mode_navigation's own doc comment), so
-                // `window next`/`previous` away from this job stays exactly
-                // as reachable as before, just one keystroke further in.
-                // NavStart::JobDetach: this pane's top frame is Frame::Job,
-                // not a live prompt, so whatever this returns for "resume
-                // editing here" is meaningless and gets silently discarded
-                // anyway once the main loop sees the same Frame::Job still
-                // on top and re-drives this job instead of ever calling
-                // read_line with it.
+                // Normal mode, as the detach key gives from an idle prompt
+                // (`ReadOutcome::NormalMode`); `:` reaches command mode
+                // from there. `NavStart::JobDetach`: the top frame is the
+                // job, so any "resume editing" result is discarded, and the
+                // loop re-drives the job.
                 let _ = run_normal_mode_navigation(app, session_id, None, NavStart::JobDetach, None);
-                // Whatever that excursion did (window action, or plain EOF)
-                // hands control straight back to re-driving this same job
-                // live -- which only redraws once fresh output actually
-                // arrives (drive_fg_job's own redraw callback). A quiet job
-                // could sit for a while with the global mode-line row
-                // (render_normal_mode_frame's own render_global_status_row)
-                // still showing this excursion's now-stale text otherwise.
+                // Back to driving the job, which redraws only on new
+                // output, so the excursion's mode line would linger;
+                // erased.
                 if app.sinks_are_grid {
                     compositor_redraw(app);
                 }
                 return;
             }
             FgOutcome::Stopped => {
-                // Unlike Detached, this job doesn't go back into app.job_frames
-                // -- it's no longer "a window's live top frame," it's a
-                // genuine Stopped job now, addressable via jobs/fg/bg like
-                // any other (see Shell::park_stopped_fg_job).
+                // Not back into `job_frames`: it's a Stopped job now,
+                // reachable with `jobs`, `fg` and `bg`
+                // (`Shell::park_stopped_fg_job`).
                 app.windows[app.current_window].stack_mut().pop();
                 let session = app.sessions.get_mut(&session_id).unwrap();
                 let (id, cmd_text) = session.shell.park_stopped_fg_job(job);
@@ -2051,11 +1526,8 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                 return;
             }
             FgOutcome::MouseClick(ev) => {
-                // &mut app.sinks_are_grid gate matches every other hit_test_click
-                // call site: there's no tab bar/pane layout to click on
-                // before the first promotion, so there's nothing to
-                // hit-test against -- falls straight to the "forward it"
-                // arm below, same as a genuine miss.
+                // Before promotion there's nothing to hit-test, so the
+                // click goes to the job.
                 let target = if app.sinks_are_grid { hit_test_click(app, ev) } else { None };
                 match target {
                     Some(ClickTarget::Window(idx)) if idx != app.current_window => {
@@ -2075,12 +1547,9 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                         }
                         return;
                     }
-                    // A miss, the already-focused tab/pane, or &mut app.sinks_are_grid
-                    // was false -- this click was for the job itself (or
-                    // nothing meaningful bish owns either way). Reconstruct
-                    // the exact SGR press byte drive_fg_job held back and
-                    // forward it, then keep driving the same job (the
-                    // enclosing loop, not a recursive call).
+                    // A miss, or the focused tab or pane: the click was for
+                    // the job. The SGR press `drive_fg_job` held back is
+                    // rebuilt and forwarded, and the loop drives on.
                     _ => {
                         let seq = format!("\x1b[<{};{};{}M", ev.button, ev.col, ev.row);
                         let _ = job.pty_master().write_all(seq.as_bytes());
@@ -2088,54 +1557,28 @@ fn run_fg_job_frame(app: &mut App, job_frame_id: JobFrameId, session_id: Session
                 }
             }
             FgOutcome::Resized => {
-                // service_background_jobs's own on_idle-driven WINCH handling
-                // (poll_and_apply_resize) already resized every session's
-                // screen and every *background* job's pty; drive_fg_job
-                // already caught this job's own pty up too. All that's left
-                // is this function's own pane-rects/tab-bar snapshot, taken
-                // before this loop started and now stale -- without
-                // recomputing it, the compositor would keep drawing this
-                // job's now-correctly-sized output into the old geometry
-                // until this whole function eventually returned. No redraw
-                // forced here: drive_fg_job's own redraw() fires again as
-                // soon as the job's next output arrives, which for a
-                // well-behaved full-screen program is basically immediate
-                // (TIOCSWINSZ delivers SIGWINCH to its own process group).
+                // `poll_and_apply_resize` resized every session's screen
+                // and background job's pty, and `drive_fg_job` this job's
+                // pty. What's left is this function's pane rects and tab
+                // bar snapshot. No forced redraw: the job's next output,
+                // prompt after `SIGWINCH`, redraws.
                 layout = snapshot_window(&app.windows[app.current_window], &app.sessions, app.term_rows, app.term_cols);
                 tab_bar = tab_bar_line(app);
                 sync_terminal_title(app);
-                // The geometry frame_cache's own cells describe is no longer
-                // even the right shape -- render_compositor_frame_diff's own
-                // stale check would catch a rows/cols mismatch anyway, but
-                // resetting explicitly here is what forces the *next* redraw
-                // back to a full, self-healing repaint (matching
-                // poll_and_apply_resize's own direct compositor_redraw call,
-                // which already painted a full frame with the new geometry
-                // via a completely different path this cache knows nothing
-                // about) rather than potentially diffing against content from
-                // before the resize.
+                // The cache describes the old shape; resetting it makes the
+                // next redraw a full repaint.
                 frame_cache = None;
             }
         }
     }
 }
 
-// A pane's editor frames (`Frame::Edit`, `Frame::Hex`) render full-screen
-// over whatever the shell was showing, and freeze that same content into
-// the owning session's own vt100 grid whenever focus moves away -- which
-// would otherwise destroy the scrollback underneath it: the prompt, the
-// `e` command that opened the editor, every command before that.
-//
-// So they do exactly what a real full-screen terminal program does, using
-// the machinery `vt100::Screen` already has for it: switch that grid to
-// its *alternate* buffer on the way in and back on the way out. The
-// primary buffer is left untouched throughout, and `?1049l` restores the
-// cursor to the row the shell was about to draw its next prompt on, so
-// leaving the editor puts the pane back exactly as it was found.
-//
-// Both are idempotent (`Screen::switch_alt_screen` returns early when
-// already in the requested state), which is what lets `enter` be called
-// on every re-focus rather than only on the frame's first one.
+// Editor frames (`Frame::Edit`, `Frame::Hex`) render full-screen over the
+// shell and freeze into the session's grid when focus moves, which
+// would destroy the scrollback beneath. So, like a full-screen program,
+// they switch the grid to its alternate buffer on the way in and back on
+// the way out; `?1049l` restores the cursor to where the next prompt
+// goes. Both are idempotent, so entering on every refocus is fine.
 fn enter_alt_screen(screen: &Rc<RefCell<vt100::Screen>>) {
     screen.borrow_mut().feed(b"\x1b[?1049h");
 }
@@ -2144,38 +1587,23 @@ fn leave_alt_screen(screen: &Rc<RefCell<vt100::Screen>>) {
     screen.borrow_mut().feed(b"\x1b[?1049l");
 }
 
-// `e --hex`'s own counterpart to run_edit_frame just below -- drives
-// whatever hex session is behind `hex_frame_id`, freshly opened by the
-// pending_edit handling or already sitting in `hex_frames` from an
-// earlier focus change.
-//
-// Unlike run_edit_frame, this doesn't delegate to
-// run_normal_mode_navigation: that function is built around a
-// `NavBuffer` (a `TextBuffer` or a session's own vt100 grid), and a byte
-// buffer is neither. hexedit.rs owns the whole view instead -- this
-// function only provides `rect`, moves the session's state (and the
-// shared register table) in and back out, and reacts to how driving it
-// ended. Same split, one level up, that run_diagnostics_frame already
-// uses for its own non-NavBuffer view.
-//
-// Mouse reporting is deliberately left off (`RawGuard::enable`, not
-// `enable_with_mouse`): there's nothing in a hex dump a click means
-// anything to, and off is what makes a click send no bytes at all rather
-// than escape sequences this loop would have to swallow.
+// `e --hex`'s counterpart to `run_edit_frame`: drives the hex session
+// behind `hex_frame_id`. Not through `run_normal_mode_navigation`, which
+// works on a `NavBuffer` (a `TextBuffer` or a grid); hexedit.rs owns the
+// view, and this provides the rect, moves state and registers in and
+// out, and handles the ending, as `run_diagnostics_frame` does. No mouse
+// reporting: clicks mean nothing in a hex dump.
 fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId) {
-    // Taken out of app.hex_frames rather than borrowed, for the same reason
-    // run_edit_frame/run_fg_job_frame take theirs out: it leaves the map
-    // free for the on_idle closure below to borrow.
+    // Taken out, as `run_edit_frame` does, leaving the map free for
+    // `on_idle`.
     let mut session = app.hex_frames.remove(&hex_frame_id).expect("Frame::Hex always has a live app.hex_frames entry");
-    // Same reasoning as run_edit_frame's own call -- see
-    // `enter_alt_screen`.
+    // See `enter_alt_screen`.
     enter_alt_screen(&app.sessions[&session_id].screen);
-    // The shell's one shared register table, moved in for as long as this
-    // frame is the one being driven -- see HexSession's own `app.registers`
-    // field doc comment.
+    // The shared register table, moved in while this frame is driven (see
+    // `HexSession`'s `registers`).
     session.attach_registers(&mut app.registers);
-    // Captured before any window command can move focus elsewhere --
-    // exactly run_edit_frame's own reasoning for the same two locals.
+    // Captured before a window command can move focus, as in
+    // `run_edit_frame`.
     let own_window = app.current_window;
     let own_pane_id = app.windows[app.current_window].focused_pane;
 
@@ -2184,9 +1612,8 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         app.hex_frames.insert(hex_frame_id, session);
         return;
     };
-    // The very first entry into this frame can be the moment promotion
-    // happened, leaving the alternate screen blank -- same repaint
-    // run_normal_mode_navigation opens with, and harmless afterward.
+    // The first entry can be where promotion happened, with a blank
+    // alternate screen.
     compositor_redraw(app);
 
     let quit = loop {
@@ -2198,13 +1625,10 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         }
         let _ = io::stdout().flush();
 
-        // Waiting for the next byte out here, rather than inside
-        // read_key_idle's own on_idle, for the reason
-        // run_normal_mode_navigation's identical loop spells out: only
-        // here is `session` free for the redraw a just-attached client
-        // needs (compositor_redraw alone paints this pane blank -- its
-        // real content never feeds the session's vt100 grid while it's
-        // being driven).
+        // Waiting for input out here rather than in `read_key_idle`'s
+        // `on_idle`, as `run_normal_mode_navigation` does: only here is
+        // `session` free for the redraw a reattached client needs
+        // (`compositor_redraw` alone paints this pane blank).
         while !term::stdin_ready(editor::IDLE_POLL_MS) {
             if service_background_jobs(app) {
                 let rect = pane_rect(&app.windows[app.current_window], own_pane_id, app.term_rows, app.term_cols);
@@ -2218,32 +1642,27 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         }
         let key = match editor::read_key_idle(&mut || {}) {
             Ok(Some(k)) => k,
-            // EOF/error: nothing sensible to resume into -- drop the
-            // frame the same way run_edit_frame's own Err arm does.
+            // EOF or an error: drop the frame, as `run_edit_frame`'s Err
+            // arm does.
             Ok(None) | Err(_) => break true,
         };
 
-        // Cloned rather than borrowed: the idle hook beside it needs
-        // the whole `app` mutably, and `History` is an Rc-backed
-        // persistent list whose clone is O(1) -- see its own doc
-        // comment, which names this exact situation.
+        // Cloned, since the idle hook needs all of `app`; a `History` clone
+        // is O(1).
         let history = app.cmd_history.clone();
         let outcome = session.handle_key(key, rect, app.term_rows, app.term_cols, &history, &mut || {
             service_background_jobs(app);
         });
         match outcome {
             hexedit::HexOutcome::Continue => {}
-            // This pane itself is repainted by the loop's own
-            // `session.render` on the very next turn, so all that is
-            // needed here is everything *else*.
+            // This pane repaints on the next `session.render`; everything
+            // else is redrawn here.
             hexedit::HexOutcome::Redraw => {
                 compositor_redraw(app);
             }
             hexedit::HexOutcome::Quit => break true,
-            // Same shape as `Window` just below, down to the "it may
-            // turn out to be a no-op, so check whether this frame is
-            // still on top" test: putting the opener away leaves this
-            // view exactly where it was.
+            // Like `Window` below: if putting the opener away left this
+            // frame on top, keep driving it.
             hexedit::HexOutcome::Opener => {
                 if let Some((target, destination)) = run_opener(app) {
                     act_on_opener_choice(app, target, destination, None);
@@ -2255,11 +1674,9 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
             }
             hexedit::HexOutcome::Window(cmd, count) => {
                 dispatch_window_cmd(app, cmd, count);
-                // A `<C-w>` that turned out to be a no-op from this
-                // pane's perspective (`<C-w>h` with nowhere to go, ...)
-                // leaves this frame on top -- keep driving it rather
-                // than freezing and returning, exactly as
-                // run_edit_frame's own Detached arm does.
+                // A `<C-w>` that changed nothing for this pane leaves the
+                // frame on top; keep driving, as `run_edit_frame`'s
+                // Detached arm does.
                 if app.windows[app.current_window].stack().last() != Some(&Frame::Hex(hex_frame_id)) {
                     break false;
                 }
@@ -2270,12 +1687,10 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
     session.detach_registers(&mut app.registers);
     if quit {
         app.windows[app.current_window].stack_mut().pop();
-        // Same cleanup run_edit_frame does on the way out, in the same
-        // order and for the same reasons: back to the primary screen
-        // (which still holds this session's scrollback), then erase the
-        // colon line's own last text off the global status row -- before
-        // the redraw, so the redraw's closing cursor placement is what
-        // the shell prompt draws against.
+        // `run_edit_frame`'s exit cleanup, in its order: back to the
+        // primary screen with the scrollback, then erase the colon line's
+        // text from the status row, before the redraw, whose closing cursor
+        // placement the prompt uses.
         leave_alt_screen(&app.sessions[&session_id].screen);
         print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
         if app.sinks_are_grid {
@@ -2285,168 +1700,107 @@ fn run_hex_frame(app: &mut App, hex_frame_id: HexFrameId, session_id: SessionId)
         return;
     }
 
-    // Focus genuinely moved elsewhere -- freeze this frame's real
-    // content into its own pane's grid so a compositor redraw shows the
-    // dump rather than stale rows, and put the session back for whenever
-    // it's focused again. Recomputed fresh (not reused from the loop):
-    // the window command that moved focus can have resized panes too.
+    // Focus moved: freeze this frame into its pane's grid so a redraw shows
+    // the dump, and put the session back. The rect is recomputed: the
+    // window command may have resized panes.
     let rect = if own_window < app.windows.len() && app.windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
         pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols)
     } else {
         pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols)
     };
-    // Resized first: the split that moved focus made this pane narrower,
-    // and freezing a full-width frame into a grid still sized for the old
-    // rect would clip it -- run_diagnostics_frame's own refresh_editor_
-    // frame does exactly this, for exactly this reason.
+    // Resized first: a split made this pane narrower, and freezing a
+    // full-width frame into the old grid would clip it, as
+    // `refresh_editor_frame` avoids.
     app.sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
     session.freeze(&app.sessions[&session_id].screen, rect);
     app.hex_frames.insert(hex_frame_id, session);
-    // dispatch_window_cmd already redrew, but that was *before* the
-    // freeze above -- without a second one this pane stays blank until
-    // some unrelated activity happens to repaint it. Found via pty
-    // against the real binary: `<C-w>s` from a hex frame left its own
-    // half of the split empty until the next command ran.
+    // `dispatch_window_cmd` redrew before the freeze, so another is needed
+    // or this pane stays blank (`<C-w>s` from a hex frame).
     if app.sinks_are_grid {
         compositor_redraw(app);
     }
-    // The status row still holds this frame's own last status line (and
-    // any half-typed `^W` chord shown in it). Whatever takes focus next
-    // draws its own over this if it has one; a plain shell prompt
-    // doesn't, and would otherwise leave a hex status line sitting above
-    // it forever.
+    // The status row still holds this frame's status line; a prompt doesn't
+    // draw over it, so it's erased.
     print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
     let _ = io::stdout().flush();
 }
 
-// `e`'s own counterpart to run_fg_job_frame, above -- drives whatever
-// editor session is behind `edit_frame_id`, freshly opened by the
-// pending_edit handling below or already sitting there from an earlier
-// detach. `run_normal_mode_navigation` is what actually drives it (see
-// `NavBuffer`'s own doc comment -- an editor pane is that same one real
-// Normal mode, not a separate loop) -- this function's only job is
-// providing `rect`, moving the session's state in and back out, and
-// reacting to how driving it ended.
+// `e`'s counterpart to `run_fg_job_frame`: drives the editor session
+// behind `edit_frame_id` through `run_normal_mode_navigation` (an editor
+// pane is the same Normal mode; see `NavBuffer`). This provides the rect,
+// moves state in and out, and handles the ending.
 fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: SessionId) {
-    // Taken out of app.edit_frames (rather than borrowed via get_mut) so
-    // on_idle below can freely borrow app.edit_frames -- moot today (nothing
-    // in service_background_jobs touches it), but matches
-    // run_fg_job_frame's own reasoning for app.job_frames exactly, and keeps
-    // the two symmetric.
+    // Taken out, as `run_fg_job_frame` does, so `on_idle` could borrow the
+    // map.
     let session = app.edit_frames.remove(&edit_frame_id).expect("Frame::Edit always has a live app.edit_frames entry");
-    // Everything this frame draws (and everything it freezes into the
-    // session's grid on the way out) belongs on the alternate screen, not
-    // on top of the shell's scrollback -- see `enter_alt_screen`.
+    // Drawn on the alternate screen, not over the scrollback (see
+    // `enter_alt_screen`).
     enter_alt_screen(&app.sessions[&session_id].screen);
-    // "%": refreshed here, once, whenever this function starts driving a
-    // session -- see fileeditor::set_last_filename's own doc comment for
-    // the other place (a successful :w/:wq/:x) it needs the same
-    // refresh.
+    // `%` refreshed when this starts driving a session; `:w`, `:wq` and `:x`
+    // refresh it too (`fileeditor::set_last_filename`).
     fileeditor::set_last_filename(&session.buffer, &mut app.registers);
     let mut buffer = session.buffer;
     let mut vk = session.vk;
-    // The starting values only. `bishopt` is a builtin, and command
-    // mode runs builtins, so `:bishopt --set wrap on` from the colon
-    // line right here really does change them mid-edit --
-    // run_normal_mode_navigation re-reads both after every command-mode
-    // command for exactly that reason. (An earlier comment here claimed
-    // bishopt was "unreachable from inside the modal file editor",
-    // which was never true and made a `:bishopt` appear to do nothing
-    // until the file was reopened.)
+    // Starting values: `:bishopt --set wrap on` can change them mid-edit,
+    // and `run_normal_mode_navigation` re-reads them after every command.
     let color_overrides = syntax_color_overrides(&app.sessions[&session_id].shell);
     apply_view_options(&app.sessions[&session_id].shell, &mut buffer);
-    // The buffer exists and its options are resolved, which is the
-    // moment `editor:file:open` is about -- a hook that configures a
-    // language server for this file wants a real buffer to ask about,
-    // not a path.
+    // The buffer exists with its options resolved: `editor:file:open`'s
+    // moment, so a hook configuring a language server has a buffer.
     run_hooks(&mut app.sessions, session_id, "editor:file:open", &buffer);
     open_language_server_document(&mut app.sessions, session_id, &buffer);
-    // Where this editor frame actually lives -- captured once, before
-    // any window command can move focus elsewhere. The Detached arm
-    // below needs this pane's own rect to freeze into, not whatever
-    // pane/window happens to be focused *after* the command that
-    // detached this one ran (that could be a sibling pane a split just
-    // switched to, or even a different window entirely after `<C-w>w`/
-    // `window next` -- `app.windows[app.current_window].focused_pane` at that
-    // point names neither).
+    // Where this frame lives, captured before a window command can move
+    // focus: the Detached arm freezes into this pane's rect, not whatever is
+    // focused after the command (a split's new pane, another window).
     let own_window = app.current_window;
     let own_pane_id = app.windows[app.current_window].focused_pane;
-    // Loops rather than returning straight after one call: a `Window`
-    // keypress (KeyOutcome::Window, handled inside run_normal_mode_
-    // navigation) always resolves to NavExit::Detached, even when
-    // dispatch_window_cmd's own action turned out to be a no-op from
-    // *this* pane's perspective (`<C-w>n` with only one window, `<C-w>h`
-    // with nowhere to go, ...) -- that loop has no way to tell a real
-    // focus change from a no-op one. See the `Detached` arm below for
-    // what goes wrong if this pane's own frame is still on top after
-    // one of those and this function returns anyway instead of noticing
-    // and just continuing to drive it.
+    // A loop: a `Window` key always ends `run_normal_mode_navigation` as
+    // `NavExit::Detached`, even when the action changed nothing for this
+    // pane (`<C-w>n` with one window, `<C-w>h` with nowhere to go). See the
+    // `Detached` arm for why this frame, still on top, must keep being
+    // driven.
     loop {
         let outcome =
             run_normal_mode_navigation(app, session_id, Some(edit_frame_id), NavStart::Edit(Box::new(buffer), Box::new(vk)), Some(&color_overrides));
         match outcome {
             Ok((NavExit::Quit, ref state)) => {
-                // *Before* the frame goes away: afterwards there is
-                // nothing left for a hook to look at, which is why vim's
-                // own BufUnload/BufDelete are both "before" too.
+                // Before the frame goes, while there's a buffer for a hook
+                // to see, as vim's BufUnload and BufDelete are.
                 if let Some((tb, _)) = state {
                     run_hooks(&mut app.sessions, session_id, "editor:file:close", tb);
-                    // Same moment, same reason: the buffer still exists,
-                    // so its URI is still resolvable.
+                    // Same moment: the buffer's URI still resolves.
                     close_language_server_document(&mut app.sessions, session_id, tb);
                 }
                 app.windows[app.current_window].stack_mut().pop();
-                // Back to the primary screen, which still holds this
-                // session's own scrollback -- prompt, the `e` command
-                // that opened this editor, everything before it -- with
-                // the cursor restored to the row the shell was about to
-                // print its next prompt on. See `enter_alt_screen`.
+                // Back to the primary screen with the scrollback, cursor
+                // where the next prompt goes (`enter_alt_screen`).
                 leave_alt_screen(&app.sessions[&session_id].screen);
-                // A file with an open diagnostics pane (`:diag`) below
-                // it -- close that too rather than leaving an orphaned
-                // pane no `Frame::Edit` will ever point at again.
+                // Close a `:diag` pane below the file too, rather than
+                // orphan it.
                 if let Some(diag_pane) = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id) {
                     close_pane(&mut app.windows[app.current_window], diag_pane);
                     close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
-                // The same for a `gr` location list: it is about the
-                // buffer that is going away, and its entries are
-                // addressed against a frame id that is about to be
-                // reused.
+                // And a `gr` location list, whose entries refer to a frame
+                // id about to be reused.
                 if let Some(pane) = locations_sibling(&app.windows[app.current_window], edit_frame_id) {
                     close_pane(&mut app.windows[app.current_window], pane);
                     close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
                 app.location_lists.remove(&edit_frame_id);
-                // Same idea for an attached `:dbg` session's own
-                // DebugRun sibling -- the buffer this session was
-                // attached to is going away regardless of whether
-                // `:dbg quit` was ever run explicitly, so there's
-                // nothing left for it to debug.
+                // And an attached `:dbg` session's DebugRun pane: its
+                // buffer is going.
                 if app.debug_frames.remove(&edit_frame_id).is_some()
                     && let Some(debug_pane) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
                 {
                     close_pane(&mut app.windows[app.current_window], debug_pane);
                     close_orphaned_sessions(&mut app.sessions, &app.windows);
                 }
-                // Command mode's own colon-line (`:q`/`:q!`/`:wq`/`:x`)
-                // paints straight to the real terminal's global status row
-                // (see run_command_mode's own doc comment on why -- it
-                // bypasses the session's vt100 grid model entirely), which
-                // means it's invisible to compositor_redraw's own grid-
-                // diffed repaint below: nothing else ever re-touches
-                // that row on the way out, so the colon-line's own last
-                // text (literally "q!") would otherwise sit there forever
-                // once this editor pane is gone.
-                //
-                // Erased *before* the redraw, not after: this write leaves
-                // the real cursor parked on the status row, and the shell
-                // prompt that draws next positions itself by column only
-                // (editor::compose_redraw), so it would land on that row
-                // instead of where the session's own grid says. The
-                // redraw's own closing cursor placement (see
-                // build_compositor_frame_output) is what has to be the
-                // last word.
+                // The colon line (`:q`, `:wq`) paints the global status row
+                // directly, outside the grid, so the compositor's repaint
+                // never touches it and "q!" would stay. Erased before the
+                // redraw, whose closing cursor placement the prompt draws
+                // against.
                 print!("{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
                 if app.sinks_are_grid {
                     compositor_redraw(app);
@@ -2454,21 +1808,18 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
                 let _ = io::stdout().flush();
                 return;
             }
-            // `gd` landed in another file. Stash this one back exactly
-            // as a detach would, open the target as a *new* frame on
-            // top of this pane's stack, and return so the main loop
-            // starts driving it -- which makes `:q` on the new file pop
-            // straight back here, the natural "go look, then come back"
-            // shape, and one this codebase's pane stack already has.
+            // `gd` landed in another file. This one is stashed as for a
+            // detach, the target opens as a new frame on top of the pane's
+            // stack, and the main loop drives it, so `:q` there pops
+            // straight back here.
             Ok((NavExit::OpenAt { path, line, character, encoding, root }, state)) => {
                 if let Some((b, v)) = state {
                     app.edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
                 }
-                // Already open in this pane? Bring that frame to the
-                // front rather than opening the file twice. Nothing is
-                // closed, which is what lets `Ctrl-I` step forward
-                // again -- and it means a buffer with unsaved work is
-                // never quietly dropped on the way back to it.
+                // Already open in this pane: bring that frame to the front
+                // rather than open the file twice. Nothing closes, so
+                // `Ctrl-I` can step forward again and unsaved work is never
+                // dropped.
                 let existing = app.windows[own_window].pane(own_pane_id).stack.iter().position(
                     |frame| matches!(frame, Frame::Edit(id) if app.edit_frames.get(id).and_then(|s| s.buffer.path()) == Some(path.as_path())),
                 );
@@ -2489,10 +1840,9 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
                 let rect = pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols);
                 match fileeditor::EditSession::open(path.to_str(), normal_mode_content_rows(rect)) {
                     Ok(mut opened) => {
-                        // Converted here rather than before the exit,
-                        // because turning a `(line, character)` into a
-                        // cursor needs the text of this file -- which
-                        // did not exist until a moment ago.
+                        // Converted here: a `(line, character)` becomes a
+                        // cursor only with this file's text, which didn't
+                        // exist until now.
                         let starts = fileeditor::line_starts_of(&opened.buffer);
                         let offset = fileeditor::diagnostic_offset(&opened.buffer, &starts, line, character, encoding);
                         let (row, col) = fileeditor::diagnostic_position(&opened.buffer, offset);
@@ -2510,57 +1860,36 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
                 return;
             }
             Ok((NavExit::Detached, Some((b, v)))) => {
-                // If this exact edit frame is still the top of the
-                // (possibly now-different) current window's own focused
-                // pane, nothing actually took over -- freezing here
-                // would bake this frame's *current* content into the
-                // session's grid for no reason, where it would then sit
-                // untouched (nothing else feeds that grid while an
-                // editor pane is being driven -- see freeze_editor_
-                // frame's own doc comment on why this is normally the
-                // *only* place that happens) until some later
-                // compositor_redraw painted it back onto the real
-                // terminal on top of whatever a genuine exit draws
-                // afterward -- exactly the "shell prompt drawn over the
-                // file's own last content" bug this loop exists to
-                // avoid. Keep driving it instead.
+                // This frame still tops the focused pane, so nothing took
+                // over. Freezing would bake its content into the grid,
+                // where nothing updates it while an editor is driven (see
+                // `freeze_editor_frame`), and a later redraw would paint it
+                // over whatever a real exit draws. Keep driving.
                 if app.windows[app.current_window].stack().last() == Some(&Frame::Edit(edit_frame_id)) {
                     buffer = b;
                     vk = v;
                     continue;
                 }
-                // A genuine focus change (or this pane now shows
-                // something else entirely, e.g. `window fg` pushed a
-                // different frame on top) -- freeze for real. Recomputed
-                // fresh rather than reusing anything computed before
-                // this loop's first iteration: a window action that
-                // *does* leave this frame on top (the branch above) can
-                // still have resized panes (`window balance`, `+`/`-`),
-                // and one that moves focus away can too.
+                // A real focus change, or the pane shows something else now
+                // (`window fg` pushed a frame): freeze. The rect is
+                // recomputed, since window actions can resize panes
+                // (`window balance`, `+`, `-`).
                 let rect = if own_window < app.windows.len() && app.windows[own_window].panes.iter().any(|p| p.id == own_pane_id) {
                     pane_rect(&app.windows[own_window], own_pane_id, app.term_rows, app.term_cols)
                 } else {
-                    // This pane (or its whole window) is gone by now --
-                    // nothing sensible to freeze into; fall back to
-                    // wherever focus actually landed rather than
-                    // indexing a pane that no longer exists.
+                    // This pane or its window is gone: fall back to where
+                    // focus landed.
                     pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols)
                 };
-                // Resized first: the window action that moved focus is
-                // usually a split, which made this pane narrower, and
-                // freezing a full-width frame into a grid still sized for
-                // the old rect would clip it -- exactly what
-                // run_diagnostics_frame's own refresh_editor_frame does,
-                // for the same reason.
+                // Resized first: a split narrows this pane, and freezing a
+                // full-width frame into the old grid would clip it, as
+                // `refresh_editor_frame` avoids.
                 app.sessions[&session_id].screen.borrow_mut().resize(rect.rows, rect.cols);
                 fileeditor::freeze_editor_frame(&app.sessions[&session_id].screen, &b, &v, rect, Some(&color_overrides));
                 app.edit_frames.insert(edit_frame_id, fileeditor::EditSession { buffer: b, vk: v });
-                // dispatch_window_cmd already redrew, but that ran
-                // *before* the freeze above -- so without a second one
-                // this pane keeps showing whatever its grid held a moment
-                // ago (a freshly-switched alternate screen: blank) until
-                // some unrelated activity happens to repaint it. Same
-                // ordering gap, same fix, as run_hex_frame's own.
+                // `dispatch_window_cmd` redrew before the freeze, so
+                // another is needed or the pane shows a blank alternate
+                // screen; as in `run_hex_frame`.
                 if app.sinks_are_grid {
                     compositor_redraw(app);
                 }
@@ -2570,10 +1899,8 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
                 unreachable!("NavStart::Edit never produces NavExit::Resume, and always hands its buffer back")
             }
             Err(e) => {
-                // A real I/O error reading a key -- same treatment the main
-                // loop itself gives one (see its own read_line Err arm):
-                // sink it and drop the session; there's no good way to
-                // resume from here.
+                // An I/O error reading a key, treated as the main loop
+                // treats one: sink it and drop the session.
                 app.windows[app.current_window].stack_mut().pop();
                 leave_alt_screen(&app.sessions[&session_id].screen);
                 app.sessions.get_mut(&session_id).unwrap().shell.sink_err(&format!("bish: e: error reading input: {}\n", e));
@@ -2586,43 +1913,30 @@ fn run_edit_frame(app: &mut App, edit_frame_id: EditFrameId, session_id: Session
     }
 }
 
-// The Edit-frame pane whose own diagnostics `edit_frame_id` names, if
-// it's currently live in this window -- diagnostics_sibling's own
-// mirror image, walked the other direction (from the diagnostics pane
-// back to the editor pane it belongs to, e.g. to refocus it once the
-// diagnostics pane collapses).
+// The editor pane whose diagnostics `edit_frame_id` names, if live in
+// this window: `diagnostics_sibling` the other way, for refocusing the
+// editor when the diagnostics pane collapses.
 fn editor_pane_for(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Edit(edit_frame_id))).map(|p| p.id)
 }
 
-// How many rows the diagnostics pane's own SplitChild should claim
-// while expanded (focused): sized to fit its own list content, plus
-// DIAG_DETAIL_ROWS more while the selected item's own detail block is
-// showing (see Space's own handling) -- but capped at half of `budget`
-// regardless of how long the list or the detail gets, per this
-// feature's own spec ("only the space it needs, up to 50%"). `budget`
-// is the split's own total (the editor sibling's rows *plus* the one
-// row a minimized pane's own divider-pill costs -- see SplitChild's own
-// doc comment), captured once when this pane is first focused and
-// reused for every resize during that same focus session, not
-// recomputed from the *already-shrunk* editor rect on every keystroke
-// (which would make the cap itself shrink every time the pane grew).
+// Extra rows while the selected item's detail shows (Space).
 const DIAG_DETAIL_ROWS: usize = 2;
+// Rows the diagnostics pane claims while focused: its list, plus
+// `DIAG_DETAIL_ROWS` while a detail shows, capped at half of `budget`
+// ("only the space it needs, up to 50%"). `budget` is the split's total
+// (the editor's rows and the minimized pane's one divider row), captured
+// when the pane is focused and kept, or the cap would shrink as the pane
+// grew.
 fn diagnostics_pane_rows(diagnostics_len: usize, show_detail: bool, budget: usize) -> usize {
     let max_rows = (budget / 2).max(1);
     let wanted = if show_detail { diagnostics_len + DIAG_DETAIL_ROWS } else { diagnostics_len };
     wanted.max(1).min(max_rows)
 }
 
-// The three things a diagnostics/locations pane does to its own
-// geometry and to its editor sibling. All three used to be closures
-// taking the pieces of state they touched as explicit parameters --
-// `refresh_editor_frame`'s own comment said why: capturing them would
-// have held a borrow alive across the whole enclosing function, which
-// conflicted with the idle hook's need to reborrow them. One `&mut App`
-// is not several borrows, so they are ordinary functions again, and the
-// two copies of each (diagnostics and locations had one apiece) are one
-// copy.
+// What a diagnostics or locations pane does to its own geometry and its
+// editor sibling. Plain functions over `&mut App`, which, being one
+// borrow, doesn't conflict with the idle hook.
 fn set_pane_expanded(app: &mut App, pane_id: PaneId, rows: usize) {
     if let Some((_, children, idx)) = find_parent_split_mut(&mut app.windows[app.current_window].layout, pane_id) {
         children[idx].minimized = false;
@@ -2644,8 +1958,8 @@ fn focus_editor_pane(app: &mut App, edit_frame_id: EditFrameId) {
     }
 }
 
-// Repaints the editor pane beside a diagnostics/locations pane, at
-// whatever size that pane's own expansion has left it.
+// Repaints the editor pane beside a diagnostics or locations pane at
+// the size the pane's expansion left it.
 fn refresh_editor_frame(app: &App, edit_frame_id: EditFrameId) {
     let Some(editor_pane) = editor_pane_for(app.window(), edit_frame_id) else { return };
     let Some(session) = app.edit_frames.get(&edit_frame_id) else { return };
@@ -2657,43 +1971,25 @@ fn refresh_editor_frame(app: &App, edit_frame_id: EditFrameId) {
     fileeditor::freeze_editor_frame(screen, &session.buffer, &session.vk, rect, Some(&color_overrides));
 }
 
-// The diagnostics pane's own interactive list -- dispatched from repl::
-// run's main loop whenever a pane's top frame is `Frame::Diagnostics
-// (edit_frame_id)`, the same tier as run_fg_job_frame/run_edit_frame
-// just above. Deliberately not built on bishedit::Buffer/VimKeys::
-// feed's motion machinery the way run_normal_mode_navigation is (see
-// Frame::Diagnostics's own doc comment) -- a flat list with nothing to
-// edit doesn't need vim's word/line motions, registers, or Insert mode.
-// Still constructs a bare VimKeys purely to reuse its already-correct
-// `<C-w>` chord parsing (KeyOutcome::Window -> dispatch_window_cmd, the
-// exact same call every other loop makes) and its plain Motion::Down/Up
-// parsing (so `5j`/`3k` move the selection by count too, for free) --
-// every other key is intercepted before `vk.feed`, same tier run_
-// normal_mode_navigation's own Visual-mode `y`/`d`/`Z` interception
-// already uses. Selection/expanded-detail state is purely local to this
-// call (see Frame::Diagnostics's own doc comment on why it's never
-// worth persisting) -- every (re-)entry starts fresh at row 0,
-// collapsed detail.
+// The diagnostics pane's interactive list, dispatched from `run`'s loop
+// for a `Frame::Diagnostics` top frame. Not built on `Buffer` and
+// `VimKeys` motions: a flat list needs no word motions, registers or
+// Insert mode. A bare `VimKeys` parses `<C-w>` chords (to
+// `dispatch_window_cmd`) and `j`/`k` with counts; every other key is
+// handled before `vk.feed`. Selection and detail state are local, so
+// each entry starts at row 0, collapsed.
 fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
-    // Every other loop that reads keys directly off the terminal
-    // (run_normal_mode_navigation, run_insert_mode, ...) holds one of
-    // these for its own duration -- without it the terminal is left in
-    // whatever mode the *previous* loop's own guard restored it to on
-    // return (cooked/canonical, echoing input back and line-buffering
-    // until Enter), which is not remotely usable for a `j`/`k`/`Enter`/
-    // `Space`-driven list. Silently returns (pane stays exactly as it
-    // last rendered) on the -- essentially unreachable in practice --
-    // chance this fails, same tolerance a failed read gets elsewhere.
+    // Raw mode for this loop's duration, as every key-reading loop holds:
+    // otherwise the terminal stays as the last loop's guard left it,
+    // cooked, echoing and line-buffered. On the unlikely failure, return
+    // with the pane as it was.
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
 
     let mut vk = VimKeys::new();
     let mut selected: usize = 0;
     let mut expanded: Option<usize> = None;
 
-    // Captured once, before this pane grows at all -- see
-    // diagnostics_pane_rows's own doc comment for why this can't just
-    // be recomputed from the editor's own (by-then-shrunk) rect on
-    // every later resize instead.
+    // Captured before the pane grows: see `diagnostics_pane_rows`.
     let budget = editor_pane_for(&app.windows[app.current_window], edit_frame_id)
         .map(|id| pane_rect(&app.windows[app.current_window], id, app.term_rows, app.term_cols).rows + 1)
         .unwrap_or(app.term_rows);
@@ -2713,8 +2009,7 @@ fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFram
             service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
-            // EOF/error: nothing to resume -- leave the pane exactly as
-            // it last rendered, same as every other loop's own EOF arm.
+            // EOF or an error: leave the pane as it last rendered.
             Ok(None) | Err(_) => return,
         };
 
@@ -2733,12 +2028,9 @@ fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFram
             continue;
         }
 
-        // A pane-focus-changing sibling reason to leave -- collapses
-        // back to the title row and hands focus to the editor pane this
-        // diagnostics pane belongs to, refreshing that pane's own
-        // collapsed title first so it reflects whatever's still true
-        // (only matters after `f` actually changed the count below, but
-        // cheap enough to always do).
+        // Leaving: collapse to the title row and give focus to the editor
+        // pane, refreshing this pane's title first (it matters only after
+        // `f` changed the count).
         let leave = |app: &mut App, jump: bool| {
             let sid = app.windows[app.current_window].pane(pane_id).owning_session();
             let screen = app.sessions[&sid].screen.clone();
@@ -2773,15 +2065,10 @@ fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFram
                 refresh_editor_frame(app, edit_frame_id);
                 compositor_redraw(app);
             }
-            // `f`: applies the selected item's own fix, only while its
-            // detail (and so the `[f] autofix` hint) is actually showing
-            // -- matches vim's own "an action only fires once its own
-            // hint is visible" convention nothing else in this codebase
-            // has yet, but is the obvious reading of "space shows...
-            // extra actions" from this feature's own spec. Re-diagnoses
-            // from scratch afterward (see apply_fix's own doc comment on
-            // why) and keeps the pane expanded, so applying several
-            // fixes in a row doesn't require re-entering each time.
+            // `f` applies the selected item's fix, only while its detail,
+            // with the `[f] autofix` hint, is showing. Re-diagnoses
+            // afterwards (see `apply_fix`) and stays expanded, so several
+            // fixes can follow.
             Key::Char('f') if expanded == Some(selected) => {
                 let applied = app.edit_frames.get_mut(&edit_frame_id).map(|session| {
                     let Some(d) = session.buffer.diagnostics.get(selected).cloned() else { return false };
@@ -2822,10 +2109,9 @@ fn run_diagnostics_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFram
     }
 }
 
-// One row per location: where it is, and the source line if it could be
-// read. Same shape as `render_diagnostics_list_frame` -- selected row in
-// reverse video, blank rows padded out -- so the two panes behave the
-// same under the hand.
+// One row per location: where, and the source line if readable. The
+// same shape as `render_diagnostics_list_frame` (selected row reversed,
+// blanks padded), so the two panes behave alike.
 fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize) {
     fn pad(text: &str, cols: usize) -> String {
         let mut s: String = text.chars().take(cols).collect();
@@ -2842,9 +2128,9 @@ fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize)
         out.push_str(&pad(&list.title, rect.cols));
         row = 1;
     } else {
-        // Scrolled so the selection stays visible: a list capped at
-        // MAX_LOCATIONS is routinely taller than a pane capped at half
-        // the window.
+        // Scrolled to keep the selection visible: a list up to
+        // `MAX_LOCATIONS` is often taller than a pane capped at half the
+        // window.
         let first = selected.saturating_sub(rect.rows.saturating_sub(1));
         for (i, item) in list.items.iter().enumerate().skip(first) {
             if row >= rect.rows {
@@ -2873,17 +2159,10 @@ fn render_locations_list_frame(list: &LocationList, rect: Rect, selected: usize)
     let _ = io::stdout().flush();
 }
 
-// The location pane's own interactive list -- `run_diagnostics_frame`'s
-// sibling, dispatched from the main loop the same way, and deliberately
-// the same shape: a bare `VimKeys` purely for `<C-w>` chords and
-// `j`/`k` with counts, every other key intercepted before `vk.feed`,
-// selection state local to the call.
-//
-// The one real difference is what Enter does. A diagnostic is always in
-// the buffer the pane belongs to, so selecting one just moves that
-// buffer's cursor; a location may be in any file, so selecting one can
-// have to *open* something -- which is why this takes the frame-id
-// counter its sibling does not need.
+// The location pane's list, `run_diagnostics_frame`'s sibling with the
+// same shape: a bare `VimKeys` for `<C-w>` and counted `j`/`k`, other keys
+// handled first, selection local. Enter differs: a location may be in
+// another file, so it may open one, hence the frame-id counter.
 fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     let mut vk = VimKeys::new();
@@ -2924,9 +2203,8 @@ fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
             continue;
         }
 
-        // Collapse back to the title row and hand focus to the editor
-        // pane this list belongs to -- the same exit its diagnostics
-        // sibling has.
+        // Collapse to the title row and focus the editor pane, as the
+        // diagnostics pane does.
         let collapse = |app: &mut App| {
             if let Some(list) = app.location_lists.get(&edit_frame_id) {
                 let sid = app.windows[app.current_window].pane(pane_id).owning_session();
@@ -2947,8 +2225,8 @@ fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
                 if let Some((path, line, character, encoding)) = chosen {
                     let here = app.edit_frames.get(&edit_frame_id).and_then(|s| s.buffer.path().map(|p| p.to_path_buf()));
                     if here.as_deref() == Some(path.as_path()) {
-                        // Already open: just move its cursor, the way
-                        // the diagnostics pane always does.
+                        // Already open: move its cursor, as the diagnostics
+                        // pane does.
                         if let Some(session) = app.edit_frames.get_mut(&edit_frame_id) {
                             let starts = fileeditor::line_starts_of(&session.buffer);
                             let offset = fileeditor::diagnostic_offset(&session.buffer, &starts, line, character, encoding);
@@ -2988,21 +2266,14 @@ fn run_locations_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
     }
 }
 
-// Opens `path` as a new Edit frame on the focused pane's stack, with the
-// cursor at the server position given -- the same "go look, then `:q`
-// back" shape `NavExit::OpenAt` produces for `gd`, reached from the
-// location pane instead of from the navigation loop.
+// Opens `path` as an Edit frame on the focused pane's stack with the
+// cursor at the server position: `gd`'s shape, from the location pane.
 fn open_location_frame(app: &mut App, path: &Path, line: usize, character: usize, encoding: crate::lsp::PositionEncoding) {
     open_file_frame(app, path, Some((line, character, encoding)));
 }
 
-/// `open_location_frame` without a position: the file, on the focused
-/// pane's stack, at the top.
-///
-/// `at` is a language server's own answer about where to land, which is
-/// the only thing that needs translating out of its coordinates. The
-/// opener has no such answer and wants none -- "open this file" means
-/// its first line.
+/// `open_location_frame` without a position from a server: the file at
+/// its top, as the opener wants.
 fn open_file_frame(app: &mut App, path: &Path, at: Option<(usize, usize, crate::lsp::PositionEncoding)>) {
     let pane_id = app.windows[app.current_window].focused_pane;
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
@@ -3026,56 +2297,38 @@ fn open_file_frame(app: &mut App, path: &Path, at: Option<(usize, usize, crate::
     }
 }
 
-// `e DIR`'s own browsing loop -- the terminal half of the split
-// browser.rs's module doc comment describes: that module owns the
-// listing model, the grid arithmetic and the rendering (all testable
-// without a terminal); this owns raw mode, keystrokes, and the same
-// `service_background_jobs` idle callback every other blocking loop in
-// this file already threads through, so background jobs keep draining
-// and a resize is still noticed within one poll tick while the browser
-// is what's blocking on input.
-//
-// Draws into whichever pane is focused, recomputing that pane's rect
-// every iteration (not once up front) for exactly the reason
-// run_diagnostics_frame does the same: a resize can land between two
-// keystrokes, and the very next frame has to be addressed against the
-// new rect rather than the old one.
-//
-// Restoring the pane's original content on the way out is deliberately
-// *not* this function's job -- its caller either opens editor frames
-// over the pane immediately (the ordinary outcome) or redraws it because
-// nothing was chosen, so adding a redraw here would just paint the same
-// rows twice.
-// What a browse ended with. `Nothing` covers both cancelling and an EOF
-// -- neither has anything for the caller to do.
+// How a browse ended. `Nothing` covers cancelling and EOF.
 enum BrowseOutcome {
     Nothing,
     Chosen(Vec<std::path::PathBuf>),
     ChangeDirectory(std::path::PathBuf),
 }
 
+// `e DIR`'s browsing loop: browser.rs owns the listing, layout and
+// rendering; this owns raw mode, keys and the `service_background_jobs`
+// idle hook, so jobs drain and resizes are noticed while browsing. The
+// focused pane's rect is recomputed every iteration, as a resize can
+// land between keys. Restoring the pane is the caller's: it opens frames
+// over it or redraws it.
 fn run_browse_frame(
     app: &mut App,
     start: &std::path::Path,
     can_change_directory: bool,
-    // The `gitignore` bishopt, read fresh per browse rather than once
-    // at startup -- `bishopt --set gitignore off` should take effect on
-    // the next `e .`, not on the next shell.
+    // The `gitignore` bishopt, read per browse, so `bishopt --set gitignore
+    // off` applies to the next `e .`.
     honor_gitignore: bool,
     session_id: SessionId,
 ) -> Result<BrowseOutcome, String> {
-    // Opened before raw mode is touched, so an unreadable path is an
-    // ordinary command-mode error at the colon line rather than a
-    // flicker into a browser that immediately backs out again.
+    // Opened before raw mode, so an unreadable path is an ordinary error
+    // rather than a flicker into the browser.
     let mut browser = browser::Browser::open(start)?;
     browser.set_can_change_directory(can_change_directory);
     browser.set_honor_gitignore(honor_gitignore)?;
     if let Some(session) = app.sessions.get(&session_id) {
         browser.set_colors(ui_colors(&session.shell));
     }
-    // Same reasoning run_diagnostics_frame's own guard has: whatever
-    // loop ran last restored the terminal to cooked mode on its way
-    // out, which is unusable for a key-at-a-time grid.
+    // Raw mode, as in `run_diagnostics_frame`: the last loop left the
+    // terminal cooked.
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else {
         return Err("not a terminal".to_string());
     };
@@ -3092,51 +2345,40 @@ fn run_browse_frame(
             service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
-            // EOF/error: nothing chosen, same tolerance every other
-            // loop's own EOF arm has.
+            // EOF or an error: nothing chosen.
             Ok(None) | Err(_) => break BrowseOutcome::Nothing,
         };
 
-        // `:` opens the very same command mode the editor's own Normal
-        // mode does -- not a smaller one that only knows how to quit.
-        // The browser is a modal takeover of a pane like any other, and
-        // the way out of one of those is `:q`, so that is the way out of
-        // this one. `editing: None`, since there is no buffer here: it
-        // is what makes `q`/`q!` mean "leave this frame" rather than
-        // "close a file" (see run_command_mode's own `editing` doc
-        // comment).
+        // `:` opens the same command mode the editor does, so `:q` leaves,
+        // as from any pane takeover. `editing: None`, as there's no buffer,
+        // makes `q` and `q!` leave this frame (see `run_command_mode`'s
+        // `editing`).
         if key == editor::Key::Char(':') {
-            // Raw mode belongs to the colon line while it runs, and
-            // comes back to the browser after.
+            // Raw mode is the colon line's while it runs.
             let outcome = handle_command_mode(
                 app,
                 session_id,
                 None,
                 None,
-                // Nothing maps into the browser's colon line, so there is
-                // never a partly-delivered right-hand side to finish.
+                // Nothing maps into the browser's colon line.
                 Vec::new(),
-                // The browser has no buffer to substitute in, so no
-                // search of its own for `:s//` to reach back to.
+                // No buffer, so no search for `:s//` to reach back to.
                 "",
             );
-            // Whatever `:bishopt` just changed has to be picked up
-            // before the next redraw rather than on the next `e .` --
-            // the same reason the editor's own `:` arm re-reads its view
-            // options right here.
+            // Pick up what `:bishopt` changed before the next redraw, as the
+            // editor's `:` arm does.
             let honor = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("gitignore"));
             if let Err(e) = browser.set_honor_gitignore(honor) {
                 browser.set_message(e);
             }
             match outcome {
                 CommandModeOutcome::Quit => break BrowseOutcome::Nothing,
-                // A command that ran says so in the status row, where
-                // the browser already shows what it has to say.
+                // A command's output goes in the status row, where the
+                // browser speaks.
                 CommandModeOutcome::Ran { output, .. } if !output.trim().is_empty() => {
                     browser.set_message(output.trim().replace('\n', " "));
                 }
-                // `:normal` has no Normal mode to run in from the
-                // browser -- there is no buffer here to run it against.
+                // `:normal` has no buffer to run against here.
                 CommandModeOutcome::Ran { .. }
                 | CommandModeOutcome::Cancelled
                 | CommandModeOutcome::Action(_)
@@ -3145,9 +2387,8 @@ fn run_browse_frame(
                 | CommandModeOutcome::ConfirmSubstitute(_)
                 | CommandModeOutcome::NoHighlight => {}
             }
-            // The colon line drew over the global status row and
-            // whatever else; the next iteration repaints the browser,
-            // but the pane behind it has to come back first.
+            // The colon line drew over the status row; the pane behind the
+            // browser must come back before it repaints.
             if app.sinks_are_grid {
                 compositor_redraw(app);
             }
@@ -3162,27 +2403,18 @@ fn run_browse_frame(
         }
     };
 
-    // `render` hides the real cursor for every frame it draws (there's
-    // no text insertion point in a grid), so put it back before handing
-    // the pane to a caller that expects to place it itself. The hint
-    // line goes with it: that's the terminal's shared global status row,
-    // which lives outside every pane's rect and so is the one thing a
-    // caller's `compositor_redraw` cannot clean up on its own -- found
-    // via pty, where cancelling a browse left "esc back" sitting above a
-    // perfectly ordinary shell prompt.
+    // `render` hides the cursor (no insertion point in a grid), so show it
+    // again for the caller. The hint line is on the global status row,
+    // outside every pane, which `compositor_redraw` can't clean, so it's
+    // erased here.
     print!("\x1b[?25h{}{}", fileeditor::CURSOR_SHAPE_RESET, erase_global_status_row(app.term_rows));
     let _ = io::stdout().flush();
     Ok(outcome)
 }
 
-// Renders the diagnostics pane's own expanded list directly to the real
-// terminal -- same "print straight to the terminal while this pane is
-// the one actually focused/driven" model run_normal_mode_navigation's
-// own render_normal_mode_frame uses (see Frame's doc comment on why
-// only the focused pane ever draws live). Hides the real cursor
-// (`\x1b[?25l`) rather than parking it somewhere arbitrary -- unlike
-// every other interactive pane in this codebase, there's no text
-// insertion point here for a blinking cursor to usefully mark.
+// Draws the diagnostics pane's expanded list straight to the terminal
+// while it's the driven pane, as `render_normal_mode_frame` does. The
+// cursor is hidden: there's no insertion point here.
 fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, expanded: Option<usize>) {
     fn pad(text: &str, cols: usize) -> String {
         let mut s: String = text.chars().take(cols).collect();
@@ -3240,27 +2472,15 @@ fn render_diagnostics_list_frame(buf: &TextBuffer, rect: Rect, selected: usize, 
     let _ = io::stdout().flush();
 }
 
-// The `Frame::DebugRun` sibling's own idle view -- reached whenever the
-// user navigates focus onto it directly (`<C-w>j`, or clicking its own
-// collapsed title bar) while nothing is actually running (a real run
-// drives the terminal itself, from inside `PauseState::on_statement`/
-// repl.rs's own "dbg run"/"continue"/"next"/"step" handling -- see
-// debugger.rs's own top-of-file doc comment for why that can't go
-// through this function instead). There's nothing to select/expand here
-// the way `run_diagnostics_frame` has -- just a status line and
-// `<C-w>`/Escape/`q` to leave, so this is much smaller than that
-// function despite the shared shape.
+// The `Frame::DebugRun` pane's idle view, when focused while nothing
+// runs (a run drives the terminal itself; see debugger.rs). Just a
+// status line and `<C-w>`, Escape or `q` to leave.
 fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameId) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
     let mut vk = VimKeys::new();
 
-    // Same reasoning run_diagnostics_frame's own identical call has:
-    // whichever pane this one's *sibling* is (the editor pane) has never
-    // had this pane's own rect painted around it before now -- without
-    // this, only the rows this loop's own writes below touch would ever
-    // update, leaving the editor pane's last content sitting there at
-    // its *previous* (unshrunk) size until something else happens to
-    // trigger a full repaint.
+    // As in `run_diagnostics_frame`: repaint everything, or the editor pane
+    // keeps its old, larger content.
     compositor_redraw(app);
 
     loop {
@@ -3300,25 +2520,12 @@ fn run_debug_run_frame(app: &mut App, pane_id: PaneId, edit_frame_id: EditFrameI
     }
 }
 
-// Performs a `window`-family action against the real session/window
-// state repl.rs owns directly (see ExecResult::Window's doc comment in
-// exec.rs for why this can't live inside Shell itself). Redraws the
-// compositor afterward for every action, including the rejected-close
-// case (its error message needs to actually become visible once
-// promoted, same as any other captured output).
-// One-time transition, shared by two independent triggers: every
-// window-family command (via apply_window_action -- see its own former
-// comment, preserved in spirit here) and, as of bishedit, Ctrl+G
-// entering normal-mode navigation (run_normal_mode_navigation), which
-// bypasses the command-dispatch path entirely and so has to trigger this
-// itself rather than relying on exec.rs's run_window having already done
-// it. `promote_if_needed` (the actual alt-screen switch) is idempotent
-// and shared (`Rc<Cell<bool>>`) across every session forked from the same
-// root, so calling it here even when exec.rs already did is harmless --
-// covers both callers with one unconditional call rather than needing to
-// know which case this is. The sink flip (every session's shell writing
-// into its own grid instead of straight to the real terminal) still only
-// happens once, guarded by `sinks_are_grid` same as before.
+// The one-time switch to promoted mode, from two places: every window
+// command (`apply_window_action`) and Ctrl+G's Normal mode, which doesn't
+// go through command dispatch. `promote_if_needed` (the alternate
+// screen) is idempotent and shared across sessions, so calling it again
+// is harmless; the switch of every session's sink to its grid happens
+// once, guarded by `sinks_are_grid`.
 fn ensure_promoted(sessions: &mut HashMap<SessionId, SessionState>, sinks_are_grid: &mut bool) {
     if *sinks_are_grid {
         return;
@@ -3333,22 +2540,12 @@ fn ensure_promoted(sessions: &mut HashMap<SessionId, SessionState>, sinks_are_gr
     *sinks_are_grid = true;
 }
 
-// Freezes the currently-focused window's idle prompt into its own grid
-// (see freeze_idle_prompt's own doc comment) if it's genuinely idle (top
-// frame a Session, not a still-running detached job) -- same guard
-// split_focused_pane/focus_pane_direction already use for exactly this
-// before they move focus elsewhere. Called unconditionally up front by
-// apply_window_action (and by run_normal_mode_navigation's own
-// GotoFirstWindow/GotoLastWindow handling, which doesn't go through
-// apply_window_action at all -- see its own call site), since *any*
-// window action might be the one that switches focus away: without this,
-// a window's own live prompt -- only ever drawn straight to the real
-// terminal by editor::read_line, never captured anywhere on its own --
-// is lost the moment focus moves away and something later navigates
-// back before typing anything new there (a fresh command's own explicit
-// prompt+line grid-feed self-heals the display regardless, which is why
-// this went unnoticed until normal mode's own `<C-w>gg`/`<C-w>G` made it
-// possible to land on a window and *not* immediately type something).
+// Freezes the focused window's idle prompt into its grid
+// (`freeze_idle_prompt`) if it's idle (a Session on top, not a running
+// job), as `split_focused_pane` and `focus_pane_direction` do before
+// moving focus. `apply_window_action` and Normal mode's `<C-w>gg`/`<C-w>G`
+// call it first, since any action may move focus, and a prompt drawn
+// only on the real terminal would otherwise be lost when coming back.
 fn freeze_focused_idle_prompt(app: &mut App) {
     if matches!(app.windows[app.current_window].stack().last(), Some(Frame::Session(_))) {
         let sid = app.windows[app.current_window].owning_session();
@@ -3356,18 +2553,10 @@ fn freeze_focused_idle_prompt(app: &mut App) {
     }
 }
 
-// Hands a `window new <cmd>` / `window split <cmd>` command to the
-// session that was just created for it. Nothing happens here beyond
-// queueing: the command runs at that session's next prompt, through the
-// ordinary typed-a-line path -- see App::pending_input.
-// The `::bish window` script that rebuilds every window as it stands
-// now: its name, its pane tree, and each pane's directory.
-//
-// Every window is re-created rather than the first one being reused, so
-// restoring adds to what is there rather than rearranging it -- one
-// spare window is a much smaller surprise than a layout silently
-// overwritten. Sizes are deliberately absent: see
-// WindowEntry::rebuild_commands.
+// The `::bish window` script that rebuilds every window as it stands:
+// name, pane tree, each pane's directory. Every window is re-created,
+// not the first reused, so restoring adds rather than overwriting a
+// layout. No sizes (see `WindowEntry::rebuild_commands`).
 fn layout_script(app: &App) -> String {
     use crate::serialize::quote_literal;
     let mut out = String::from("# A bish layout. `::bish window restore <this file>` rebuilds it.\n");
@@ -3381,32 +2570,37 @@ fn layout_script(app: &App) -> String {
             out.push_str(&command);
             out.push('\n');
         }
-        // Directories last, once every pane exists: a pane inherits the
-        // cwd of the one it was split from, which is rarely the one it
-        // had.
+        // Directories last, once every pane exists: a pane inherits the cwd
+        // of the one it was split from.
         for (position, pane) in window.panes_in_layout_order().iter().enumerate() {
             let sid = window.pane(*pane).owning_session();
             let cwd = app.sessions[&sid].shell.cwd.to_string_lossy().to_string();
             out.push_str(&format!("::bish window focus {}\n", position + 1));
             out.push_str(&format!("cd {}\n", quote_literal(&cwd)));
         }
-        // And leave this window on the pane that had focus.
+        // Leave this window on the pane that had focus.
         out.push_str(&format!("::bish window focus {}\n", window.focused_position()));
     }
-    // Finally, the window that was in front -- by name, the only handle
-    // that still means the same thing in a different process.
+    // Finally the window in front, by name, the only handle meaning the
+    // same in another process.
     if let Some(name) = app.windows.get(app.current_window).and_then(|w| w.name.as_ref()) {
         out.push_str(&format!("\n::bish window select {}\n", quote_literal(name)));
     }
     out
 }
 
+// Hands a `window new <cmd>` or `window split <cmd>` command to the new
+// session, to run at its next prompt like a typed line (see
+// `App::pending_input`).
 fn queue_pending_input(app: &mut App, command: Option<String>) {
     if let Some(command) = command {
         app.pending_input.push_back(command);
     }
 }
 
+// Performs a window action on the session and window state repl.rs owns
+// (see `ExecResult::Window` for why `Shell` can't). Redraws afterwards for
+// every action, a refused close included, so its message shows.
 fn apply_window_action(app: &mut App, action: WindowAction) {
     ensure_promoted(&mut app.sessions, &mut app.sinks_are_grid);
     freeze_focused_idle_prompt(app);
@@ -3422,8 +2616,8 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             let parent_id = app.windows[app.current_window].owning_session();
             let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
             let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
-            // The same table every other session sees -- one per process, like
-            // `jobs`, so a server started for one pane serves them all.
+            // The same table every session sees, so a server started for
+            // one pane serves all.
             let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
             install_service_table(&mut child_shell, &child_lsp);
             install_history(&mut child_shell, &child_history);
@@ -3446,11 +2640,9 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                     lsp_inlay_applied: None,
                     buffer: String::new(),
                     buffer_unrecorded: false,
-                    // A fork of the parent's own History (see its doc
-                    // comment): the new window/pane's Up/Down includes
-                    // everything the parent could already see, but from
-                    // here on diverges independently -- neither side's
-                    // later commands leak into the other's.
+                    // A fork of the parent's `History`: the new pane's
+                    // Up/Down sees what the parent could, then the two
+                    // diverge.
                     history: Rc::clone(&child_history),
                     screen,
                     warned_stopped_jobs: false,
@@ -3467,28 +2659,21 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             app.current_window = app.windows.len() - 1;
             queue_pending_input(app, command);
         }
-        // The three that make a workflow scriptable: something to call a
-        // window, a way to see what is there, and a way to ask for one
-        // back -- see WindowAction's own doc comments.
+        // Naming a window, listing them and selecting one: what makes a
+        // workflow scriptable (see `WindowAction`).
         WindowAction::Rename(name) => app.windows[app.current_window].name = name,
-        // `select` is resolved in the builtin against Shell::app.windows, so
-        // by the time one reaches here the index is known good -- a miss
-        // never gets this far, it is an ordinary failing command.
+        // `select` is checked in the builtin against the windows, so the
+        // index is good here; a miss is an ordinary failing command.
         WindowAction::Select(index) => app.current_window = index.min(app.windows.len().saturating_sub(1)),
         WindowAction::Close => {
             if app.windows[app.current_window].stack().len() > 1 {
-                // Popping a frame off the focused pane's own stack, not
-                // closing anything -- always fine regardless of how
-                // many app.windows/panes exist, and never orphans a session
-                // since what's revealed underneath was already a live
-                // frame.
+                // Pops a frame off the focused pane's stack: always fine,
+                // and orphans nothing, as what's revealed was already live.
                 app.windows[app.current_window].stack_mut().pop();
             } else if app.windows[app.current_window].panes.len() > 1 {
-                // The focused pane's stack is down to just its own
-                // session with nothing else to reveal -- but it's one
-                // of several panes in a split window, so close just
-                // this pane (collapsing the split) rather than falling
-                // through to "close the whole window".
+                // The focused pane is down to its session, but the window
+                // has other panes: close just this pane rather than the
+                // window.
                 close_focused_pane(&mut app.windows[app.current_window]);
                 close_orphaned_sessions(&mut app.sessions, &app.windows);
             } else if app.windows.len() == 1 {
@@ -3509,31 +2694,25 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             let cur_sid = app.windows[app.current_window].owning_session();
             match target_frame {
                 Some(frame @ Frame::Session(_)) => app.windows[app.current_window].stack_mut().push(frame),
-                // A running job is a one-place-at-a-time resource (see
-                // Frame's doc comment) -- unlike a session, it can't
-                // legitimately be shown in two app.windows at once.
+                // A running job can be in one place at a time (see
+                // `Frame`), unlike a session.
                 Some(Frame::Job(_)) => {
                     app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a job, not a session\n");
                 }
-                // Same one-place-at-a-time reasoning as Job just above --
-                // an open editor session can't be shown in two app.windows
-                // simultaneously either.
+                // Likewise an open editor session.
                 Some(Frame::Edit(_) | Frame::Hex(_)) => {
                     app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running an editor, not a session\n");
                 }
-                // Same reasoning again -- a diagnostics pane is scoped
-                // to the one Edit frame's own pane it sits below, not a
-                // session that could sensibly show up somewhere else.
+                // Likewise a diagnostics pane, which belongs below one Edit
+                // frame's pane.
                 Some(Frame::Diagnostics(_)) => {
                     app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing diagnostics, not a session\n");
                 }
-                // Same reasoning again -- a location list belongs to the
-                // one Edit frame's pane it sits below.
+                // Likewise a location list.
                 Some(Frame::Locations(_)) => {
                     app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is showing a location list, not a session\n");
                 }
-                // Same reasoning again -- the debug-run pane is scoped to
-                // the one Edit frame's own pane it sits below too.
+                // Likewise the debug-run pane.
                 Some(Frame::DebugRun(_)) => {
                     app.sessions[&cur_sid].shell.sink_err("bish: window: fg: that window is running a debugged script, not a session\n");
                 }
@@ -3568,10 +2747,9 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             let sid = app.windows[app.current_window].owning_session();
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    // Queued rather than run here: every line is an
-                    // ordinary command, and several of them move focus
-                    // to the pane the previous line made. See
-                    // App::pending_input.
+                    // Queued, not run here: each line is an ordinary
+                    // command, and several move focus to the pane the
+                    // previous one made (`App::pending_input`).
                     for line in text.lines() {
                         let line = line.trim();
                         if !line.is_empty() && !line.starts_with('#') {
@@ -3588,9 +2766,8 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
             let to = match where_to {
                 WindowMove::Left => from.saturating_sub(1),
                 WindowMove::Right => (from + 1).min(last),
-                // Clamped rather than refused: "put it at the end" is
-                // most naturally typed as a number larger than the tab
-                // bar, and there is only one thing it can mean.
+                // Clamped rather than refused: a number past the tab bar's
+                // end means the end.
                 WindowMove::To(position) => (position - 1).min(last),
             };
             if to != from {
@@ -3620,8 +2797,7 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                     app.windows.push(WindowEntry::from_pane(wid, pane));
                     app.current_window = app.windows.len() - 1;
                 }
-                // The pane already has a window all to itself, which is
-                // what breaking it out would give it.
+                // The pane already has a window to itself.
                 None => {
                     let sid = app.windows[app.current_window].owning_session();
                     app.sessions[&sid].shell.sink_err(
@@ -3646,10 +2822,9 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                     );
                 }
                 Some(index) => {
-                    // A window down to its last pane goes away with it:
-                    // `detach_pane` refuses there (a window needs a
-                    // pane), and an empty window left behind in the tab
-                    // bar is not what "join" means.
+                    // A window down to its last pane goes with it:
+                    // `detach_pane` refuses there (a window needs a pane),
+                    // and leaving an empty window isn't what "join" means.
                     let pane = match app.windows[index].panes.len() {
                         1 => {
                             let mut emptied = app.windows.remove(index);
@@ -3669,10 +2844,8 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
                 }
             }
         }
-        // Everything from here down either moves focus or reshapes the
-        // layout, and a zoom hides both: whatever it did would happen
-        // underneath the one pane on screen, invisibly. So each of them
-        // puts the split back first, which is what tmux does too.
+        // Everything below moves focus or reshapes the layout, which a zoom
+        // would hide, so each restores the split first.
         WindowAction::Split { horizontal, command } => {
             app.windows[app.current_window].unzoom();
             split_focused_pane(app, horizontal);
@@ -3706,20 +2879,14 @@ fn apply_window_action(app: &mut App, action: WindowAction) {
     compositor_redraw(app);
 }
 
-// Creates a new pane in the current window by splitting the focused one
-// in two: the new half holds a freshly cloned session (the same
-// session-cloning primitive `window new` uses -- see WindowAction::New
-// above) and takes focus, matching tmux's own "split creates a new
-// shell and focuses it" convention. See PaneLayout's doc comment for
-// how `horizontal` maps to the divider's orientation, and
-// insert_sibling for why repeated same-direction splits stay flat (N
-// evenly sized panes) rather than progressively halving.
+// Splits the focused pane: the new half gets a cloned session (as
+// `window new` makes) and focus. See `PaneLayout` for `horizontal`, and
+// `insert_sibling` for why repeated splits in one direction stay flat.
 fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
     let parent_id = app.windows[app.current_window].owning_session();
     let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
-    // The same table every other session sees -- one per process, like
-    // `jobs`, so a server started for one pane serves them all.
+    // The same table every session sees.
     let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
@@ -3742,8 +2909,7 @@ fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
             lsp_inlay_applied: None,
             buffer: String::new(),
             buffer_unrecorded: false,
-            // See WindowAction::New's own comment on forking the
-            // parent's History instead of starting from "now".
+            // A fork of the parent's `History`, as in `WindowAction::New`.
             history: Rc::clone(&child_history),
             screen,
             warned_stopped_jobs: false,
@@ -3756,16 +2922,11 @@ fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
     let window = &mut app.windows[app.current_window];
     let new_pane_id = window.add_pane(vec![Frame::Session(sid)], horizontal, false);
 
-    // The pane being split is about to lose focus to its new sibling --
-    // freeze its current idle prompt into its own grid first, or it'll
-    // render blank (see freeze_idle_prompt's own doc comment). Only
-    // when it's genuinely idle at its own prompt (top frame a Session):
-    // splitting can also be reached right after detaching from a job
-    // (M10c's Ctrl+G drops into command mode without popping the
-    // Frame::Job -- see run_fg_job_frame's Detached arm), and that
-    // pane's grid is already being live-written by the still-running
-    // job (service_background_jobs) -- freezing a prompt there would
-    // splice a bogus prompt line into the middle of its real output.
+    // The split pane loses focus to its new sibling, so freeze its idle
+    // prompt into its grid first (`freeze_idle_prompt`). Only at an idle
+    // prompt (a Session on top): after detaching from a job, the pane's grid
+    // is being written by the running job, and a frozen prompt would land
+    // in its output.
     if matches!(app.windows[app.current_window].stack().last(), Some(Frame::Session(_))) {
         freeze_idle_prompt(app.sessions.get_mut(&parent_id).unwrap());
     }
@@ -3773,24 +2934,16 @@ fn split_focused_pane(app: &mut App, horizontal: bool) -> SessionId {
     sid
 }
 
-// `:diag`'s own sibling to split_focused_pane, just above -- same
-// "fork a session purely to give the new pane a screen to composite
-// from" pattern (see Frame's own doc comment on why every pane needs
-// one), but the new pane is never a usable shell: `Frame::Diagnostics
-// (edit_frame_id)` goes straight on top of its `Frame::Session`, it
-// starts `minimized` (see SplitChild's own doc comment), and -- unlike
-// an ordinary `<C-w>s`/`<C-w>v` split -- focus stays right where it was
-// (running `:diag` shouldn't yank you out of the file you're editing).
-// Always a horizontal split (the pane goes at the bottom, per the
-// feature's own name); `focused_id` is the *editor's* own pane, i.e.
-// whichever pane is currently focused when `:diag` runs (it's the one
-// driving this command in the first place).
+// `:diag`'s sibling to `split_focused_pane`: a session forked only so the
+// pane has a screen to composite (see `Frame`), with
+// `Frame::Diagnostics` on top, starting minimized (`SplitChild`), focus
+// staying in the file. Always a horizontal split, the pane at the
+// bottom.
 fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
     let parent_id = app.windows[app.current_window].owning_session();
     let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
-    // The same table every other session sees -- one per process, like
-    // `jobs`, so a server started for one pane serves them all.
+    // The same table every session sees.
     let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
@@ -3828,11 +2981,8 @@ fn split_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
     new_pane_id
 }
 
-// The location-list sibling of `split_diagnostics_pane` just above.
-// Same shape and the same reasoning throughout: a session forked purely
-// to give the new pane a screen to composite from, always horizontal,
-// starts minimized, and does not move focus -- asking where something
-// is used should not take you out of the file.
+// The location list's counterpart: the same shape, horizontal,
+// minimized, focus left in the file.
 fn split_locations_pane(app: &mut App, edit_frame_id: EditFrameId) -> PaneId {
     let parent_id = app.windows[app.current_window].owning_session();
     let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
@@ -3876,9 +3026,8 @@ fn locations_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Locations(edit_frame_id))).map(|p| p.id)
 }
 
-// The collapsed title row, exactly `render_diagnostics_title`'s shape
-// -- a short reverse-video pill set into an otherwise ordinary dashed
-// divider -- so the two panes read as the same kind of thing.
+// The collapsed title row, shaped as `render_diagnostics_title`'s (a
+// reverse-video pill in a dashed divider), so the two panes look alike.
 fn render_locations_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, title: &str) {
     let pill: String = format!(" {title} ").chars().take(cols).collect();
     let pill_len = pill.chars().count();
@@ -3893,9 +3042,8 @@ fn render_locations_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, titl
     screen.borrow_mut().feed(framed.as_bytes());
 }
 
-// Creates the location sibling if there isn't one, records the list,
-// and repaints -- called from `gr`, while the buffer it is about is
-// still the caller's own local.
+// Creates the location pane if needed, records the list and repaints,
+// from `gr`, while its buffer is still the caller's.
 fn sync_locations_pane(app: &mut App, edit_frame_id: EditFrameId, list: LocationList) {
     let pane_id = locations_sibling(&app.windows[app.current_window], edit_frame_id).unwrap_or_else(|| split_locations_pane(app, edit_frame_id));
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
@@ -3905,33 +3053,22 @@ fn sync_locations_pane(app: &mut App, edit_frame_id: EditFrameId, list: Location
     compositor_redraw(app);
 }
 
-// The diagnostics sibling pane already sitting below `edit_frame_id`'s
-// own editor pane, if `:diag` has created one -- `None` before the
-// first `:diag` run, or after `:diag clear`/the file closing removed
-// it.
+// The `:diag` pane below `edit_frame_id`'s editor pane, if there is one.
 fn diagnostics_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::Diagnostics(edit_frame_id))).map(|p| p.id)
 }
 
-// `:dbg`'s own sibling to split_diagnostics_pane, just above -- same
-// "fork a session purely to give the new pane a screen to composite
-// from" pattern, same "always horizontal, starts minimized, doesn't
-// move focus" shape (attaching a debug session shouldn't yank you out
-// of the file either). The new pane's own `SessionState.shell` is,
-// like diagnostics' own, never actually used to run anything -- it
-// exists only so this pane has a `Frame::Session` underneath
-// `DebugRun` to sit on, and a screen to composite from. The *debugged
-// script's own* Shell lives separately, in the `debugger::DebugSession`
-// this frame's own `EditFrameId` indexes into (`debug_frames`), set to
-// render into this exact same screen (`Shell::set_sink_grid`) so the
-// script's real output actually shows up in this pane the same way any
-// ordinary session's own live output does -- no bespoke ANSI-building.
+// `:dbg`'s counterpart: horizontal, minimized, focus left in the file.
+// Its session runs nothing; it exists so `DebugRun` has a
+// `Frame::Session` beneath and a screen. The debugged script's `Shell`
+// is in the `debugger::DebugSession` in `debug_frames`, rendering into
+// this same screen (`Shell::set_sink_grid`), so its output shows as any
+// session's does.
 fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, Rc<RefCell<vt100::Screen>>) {
     let parent_id = app.windows[app.current_window].owning_session();
     let child_history = Rc::new(RefCell::new(app.sessions[&parent_id].history.borrow().fork()));
     let mut child_shell = app.sessions[&parent_id].shell.new_virtual_child();
-    // The same table every other session sees -- one per process, like
-    // `jobs`, so a server started for one pane serves them all.
+    // The same table every session sees.
     let child_lsp = Rc::clone(&app.sessions[&parent_id].lsp);
     install_service_table(&mut child_shell, &child_lsp);
     install_history(&mut child_shell, &child_history);
@@ -3969,48 +3106,35 @@ fn split_debug_run_pane(app: &mut App, edit_frame_id: EditFrameId) -> (PaneId, R
     (new_pane_id, screen)
 }
 
-// The debug-run sibling pane already sitting below `edit_frame_id`'s
-// own editor pane, if `:dbg` has attached a session -- `None` before
-// the first `:dbg` run, or after `:dbg quit`/the file closing removed
-// it.
-// A debug session driven over the Debug Adapter Protocol -- the other
-// kind of `:dbg`, for a program in a language bish knows nothing about.
-//
-// `debugger::DebugSession` is the bish-script one and stays what it is:
-// it runs the script *in this process* so that breakpoints are visible
-// inside subshells, and a pause blocks in place inside the run. This
-// one cannot work that way and must not: the adapter is a subprocess
-// that sends events whenever it likes, so the session is polled from
-// the editor's own idle tick (`sync_debug_adapter`) and the editor
-// stays live the whole time. Stopping is something that *arrives*, not
-// something that blocks.
+// A debug session over the Debug Adapter Protocol, for a program in a
+// language bish doesn't know. `debugger::DebugSession` runs a bish script
+// in this process, so breakpoints work in subshells and a pause blocks
+// in place. An adapter is a subprocess sending events when it likes, so
+// this one is polled from the editor's idle tick (`sync_debug_adapter`)
+// and the editor stays live; a stop arrives rather than blocks.
 struct DapFrame {
     session: crate::dapclient::Session,
-    /// What is being debugged, for the status line -- the adapter takes
-    /// a program, not the source file being looked at.
+    /// What's debugged, for the status line: the adapter takes a program,
+    /// not the source file shown.
     program: String,
-    /// The thread the last stop was on, which every step command needs
-    /// and which only a `stopped` event can say.
+    /// The thread of the last stop, which every step needs and only a
+    /// `stopped` event gives.
     thread: Option<i64>,
     /// The stack as of the last stop, innermost first. Empty while
     /// running.
     frames: Vec<crate::dap::StackFrame>,
-    /// The `stackTrace` request whose answer is still coming, so the
-    /// idle tick knows to look for it.
+    /// The pending `stackTrace` request, for the idle tick to look for.
     awaiting_stack: Option<i64>,
-    /// A `print`/`locals` answer being waited on, and what to label it
-    /// with when it lands.
+    /// A pending `print`/`locals` answer and its label.
     awaiting_answer: Option<(i64, String)>,
-    /// Set when a stop has been seen but the cursor has not been moved
-    /// to it yet -- the move happens once the stack arrives, since only
-    /// that says which line.
+    /// A stop seen but the cursor not yet moved: that waits for the stack,
+    /// which gives the line.
     landing: bool,
 }
 
 impl DapFrame {
-    /// The frame the user is looking at, which is the innermost one.
-    /// Everything that takes a `frameId` -- `scopes`, `evaluate` --
-    /// means this one.
+    /// The frame being looked at, the innermost; what `scopes` and `evaluate`
+    /// mean by `frameId`.
     fn current_frame(&self) -> Option<i64> {
         self.frames.first().map(|f| f.id)
     }
@@ -4033,21 +3157,12 @@ impl DapFrame {
     }
 }
 
-/// `[--adapter=COMMAND] PROGRAM` -- the arguments `:dbg launch` takes.
-///
-/// `None` when there is no program, which is the only thing that is
-/// genuinely required: an adapter has a default for the languages that
-/// have one, and a program does not.
-///
-/// **The program is the last word**, and an `--adapter=` runs from
-/// where it starts to just before it. That rule exists because an
-/// adapter is a command *line* and not a word -- `gdb -i=dap` is two,
-/// `lldb-dap --port 0` is three -- and any rule that stopped at the
-/// first space would make the commonest adapter unspellable.
-///
-/// Quoting is deliberately not implemented: a path with a space in it
-/// would need it, and this says so rather than pretending, because a
-/// half-working quote is worse than none.
+/// `[--adapter=COMMAND] PROGRAM`, `:dbg launch`'s arguments. `None` with no
+/// program, the only requirement (adapters have defaults). The program
+/// is the last word and an `--adapter=` runs up to it, since an adapter
+/// is a command line (`gdb -i=dap`, `lldb-dap --port 0`). No quoting: a
+/// path with a space can't be given, and a half-working quote would be
+/// worse.
 fn parse_launch_arguments(rest: &str) -> Option<(Option<Vec<String>>, String)> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let (program, before) = words.split_last()?;
@@ -4061,22 +3176,12 @@ fn parse_launch_arguments(rest: &str) -> Option<(Option<Vec<String>>, String)> {
     Some((adapter, program.to_string()))
 }
 
-/// The adapter to run for a language, when the user did not name one.
-///
-/// Deliberately tiny, and deliberately not a configuration mechanism
-/// yet: `gdb` has spoken this protocol since version 14, it is on
-/// almost every machine that has a compiler, and it debugs every
-/// language on this list. Anything else is named on the command line
-/// (`:dbg launch --adapter=... PROGRAM`), which is what the registry
-/// would generalise once it is clear what people actually type.
-///
-/// **Go is not on the list, and that is the interesting entry.** It
-/// was, briefly, because gdb will load a Go binary -- but gdb does not
-/// understand goroutines, so what it shows of a running Go program is
-/// misleading rather than merely incomplete. Delve is the Go debugger
-/// and speaks this protocol itself; its exact invocation is not
-/// guessed at here, because a default nobody has run is worse than no
-/// default at all. `--adapter=` names it.
+/// The adapter for a language when none was named. Deliberately small:
+/// `gdb` has spoken this protocol since version 14, is on most machines
+/// with a compiler, and debugs every language listed; anything else is
+/// `--adapter=`. Go isn't listed: gdb loads a Go binary but doesn't
+/// understand goroutines, so its view is misleading. Delve speaks the
+/// protocol, but its invocation isn't guessed; `--adapter=` names it.
 fn default_debug_adapter(language: &str) -> Option<Vec<String>> {
     match language {
         "c" | "cpp" | "c++" | "rust" | "zig" => Some(vec!["gdb".to_string(), "-i=dap".to_string()]),
@@ -4084,14 +3189,15 @@ fn default_debug_adapter(language: &str) -> Option<Vec<String>> {
     }
 }
 
+// The `:dbg` pane below `edit_frame_id`'s editor pane, if a session is
+// attached.
 fn debug_run_sibling(window: &WindowEntry, edit_frame_id: EditFrameId) -> Option<PaneId> {
     window.panes.iter().find(|p| p.stack.last() == Some(&Frame::DebugRun(edit_frame_id))).map(|p| p.id)
 }
 
-// The debug-run pane's own 1-row collapsed title, same "dashes + reverse-
-// video pill + dashes" convention render_diagnostics_title uses -- shown
-// while idle (not actually running/paused, which draws directly instead,
-// see PauseState::render's own doc comment).
+// The debug-run pane's collapsed title, the dashes and pill of
+// `render_diagnostics_title`, shown while idle (running or paused draws
+// directly; see `PauseState::render`).
 fn render_debug_run_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, status: &str) {
     let pill: String = format!(" dbg: {status} ").chars().take(cols).collect();
     let pill_len = pill.chars().count();
@@ -4106,20 +3212,10 @@ fn render_debug_run_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, stat
     screen.borrow_mut().feed(framed.as_bytes());
 }
 
-// The diagnostics pane's own 1-row title, in reverse video (matching
-// the tab bar's own convention, tab_bar_line) -- fed directly into its
-// session's grid via feed(), the same mechanism freeze_editor_frame/
-// freeze_idle_prompt already use to bake static content into a pane's
-// grid outside of anything actually being "typed". Left-aligned; the
-// rest of the row is left blank (reverse video still fills it visually
-// once composited, same as how render_row already pads a styled run).
-// The whole point of `minimized` (see SplitChild's own doc comment):
-// this pane's one row *is* the divider between it and the editor pane
-// above it, styled to read as one -- a short reverse-video "pill"
-// holding the title, set into an otherwise ordinary dashed divider
-// line, not a full-width bar filling the entire row (that read as its
-// own separate content line sitting *below* a real, plain divider,
-// exactly the "title shown as a separate line" this replaces).
+// The diagnostics pane's one-row title, fed into its grid as
+// `freeze_editor_frame` does: a reverse-video pill holding the title in
+// an otherwise ordinary dashed divider, so the minimized pane's row is
+// the divider below the editor (see `SplitChild`).
 fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, diagnostics: &[lint::Diagnostic]) {
     let text = match diagnostics.len() {
         0 => "No problems found".to_string(),
@@ -4139,12 +3235,9 @@ fn render_diagnostics_title(screen: &Rc<RefCell<vt100::Screen>>, cols: usize, di
     screen.borrow_mut().feed(framed.as_bytes());
 }
 
-// Creates the diagnostics sibling if `:diag` hasn't already (via
-// split_diagnostics_pane), then (re)writes its collapsed title and
-// repaints -- called by `:diag`'s own handler right after it recomputes
-// `tb.diagnostics`, while that buffer is still this function's own
-// caller's local (see this module's own doc comment on why that's the
-// only time this pane's content can be synced at all).
+// Creates the diagnostics pane if needed (`split_diagnostics_pane`),
+// rewrites its title and repaints, from `:diag` right after it computes
+// `tb.diagnostics`, while that buffer is the caller's.
 fn sync_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId, diagnostics: &[lint::Diagnostic]) {
     let pane_id = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id).unwrap_or_else(|| split_diagnostics_pane(app, edit_frame_id));
     let rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
@@ -4153,15 +3246,10 @@ fn sync_diagnostics_pane(app: &mut App, edit_frame_id: EditFrameId, diagnostics:
     compositor_redraw(app);
 }
 
-// Repaints the diagnostics pane's own collapsed title for the focused
-// editor pane, if one is open.
-//
-// Unlike `sync_diagnostics_pane` this never *creates* the pane: it is
-// called from the idle path, where a server publication arriving is not
-// a reason to split the window open. It exists because the title says
-// how many problems there are, and until this existed that count was
-// only ever as fresh as the last `:diag` -- a server fixing every error
-// left "3 problems" on screen indefinitely.
+// Repaints the diagnostics pane's title for the focused editor pane, if
+// one is open, never creating it: called on the idle path, where a
+// server publication isn't a reason to split. It keeps the problem count
+// current as the server reports.
 fn refresh_diagnostics_title(app: &mut App, diagnostics: &[lint::Diagnostic]) {
     let window = &app.windows[app.current_window];
     let Some(Frame::Edit(edit_frame_id)) = window.panes.iter().find(|p| p.id == window.focused_pane).and_then(|p| p.stack.last()).copied() else {
@@ -4171,58 +3259,31 @@ fn refresh_diagnostics_title(app: &mut App, diagnostics: &[lint::Diagnostic]) {
     let rect = pane_rect(window, pane_id, app.term_rows, app.term_cols);
     let sid = window.pane(pane_id).owning_session();
     render_diagnostics_title(&app.sessions[&sid].screen, rect.cols, diagnostics);
-    // The grid alone changes nothing on screen, and the redraw
-    // `service_background_jobs` already did happened before this wrote
-    // anything. Painting the editor pane blank on the way is fine and
-    // expected: every caller of this repaints it immediately after --
-    // that is what the `diagnosed` flag they are acting on is for.
+    // The grid alone changes nothing on screen, and the earlier redraw
+    // preceded this; callers repaint the editor pane right after, which is
+    // what their `diagnosed` flag is for.
     compositor_redraw(app);
 }
 
-// Captures a pane's *idle* prompt (nothing submitted, just sitting
-// there waiting for input) into its own session's grid. Needed only at
-// the moment a pane is about to lose focus (see this function's call
-// sites): the currently focused pane's live prompt has only ever been
-// drawn straight to the real terminal by editor::read_line, never
-// captured anywhere -- fine as long as it's the only thing on screen
-// (the plain pre-panes case), but the moment a *second*, simultaneously
-// visible pane exists, whatever real redraw happens next (sourced only
-// from grids -- see render_compositor_frame's own doc comment) would
-// show this pane blank unless its idle prompt has been fed into its
-// grid first. Mirrors exactly what the main loop's own Line-outcome
-// handler already does for a *submitted* command line, just for the
-// "about to be left idle, nothing submitted yet" case instead -- and
-// deliberately omits that other feed's trailing "\r\n", so the frozen
-// grid's cursor lands right after the prompt text, matching a genuinely
-// idle prompt waiting for input rather than one that just finished a
-// line. Leading "\r\x1b[K": a pane can lose focus more than once over
-// its lifetime (e.g. `window k` then later `window j` back), and each
-// time this runs the grid's cursor is still sitting wherever the
-// *previous* freeze (or submitted line) left it -- without returning
-// to this row's start and clearing first, a second freeze would append
-// another copy of the prompt right after the first instead of
-// overwriting it, showing the same pane's prompt twice once focus
-// returns there. Same reasoning, and the same "safe here, not for the
-// real terminal" caveat, as the Line-outcome handler's own echo fix.
+// Captures a pane's idle prompt into its grid when the pane is about to
+// lose focus: `read_line` draws the live prompt only on the terminal,
+// and once another pane is visible, redraws come from grids, so this
+// pane would show blank. Like the Line handler's feed for a submitted
+// line, without its trailing "\r\n", leaving the cursor after the
+// prompt. The leading `\r\x1b[K` overwrites a previous freeze on the
+// row, or the prompt would appear twice.
 fn freeze_idle_prompt(session: &mut SessionState) {
-    // The pane's own grid, which is the line this is about to be drawn
-    // into -- not the terminal, which may be several panes wide.
+    // The pane's grid width, not the terminal's.
     let cols = session.screen.borrow().size().1;
     let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell, cols) } else { prompt::continuation() };
     let framed = format!("\r\x1b[K{}", prompt_str);
     session.screen.borrow_mut().feed(framed.as_bytes());
 }
 
-// Same idea as freeze_idle_prompt, but also feeds `text` -- the
-// in-progress, not-yet-submitted buffer content -- right after the
-// prompt, so run_normal_mode_navigation's pane view shows exactly what's
-// already been typed instead of just the bare prompt (see editor::
-// ReadOutcome::NormalMode's own doc comment: Ctrl+G is no longer
-// empty-buffer-only). Returns the prompt string it used, so the caller
-// can compute `editor::visible_len` on it to know which column `text`
-// actually starts at (needed to position the resulting ScreenBuffer's
-// cursor correctly -- this function only feeds bytes into the grid, it
-// doesn't touch any ScreenBuffer itself).
+// `freeze_idle_prompt` plus `text`, the unsubmitted buffer, so Normal
+// mode's pane view shows what was typed. Returns the prompt it used, so
+// the caller can find the column `text` starts at for the
+// `ScreenBuffer` cursor.
 fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
     let cols = session.screen.borrow().size().1;
     let prompt_str = if session.buffer.is_empty() { prompt::render(&session.shell, cols) } else { prompt::continuation() };
@@ -4231,24 +3292,18 @@ fn freeze_input_with_text(session: &mut SessionState, text: &str) -> String {
     prompt_str
 }
 
-// Records the line Ctrl-C just abandoned into this session's own grid,
-// exactly as the real terminal is showing it -- the prompt, whatever had
-// been typed, and the `^C` read_line echoed after it -- leaving the grid
-// cursor on the next row for the fresh prompt to be drawn on. See
-// `editor::ReadOutcome::Interrupted`'s own doc comment for why the grid
-// needs this at all, and the Line handler's own echo for the same idea
-// applied to a command that actually ran.
+// Records the line Ctrl-C abandoned into the grid as the terminal shows
+// it (prompt, text, `^C`), leaving the cursor on the next row. See
+// `ReadOutcome::Interrupted`, and the Line handler's echo for a command
+// that ran.
 fn freeze_interrupted_line(session: &mut SessionState, text: &str) {
     freeze_input_with_text(session, text);
     session.screen.borrow_mut().feed(b"^C\r\n");
 }
 
-// A session stops being referenced when the last window whose stack
-// contained it (at any depth, not just the top -- `window fg` can leave
-// it buried under another frame in a different window) closes. Called
-// only from the "window itself is removed" branch of Close, above --
-// no other action can ever orphan a session (New/FgSession only add
-// references; Next/Previous don't touch the stack at all).
+// A session is unreferenced once the last window holding it at any
+// depth closes (`window fg` can bury it in another window). Called only
+// when Close removes a window; no other action orphans one.
 fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, windows: &[WindowEntry]) {
     let referenced: std::collections::HashSet<SessionId> = windows
         .iter()
@@ -4263,30 +3318,19 @@ fn close_orphaned_sessions(sessions: &mut HashMap<SessionId, SessionState>, wind
     sessions.retain(|id, _| referenced.contains(id));
 }
 
-// Full redraw of the currently-focused window's grid plus the tab bar --
-// every pane row, every divider and the tab bar, which together already
-// cover every cell, so no explicit erase is involved (see
-// build_compositor_frame_output on why the `\x1b[2J` this used to lead
-// with had to go). Repaints everything rather than diffing: M9a's
-// discrete-event redraws (a command finished, a window switch, a resize)
-// are infrequent enough that flicker isn't a real concern, and a full
-// redraw is trivially correct (self-healing against anything that wrote
-// to the real terminal directly in between, like editor.rs's Ctrl-L).
-// Poll-driven `fg` (see drive_fg_job below) is the first truly
-// continuous redraw loop this codebase has -- still full-redraw for now,
-// since a real cell/row diff is an optimization, not a correctness
-// requirement, and this keeps both redraw paths sharing one
-// implementation (render_compositor_frame) rather than risking them
-// drifting apart.
-// Picks up a changed `divider_budget` for this window before its layout
-// is resolved. Cheap, and the one place every visible change already
-// passes through.
+// Picks up a changed `divider_budget` before the layout is resolved:
+// every visible change passes through here.
 fn refresh_divider_budget(sessions: &HashMap<SessionId, SessionState>, window: &mut WindowEntry) {
     if let Some(session) = sessions.get(&window.owning_session()) {
         window.divider_budget = session.shell.bishopt_int("divider_budget").max(0) as usize;
     }
 }
 
+// Full redraw of the focused window's panes and the tab bar, which
+// together cover every cell, so nothing is erased first
+// (`build_compositor_frame_output`). A full redraw rather than a diff:
+// these happen on discrete events, and it heals anything written to the
+// terminal directly in between.
 fn compositor_redraw(app: &App) {
     let tab_bar = tab_bar_line(app);
     sync_terminal_title(app);
@@ -4294,68 +3338,39 @@ fn compositor_redraw(app: &App) {
     render_compositor_frame(&layout, &tab_bar, app.term_rows);
 }
 
-// How drive_fg_job's blocking loop ended.
+// How `drive_fg_job`'s loop ended.
 enum FgOutcome {
-    // The job itself exited or was killed (e.g. by a forwarded Ctrl-C).
+    // The job exited or was killed (a forwarded Ctrl-C).
     Exited(i32),
-    // The user hit the detach key (see the Ctrl+G comment below)
-    // instead of the job exiting. The job is left completely untouched --
-    // still running, still the top Frame::Job of whatever window it
-    // belongs to -- it's the caller's job to decide what to do next (M10c:
-    // fall into command mode so `window next`/`previous` can switch away
-    // from it while it keeps running in the background).
+    // The detach key (Ctrl+G) instead of an exit. The job is untouched,
+    // still running and on top; the caller decides what's next (Normal
+    // mode, from which `window next`/`previous` can leave).
     Detached,
-    // The job stopped (M11b: a forwarded Ctrl-Z reached its own pty's
-    // line discipline, or an explicit `kill -STOP`) rather than exiting.
-    // Unlike Detached, the caller needs to do real bookkeeping here --
-    // see run_fg_job_frame's own handling -- since this job is no longer
-    // "the thing this window is actively watching," it's a genuine
-    // Stopped job now (exec.rs's Shell::park_stopped_fg_job).
+    // The job stopped (a forwarded Ctrl-Z through its pty, or
+    // `kill -STOP`). Unlike Detached, it's now a Stopped job for
+    // `run_fg_job_frame` to file (`Shell::park_stopped_fg_job`).
     Stopped,
-    // A qualifying left click (MouseEvent::is_left_click) arrived at
-    // bish's own stdin instead of being forwarded to the job -- see
-    // decode_fg_click's own doc comment for why this one gesture gets
-    // intercepted while every other byte (including every other kind of
-    // mouse event) still just goes straight through. The caller
-    // (run_fg_job_frame) hit-tests it: a miss, or a hit within the
-    // job's own pane, means it was actually meant for the job after
-    // all, and gets forwarded there before resuming; a hit elsewhere
-    // (the tab bar, a different pane) switches focus there instead,
-    // leaving the job running in the background -- the same outcome
-    // Ctrl+G's own Detached already produces, just reached by a
-    // click instead of a keystroke.
+    // A left click (`MouseEvent::is_left_click`) intercepted from stdin
+    // instead of forwarded (see `decode_fg_click`). `run_fg_job_frame`
+    // hit-tests it: a miss or the job's own pane forwards it; the tab bar or
+    // another pane takes focus there, the job running on, like a detach.
     MouseClick(editor::MouseEvent),
-    // This job's own screen (the same Rc<RefCell<vt100::Screen>> as
-    // `screen`, drive_fg_job's own param) changed size mid-drive --
-    // service_background_jobs's own on_idle-driven WINCH handling
-    // (poll_and_apply_resize) already applied the resize everywhere else
-    // (every session's screen, every *background* job's pty) by the time
-    // this is returned; drive_fg_job already caught this one job's own
-    // pty up to match too (see its own doc comment), so all that's left
-    // for the caller is to stop driving with whatever pane-rects/tab-bar
-    // snapshot it took before this loop started (now stale) and take a
-    // fresh one before resuming -- see run_fg_job_frame's own handling.
+    // The job's screen changed size mid-drive. `poll_and_apply_resize` has
+    // resized everything else and `drive_fg_job` this job's pty; the caller
+    // must replace its stale pane-rect and tab-bar snapshot before
+    // resuming.
     Resized,
 }
 
 const BRACKETED_PASTE_ENABLE: &str = "\x1b[?2004h";
 const BRACKETED_PASTE_DISABLE: &str = "\x1b[?2004l";
 
-// Turns real-terminal mouse reporting on/off (SGR extended coordinates,
-// mode 1006, plus button-event tracking, mode 1002) to match whatever
-// the job's own program has asked for on its virtual screen (vt100::
-// Screen::mouse_reporting, set by its own DECSET 1000/1002/1003/1006
-// request -- see that field's own doc comment: all four collapse into
-// one flag there already, so this can't mirror "just clicks" vs. "every
-// motion" any more precisely than that; 1002 is a reasonable default
-// either way, tmux's own). A no-op if the wanted state already matches
-// `enabled`. Called from drive_fg_job only -- the one place a job's own
-// pty output (and thus a fresh DECSET request) is actually read while
-// this job also owns real stdin, so it's the only place enabling this on
-// the *real* terminal is ever correct (see drive_fg_job's own doc
-// comment on why it's turned back off again before returning,
-// unconditionally, rather than left however the job happened to leave
-// it).
+// Turns the terminal's mouse reporting (SGR mode 1006, button-event mode
+// 1002) on or off to match what the job asked of its virtual screen
+// (`vt100::Screen::mouse_reporting`, which merges DECSET 1000, 1002,
+// 1003 and 1006 into one flag). Only from `drive_fg_job`, where the job
+// owns stdin and its requests are read; it's turned off again before
+// returning, whatever the job left.
 fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>) {
     let wants = screen.borrow().mouse_reporting;
     if wants == *enabled {
@@ -4366,20 +3381,10 @@ fn sync_mouse_reporting(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
     *enabled = wants;
 }
 
-// Same idea as sync_mouse_reporting, for DECSET 2004 (bracketed paste --
-// vt100::Screen::bracketed_paste, set by the job's own \x1b[?2004h/l
-// request): without this, a job like vim asking its controlling
-// terminal to bracket pastes (so it knows to suspend autoindent for the
-// duration, rather than treating pasted text as fast typing) was asking
-// bish's own vt100::Screen -- which faithfully tracked the flag but
-// never actually told the *real* terminal to start bracketing pastes.
-// The real terminal would then hand a pasted block to bish as an
-// ordinary burst of characters, indistinguishable from typing, which
-// drive_fg_job's raw stdin-forwarding loop passes straight through to
-// the job -- so vim received it as unbracketed "typing" and mangled
-// every line with its own autoindent, even though vim did everything
-// right on its end. Mirrors sync_mouse_reporting's own on/off/cleanup
-// shape exactly, called from the same two spots.
+// The same for DECSET 2004, bracketed paste
+// (`vt100::Screen::bracketed_paste`). Without telling the real terminal,
+// a paste reaches a job like vim as fast typing, and its autoindent
+// mangles every line.
 fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>) {
     let wants = screen.borrow().bracketed_paste;
     if wants == *enabled {
@@ -4390,19 +3395,11 @@ fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
     *enabled = wants;
 }
 
-// Same idea again, for this job's own pty size -- keeps it matching
-// `screen`'s own size (the source of truth: repl.rs always keeps a
-// session's screen resized to exactly its own on-screen area) instead
-// of polling SIGWINCH itself. `screen` only ever changes size from
-// *outside* drive_fg_job (service_background_jobs's own on_idle-driven
-// poll_and_apply_resize, reached via drive_fg_job's own on_idle
-// argument) -- this just needs to notice that already happened and
-// catch this one job's own pty up to match, the same way a real
-// terminal multiplexer propagates a resize straight through to whatever
-// program is running in the pane you're looking at. Returns whether it
-// changed, so the caller can stop driving with now-stale chrome
-// geometry built around the old size (see FgOutcome::Resized's own doc
-// comment) instead of silently continuing.
+// The same for the job's pty size, kept equal to `screen`'s, which
+// repl.rs sizes to the pane. `screen` changes only from outside
+// (`poll_and_apply_resize` through `on_idle`); this catches the pty up.
+// Returns whether it changed, so the caller rebuilds stale geometry
+// (`FgOutcome::Resized`).
 fn sync_pty_size(last: &mut (u16, u16), job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>) -> bool {
     use std::os::fd::AsRawFd;
     let (rows, cols) = screen.borrow().size();
@@ -4415,20 +3412,11 @@ fn sync_pty_size(last: &mut (u16, u16), job: &mut exec::FgJob, screen: &Rc<RefCe
     true
 }
 
-// A complete SGR mouse report ("\x1b[<Cb;Cx;CyM/m") decoded from the
-// *first* such report at the start of `seq`, but only when it's a
-// qualifying left click (see MouseEvent::is_left_click) -- anything
-// else (incomplete, malformed, a release/drag/wheel/other button) is
-// `None`, meaning "forward this unmodified, exactly like every other
-// byte sequence" (drive_fg_job's own call site). Deliberately scans for
-// the first 'M'/'m' rather than trusting `seq`'s own last byte: a press
-// and its paired release (or several clicks in quick succession) can
-// easily arrive in the very same read as one another over a local pty,
-// and treating the *whole* buffer as one report would garble the params
-// and silently fail to recognize a genuine click. Pure and separate
-// from drive_fg_job's own loop so the decoding itself has unit test
-// coverage without a real pty, mirroring editor.rs's own
-// decode_sgr_mouse_final split from read_sgr_mouse.
+// The first SGR mouse report in `seq` (`\x1b[<Cb;Cx;CyM/m`), if it's a
+// left click; `None` otherwise (incomplete, malformed, other buttons),
+// meaning forward it unchanged. Scans for the first `M`/`m`: a press and
+// its release, or several clicks, can arrive in one read. Separate so
+// it's tested without a pty, like editor.rs's `decode_sgr_mouse_final`.
 fn decode_fg_click(seq: &[u8]) -> Option<editor::MouseEvent> {
     if !seq.starts_with(b"\x1b[<") {
         return None;
@@ -4442,42 +3430,18 @@ fn decode_fg_click(seq: &[u8]) -> Option<editor::MouseEvent> {
     }
 }
 
-// Drives a job pushed as a Frame::Job: reads its pty master and feeds
-// bytes into `screen`, calls `redraw` after every batch of output, and
-// forwards raw bytes read from bish's own stdin straight to the job's pty
-// master unmodified -- the job's own pty slave termios (never touched by
-// this shell) handles things like Ctrl-C triggering real SIGINT delivery
-// to the job's process group exactly like a real terminal would, no
-// signal-forwarding code needed here. Moved here from exec.rs's old
-// Shell::drive_pending_fg (M9b) now that the job itself is owned by
-// repl.rs (see FgJob's doc comment) rather than stashed inside a
-// session's Shell.
+// Drives a job pushed as a `Frame::Job`: reads its pty master into
+// `screen`, calls `redraw` after each batch, and forwards stdin bytes
+// to the master unmodified, so the job's pty turns Ctrl-C into SIGINT
+// for its group as a terminal would. `on_idle` runs on ticks with
+// neither output nor input (`service_background_jobs`), as `read_line`'s
+// does at a prompt.
 //
-// `on_idle` is called on every tick that finds neither job output nor
-// stdin input ready (M10c) -- repl.rs's caller uses it to keep other
-// windows' backgrounded jobs alive (see service_background_jobs) while
-// this one owns the terminal, the same way editor::read_line's own
-// on_idle does for a window sitting at a plain prompt.
-//
-// Ctrl+G (0x07), or a raw NUL byte (Ctrl+Space, where a terminal still
-// sends it), is intercepted before being forwarded and means "detach":
-// plan.md long anticipated a single control-mode trigger alongside ':',
-// and reusing this one for "hand control back to the window manager
-// without touching the job" keeps that one gesture rather than inventing
-// a second. Still no detach-and-*resume*-a-*stopped* job (matching this
-// codebase's existing "no SIGTSTP/Ctrl-Z, no genuine Stopped jobs" scope,
-// see exec.rs's run_bg doc comment) -- detaching here never stops the
-// job, it just stops *this shell* from actively watching it, exactly
-// like switching a real terminal multiplexer pane away from a running
-// program.
-//
-// Real mouse events (an SGR sequence typed at bish's own stdin) reach the
-// job below via the same raw-forwarding this loop already does for every
-// other byte -- see sync_mouse_reporting's own doc comment for the
-// on/off toggle that makes the real terminal actually send them. A real
-// paste reaches the job the same way, already bracketed in
-// \x1b[200~/\x1b[201~ if it asked for that too -- see
-// sync_bracketed_paste's own doc comment.
+// Ctrl+G (0x07), or the NUL Ctrl+Space sends, means detach: the job keeps
+// running, this shell just stops watching it, like switching away from a
+// multiplexer pane. Mouse reports and bracketed pastes reach the job
+// through the same forwarding (see `sync_mouse_reporting`,
+// `sync_bracketed_paste`).
 fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut(), mut on_idle: impl FnMut()) -> FgOutcome {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -4485,11 +3449,8 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     pty::set_nonblocking(job.pty_master().as_raw_fd());
     let _raw_guard = term::RawGuard::enable(0).ok();
 
-    // Checked once up front (in case the job already asked for mouse
-    // reporting before this particular drive call started -- e.g.
-    // resuming a previously-detached job) and again after every batch of
-    // freshly-read output below, since that's exactly when a fresh
-    // DECSET request could have just arrived.
+    // Checked first (a resumed job may have asked already) and after each
+    // batch of output, where a new DECSET request could arrive.
     let mut mouse_enabled = false;
     sync_mouse_reporting(&mut mouse_enabled, screen);
     let mut bracketed_paste_enabled = false;
@@ -4500,38 +3461,22 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     };
 
     let mut buf = [0u8; 4096];
-    // Caps how many chunks get drained per outer-loop tick before
-    // forcing a redraw/stdin-check/exit-check. A firehose job (`yes` is
-    // the extreme case) can keep the pty's read buffer topped up
-    // indefinitely -- reading "until WouldBlock" against a producer like
-    // that means WouldBlock may never actually arrive, starving this
-    // loop's other responsibilities forever. Bounding the drain
-    // guarantees this loop always comes back around.
+    // How many chunks are drained per tick before checking input, exit and
+    // redrawing: a firehose job (`yes`) can keep the buffer full forever, so
+    // reading until WouldBlock might never return.
     const MAX_READS_PER_TICK: u32 = 16;
     let outcome = loop {
-        // Checked every iteration (cheap: an Rc<RefCell> borrow plus a
-        // comparison, no syscall unless it actually changed) rather than
-        // only in the idle branch below -- a firehose job can keep this
-        // loop busy draining output for a while without ever reaching
-        // that branch, and this job's own pty should still catch up
-        // promptly regardless. See sync_pty_size's own doc comment for
-        // why this doesn't need its own SIGWINCH poll.
+        // Every iteration (a borrow and a comparison, no syscall unless
+        // changed), not only when idle: a firehose job can keep this loop
+        // draining, and its pty should still catch up. See `sync_pty_size`.
         if sync_pty_size(&mut pty_size, job, screen) {
             break FgOutcome::Resized;
         }
 
-        // Drain *before* checking whether the job has ended -- a fast,
-        // freshly-spawned foreground command (M11b: `echo`, `pwd`, ...
-        // aren't builtins, so they hit this exact path now, not just a
-        // job that was already backgrounded for a while before being
-        // fg'd) can write its entire output and exit within microseconds
-        // of being spawned. Checking poll_untraced first would let this
-        // loop break on the very first iteration, before ever draining
-        // the pty -- discarding output that's already sitting in the
-        // kernel's pty buffer, silently. Draining first (every
-        // iteration, not just once) means that buffer always gets a
-        // chance to be read before this loop can decide to stop,
-        // regardless of how fast the job finishes.
+        // Drain before checking whether the job ended: a fast command
+        // (`echo`, `pwd`) can write everything and exit within
+        // microseconds, and checking `poll_untraced` first would stop
+        // before reading output already in the pty.
         let mut made_progress = false;
         for _ in 0..MAX_READS_PER_TICK {
             match job.pty_master().read(&mut buf) {
@@ -4556,51 +3501,31 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
             exec::FgWait::Running => {}
         }
 
-        // Short poll timeout: paces this loop (avoiding a CPU-spinning
-        // busy-wait) while staying responsive to both new job output and
-        // new keystrokes.
+        // A short poll paces the loop without spinning while staying
+        // responsive.
         let ready = term::stdin_ready(10);
         if ready {
             let n = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
             if n > 0 {
-                // Ctrl+G (0x07), or the NUL that Ctrl+Space sends where a
-                // terminal still sends it -- the gesture arrives here as a
-                // raw byte, a job holding the terminal meaning nothing has
-                // decoded it into a `Key`.
+                // Ctrl+G, or Ctrl+Space's NUL: a raw byte, as nothing
+                // decodes keys while a job holds the terminal.
                 if n == 1 && matches!(buf[0], 0x07 | 0x00) {
                     break FgOutcome::Detached;
                 }
-                // Ctrl-Z (0x1a): explicitly signaled rather than
-                // forwarded -- see FgJob::send_stop's doc comment for
-                // why the natural "just forward the byte, let the job's
-                // own pty generate SIGTSTP" trick that works for Ctrl-C
-                // doesn't work here. Not forwarded as a literal byte
-                // either: a real terminal wouldn't hand VSUSP through to
-                // the program's stdin as data, only deliver the signal
-                // it causes.
+                // Ctrl-Z (0x1a) is signalled rather than forwarded (see
+                // `FgJob::send_stop` for why forwarding doesn't stop the
+                // job). Nor is it sent as data: a terminal delivers only
+                // the signal.
                 if n == 1 && buf[0] == 0x1a {
                     job.send_stop();
                     continue;
                 }
-                // A lone ESC (0x1b) might be a genuine Escape keypress,
-                // or it might be the first byte of a multi-byte escape
-                // sequence (arrow/function/Home/End keys, ...) whose
-                // remaining bytes just haven't arrived in this same
-                // read yet -- common enough over tmux/nested terminals
-                // that this reliably lost arrow keys inside a fg'd job
-                // like vim: the lone ESC got forwarded on its own tick,
-                // and by the time the rest arrived (a tick or more
-                // later, since forwarding here happens immediately per
-                // read rather than gathering a whole sequence first),
-                // vim's own ESC-vs-sequence disambiguation timeout
-                // (ttimeoutlen, ~50ms by default) had already lapsed,
-                // so it took the ESC as a real Escape and then
-                // interpreted the rest as separate normal-mode keys
-                // instead of recognizing the sequence. Waiting briefly
-                // here for the rest, and forwarding the whole thing as
-                // one write, matches what a real terminal effectively
-                // guarantees (a keyboard driver emits an escape
-                // sequence's bytes as one contiguous burst).
+                // A lone ESC may be an Escape key or the start of a
+                // sequence whose rest hasn't arrived (common through nested
+                // terminals). Forwarded alone, a program like vim would
+                // time it out as Escape (`ttimeoutlen`, about 50ms) and
+                // read the rest as separate keys. So wait briefly and send
+                // the whole sequence in one write, as a keyboard emits it.
                 let mut seq = buf[..n as usize].to_vec();
                 if n == 1 && buf[0] == 0x1b && term::stdin_ready(50) {
                     let more = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
@@ -4608,25 +3533,15 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                         seq.extend_from_slice(&buf[..more as usize]);
                     }
                 }
-                // An SGR mouse report ("\x1b[<Cb;Cx;CyM/m") -- wait for
-                // the rest if it hasn't all arrived in this same read
-                // yet (same reasoning as the lone-ESC wait just above),
-                // then decode it before deciding whether to forward: a
-                // qualifying left click (decode_fg_click's own doc
-                // comment) might be aimed at bish's own UI chrome (the
-                // tab bar, a different pane) rather than this job, and
-                // gets handed back to the caller instead of forwarded.
-                // Everything else here (a release, drag, wheel, right/
-                // middle click, or the sequence just never completing)
-                // falls straight through to the ordinary forward below,
-                // unmodified.
+                // An SGR mouse report (`\x1b[<Cb;Cx;CyM/m`): wait for the
+                // rest as for a lone ESC, then decode it. A left click
+                // (`decode_fg_click`) may be for bish's tab bar or another
+                // pane, so it goes back to the caller; anything else is
+                // forwarded unchanged.
                 if seq.starts_with(b"\x1b[<") {
-                    // Whether the *first* report has terminated yet --
-                    // not just seq's own last byte, which a
-                    // fast-arriving paired release (or several clicks in
-                    // a row) could easily make M/m without the first
-                    // report actually being complete (decode_fg_click's
-                    // own doc comment).
+                    // Whether the first report has ended, not just whether
+                    // `seq` ends in `M`/`m`, which a quickly following
+                    // release could make it.
                     while !seq[3..].iter().any(|b| *b == b'M' || *b == b'm') && term::stdin_ready(50) {
                         let more = crate::platform::read_bytes(0, &mut buf).map(|n| n as isize).unwrap_or(-1);
                         if more <= 0 {
@@ -4638,14 +3553,10 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
                         break FgOutcome::MouseClick(ev);
                     }
                 }
-                // The real keyboard always sends arrow keys in the plain
-                // CSI form (ESC [ A/B/C/D), whether they arrived here as
-                // one single read or were just gathered above -- re-
-                // encode to SS3 (ESC O A/B/C/D) if the job has switched
-                // into DECCKM/application cursor-key mode (see Screen::
-                // app_cursor_keys' own doc comment for why bish has to
-                // do this translation itself rather than the real
-                // terminal doing it).
+                // The keyboard sends arrows as CSI (`ESC [ A`); if the job
+                // switched to application cursor-key mode (DECCKM),
+                // re-encode as SS3 (`ESC O A`). See
+                // `Screen::app_cursor_keys` for why bish translates.
                 if screen.borrow().app_cursor_keys {
                     if let [0x1b, b'[', letter @ b'A'..=b'D'] = seq.as_slice() {
                         seq = vec![0x1b, b'O', *letter];
@@ -4660,22 +3571,15 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
         }
     };
     drop(_raw_guard);
-    // Unconditionally, regardless of which `break` above got here: the
-    // real terminal has no notion of "this job's own mouse mode," so
-    // leaving it enabled past this point (however the job itself might
-    // still feel about it) would leak mouse escape sequences into
-    // whatever reads stdin next -- the shell prompt, bishedit's own
-    // normal-mode navigation, .... Harmless (and cheap) to send even if
-    // it was never actually turned on.
+    // Always, however the loop ended: the terminal has no notion of this
+    // job's mouse mode, and leaving it on would leak mouse sequences into
+    // whatever reads stdin next. Harmless if never enabled.
     if mouse_enabled {
         print!("{}", term::MOUSE_REPORTING_DISABLE);
         let _ = io::stdout().flush();
     }
-    // Same unconditional cleanup, and for the same reason: bish's own
-    // prompt (editor::read_line) never recognizes \x1b[200~/\x1b[201~ --
-    // left enabled, a paste right after this job exits would land in the
-    // next read_line call as literal garbage bytes instead of a bracketed
-    // block it knows to ignore as markers.
+    // The same cleanup: `read_line` doesn't understand paste brackets, so a
+    // paste after the job exits would arrive with them as garbage.
     if bracketed_paste_enabled {
         print!("{BRACKETED_PASTE_DISABLE}");
         let _ = io::stdout().flush();
@@ -4684,36 +3588,9 @@ fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut 
     outcome
 }
 
-// Keeps every fg'd job alive while some other loop owns the terminal --
-// called as the on_idle hook of `drive_fg_job` (watching one job),
-// `editor::read_line` (typing at a prompt), and normal mode. It used to
-// take the window those loops' focus belongs to as a parameter; every
-// caller passed the focused window, and a few had to snapshot it first
-// because they could not read it while it was borrowed. `App` makes it
-// readable in place, so the parameter is gone. It never exempted that
-// window's focused *pane* from being drained (see the loop below for
-// why that exemption was both unnecessary and harmful), only steered
-// the resize/redraw handling above. A Frame::Job can end up
-// in any pane, not just the focused one of its window (the user can
-// navigate focus away via `window` h/j/k/l while it's still running),
-// so every pane of every window is checked here, not just each
-// window's single focused-pane stack. Non-blocking, bounded the same
-// way drive_fg_job's own drain is: a firehose producer in a
-// backgrounded pane shouldn't be able to make this take arbitrarily
-// long before returning control to whichever of the two loops above
-// called it.
-// Returns true iff a session-daemon client just (re)attached this call
-// -- see the `just_attached` handling below for what that triggers here
-// (a full compositor_redraw), and its own doc comment for why that
-// alone isn't enough for a caller currently driving a grid-bypassing
-// view (a `Frame::Edit`'s own real content, see run_normal_mode_
-// navigation's own on_idle closure for the caller that needs to react
-// to this return value; every other caller correctly ignores it).
-/// One open buffer, in the shape anything outside this process reads it
-/// in. Positions come out as 0-based (line, character), which is what
-/// every protocol wants and what only this side can compute -- a
-/// diagnostic is stored as a flat char offset, and the buffer is the
-/// only thing that knows where its lines begin.
+// One buffer as anything outside this process reads it: positions as
+// 0-based (line, character), which only this side can compute, since a
+// diagnostic is a flat offset and the buffer knows where lines start.
 fn file_state(tb: &TextBuffer, focused: bool) -> Option<mcp::FileState> {
     let path = tb.path()?.to_path_buf();
     let selection = tb.selections.first().map(|range| {
@@ -4739,15 +3616,14 @@ fn file_state(tb: &TextBuffer, focused: bool) -> Option<mcp::FileState> {
     Some(mcp::FileState { path, line_count: tb.line_count(), focused, dirty: tb.is_dirty(), selection, selected_text, diagnostics })
 }
 
-/// Everything bish is willing to say about itself: the focused buffer as
-/// the navigation loop last published it, plus every other one still in
-/// `edit_frames`.
+/// Everything bish will say about itself: the focused buffer as the
+/// navigation loop published it, and every other in `edit_frames`.
 fn editor_state(app: &App) -> mcp::EditorState {
     let mut files: Vec<mcp::FileState> = app.focus.iter().cloned().collect();
     for session in app.edit_frames.values() {
-        // The focused buffer is not in here (see `App::focus`), but a
-        // second pane on the same file can be, and one entry per path is
-        // what a reader expects.
+        // The focused buffer isn't here (see `App::focus`), but a second
+        // pane on the same file can be, and readers expect one entry per
+        // path.
         if files.iter().any(|f| Some(f.path.as_path()) == session.buffer.path()) {
             continue;
         }
@@ -4758,17 +3634,13 @@ fn editor_state(app: &App) -> mcp::EditorState {
     mcp::EditorState { files }
 }
 
-/// Publishes what the focused editor is showing, and says whether it
-/// changed.
-///
-/// The change is the interesting part: it is what a selection
-/// notification fires on, so nothing needs a hook of its own for that.
+/// Publishes what the focused editor shows, returning whether it changed,
+/// which is what fires a selection notification.
 fn publish_focus(app: &mut App, buf: &NavBuffer) -> bool {
     match buf.as_editable() {
         Some(tb) => publish_focus_buffer(app, tb),
-        // A pane showing something that is not a file has nothing to
-        // publish, and saying so is the point: a reader must be able to
-        // tell "no file" from "the file I saw last time".
+        // A pane not showing a file publishes that, so a reader can tell "no
+        // file" from "the same file".
         None => {
             let changed = app.focus.is_some();
             app.focus = None;
@@ -4778,15 +3650,10 @@ fn publish_focus(app: &mut App, buf: &NavBuffer) -> bool {
 }
 
 fn publish_focus_buffer(app: &mut App, tb: &TextBuffer) -> bool {
-    // Deliberately *not* gated on anybody currently listening, which is
-    // what it was at first. A peer becomes known only once it has
-    // spoken, and it speaks a few milliseconds before its first
-    // question -- inside the same idle tick, whose publishing step comes
-    // after the answering step. So the gate made the very first question
-    // a peer ever asked report an editor with nothing open in it, every
-    // time. Being always current is the only version of this that is
-    // right the first time, and the cost is one comparison per idle tick
-    // against work this loop already does far more of.
+    // Not gated on a listener: a peer becomes known when it first speaks, a
+    // few milliseconds before its first question, in the same tick before
+    // publishing, so a gate would answer that question with nothing open.
+    // Always current costs a comparison per tick.
     let next = file_state(tb, true);
     if next == app.focus {
         return false;
@@ -4795,94 +3662,61 @@ fn publish_focus_buffer(app: &mut App, tb: &TextBuffer) -> bool {
     true
 }
 
-/// Tells every peer what is selected now, if anything changed enough to
-/// be worth saying.
-///
-/// Debounced by construction rather than by a timer: this only runs on
-/// an idle tick, and only when the published snapshot actually differs
-/// from the last one, so a keystroke that moves the cursor within one
-/// line says nothing.
+/// Tells every peer what's selected now, if the snapshot changed.
+/// Debounced by construction: only on an idle tick, and only on a
+/// change, so moving within a line says nothing.
 fn notify_selection(app: &App) {
     let Some(payload) = mcp::selection_notification(app.focus.as_ref()) else { return };
     session::push_rpc_notification(&payload);
 }
 
+// Keeps fg'd jobs alive while another loop owns the terminal: the
+// `on_idle` of `drive_fg_job`, `read_line` and Normal mode. A
+// `Frame::Job` can be in any pane, so every pane of every window is
+// drained, bounded as `drive_fg_job`'s drain is so a firehose can't hold
+// it. Returns whether a session client just attached, for a caller
+// driving a view the grid doesn't hold (a `Frame::Edit`) to redraw it.
 fn service_background_jobs(app: &mut App) -> bool {
     use std::io::Read;
 
-    // Every blocking loop in this file calls this as its idle callback,
-    // which makes it the one place a setting change reliably passes
-    // through however it was made -- the colon line, the shell prompt,
-    // a sourced file. `divider_budget` is a layout parameter kept on
-    // the window itself (see WindowEntry), so this is where it catches
-    // up.
+    // Every blocking loop calls this as its idle hook, so a setting change
+    // passes through here however it was made; `divider_budget`, kept on
+    // the window, catches up here.
     for window in app.windows.iter_mut() {
         refresh_divider_budget(&app.sessions, window);
     }
-    // ...and the window list every session's `window` builtin reads.
-    // A `<( )` producer is a coroutine in this process, and it only
-    // makes progress when something gives it a turn. Every blocking
-    // loop in this file calls this, so this is the one place that
-    // reliably does -- without it a producer fills its pipe, parks, and
-    // is never resumed while a foreground command reads it, which
-    // truncated `wc -l < <(seq 1 20000)` at exactly one pipe buffer.
+    // `<( )` producers are coroutines here and progress only when given a
+    // turn; every blocking loop reaches this, so it's where they get one,
+    // or a producer would fill its pipe, park and never resume
+    // (`wc -l < <(seq 1 20000)` would stop at one pipe buffer).
     for session in app.sessions.values() {
         session.shell.pump_coroutines();
     }
-    // Built once from an immutable borrow, then handed to each session,
-    // so `window ls`/`select` answer about the app.windows that exist right
-    // now rather than about whatever they last heard.
+    // The window list every session's `window` builtin reads, so `window ls`
+    // and `select` see the windows that exist now.
     let snapshot = window_snapshot(app);
     for session in app.sessions.values_mut() {
         session.shell.windows = snapshot.clone();
     }
 
-    // Every language server gets one non-blocking tick here, for the
-    // same reason job ptys do: this is the one callback every blocking
-    // loop in this file passes as `on_idle`, so it is the only place
-    // that reliably runs no matter which of them the user is sitting
-    // in. The table is shared by every session's shell (see
-    // `lspclient::Table`), so reaching it through any one of them
-    // reaches all of them.
+    // One non-blocking tick per language server, here for the same reason:
+    // the one callback every loop runs. The table is shared, so any
+    // session's handle reaches all of it.
     if let Some(lsp) = app.sessions.values().next().map(|s| Rc::clone(&s.lsp)) {
         lsp.borrow_mut().service_all();
     }
 
-    // A plain no-op unless this process is running as a `bish session`
-    // daemon (session::install_bridge was called) -- see session.rs's
-    // own module doc comment for why this one call, here, is the whole
-    // wiring needed rather than a new parameter threaded through every
-    // caller between here and repl::run.
+    // A no-op unless this process is a `bish session` daemon
+    // (`session::install_bridge`); see session.rs for why this call is all
+    // the wiring needed.
     session::service_current_bridge();
-    // `bish session capture` asks what the focused pane shows; the
-    // bridge records the question and this answers it, since the grid
-    // it needs lives here. Rendered only when somebody is actually
-    // waiting.
+    // `bish session capture` asks what the focused pane shows; the grid is
+    // here, so it's answered here, rendered only when asked.
     session::answer_capture_requests(|| focused_pane_text(app));
-    // A client just (re)connected -- force one full repaint (not the
-    // ordinary incremental diff) so its own blank real terminal starts
-    // correctly caught up, rather than staying empty until unrelated
-    // activity happens to redraw something. See take_bridge_just_
-    // attached's own doc comment. `compositor_redraw` alone is *not*
-    // sufficient when the currently-focused pane is a `Frame::Edit`
-    // being actively driven -- its real content never feeds the
-    // session's own vt100 grid while that's happening (the exact same
-    // gap this codebase already hit once before, for command mode's own
-    // post-return redraw -- see this file's own history), so
-    // `compositor_redraw` alone would just paint that pane blank. The
-    // `bool` returned here is what lets such a caller notice and follow
-    // up with its own direct redraw of the real content it alone has
-    // access to.
-    // Beside the capture answer above and for the same reason: the
-    // bridge holds no session state, so the answers are produced here,
-    // where `App` is, and handed down.
-    // Built inside the closure, which only runs when a question is
-    // actually waiting -- unlike the snapshot above, this walks every
-    // open buffer, and nothing asks on most ticks.
-    //
-    // A review is the one question not answered here: its answer is
-    // somebody's decision, so it is set aside with who asked, for the
-    // prompt or the editor to open when it can (see `pending_reviews`).
+    // Answers peers' questions here, where `App` is; the bridge holds no
+    // session state. The state is built only when a question waits. A
+    // review's answer is someone's decision, so it's set aside with its
+    // asker for the prompt or editor to open (`pending_reviews`).
     let asked = &*app;
     let mut reviews = Vec::new();
     session::answer_rpc_requests_with(|question, caller| {
@@ -4893,44 +3727,34 @@ fn service_background_jobs(app: &mut App) -> bool {
         mcp::answer(&editor_state(asked), question)
     });
     app.pending_reviews.extend(reviews);
+    // A client just attached: one full repaint, so its blank terminal
+    // catches up (`take_bridge_just_attached`). Not enough for a driven
+    // `Frame::Edit`, whose content isn't in the grid, hence the return
+    // value.
     let just_attached = session::take_bridge_just_attached();
-    // Whatever the background jobs have said since the last tick, into
-    // the grid of whichever session started each one -- see
-    // Shell::drain_background_output. One call covers every session: the
-    // job table is shared, and each job carries its own destination. Any
-    // live shell will do as the receiver; there is always at least one.
+    // Background jobs' output since the last tick, into the grid of the
+    // session that started each (`Shell::drain_background_output`); the job
+    // table is shared, so one call covers every session.
     let bg_output = app.sessions.values().next().is_some_and(|s| s.shell.drain_background_output());
-    // Only `just_attached` repaints from in here. Background output
-    // deliberately does *not*: this function has no idea what is
-    // currently drawn over the pane, and a blind compositor_redraw
-    // wiped whatever wasn't in the grid -- a half-typed prompt, an open
-    // file browser, the diagnostics list. It's reported through the
-    // return value instead, so each caller repaints whatever it alone
-    // knows how to.
+    // Only a client attaching repaints here. Background output doesn't:
+    // this can't know what's drawn over the pane (a half-typed prompt, a
+    // browser, the diagnostics list), and a blind redraw would wipe it; it's
+    // reported through the return value for each caller to repaint.
     if just_attached && app.sinks_are_grid {
         compositor_redraw(app);
     }
-    // The new client's own TERM/COLORTERM -- applied to *every*
-    // session's own remembered environment (Shell::
-    // set_terminal_capability_env), not just the currently-focused one:
-    // there's only one real attached client for the whole daemon, so a
-    // window that isn't focused right now still needs to see the
-    // update whenever it's focused later. Applying this directly via
-    // `std::env::set_var` here wouldn't stick -- see that method's own
-    // doc comment for why it has to go through each session's env_
-    // snapshot instead.
+    // The new client's TERM and COLORTERM go to every session's remembered
+    // environment (`Shell::set_terminal_capability_env`): one client serves
+    // the whole daemon, and unfocused windows need it later. `set_var` here
+    // wouldn't stick (see that method).
     if let Some((term, colorterm)) = session::take_pending_capability() {
         for session in app.sessions.values_mut() {
             session.shell.set_terminal_capability_env(&term, &colorterm);
         }
     }
 
-    // A resize repaints the compositor from the session grids, which
-    // blanks a `Frame::Edit` pane being driven for exactly the reason
-    // the just_attached comment above gives. Its answer was being
-    // discarded here, so the caller never learned to follow up -- which
-    // is what made shrinking the terminal leave an editor pane empty
-    // until the next keystroke that happened to redraw something.
+    // A resize repaints from the grids, blanking a driven `Frame::Edit`, so
+    // its result is returned for the caller to follow up.
     let resized = poll_and_apply_resize(app);
 
     const MAX_READS_PER_TICK: u32 = 16;
