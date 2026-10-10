@@ -1,13 +1,8 @@
-//! What a wasm target does where Linux and macOS reach for the kernel.
-//!
-//! The counterpart to `linux.rs` / `darwin.rs`: the capabilities whose
-//! body cannot be shared because the OSes do them differently. On wasm
-//! (WASI preview 1) almost none of them exist at all, so these are
-//! honest refusals rather than alternative implementations -- a pipe
-//! between two processes, a peer's credentials over a socket, and an
-//! anonymous capture file are all things the sandbox does not offer.
-//! The rest of bish calls them through the same names and gets an error
-//! it can report, rather than a link failure.
+//! What wasm does where Linux and macOS use the kernel: the counterpart
+//! to `linux.rs` and `darwin.rs`. On WASI preview 1 almost none of it
+//! exists (cross-process pipes, peer credentials, anonymous capture
+//! files), so these are refusals, which the rest of bish reports, rather
+//! than link failures.
 
 use std::os::fd::RawFd;
 
@@ -34,8 +29,8 @@ pub(crate) fn peer_user(_socket: RawFd) -> std::io::Result<u32> {
     unsupported("a socket peer's credentials")
 }
 
-/// What has to stay open beside a pty master. There are no ptys, so
-/// nothing -- same answer as Linux, for want of the question.
+/// What must stay open beside a pty master: nothing, since there are no
+/// ptys.
 pub(crate) fn pty_keepalive(_slave_path: &str) -> std::io::Result<Option<std::fs::File>> {
     Ok(None)
 }
