@@ -1,28 +1,20 @@
 // Which directories the user has vouched for, and for what.
 //
-// bish does a handful of things that let a directory's *own* contents
-// decide what code runs: a git repository's config and attributes can
-// name a filter or a textconv command that git executes while bish is
-// only asking it a question (see `git::command`), and a toolchain hook
-// may want to source a project-local env file or run a project-local
-// formatter. All of that is useful in a directory you put there and a
-// trap in one you downloaded -- the difference is not in the files, it
-// is in whether you trust them, which is a thing only you can say.
+// Some things let a directory's own contents decide what runs: a git
+// repository's config can name a filter or textconv that git executes
+// while bish only asks it something (see `git::command`), and a hook may
+// source a project's env file or run its formatter. Fine in a directory
+// you made, a trap in one you downloaded; only the user can tell them
+// apart.
 //
-// So this is where you say it. `::bish trust` records a directory and a
-// glob of *capabilities* it is trusted for; everything that would act on
-// a directory's own say-so asks `is_trusted` first, naming the
-// capability it needs. bish's own git integration uses the capability
-// `"git"`; a hook can invent any key it likes and gate itself on
-// `::bish trust --check <key>`, so the mechanism is the shell's and the
-// policy is the tool's.
+// `::bish trust` records a directory and a glob of capabilities it's
+// trusted for, and everything acting on a directory's say-so asks
+// `is_trusted` with the capability it needs. bish's git integration uses
+// `"git"`; a hook can use any key via `::bish trust --check <key>`.
 //
-// Trust descends: vouching for a repository root vouches for everything
-// under it, because that is where you stand when you run the command and
-// where the subdirectories you work in live. It is per real path --
-// resolved through symlinks at the moment it is recorded and at the
-// moment it is checked -- so a trusted name cannot be made to cover an
-// untrusted place by moving a link.
+// Trust descends: trusting a repository root covers everything under
+// it. Paths are resolved through symlinks when recorded and when
+// checked, so moving a link can't stretch trust to another place.
 
 use crate::glob;
 use std::io::Write;
@@ -36,35 +28,26 @@ pub struct Entry {
     pub capabilities: String,
 }
 
-/// `$XDG_CONFIG_HOME/bish/trust`, or `~/.config/bish/trust`.
-///
-/// The same place `gitignore`'s own config lookup already treats as
-/// bish's config root, so trust sits beside the rc rather than inventing
-/// a directory of its own. `None` when neither variable is set, which is
-/// the same "then there is nowhere to read or write" every other
-/// config-file path here reaches.
+/// `$XDG_CONFIG_HOME/bish/trust`, or `~/.config/bish/trust`, beside the
+/// rc, as `gitignore`'s config lookup finds it. `None` when neither
+/// variable is set.
 pub fn store_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.map(|h| h.join(".config")))?;
     Some(base.join("bish").join("trust"))
 }
 
-/// The real, absolute form of a directory -- what both recording and
-/// checking compare, so a relative path, a `.`, a trailing slash or a
-/// symlink in the middle can never make two names for one place look
-/// like two places. Falls back to the path as given when it cannot be
-/// resolved (it does not exist yet, say), which still compares equal to
-/// itself.
+/// The real absolute form of a directory, so a relative path, `.`, a
+/// trailing slash or a symlink can't make one place look like two. Falls
+/// back to the path as given when it can't be resolved.
 fn canonical(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// Every recorded entry, in file order. A line is `GLOB\tDIR`; the glob
-/// comes first because a glob never contains a tab and a path might, so
-/// the directory is the whole of the rest of the line. A line without a
-/// tab, or an empty or `#`-commented one, is skipped rather than
-/// refused -- a trust file is something a person may edit, and one bad
-/// line should not void the rest.
+/// Every entry, in file order. A line is `GLOB\tDIR`, glob first because
+/// a path may contain a tab and a glob can't. A line without a tab, or
+/// blank, or `#`-commented, is skipped: a person may edit this file, and
+/// one bad line shouldn't void the rest.
 pub fn load() -> Vec<Entry> {
     let Some(path) = store_path() else { return Vec::new() };
     let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
@@ -77,18 +60,12 @@ pub fn load() -> Vec<Entry> {
         .collect()
 }
 
-/// Whether `dir` is trusted for `capability` -- the one question
-/// everything that acts on a directory's own say-so asks.
+/// Whether `dir` is trusted for `capability`: some entry is `dir` or an
+/// ancestor, with a matching glob, both sides resolved to real paths.
 ///
-/// Trusted when some recorded entry covers `dir` -- is it, or an
-/// ancestor of it -- and that entry's capability glob matches; both
-/// sides are resolved to real paths first.
-///
-/// `owned_default` is the `trust_owned` bishopt: a glob of capabilities a
-/// directory you own is trusted for with no recorded entry. Empty by
-/// default, trusting nothing -- owning a place is a weaker signal than
-/// vouching for it (a downloaded archive is yours the moment you unpack
-/// it), so this grants nothing unless the option is deliberately set.
+/// `owned_default` is the `trust_owned` bishopt: capabilities a directory
+/// you own gets without an entry. Empty by default: owning a place is
+/// weaker than vouching for it (an unpacked download is yours).
 pub fn is_trusted(dir: &Path, capability: &str, owned_default: &str) -> bool {
     let dir = canonical(dir);
     let by_entry = load().iter().any(|entry| {
@@ -98,18 +75,14 @@ pub fn is_trusted(dir: &Path, capability: &str, owned_default: &str) -> bool {
     by_entry || (!owned_default.is_empty() && glob::matches(owned_default, capability) && owned_by_this_user(&dir))
 }
 
-/// Whether `dir` is owned by the user bish is running as.
-///
-/// The effective uid, since that is who would act on the trust. A
-/// directory bish cannot stat is not owned -- the check fails closed, so
-/// an unreadable or vanished path grants nothing.
+/// Whether `dir` is owned by bish's effective uid, who would act on the
+/// trust. Fails closed: an unstattable path isn't owned.
 fn owned_by_this_user(dir: &Path) -> bool {
     std::fs::metadata(dir).map(|m| crate::platform::file_owner(&m) == crate::platform::effective_user()).unwrap_or(false)
 }
 
 /// Records `dir` as trusted for `capabilities`, replacing any entry for
-/// the same directory rather than stacking a second one -- trusting a
-/// place twice is setting what it is trusted for, not adding to it.
+/// it: trusting twice sets, not adds.
 pub fn trust(dir: &Path, capabilities: &str) -> std::io::Result<()> {
     let dir = canonical(dir);
     let mut entries = load();
@@ -118,9 +91,8 @@ pub fn trust(dir: &Path, capabilities: &str) -> std::io::Result<()> {
     save(&entries)
 }
 
-/// Removes the entry for exactly `dir`, if there is one. Returns whether
-/// there was: the caller says "nothing was trusted there" rather than
-/// claiming it removed something it did not.
+/// Removes the entry for exactly `dir`, returning whether there was one,
+/// so the caller doesn't claim to have removed something.
 pub fn untrust(dir: &Path) -> std::io::Result<bool> {
     let dir = canonical(dir);
     let mut entries = load();
@@ -133,10 +105,8 @@ pub fn untrust(dir: &Path) -> std::io::Result<bool> {
     Ok(removed)
 }
 
-/// Writes the whole list back, creating the config directory if it is
-/// not there yet. `0600`, because the list of places you trust is not
-/// anybody else's business -- and the directory `0700` for the same
-/// reason, matching how the session code treats its own.
+/// Writes the list back, creating the config directory. The file `0600`
+/// and the directory `0700`: where you trust is nobody else's business.
 fn save(entries: &[Entry]) -> std::io::Result<()> {
     let path = store_path().ok_or_else(|| std::io::Error::other("no config directory (set HOME or XDG_CONFIG_HOME)"))?;
     if let Some(parent) = path.parent() {
@@ -144,11 +114,9 @@ fn save(entries: &[Entry]) -> std::io::Result<()> {
     }
     let mut body = String::new();
     for entry in entries {
-        // A path with a newline or a tab in it cannot be represented a
-        // line at a time and is dropped rather than written as a line
-        // that would read back as something else. Both are pathological
-        // in a directory name; a dropped entry is a trust not recorded,
-        // which fails safe.
+        // A path with a newline or tab can't be stored a line at a time, so
+        // it's dropped rather than written as something else; a trust not
+        // recorded fails safe.
         let dir = entry.dir.to_string_lossy();
         if dir.contains('\n') || dir.contains('\t') {
             continue;
@@ -166,20 +134,17 @@ fn save(entries: &[Entry]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    // A whole trust store in one place, isolated from the real one:
-    // point XDG_CONFIG_HOME at a fresh temp dir for the duration. The
-    // store is process-global state (a file), so these take the env
-    // lock the rest of the suite uses for the same reason.
+    // A trust store isolated from the real one, with XDG_CONFIG_HOME on a
+    // fresh temp dir meanwhile.
     fn with_store(body: impl FnOnce(&Path)) {
-        // The store is a file keyed off env vars, so these serialize on
-        // their own lock and put every var back -- the same shape
-        // session.rs's own env-mutating tests use.
+        // The store is a file keyed off env vars, so these tests serialize
+        // on a lock and restore every variable, as session.rs's do.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = crate::tempdir::TempDir::new("trust");
         let saved = std::env::var_os("XDG_CONFIG_HOME");
         let home = std::env::var_os("HOME");
-        // SAFETY: under the env lock, like every other env-mutating test.
+        // SAFETY: under the env lock, like every env-mutating test.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir.path());
             std::env::remove_var("HOME");
@@ -204,11 +169,11 @@ mod tests {
             std::fs::create_dir_all(repo.join("src/inner")).unwrap();
             trust(&repo, "*").unwrap();
 
-            // The directory itself and everything under it.
+            // The directory and everything under it.
             assert!(is_trusted(&repo, "git", ""));
             assert!(is_trusted(&repo.join("src"), "git", ""));
             assert!(is_trusted(&repo.join("src/inner"), "anything-at-all", ""));
-            // Not its parent, and not a sibling.
+            // Not its parent, nor a sibling.
             assert!(!is_trusted(root, "git", ""));
             std::fs::create_dir_all(root.join("other")).unwrap();
             assert!(!is_trusted(&root.join("other"), "git", ""));
@@ -229,8 +194,8 @@ mod tests {
             std::fs::create_dir_all(&real).unwrap();
             trust(&real, "*").unwrap();
 
-            // A symlink to the trusted directory is the trusted
-            // directory: trust is about the place, not the name.
+            // A symlink to the trusted directory is that directory: trust
+            // is about the place, not the name.
             let link = root.join("link");
             std::os::unix::fs::symlink(&real, &link).unwrap();
             assert!(is_trusted(&link, "git", ""), "a symlink to a trusted dir is trusted");
@@ -267,32 +232,27 @@ mod tests {
         });
     }
 
-    // `trust_owned`: a directory you own is trusted for the capabilities
-    // its glob matches, with no recorded entry -- the opt-in "trust what
-    // I own", off by default.
+    // `trust_owned`: a directory you own is trusted for what its glob
+    // matches, without an entry; off by default.
     #[test]
     fn owning_a_directory_trusts_it_only_when_the_option_is_set() {
         with_store(|root| {
             let mine = root.join("mine");
             std::fs::create_dir_all(&mine).unwrap();
-            // The temp dir is created by this test, so it is owned by
-            // this user -- the case the option is about.
+            // Created by this test, so owned by this user.
 
-            // Default (empty) trusts nothing, even what you own: this is
-            // the no-trust-by-default the audit settled on.
+            // The default (empty) trusts nothing, even what you own.
             assert!(!is_trusted(&mine, "git", ""));
-            // Set to `git`: owned directory is now trusted for git, and
-            // only git.
+            // `git`: an owned directory is trusted for git, and only git.
             assert!(is_trusted(&mine, "git", "git"));
             assert!(!is_trusted(&mine, "mise:env", "git"));
             // `*` trusts it for everything.
             assert!(is_trusted(&mine, "anything", "*"));
-            // It descends like any trust -- a subdir you own is covered.
+            // It descends like any trust.
             std::fs::create_dir_all(mine.join("sub")).unwrap();
             assert!(is_trusted(&mine.join("sub"), "git", "git"));
-            // A directory owned by someone else is not trusted no matter
-            // the option: /proc is root-owned and a reliable stand-in on
-            // the machines bish runs on. Skipped where it is not there.
+            // Someone else's directory isn't trusted whatever the option:
+            // `/proc` is root-owned. Skipped where it doesn't exist.
             let other = std::path::Path::new("/proc");
             if other.is_dir() {
                 use std::os::unix::fs::MetadataExt;
@@ -300,8 +260,7 @@ mod tests {
                     assert!(!is_trusted(other, "git", "*"), "ownership, not just the glob, has to hold");
                 }
             }
-            // An explicit entry still works with the option off, which
-            // is the ordinary path.
+            // An explicit entry works with the option off.
             assert!(!is_trusted(&root.join("elsewhere"), "git", ""));
             std::fs::create_dir_all(root.join("elsewhere")).unwrap();
             trust(&root.join("elsewhere"), "*").unwrap();
