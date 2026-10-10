@@ -1,43 +1,23 @@
-// The Language Server Protocol, as far as it is a *wire format*: the
-// stdio framing, JSON-RPC 2.0 on top of it, and the position arithmetic
-// that has to happen at the boundary because bish and LSP count columns
-// differently. Deliberately nothing else -- no process, no editor, no
-// `Shell`. This module can be exercised entirely by handing it bytes and
-// reading back messages, which is the whole reason it is separate from
-// the half that owns a running server.
+// The Language Server Protocol as a wire format: JSON-RPC 2.0 over the
+// stdio framing, and the position arithmetic at the boundary, since bish
+// and LSP count columns differently. No process, editor or `Shell`, so
+// it's tested by handing it bytes.
 //
-// Same split, and the same reasoning, as `session.rs`'s own framing: a
-// hand-rolled length-prefixed format whose encode and decode are tested
-// directly against each other, rather than a parser bolted onto the
-// thing that reads the socket.
-//
-// Messages are built on `json::Value` rather than a typed model of LSP.
-// A full one is thousands of lines of optional fields that vary by
-// server and by protocol version, and `json::query` already exists for
-// reaching into a reply whose exact shape we don't want to commit to
-// (`query(&result, ".contents.value")`). Typed structs earn their place
-// only where bish *constructs* a message, which is a much smaller set.
-//
-// `allow(dead_code)`, the way theme.rs does it and for the same kind of
-// reason: this is a complete, self-contained description of a wire
-// format, and which parts of it have a caller yet is a fact about how
-// far the client has been built, not about whether the protocol has
-// those pieces. Half of it goes unused until document sync lands.
+// Messages are `json::Value`, not a typed model of LSP: a full one is
+// thousands of lines of optional fields varying by server and version,
+// and `json::query` reaches into a reply without committing to its shape
+// (`query(&result, ".contents.value")`). Types appear only where bish
+// builds messages. The allow is because this describes the whole
+// format, not just what the client uses.
 #![allow(dead_code)]
 
 use crate::json::{self, Value};
 
-// The framing, and the size cap that goes with it, are shared with the
-// Debug Adapter Protocol -- see framing.rs, which is where both live.
+// The framing and its size cap are shared with DAP, in framing.rs.
 
-// ---------------------------------------------------------------------
-// Framing
-// ---------------------------------------------------------------------
-
-/// A JSON-RPC id. Ours are always numbers; a *server*'s own requests
+/// A JSON-RPC id. Ours are numbers; a server's own requests
 /// (`workspace/configuration`, `client/registerCapability`) may use
-/// either, and the reply has to echo back exactly what arrived -- which
-/// is the only reason the string case exists.
+/// strings, and a reply must echo what arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Id {
     Number(i64),
@@ -68,10 +48,9 @@ pub struct ResponseError {
     pub message: String,
 }
 
-/// One JSON-RPC message, in either direction. The three shapes are
-/// distinguished exactly as the spec does: a `method` with an `id` is a
-/// request, a `method` without one is a notification, and an `id` with
-/// `result`/`error` is a response.
+/// One JSON-RPC message in either direction, told apart as the spec does:
+/// `method` and `id` is a request, `method` alone a notification, `id`
+/// with `result` or `error` a response.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Request { id: Id, method: String, params: Value },
@@ -109,10 +88,8 @@ impl Message {
         Value::Object(fields)
     }
 
-    /// The inverse. `Err` for anything that isn't recognizably one of
-    /// the three shapes -- a server that sends such a thing is broken,
-    /// and guessing which shape was meant would only move the failure
-    /// somewhere less obvious.
+    /// The inverse. `Err` for anything not clearly one of the three shapes:
+    /// a server sending that is broken, and guessing would hide it.
     pub fn from_value(v: &Value) -> Result<Message, String> {
         let Value::Object(fields) = v else {
             return Err("message is not a JSON object".to_string());
@@ -124,9 +101,8 @@ impl Message {
             Some(_) => return Err("`method` is not a string".to_string()),
             None => None,
         };
-        // `params` is optional in JSON-RPC; an absent one is `Null`
-        // rather than an error, so a caller reading it with `json::query`
-        // gets the same "absent means null" it gets everywhere else.
+        // `params` is optional; absent is `Null`, as `json::query` reads
+        // absent fields.
         let params = field("params").cloned().unwrap_or(Value::Null);
         match (method, id) {
             (Some(method), Some(id)) => Ok(Message::Request { id, method, params }),
@@ -145,11 +121,9 @@ impl Message {
                         };
                         Err(ResponseError { code, message })
                     }
-                    // A response with neither `result` nor `error` is
-                    // malformed by the spec, but the harmless reading is
-                    // "succeeded with nothing," which is also what a
-                    // `null` result means -- so it takes that reading
-                    // rather than failing the whole message.
+                    // Neither `result` nor `error` is malformed, but reads
+                    // harmlessly as success with nothing, like a `null`
+                    // result.
                     _ => Ok(field("result").cloned().unwrap_or(Value::Null)),
                 };
                 Ok(Message::Response { id, result })
@@ -159,22 +133,15 @@ impl Message {
     }
 }
 
-/// One message, framed and ready to write to a server's stdin.
-///
-/// `Content-Length` counts *bytes*, not characters -- the one detail
-/// this whole function exists to get right, since every string that
-/// reaches here has been through a `char`-based codebase.
+/// One message framed for a server's stdin. `Content-Length` counts
+/// bytes, not chars.
 pub fn encode(message: &Message) -> Vec<u8> {
     crate::framing::encode(&json::compact_print(&message.to_value()))
 }
 
-/// The receiving half: bytes in (in whatever sizes a non-blocking read
-/// happens to produce), whole messages out.
-///
-/// A state machine rather than a `read_message(fd)` function because
-/// there is no blocking read to hide behind -- a message can and does
-/// arrive split across reads, and half a header has to be kept until the
-/// rest of it shows up.
+/// The receiving half: bytes in, in whatever pieces non-blocking reads
+/// give, whole messages out. A state machine, since a message can arrive
+/// split and half a header must be kept.
 pub struct Decoder {
     frames: crate::framing::Frames,
 }
@@ -194,15 +161,13 @@ impl Decoder {
         self.frames.feed(bytes);
     }
 
-    /// The next complete message, if the bytes fed so far contain one.
-    /// `None` means "not yet" -- call again after feeding more.
+    /// The next complete message, if the bytes fed so far hold one; `None`
+    /// until more is fed.
     pub fn take_message(&mut self) -> Option<Result<Message, String>> {
         match self.frames.take_body()? {
             Err(e) => Some(Err(e)),
-            // A body that isn't JSON is *not* a framing error: the
-            // frame itself was well-formed, so the stream is still
-            // synchronized and the next message is still findable.
-            // Report it and carry on.
+            // A body that isn't JSON isn't a framing error: the frame was
+            // fine, so the next message is still findable.
             Ok(body) => Some(match json::parse(&body) {
                 Err(e) => Err(format!("malformed JSON body: {e}")),
                 Ok(value) => Message::from_value(&value),
@@ -210,59 +175,43 @@ impl Decoder {
         }
     }
 
-    /// Whether a framing error has put this decoder out of action. The
-    /// owner of the server treats this as "the connection is dead."
+    /// Whether a framing error stopped this decoder; the server's owner
+    /// treats it as a dead connection.
     pub fn is_failed(&self) -> bool {
         self.frames.is_failed()
     }
 }
 
-// ---------------------------------------------------------------------
-// Diagnostics
-// ---------------------------------------------------------------------
-
-/// One finding from a `textDocument/publishDiagnostics`, still in the
-/// protocol's own coordinates.
-///
-/// Named `Finding` rather than `Diagnostic` on purpose: `lint::
-/// Diagnostic` is what the editor draws, and the two are genuinely
-/// different things until a buffer has converted one into the other.
-/// This one's positions are `(line, character)` in whatever encoding the
-/// server negotiated; that one's are flat char offsets. Only something
-/// holding the actual text can bridge them, which is why this type stops
-/// here.
+/// One finding from `textDocument/publishDiagnostics`, in the protocol's
+/// coordinates: `(line, character)` in the negotiated encoding, where
+/// `lint::Diagnostic` has flat char offsets. Only something holding the
+/// text can convert, hence the separate name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub start: (usize, usize),
     pub end: (usize, usize),
-    /// LSP's 1..=4. Kept as the number rather than mapped here, because
-    /// the enum it maps to lives in `lint` and this module has no
-    /// business knowing about it.
+    /// LSP's 1..=4, kept as the number; the enum it maps to is `lint`'s.
     pub severity: u8,
     pub code: String,
     pub source: Option<String>,
     pub message: String,
 }
 
-/// A whole `publishDiagnostics` payload: which document, which revision
-/// of it, and what was found.
+/// A `publishDiagnostics` payload: the document, its revision, the
+/// findings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publication {
     pub uri: String,
-    /// The document version these describe, when the server said. LSP
-    /// makes it optional; absent means "no idea", and a client has
-    /// little choice but to trust them.
+    /// The document version these describe, if given. Optional in LSP;
+    /// absent means unknown.
     pub version: Option<u64>,
     pub findings: Vec<Finding>,
 }
 
-/// Reads a `textDocument/publishDiagnostics` payload. `None` if it isn't
-/// one -- no uri, or a `diagnostics` that isn't an array.
-///
-/// Every string here comes from another process and ends up drawn into a
-/// terminal, so all of them go through `sanitize` on the way in: one
-/// place, at the boundary, rather than a rule every rendering path has
-/// to remember. Exactly what `url::is_safe` exists for, one layer down.
+/// Reads a `publishDiagnostics` payload, or `None` without a uri or a
+/// `diagnostics` array. Every string comes from another process and will
+/// be drawn in a terminal, so all go through `sanitize` here, at the
+/// boundary, as `url::is_safe` does a layer down.
 pub fn publication(params: &Value) -> Option<Publication> {
     let Ok(Value::Str(uri)) = json::query(params, ".uri") else { return None };
     let Ok(Value::Array(items)) = json::query(params, ".diagnostics") else { return None };
@@ -277,23 +226,20 @@ pub fn publication(params: &Value) -> Option<Publication> {
 fn finding(value: &Value) -> Option<Finding> {
     let start = position(json::query(value, ".range.start").ok()?)?;
     let end = position(json::query(value, ".range.end").ok()?)?;
-    // A range whose end precedes its start is a server bug; taking it at
-    // face value would produce an underline of negative width. Reading
-    // it as an empty range at `start` keeps the finding, which is the
-    // part the user actually needs.
+    // A range ending before it starts is a server bug; read as empty at
+    // `start`, keeping the finding.
     let end = if end < start { start } else { end };
     Some(Finding {
         start,
         end,
         severity: match json::query(value, ".severity") {
             Ok(Value::Number(s)) if (1.0..=4.0).contains(s) => *s as u8,
-            // "If omitted it is up to the client to interpret" -- and
-            // the safe interpretation is the loudest one: a finding
-            // shown as an error that was meant as a hint is a small
-            // annoyance, the reverse is a missed problem.
+            // "If omitted it is up to the client to interpret": an error,
+            // since a hint shown as an error is an annoyance and the
+            // reverse a missed problem.
             _ => 1,
         },
-        // A code may be a string or a number, and both are common.
+        // A code may be a string or a number.
         code: match json::query(value, ".code") {
             Ok(Value::Str(code)) => sanitize(code),
             Ok(Value::Number(code)) => format!("{}", *code as i64),
@@ -320,19 +266,15 @@ fn position(value: &Value) -> Option<(usize, usize)> {
     Some((*line as usize, *character as usize))
 }
 
-/// How long a message may be before it is cut. A compiler can produce a
-/// diagnostic with a whole worked example in it; a gutter row cannot.
+/// How long a message may be: a compiler's can include a worked example,
+/// and a gutter row can't.
 const MAX_MESSAGE: usize = 400;
 
-/// Text from a server, made safe to draw.
-///
-/// Two separate hazards. Control characters would be spliced straight
-/// into a terminal's escape-sequence stream -- the exact bug class
-/// `url::is_safe` exists for -- and newlines and tabs would break the
-/// one-line-per-finding shape every place that shows these assumes
-/// (`rustc` messages are routinely several lines). So every whitespace
-/// run collapses to one space and every other control character is
-/// dropped, and the result is capped.
+/// Text from a server made safe to draw. Control characters would go
+/// straight into the terminal's escape stream (what `url::is_safe`
+/// guards against), and newlines and tabs would break one finding per
+/// line (`rustc`'s span several). So whitespace runs collapse to a space,
+/// other control characters go, and the result is capped.
 fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_MESSAGE));
     let mut pending_space = false;
@@ -357,31 +299,21 @@ fn sanitize(text: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------
-// Hover
-// ---------------------------------------------------------------------
-
-/// How many lines of hover to keep, and how wide. A server can return a
-/// type signature with every trait bound spelled out; a popup floating
-/// over someone's code cannot.
+/// How many hover lines to keep, and how wide: a signature with every
+/// bound spelled out can't float over the code.
 const MAX_HOVER_LINES: usize = 30;
 const MAX_HOVER_WIDTH: usize = 120;
 
-/// A `textDocument/hover` result as lines to draw, or `None` when the
-/// server had nothing to say (a `null` result, or contents that are
-/// empty once cleaned up) -- which is a perfectly ordinary answer and
-/// the caller's cue to fall back to whatever it knows itself.
-///
-/// LSP allows three shapes here and all three are in the wild: the
-/// current `MarkupContent { kind, value }`, the deprecated bare or
-/// `{language, value}` `MarkedString`, and an array of those. Handling
-/// only the first would mean no hover at all from a number of real
-/// servers, so all three are read.
+/// A `textDocument/hover` result as lines, or `None` when the server had
+/// nothing (`null`, or empty once cleaned), the caller's cue to fall
+/// back. All three shapes LSP allows are in use: `MarkupContent`, the
+/// deprecated `MarkedString` (bare or `{language, value}`), and an array
+/// of those.
 pub fn hover_lines(result: &Value) -> Option<Vec<String>> {
     let contents = json::query(result, ".contents").ok()?;
     let raw = match contents {
-        // MarkupContent, and the `{language, value}` MarkedString, are
-        // told apart by which fields they have -- both carry `value`.
+        // `MarkupContent` and `{language, value}` both carry `value`; their
+        // other fields tell them apart.
         Value::Object(_) => match json::query(contents, ".value") {
             Ok(Value::Str(value)) => value.clone(),
             _ => return None,
@@ -405,14 +337,9 @@ pub fn hover_lines(result: &Value) -> Option<Vec<String>> {
     (!lines.is_empty()).then_some(lines)
 }
 
-/// Server markdown as plain lines.
-///
-/// Deliberately not a markdown *renderer*: the popup this feeds shows
-/// plain text, and the one thing worth doing is not showing the
-/// syntax. Code fences are dropped rather than kept, because a hover is
-/// most often exactly one fenced signature and leaving the ``` in makes
-/// the useful line look like debris. Everything else is left as written
-/// -- a half-rendered `**bold**` would be worse than an honest one.
+/// Server markdown as plain lines, not rendered: code fences are dropped
+/// (a hover is often one fenced signature), everything else left as
+/// written, since half-rendered `**bold**` is worse than honest.
 fn hover_text_lines(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.split('\n') {
@@ -424,10 +351,9 @@ fn hover_text_lines(text: &str) -> Vec<String> {
         if trimmed.trim_start().starts_with("```") {
             continue;
         }
-        // Same hazard as a diagnostic message: this is text from
-        // another process on its way into a terminal. Line structure is
-        // meaningful here, so only the *within*-line control characters
-        // are dropped, with a tab becoming a space rather than nothing.
+        // Text from another process on its way to a terminal, as for
+        // diagnostics, but keeping lines: only control characters within a
+        // line go, a tab becoming a space.
         let mut clean = String::new();
         for c in trimmed.chars() {
             if clean.chars().count() >= MAX_HOVER_WIDTH {
@@ -440,8 +366,8 @@ fn hover_text_lines(text: &str) -> Vec<String> {
                 c => clean.push(c),
             }
         }
-        // A blank line between paragraphs is worth keeping; a run of
-        // them, or ones at either end, is not.
+        // One blank line between paragraphs is kept; runs and ones at the
+        // ends aren't.
         if clean.trim().is_empty() && (out.is_empty() || out.last().is_some_and(|l| l.trim().is_empty())) {
             continue;
         }
@@ -453,14 +379,8 @@ fn hover_text_lines(text: &str) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------------
-// Locations
-// ---------------------------------------------------------------------
-
-/// Somewhere in some file: what `textDocument/definition` (and later
-/// `references`, `documentSymbol`) answers with. Positions are still in
-/// the server's own `(line, character)`, for the same reason `Finding`'s
-/// are.
+/// Somewhere in some file, as `textDocument/definition` answers. Positions
+/// are the server's `(line, character)`, as `Finding`'s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub uri: String,
@@ -468,40 +388,30 @@ pub struct Location {
     pub end: (usize, usize),
 }
 
-/// One piece of text the server wants drawn inside the line, at a
-/// position that is *between* two characters rather than over them:
-/// `textDocument/inlayHint`'s answer. A parameter name before an
-/// argument, an inferred type after a binding.
-///
-/// Positions are still in the server's own `(line, character)`, like
-/// every other position in this module.
+/// Text the server wants drawn between two characters of a line
+/// (`textDocument/inlayHint`): a parameter name before an argument, an
+/// inferred type after a binding. Positions are the server's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlayHint {
     pub line: usize,
     pub character: usize,
-    /// Already padded per the server's own `paddingLeft`/`paddingRight`
-    /// -- a hint is spliced into the line verbatim, so where its spaces
-    /// go is part of the text, not a separate instruction.
+    /// Already padded per `paddingLeft`/`paddingRight`: a hint is spliced in
+    /// verbatim.
     pub label: String,
 }
 
-/// How many hints one request's worth is allowed to produce. The
-/// request is for the visible range, so this is generous; it exists so
-/// that a server answering about a whole generated file cannot make
-/// splicing them in the expensive part of a redraw.
+/// How many hints one request may produce. The request is for the
+/// visible range, so this is generous, and stops a whole generated file
+/// from making the splice the expensive part of a redraw.
 const MAX_INLAY_HINTS: usize = 500;
 
-/// How long one hint may be. A hint is spliced into the line, so a
-/// server that answers with a fully-qualified generic type would push
-/// the code it annotates off the screen.
+/// How long a hint may be, so a fully qualified generic type doesn't
+/// push the code off screen.
 const MAX_HINT_LABEL: usize = 60;
 
-/// Reads an `inlayHint` result.
-///
-/// The label has two shapes, and again both are in use: a plain string,
-/// or an array of parts each with its own `value` (the form that
-/// carries per-part links and tooltips, none of which bish draws). The
-/// parts are concatenated, which is exactly what they mean.
+/// Reads an `inlayHint` result. The label is a string, or an array of
+/// parts with their own `value` (carrying links and tooltips bish doesn't
+/// draw), concatenated.
 pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
     let Value::Array(items) = result else { return Vec::new() };
     items
@@ -520,7 +430,7 @@ pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
                     .collect(),
                 _ => return None,
             };
-            // A hint with nothing in it would still take a cell.
+            // An empty hint would still take a cell.
             if label.trim().is_empty() {
                 return None;
             }
@@ -534,23 +444,15 @@ pub fn inlay_hints(result: &Value) -> Vec<InlayHint> {
         .collect()
 }
 
-/// How many lines a signature popup may take. A single overload is one
-/// line plus whatever documentation the server attached; several
-/// overloads are one line each. Past this the popup stops being a hint
-/// about the call being typed and starts covering the code it is about.
+/// How many lines a signature popup may take: one per overload, plus
+/// attached documentation. Past this it covers the code it's about.
 const MAX_SIGNATURE_LINES: usize = 8;
 
-/// Reads a `textDocument/signatureHelp` result into popup lines.
-///
-/// The active overload first and marked, the rest after it -- rather
-/// than only the active one, because which overload a server picks
-/// while the arguments are still half-typed is a guess, and seeing the
-/// alternatives is how you find out it guessed wrong.
-///
-/// The active *parameter* is deliberately not marked: doing it properly
-/// means resolving a `[start, end]` offset pair or a label substring
-/// against text this function does not own, and a popup that highlights
-/// the wrong argument is worse than one that highlights none.
+/// A `textDocument/signatureHelp` result as popup lines: the active
+/// overload first and marked, then the rest, since a server's pick while
+/// arguments are half-typed is a guess. The active parameter isn't
+/// marked: resolving its offsets or label against text this doesn't own
+/// could mark the wrong argument.
 pub fn signature_help(result: &Value) -> Vec<String> {
     let Ok(Value::Array(signatures)) = json::query(result, ".signatures") else { return Vec::new() };
     if signatures.is_empty() {
@@ -560,7 +462,7 @@ pub fn signature_help(result: &Value) -> Vec<String> {
         Ok(Value::Number(n)) if *n >= 0.0 => (*n as usize).min(signatures.len() - 1),
         _ => 0,
     };
-    // The active one first, then the others in their own order.
+    // The active one first, then the rest in order.
     let order = std::iter::once(active).chain((0..signatures.len()).filter(|&i| i != active));
     let mut out = Vec::new();
     for i in order {
@@ -574,14 +476,10 @@ pub fn signature_help(result: &Value) -> Vec<String> {
     out
 }
 
-/// One occurrence of the thing under the cursor, in this same file:
-/// `textDocument/documentHighlight`'s answer.
-///
-/// No uri, unlike `Location` -- the request is about one document and
-/// every answer is inside it. `write` distinguishes the occurrences
-/// that *assign* to the symbol (kind 3) from the ones that only read it
-/// (kinds 1 and 2, and anything a server invents), which is the
-/// distinction worth drawing differently.
+/// One occurrence of the thing under the cursor in this file, from
+/// `textDocument/documentHighlight`. No uri: it's all one document.
+/// `write` marks occurrences that assign (kind 3), apart from reads
+/// (kinds 1 and 2, and anything invented).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Highlight {
     pub start: (usize, usize),
@@ -589,14 +487,12 @@ pub struct Highlight {
     pub write: bool,
 }
 
-/// How many occurrences are worth marking. A `documentHighlight` for a
-/// name used everywhere in a generated file can run to thousands, and
-/// past a screenful the marks stop meaning anything anyway.
+/// How many occurrences to mark: a name used everywhere in a generated
+/// file can have thousands, and past a screenful they mean nothing.
 const MAX_HIGHLIGHTS: usize = 512;
 
-/// Reads a `documentHighlight` result. A `null` -- "nothing here worth
-/// pointing at" -- is the ordinary answer when the cursor is on
-/// whitespace or a comment, so it is empty rather than an error.
+/// Reads a `documentHighlight` result. `null` is the usual answer on
+/// whitespace or a comment, so it's empty, not an error.
 pub fn highlights(result: &Value) -> Vec<Highlight> {
     let Value::Array(items) = result else { return Vec::new() };
     items
@@ -615,16 +511,10 @@ pub fn highlights(result: &Value) -> Vec<Highlight> {
         .collect()
 }
 
-/// Reads a definition-shaped result. Empty when the server had nothing
-/// -- a `null` result is the ordinary way of saying "I don't know where
-/// that is", not a failure.
-///
-/// Three shapes again, and again all three are in use: a single
-/// `Location`, an array of them, and an array of `LocationLink` (the
-/// newer form, which names its target with `targetUri` and carries both
-/// a full `targetRange` and the narrower `targetSelectionRange` -- the
-/// selection range is the one to jump to, since it is the identifier
-/// itself rather than the whole declaration body).
+/// Reads a definition-shaped result, empty when the server had nothing
+/// (`null`). Three shapes in use: a `Location`, an array of them, or an
+/// array of `LocationLink` (`targetUri`, and the narrower
+/// `targetSelectionRange`, the identifier, which is where to jump).
 pub fn locations(result: &Value) -> Vec<Location> {
     match result {
         Value::Object(_) => location(result).into_iter().collect(),
@@ -634,8 +524,8 @@ pub fn locations(result: &Value) -> Vec<Location> {
 }
 
 fn location(value: &Value) -> Option<Location> {
-    // A LocationLink names its target differently, and prefers the
-    // narrower of its two ranges.
+    // A `LocationLink` names its target differently and prefers the
+    // narrower range.
     if let Ok(Value::Str(uri)) = json::query(value, ".targetUri") {
         let range = match json::query(value, ".targetSelectionRange") {
             Ok(range @ Value::Object(_)) => range,
@@ -652,20 +542,10 @@ fn location(value: &Value) -> Option<Location> {
     Some(Location { uri: uri.clone(), start: position(json::query(range, ".start").ok()?)?, end: position(json::query(range, ".end").ok()?)? })
 }
 
-// ---------------------------------------------------------------------
-// Edits
-// ---------------------------------------------------------------------
-
-/// One replacement a server wants made: put `text` where `start..end`
-/// currently is. Positions are the server's own, as everywhere else
-/// here.
-///
-/// This is LSP's `TextEdit`, and it is what `textDocument/formatting`,
-/// `rename` and a code action's `WorkspaceEdit` are all made of --
-/// which is why it is its own type rather than something formatting
-/// owns. `lint::Fix` cannot stand in: it is deliberately a *single*
-/// range (see its own doc comment), and these arrive in batches that
-/// have to be applied together.
+/// One replacement: `text` in place of `start..end`, in the server's
+/// positions. LSP's `TextEdit`, which formatting, `rename` and code
+/// actions' `WorkspaceEdit` are all made of. `lint::Fix` is a single
+/// range, and these come in batches applied together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEdit {
     pub start: (usize, usize),
@@ -673,10 +553,8 @@ pub struct TextEdit {
     pub text: String,
 }
 
-/// Reads a `TextEdit[]` -- what `textDocument/formatting` answers with,
-/// and what each file's entry in a `WorkspaceEdit` holds. `null` (the
-/// server had nothing to change) reads as an empty list, which is a
-/// real answer and not a failure.
+/// Reads a `TextEdit[]`, from `textDocument/formatting` or a
+/// `WorkspaceEdit` entry. `null` (nothing to change) is an empty list.
 pub fn text_edits(result: &Value) -> Vec<TextEdit> {
     let Value::Array(items) = result else { return Vec::new() };
     items.iter().filter_map(text_edit).collect()
@@ -686,20 +564,17 @@ fn text_edit(value: &Value) -> Option<TextEdit> {
     let range = json::query(value, ".range").ok()?;
     let start = position(json::query(range, ".start").ok()?)?;
     let end = position(json::query(range, ".end").ok()?)?;
-    // A backwards range would delete nothing and insert in the wrong
-    // place; read it as empty at the start, as a diagnostic's is.
+    // A backwards range is read as empty at the start, as for diagnostics.
     let end = if end < start { start } else { end };
     let Ok(Value::Str(text)) = json::query(value, ".newText") else { return None };
-    // Deliberately *not* sanitized. Unlike a message or a hover, this
-    // is text going into the buffer, where a tab or a newline is
-    // meaningful and stripping control characters would silently
-    // corrupt what the server asked for. A formatter's whole output is
-    // whitespace decisions.
+    // Not sanitized: this text goes into the buffer, where tabs and
+    // newlines mean something, and a formatter's output is whitespace
+    // decisions.
     Some(TextEdit { start, end, text: text.clone() })
 }
 
-/// A change to a file itself rather than to its text -- one of the
-/// resource operations `documentChanges` can carry.
+/// A change to a file itself rather than its text: a resource operation
+/// in `documentChanges`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOperation {
     Create { uri: String, overwrite: bool, ignore_if_exists: bool },
@@ -707,38 +582,32 @@ pub enum FileOperation {
     Delete { uri: String, recursive: bool, ignore_if_not_exists: bool },
 }
 
-/// A change to a whole project: which files, and what to do to each.
+/// A change to a whole project: the files, and what to do to each.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceEdit {
-    /// One entry per file, in the order the server gave them.
+    /// One entry per file, in the server's order.
     pub changes: Vec<(String, Vec<TextEdit>)>,
-    /// Files to create, rename or delete, each with how many of
-    /// `changes` come before it. `documentChanges` is one list in one
-    /// order, and the order is part of the edit: rust-analyzer renames a
-    /// module's file and then edits the file under its new name.
+    /// Files to create, rename or delete, each with how many of `changes`
+    /// come before it: `documentChanges` is ordered, and rust-analyzer
+    /// renames a module's file and then edits it under the new name.
     pub operations: Vec<(usize, FileOperation)>,
-    /// Operations that could not be read -- a kind this has never heard
-    /// of, or one missing a URI it needs -- named so the caller can say
-    /// what it is refusing.
-    ///
-    /// These are not ignorable. Applying the rest of an edit without one
-    /// of its steps leaves the project broken, so a caller that sees any
-    /// of these must do nothing at all.
+    /// Operations that couldn't be read (an unknown kind, a missing URI),
+    /// named so the caller can say what it refuses. Applying the rest without
+    /// them would leave the project broken, so a caller seeing any must do
+    /// nothing.
     pub unsupported: Vec<String>,
 }
 
-/// Reads a `WorkspaceEdit`, in either of the two shapes it comes in:
-/// the older `changes` map from uri to edits, and `documentChanges`,
-/// which is an array that may interleave `TextDocumentEdit`s with
-/// resource operations.
-///
-/// `documentChanges` wins when both are present, as the spec says.
+/// Reads a `WorkspaceEdit` in either shape: the older `changes` map from
+/// uri to edits, or `documentChanges`, an array mixing
+/// `TextDocumentEdit`s with resource operations, which wins when both are
+/// present, as the spec says.
 pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
     let mut edit = WorkspaceEdit::default();
     if let Ok(Value::Array(items)) = json::query(result, ".documentChanges") {
         for item in items {
-            // A resource operation names its own kind; a
-            // `TextDocumentEdit` has none.
+            // A resource operation names its kind; a `TextDocumentEdit`
+            // doesn't.
             if let Ok(Value::Str(kind)) = json::query(item, ".kind") {
                 match file_operation(kind, item) {
                     Some(operation) => edit.operations.push((edit.changes.len(), operation)),
@@ -765,9 +634,8 @@ pub fn workspace_edit(result: &Value) -> WorkspaceEdit {
     edit
 }
 
-// One resource operation, or `None` for a kind this does not know or one
-// without the URIs its kind needs. An option left out is false, which is
-// what the spec says it means.
+// One resource operation, or `None` for an unknown kind or missing
+// URIs. An omitted option is false, per the spec.
 fn file_operation(kind: &str, item: &Value) -> Option<FileOperation> {
     let uri = |at: &str| match json::query(item, at) {
         Ok(Value::Str(uri)) => Some(uri.clone()),
@@ -789,46 +657,36 @@ fn file_operation(kind: &str, item: &Value) -> Option<FileOperation> {
     }
 }
 
-// ---------------------------------------------------------------------
-// Code actions
-// ---------------------------------------------------------------------
-
-/// Something a server offers to do to the code here -- a quick fix for
-/// a diagnostic, a refactor, an import to add.
+/// Something a server offers to do to the code here: a quick fix, a
+/// refactor, an import.
 // No `Eq`: `unresolved` is a `json::Value`, which holds `f64`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeAction {
     /// What the picker shows.
     pub title: String,
-    /// `quickfix`, `refactor.extract`, ... Empty when the server said
-    /// nothing, which is common for plain commands.
+    /// `quickfix`, `refactor.extract`, and so on; often empty for plain
+    /// commands.
     pub kind: String,
     /// The change to make, when the server sent it up front.
     pub edit: Option<WorkspaceEdit>,
-    /// The action verbatim, for `codeAction/resolve`. A server is
-    /// allowed to send actions without their edits and compute one only
-    /// for the action actually chosen -- rust-analyzer does exactly
-    /// this -- so an action with no `edit` is not necessarily an action
-    /// with nothing to do.
+    /// The action verbatim, for `codeAction/resolve`: a server may send
+    /// actions without edits and compute one only for the chosen action, as
+    /// rust-analyzer does, so a missing `edit` doesn't mean nothing to do.
     pub unresolved: Value,
-    /// The name of the server-side command this action runs, for
-    /// saying which one when there is something to explain.
+    /// The server-side command's name, for explanations.
     pub command: Option<String>,
-    /// That same command verbatim -- `{command, arguments}` -- to hand
-    /// straight back in `workspace/executeCommand`.
-    ///
-    /// Deliberately not sanitized, and deliberately kept whole: the
-    /// `arguments` are the server's own opaque payload (rust-analyzer
-    /// puts entire computed edits in there), so anything but echoing
-    /// them back exactly is corruption.
+    /// That command verbatim, `{command, arguments}`, for
+    /// `workspace/executeCommand`. Not sanitized: the arguments are the
+    /// server's opaque payload (rust-analyzer puts whole edits there), and
+    /// anything but echoing them back is corruption.
     pub invocation: Option<Value>,
-    /// A server can offer an action and say it does not apply here,
-    /// with a reason. Shown, and refused if chosen.
+    /// A server can offer an action as not applicable here, with a reason:
+    /// shown, and refused if chosen.
     pub disabled: Option<String>,
 }
 
-/// Reads a `textDocument/codeAction` answer: an array mixing
-/// `CodeAction`s and bare `Command`s, the older form.
+/// Reads a `textDocument/codeAction` answer: `CodeAction`s mixed with
+/// bare `Command`s, the older form.
 pub fn code_actions(result: &Value) -> Vec<CodeAction> {
     let Value::Array(items) = result else { return Vec::new() };
     items.iter().filter_map(code_action).collect()
@@ -840,10 +698,10 @@ fn code_action(value: &Value) -> Option<CodeAction> {
     if title.is_empty() {
         return None;
     }
-    // A bare `Command` has `command` as a string at the top level; a
-    // `CodeAction`'s own `command` is an object with one inside.
+    // A bare `Command` has a string `command` at the top; a `CodeAction`'s
+    // `command` is an object holding one.
     let (command, invocation) = match json::query(value, ".command") {
-        // The bare-`Command` shape: this whole object is the command.
+        // A bare `Command`: the whole object is the command.
         Ok(Value::Str(name)) => (Some(sanitize(name)), Some(value.clone())),
         Ok(object @ Value::Object(_)) => match json::query(object, ".command") {
             Ok(Value::Str(name)) => (Some(sanitize(name)), Some(object.clone())),
@@ -872,42 +730,33 @@ fn code_action(value: &Value) -> Option<CodeAction> {
     })
 }
 
-// ---------------------------------------------------------------------
-// Completion
-// ---------------------------------------------------------------------
-
 /// One candidate from `textDocument/completion`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     /// What the list shows.
     pub label: String,
-    /// `CompletionItemKind` as its own name -- "function", "variable".
-    /// Empty for a number outside the table.
+    /// `CompletionItemKind` by name ("function", "variable"); empty for an
+    /// unknown number.
     pub kind: String,
-    /// The server's own one-line elaboration: a signature, a type.
-    /// Empty when it gave none.
+    /// The server's one-line detail, a signature or type; empty if none.
     pub detail: String,
     /// What to actually insert.
     pub insert: String,
-    /// The range the server says to replace, in its own coordinates.
-    /// `None` means it did not say, and the caller should replace the
-    /// word being typed -- which is what every client does, but is a
-    /// guess where this is the server's own answer.
+    /// The range the server says to replace, in its coordinates. `None`: the
+    /// caller replaces the word being typed, as clients do, which is a
+    /// guess.
     pub edit: Option<((usize, usize), (usize, usize))>,
-    /// What to sort by. `sortText` when the server gave one, which is
-    /// how a server puts the likely answers first, and the label
-    /// otherwise.
+    /// The sort key: `sortText`, how servers put likely answers first, else
+    /// the label.
     pub sort: String,
-    /// `insertTextFormat: 2` -- `insert` is a snippet, in the notation
-    /// `bishedit::snippet` reads, and goes into the buffer tentatively
-    /// with a caret in its first tabstop rather than as finished text.
+    /// `insertTextFormat: 2`: `insert` is a snippet in `bishedit::snippet`'s
+    /// notation, inserted live with the caret in its first tabstop.
     pub snippet: bool,
 }
 
 impl Completion {
-    /// What to show beside the label: the server's own elaboration when
-    /// it gave one, and the kind otherwise -- so a row is never bare
-    /// when there is something true to say about it.
+    /// Shown beside the label: the server's detail, else the kind, so a row
+    /// is never bare when something is true of it.
     pub fn detail_or_kind(&self) -> String {
         if self.detail.is_empty() { self.kind.clone() } else { self.detail.clone() }
     }
@@ -945,13 +794,9 @@ fn completion_kind(kind: f64) -> String {
     if (1..=KINDS.len()).contains(&index) { KINDS[index - 1].to_string() } else { String::new() }
 }
 
-/// Reads a `textDocument/completion` answer.
-///
-/// Two shapes, both in use: a bare `CompletionItem[]`, and a
-/// `CompletionList { isIncomplete, items }`. `isIncomplete` is read and
-/// discarded -- it means "ask again as the user types more", which this
-/// client does not do (it fetches once and filters what it got), and
-/// silently ignoring a field is better than pretending to honour it.
+/// Reads a `textDocument/completion` answer: a bare `CompletionItem[]` or
+/// a `CompletionList { isIncomplete, items }`. `isIncomplete` (ask again
+/// as the user types) is ignored: this client fetches once and filters.
 pub fn completions(result: &Value) -> Vec<Completion> {
     let items = match result {
         Value::Array(items) => items,
@@ -970,24 +815,17 @@ fn completion(value: &Value) -> Option<Completion> {
     if label.is_empty() {
         return None;
     }
-    // `insertTextFormat` 2 means the text is a snippet, with `$1`/
-    // `${1:name}` placeholders and a `$0` final position. bish has a
-    // snippet engine (`bishedit::snippet`, behind `abbr`), but wiring
-    // an LSP snippet into it is a feature of its own; until then the
-    // placeholders are flattened to their default text, which gives
-    // `foo(a, b)` rather than the literal `foo(${1:a}, ${2:b})` that
-    // ignoring the field would insert.
+    // `insertTextFormat` 2: the text is a snippet with `$1`/`${1:name}`
+    // placeholders and a final `$0`.
     let snippet = matches!(json::query(value, ".insertTextFormat"), Ok(Value::Number(f)) if *f == 2.0);
     let mut edit = None;
-    // A `textEdit` is the server saying exactly what to replace, which
-    // beats guessing at the word under the cursor -- it is how a server
-    // completes something the client would not have recognised as one
-    // word, like a dotted path or an import.
+    // A `textEdit` says exactly what to replace, better than guessing the
+    // word under the cursor, which is how a server completes a dotted path
+    // or an import.
     let text_edit = json::query(value, ".textEdit").ok().filter(|v| matches!(v, Value::Object(_)));
     let insert = if let Some(text_edit) = text_edit {
-        // `InsertReplaceEdit` has `insert`/`replace` instead of
-        // `range`; `insert` is the conservative one (it does not eat
-        // what follows the cursor), so that is what is taken.
+        // `InsertReplaceEdit` has `insert` and `replace` instead of `range`;
+        // `insert`, which doesn't eat what follows the cursor, is taken.
         let range = match json::query(text_edit, ".range") {
             Ok(range @ Value::Object(_)) => Some(range),
             _ => json::query(text_edit, ".insert").ok().filter(|v| matches!(v, Value::Object(_))),
@@ -1008,9 +846,8 @@ fn completion(value: &Value) -> Option<Completion> {
             _ => label.clone(),
         }
     };
-    // `sanitize_insert`, not `sanitize`: this is text destined for the
-    // buffer, and a multi-line snippet collapsed to one line is not the
-    // completion the server offered.
+    // `sanitize_insert`, not `sanitize`: this goes into the buffer, and a
+    // multi-line snippet on one line isn't what was offered.
     let insert = sanitize_insert(&insert);
     Some(Completion {
         label: label.clone(),
@@ -1032,21 +869,14 @@ fn completion(value: &Value) -> Option<Completion> {
     })
 }
 
-/// The most characters a single completion may insert.
-///
-/// A whole file arriving as one completion is a server malfunctioning
-/// or lying; a real snippet is a handful of lines.
+/// The most characters one completion may insert: a whole file means a
+/// malfunctioning server; a real snippet is a few lines.
 const MAX_INSERT: usize = 4096;
 
-/// Text on its way into the buffer, rather than into a one-line
-/// message: newlines and tabs survive, since a snippet is routinely
-/// several lines and indented, and everything else that cannot be
-/// displayed is dropped.
-///
-/// This is the middle setting between `sanitize` (which collapses all
-/// whitespace, for text that has to fit on one line) and no cleaning at
-/// all (`text_edits`, where the server is rewriting the file and every
-/// byte is deliberate).
+/// Text going into the buffer: newlines and tabs survive (snippets span
+/// indented lines), anything else undisplayable is dropped. Between
+/// `sanitize` (one line) and no cleaning (`text_edits`, where every byte
+/// is deliberate).
 fn sanitize_insert(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_INSERT));
     for c in text.chars() {
@@ -1061,16 +891,10 @@ fn sanitize_insert(text: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------
-// Semantic tokens
-// ---------------------------------------------------------------------
-
-/// The names a server chose for its own token types and modifiers.
-///
-/// The protocol sends tokens as bare numbers and puts the meanings in
-/// the `initialize` result, once, so this has to be kept from there --
-/// a token stream read against the wrong legend is not wrong-looking,
-/// it is confidently the wrong colour everywhere.
+/// The names a server gave its token types and modifiers. Tokens arrive
+/// as numbers with the meanings sent once in the `initialize` result, so
+/// this is kept from there: read against the wrong legend, every token is
+/// confidently the wrong colour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticLegend {
     pub types: Vec<String>,
@@ -1101,37 +925,29 @@ impl SemanticLegend {
     }
 }
 
-/// One token, in the server's own coordinates: a run on one line,
-/// named by whatever the legend called its type.
+/// One token in the server's coordinates: a run on one line, with the
+/// legend's name for its type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticToken {
     pub line: usize,
     /// In the negotiated position encoding, like every other column.
     pub start: usize,
     pub length: usize,
-    /// The legend's name for the type -- "function", "keyword",
-    /// "parameter". Empty when the server used a number the legend does
-    /// not cover, which the caller drops.
+    /// The legend's type name ("function", "keyword", "parameter"). Empty
+    /// for a number outside the legend, which the caller drops.
     pub kind: String,
-    /// The modifier names that were set, in legend order:
-    /// "declaration", "readonly", "deprecated".
+    /// The modifier names set, in legend order: "declaration", "readonly".
     pub modifiers: Vec<String>,
 }
 
-/// The most tokens read from one answer.
-///
-/// A whole large file's worth is normal; several times that is a server
-/// that has lost track of what it is describing, and every one of them
-/// costs a span in the renderer.
+/// The most tokens read from one answer: a large file's worth is normal,
+/// several times that is a lost server, and each costs a span.
 const MAX_SEMANTIC_TOKENS: usize = 20_000;
 
-/// Decodes `textDocument/semanticTokens/full`.
-///
-/// The data is a flat array of 5-tuples, each *relative to the one
-/// before it*: `[deltaLine, deltaStart, length, type, modifiers]`, where
-/// `deltaStart` is relative to the previous token's start when they are
-/// on the same line and absolute when the line moved. That encoding is
-/// the whole reason this is a decoder and not a `map`.
+/// Decodes `textDocument/semanticTokens/full`: a flat array of 5-tuples
+/// `[deltaLine, deltaStart, length, type, modifiers]`, each relative to
+/// the previous token, `deltaStart` relative on the same line and
+/// absolute when the line moved.
 pub fn semantic_tokens(result: &Value, legend: &SemanticLegend) -> Vec<SemanticToken> {
     let Ok(Value::Array(data)) = json::query(result, ".data") else { return Vec::new() };
     let mut out = Vec::new();
@@ -1142,9 +958,8 @@ pub fn semantic_tokens(result: &Value, legend: &SemanticLegend) -> Vec<SemanticT
             break;
         }
         let number = |value: &Value| match value {
-            // Negative or fractional is malformed; 0 is the harmless
-            // reading, and a malformed stream is not worth abandoning
-            // the tokens around it over.
+            // Negative or fractional is malformed; 0 is harmless, and the
+            // tokens around it are kept.
             Value::Number(n) if *n >= 0.0 => *n as usize,
             _ => 0,
         };
@@ -1173,27 +988,21 @@ pub fn semantic_tokens(result: &Value, legend: &SemanticLegend) -> Vec<SemanticT
     out
 }
 
-// ---------------------------------------------------------------------
-// Symbols
-// ---------------------------------------------------------------------
-
 /// One entry from `textDocument/documentSymbol`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
-    /// LSP's `SymbolKind`, 1..=26, as its own name -- "function",
-    /// "struct". Empty for a number outside the table, which is a
-    /// server using an extension we have no name for.
+    /// LSP's `SymbolKind` (1..=26) by name, "function", "struct"; empty for
+    /// a number outside it, a server extension.
     pub kind: String,
-    /// How deeply nested, for indenting an outline. Always 0 for a
-    /// server answering with the flat `SymbolInformation` form.
+    /// Nesting depth, for indenting an outline; 0 for a flat
+    /// `SymbolInformation` answer.
     pub depth: usize,
     pub uri: String,
     pub start: (usize, usize),
 }
 
-/// `SymbolKind` by its wire number. A plain table because that is what
-/// the spec is; the names are the spec's own, lowercased.
+/// `SymbolKind` by wire number, the spec's names lowercased.
 fn symbol_kind(kind: f64) -> String {
     const KINDS: [&str; 26] = [
         "file",
@@ -1227,14 +1036,10 @@ fn symbol_kind(kind: f64) -> String {
     if (1..=KINDS.len()).contains(&index) { KINDS[index - 1].to_string() } else { String::new() }
 }
 
-/// Reads a `textDocument/documentSymbol` answer, flattened depth-first
-/// with each entry's nesting recorded so an outline can indent it.
-///
-/// Two shapes again, both in use: the hierarchical `DocumentSymbol`
-/// (which carries `children` and no uri, since it is always about the
-/// document that was asked) and the older flat `SymbolInformation`
-/// (which carries a full `location`). `fallback_uri` is what the first
-/// form's entries belong to.
+/// Reads a `textDocument/documentSymbol` answer, flattened depth first
+/// with each depth recorded. Two shapes: hierarchical `DocumentSymbol`
+/// (`children`, no uri, so `fallback_uri` applies) and the older flat
+/// `SymbolInformation` (a full `location`).
 pub fn symbols(result: &Value, fallback_uri: &str) -> Vec<Symbol> {
     let Value::Array(items) = result else { return Vec::new() };
     let mut out = Vec::new();
@@ -1250,9 +1055,8 @@ fn collect_symbol(value: &Value, fallback_uri: &str, depth: usize, out: &mut Vec
         Ok(Value::Number(k)) => symbol_kind(*k),
         _ => String::new(),
     };
-    // `SymbolInformation` puts the place in `location`; `DocumentSymbol`
-    // has `selectionRange` (the name itself) and `range` (the whole
-    // declaration), and the name is what an outline should jump to.
+    // `SymbolInformation` has `location`; `DocumentSymbol` has
+    // `selectionRange` (the name, where an outline jumps) and `range`.
     let (uri, range) = match json::query(value, ".location") {
         Ok(location @ Value::Object(_)) => {
             let uri = match json::query(location, ".uri") {
@@ -1281,54 +1085,29 @@ fn collect_symbol(value: &Value, fallback_uri: &str, depth: usize, out: &mut Vec
     }
 }
 
-// ---------------------------------------------------------------------
-// Languages
-// ---------------------------------------------------------------------
-
-/// bish's own language name (`fileeditor::language_of`) as the
-/// `languageId` a server expects on `textDocument/didOpen`.
-///
-/// LSP defines a vocabulary for this, and it is a real vocabulary
-/// rather than a free-for-all: a server decides whether a document is
-/// any of its business by comparing this string, so `bash` where the
-/// spec says `shellscript` means a shell language server silently
-/// ignores every file bish opens.
-///
-/// Almost all of bish's names already are the spec's, which is why this
-/// is a short table of exceptions over an identity fallback rather than
-/// a full map. A name with no LSP equivalent at all (`roff`, `dotenv`,
-/// `csv`) passes through unchanged: no server speaks them today, and
-/// inventing a translation for a conversation nobody is having would be
-/// guessing.
+/// bish's language name (`fileeditor::language_of`) as the `languageId`
+/// `textDocument/didOpen` expects. Servers decide which documents are
+/// theirs by this string, so `bash` where the spec says `shellscript`
+/// would be ignored. Most of bish's names are the spec's, so this lists
+/// exceptions; a name with no LSP equivalent (`roff`, `dotenv`, `csv`)
+/// passes through.
 pub fn language_id(language: &str) -> &str {
     match language {
-        // The one that actually bites. Every shell server (bash-language-
-        // server, shellcheck-ls) matches on `shellscript`.
+        // Shell servers (bash-language-server, shellcheck-ls) match
+        // `shellscript`.
         "bash" => "shellscript",
-        // The spec's name for "no particular language", which is what
-        // `language_of` returns `text` for.
+        // The spec's "no particular language", for `language_of`'s `text`.
         "text" => "plaintext",
         other => other,
     }
 }
 
-// ---------------------------------------------------------------------
-// Positions
-// ---------------------------------------------------------------------
-
-/// How a server counts the `character` half of a position.
-///
-/// LSP's historical default is UTF-16 code units, which is a genuine
-/// hazard for this codebase: bish counts `char`s (Unicode scalar values)
-/// absolutely everywhere -- `TextBuffer`'s lines are `Vec<char>`, and
-/// `HighlightSpan`/`lint::Diagnostic` offsets index them. The two agree
-/// exactly until a line contains a non-BMP character (an emoji, most
-/// commonly), at which point every column after it is off by one per
-/// such character.
-///
-/// LSP 3.17 made this negotiable, and `Utf32` *is* bish's own counting,
-/// so that's what gets asked for first. The other two are what we accept
-/// when a server can't do it.
+/// How a server counts a position's `character`. LSP's default is UTF-16
+/// code units, while bish counts `char`s everywhere (`TextBuffer` lines
+/// are `Vec<char>`, and offsets index them); they agree until a non-BMP
+/// character, after which each one shifts the columns by one. LSP 3.17
+/// negotiates this, and `Utf32` is bish's counting, so it's asked for
+/// first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositionEncoding {
     Utf8,
@@ -1337,8 +1116,8 @@ pub enum PositionEncoding {
 }
 
 impl PositionEncoding {
-    /// The wire names, in the order bish prefers them: our own counting
-    /// first, then the one every server supports.
+    /// The wire names in bish's order of preference: its own counting, then
+    /// the one every server supports.
     pub const PREFERRED: [PositionEncoding; 3] = [PositionEncoding::Utf32, PositionEncoding::Utf16, PositionEncoding::Utf8];
 
     pub fn wire_name(self) -> &'static str {
@@ -1367,11 +1146,9 @@ impl PositionEncoding {
     }
 }
 
-/// A bish column (a count of `char`s into `line`) as the server counts
-/// it. Clamped to the line's end, so a column past it -- which the
-/// editor's own "cursor one past the last character" convention produces
-/// routinely -- maps to the position just past the last character rather
-/// than being rejected.
+/// A bish column (chars into `line`) as the server counts it, clamped to
+/// the line's end, so the editor's one-past-the-end cursor maps to just
+/// past the last character.
 pub fn to_server_column(line: &[char], char_col: usize, encoding: PositionEncoding) -> usize {
     if encoding == PositionEncoding::Utf32 {
         return char_col.min(line.len());
@@ -1379,12 +1156,9 @@ pub fn to_server_column(line: &[char], char_col: usize, encoding: PositionEncodi
     line.iter().take(char_col).map(|c| encoding.units(*c)).sum()
 }
 
-/// The inverse. A column that lands *inside* a character (only possible
-/// from a server that miscounted, or from one using an encoding where a
-/// character spans several units) resolves to the start of that
-/// character rather than failing: an off-by-a-fraction position is still
-/// pointing at a real place, and refusing it would mean discarding an
-/// otherwise-good diagnostic.
+/// The inverse. A column inside a character (a miscounting server, or a
+/// multi-unit character) resolves to that character's start: it still
+/// points somewhere real, and refusing it would drop a good diagnostic.
 pub fn from_server_column(line: &[char], server_col: usize, encoding: PositionEncoding) -> usize {
     if encoding == PositionEncoding::Utf32 {
         return server_col.min(line.len());
@@ -1392,11 +1166,9 @@ pub fn from_server_column(line: &[char], server_col: usize, encoding: PositionEn
     let mut units = 0usize;
     for (i, c) in line.iter().enumerate() {
         let next = units + encoding.units(*c);
-        // `<`, not `<=`: a column landing anywhere strictly inside this
-        // character -- including on its second UTF-16 code unit -- is
-        // this character, so it rounds *down* to where the character
-        // starts. Rounding up instead would push a diagnostic's start
-        // past the very thing it is pointing at.
+        // `<`: a column anywhere inside this character, its second UTF-16
+        // unit included, rounds down to its start, so a diagnostic doesn't
+        // start past what it points at.
         if server_col < next {
             return i;
         }
@@ -1421,8 +1193,7 @@ mod tests {
         );
         assert_eq!(found.len(), 2);
         assert_eq!((found[0].line, found[0].character, found[0].label.as_str()), (3, 9, ": u32"));
-        // The parts of a composite label mean exactly their
-        // concatenation; the extra per-part fields are not drawn.
+        // A composite label's parts mean their concatenation.
         assert_eq!(found[1].label, "Vec<u8>");
     }
 
@@ -1473,8 +1244,8 @@ mod tests {
     #[test]
     fn a_lone_signature_is_not_marked_since_there_is_nothing_to_choose_between() {
         assert_eq!(signature_of(r#"{"signatures":[{"label":"fn one(a: u32)"}]}"#), vec!["fn one(a: u32)".to_string()]);
-        // No `activeSignature` means the first one, which is what every
-        // server that omits it intends.
+        // No `activeSignature` means the first, as servers that omit it
+        // intend.
         let two = signature_of(r#"{"signatures":[{"label":"a()"},{"label":"b()"}]}"#);
         assert_eq!(two[0], "> a()");
     }
@@ -1483,7 +1254,7 @@ mod tests {
     fn nothing_to_show_is_empty_rather_than_a_box_with_nothing_in_it() {
         assert!(signature_of("null").is_empty());
         assert!(signature_of(r#"{"signatures":[]}"#).is_empty());
-        // A signature with no label is not a signature.
+        // A signature with no label isn't one.
         assert!(signature_of(r#"{"signatures":[{"documentation":"hi"}]}"#).is_empty());
     }
 
@@ -1501,9 +1272,7 @@ mod tests {
         assert_eq!(signature_of(&many).len(), MAX_SIGNATURE_LINES);
     }
 
-    // Same treatment every other string from a server gets: a label is
-    // drawn into a popup, so anything a terminal would act on has to be
-    // gone before it gets there.
+    // A label is drawn in a popup, so terminal-active characters go.
     #[test]
     fn a_signature_label_is_made_safe_to_draw() {
         let label = "fn f(\u{1b}[31mred\u{1b}[0m: u32)";
@@ -1527,19 +1296,17 @@ mod tests {
         assert_eq!((found[0].start, found[0].end), ((2, 4), (2, 7)));
         assert!(!found[0].write, "kind 1 is a plain reference");
         assert!(found[1].write, "kind 3 is a write");
-        // `kind` is optional, and the safe reading of an absent one is
-        // "a read": marking something as an assignment when it is not
-        // sends people to the wrong line.
+        // `kind` is optional and absent reads as a read: marking a non-write
+        // as an assignment sends people to the wrong line.
         assert!(!found[2].write);
     }
 
     #[test]
     fn a_null_or_malformed_highlight_answer_is_simply_empty() {
-        // `null` is the ordinary answer for a cursor on whitespace.
+        // `null` is the usual answer on whitespace.
         assert!(highlights_of("null").is_empty());
         assert!(highlights_of(r#"{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}"#).is_empty());
-        // An entry with no usable range is dropped; the ones beside it
-        // are not.
+        // An entry without a usable range is dropped, not its neighbours.
         let mixed = highlights_of(
             r#"[{"kind":1},
                 {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#,
@@ -1581,9 +1348,7 @@ mod tests {
         assert_eq!(decode_all(&[&bytes]), vec![Ok(original)]);
     }
 
-    // Content-Length is a byte count, and every string in this codebase
-    // has been through `char`-based handling to get here. A body with
-    // multi-byte characters in it is the case that catches the mistake.
+    // Content-Length counts bytes; multi-byte characters catch a char count.
     #[test]
     fn content_length_counts_bytes_not_characters() {
         let message = Message::Notification { method: "window/logMessage".to_string(), params: Value::Str("héllo 🌍".to_string()) };
@@ -1597,9 +1362,8 @@ mod tests {
         assert_eq!(decode_all(&[&bytes]), vec![Ok(message)]);
     }
 
-    // The property the whole state machine exists for: a message split
-    // across reads decodes identically to one that arrived whole. Byte
-    // at a time is the worst case, so it is the one tested.
+    // A message split across reads decodes as one that came whole; a byte
+    // at a time is the worst case.
     #[test]
     fn a_stream_split_one_byte_at_a_time_decodes_the_same_messages() {
         let stream: Vec<u8> =
@@ -1611,8 +1375,8 @@ mod tests {
         assert_eq!(whole.len(), 3);
         let chunks: Vec<&[u8]> = stream.chunks(1).collect();
         assert_eq!(decode_all(&chunks), whole);
-        // ...and at a few other split sizes, since one byte at a time
-        // never exercises a chunk that straddles a boundary.
+        // And other sizes, since single bytes never straddle a boundary
+        // within a chunk.
         for size in [2, 7, 13, 64] {
             let chunks: Vec<&[u8]> = stream.chunks(size).collect();
             assert_eq!(decode_all(&chunks), whole, "chunk size {size}");
@@ -1643,9 +1407,7 @@ mod tests {
         }
     }
 
-    // A server's own request may use a string id, and the reply has to
-    // echo back exactly what arrived rather than a number we found
-    // easier to store.
+    // A server's string id is echoed back exactly.
     #[test]
     fn a_string_id_survives_a_round_trip_as_a_string() {
         let raw = br#"{"jsonrpc":"2.0","id":"req-1","method":"workspace/configuration","params":{}}"#;
@@ -1662,8 +1424,7 @@ mod tests {
         assert_eq!(decode_all(&[framed.as_bytes()]), vec![Ok(Message::Notification { method: "initialized".to_string(), params: Value::Null })]);
     }
 
-    // A bad *body* leaves the stream synchronized -- we still know where
-    // the next message starts, so decoding continues.
+    // A bad body leaves the stream synchronized, so decoding continues.
     #[test]
     fn a_malformed_body_is_reported_without_losing_the_next_message() {
         let bad = "{not json";
@@ -1675,9 +1436,7 @@ mod tests {
         assert_eq!(decoded[1], Ok(request(2, "shutdown")));
     }
 
-    // A bad *header*, by contrast, means we no longer know where any
-    // boundary is -- so it is terminal rather than something to try to
-    // resynchronize from.
+    // A bad header loses every boundary, so it's terminal.
     #[test]
     fn a_framing_error_is_terminal() {
         let good = encode(&request(2, "shutdown"));
@@ -1698,21 +1457,19 @@ mod tests {
         assert!(decoder.is_failed());
     }
 
-    // The whole reason `positionEncoding` gets negotiated: an astral-
-    // plane character is one `char` to bish and two UTF-16 code units to
-    // a server that never heard of the negotiation.
+    // An astral character is one `char` to bish and two UTF-16 units to a
+    // server.
     #[test]
     fn columns_convert_between_bish_chars_and_each_server_encoding() {
         let line: Vec<char> = "a🌍b".chars().collect();
         assert_eq!(line.len(), 3);
         for (encoding, expected) in [(PositionEncoding::Utf32, 2), (PositionEncoding::Utf16, 3), (PositionEncoding::Utf8, 5)] {
-            // The column just after the emoji: char 2 for us, further
-            // along for anyone counting smaller units.
+            // The column after the emoji: char 2 for us, further on in
+            // smaller units.
             assert_eq!(to_server_column(&line, 2, encoding), expected, "{encoding:?}");
             assert_eq!(from_server_column(&line, expected, encoding), 2, "{encoding:?}");
         }
-        // Utf32 is bish's own counting, so it is the identity -- which
-        // is the point of asking for it first.
+        // `Utf32` is bish's counting: the identity.
         for col in 0..=line.len() {
             assert_eq!(to_server_column(&line, col, PositionEncoding::Utf32), col);
             assert_eq!(from_server_column(&line, col, PositionEncoding::Utf32), col);
@@ -1722,11 +1479,10 @@ mod tests {
     #[test]
     fn a_column_past_the_end_or_inside_a_character_still_lands_somewhere_real() {
         let line: Vec<char> = "a🌍".chars().collect();
-        // Past the end (the editor's own "one past the last character"
-        // cursor) clamps rather than overshooting.
+        // Past the end clamps.
         assert_eq!(to_server_column(&line, 99, PositionEncoding::Utf32), 2);
         assert_eq!(from_server_column(&line, 99, PositionEncoding::Utf16), 2);
-        // Mid-character resolves to that character's own start.
+        // Mid-character resolves to its start.
         assert_eq!(from_server_column(&line, 2, PositionEncoding::Utf16), 1);
         assert_eq!(from_server_column(&line, 3, PositionEncoding::Utf8), 1);
     }
@@ -1744,9 +1500,8 @@ mod tests {
         assert_eq!(locations(&many).len(), 2);
         assert_eq!(locations(&many)[1].uri, "file:///b.rs");
 
-        // A LocationLink names its target differently and carries two
-        // ranges; the selection range is the identifier itself, which is
-        // where a jump should land, rather than the whole declaration.
+        // A `LocationLink` has two ranges; the selection range, the
+        // identifier, is where a jump lands.
         let link = json::parse(
             r#"[{"targetUri":"file:///c.rs",
                 "targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}},
@@ -1755,7 +1510,7 @@ mod tests {
         .unwrap();
         assert_eq!(locations(&link), vec![Location { uri: "file:///c.rs".to_string(), start: (10, 7), end: (10, 11) }]);
 
-        // ...falling back to the full range when that is all there is.
+        // Falling back to the full range alone.
         let link_only =
             json::parse(r#"[{"targetUri":"file:///c.rs","targetRange":{"start":{"line":10,"character":0},"end":{"line":20,"character":1}}}]"#)
                 .unwrap();
@@ -1766,7 +1521,7 @@ mod tests {
     fn a_server_that_does_not_know_where_something_is_says_so_with_null() {
         assert!(locations(&Value::Null).is_empty());
         assert!(locations(&json::parse("[]").unwrap()).is_empty());
-        // One malformed entry does not cost the rest.
+        // One malformed entry doesn't cost the rest.
         let mixed =
             json::parse(r#"[{"nonsense":1},{"uri":"file:///a.rs","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#)
                 .unwrap();
@@ -1783,23 +1538,21 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].label.as_str(), found[0].kind.as_str()), ("push", "method"));
         assert_eq!(found[0].detail, "fn(&mut self, T)");
-        // Nothing said about what to insert: the label is it.
+        // No insert text: the label.
         assert_eq!(found[0].insert, "push");
-        // Nothing said about what to replace either -- the caller
-        // falls back to the word being typed.
+        // No range: the caller replaces the word being typed.
         assert_eq!(found[0].edit, None);
-        // And nothing said about ordering: sort by what is shown.
+        // No sort text: the label.
         assert_eq!(found[0].sort, "push");
 
-        // The list form, whose `isIncomplete` is deliberately ignored.
+        // The list form, `isIncomplete` ignored.
         let list = json::parse(r#"{"isIncomplete":true,"items":[{"label":"a"},{"label":"b"}]}"#).unwrap();
         assert_eq!(completions(&list).len(), 2);
         assert!(completions(&Value::Null).is_empty());
     }
 
-    // A textEdit is the server saying exactly what to replace, which
-    // beats guessing at a word -- it is how a dotted path or an import
-    // gets completed at all.
+    // A `textEdit` gives the exact range, how dotted paths and imports
+    // complete.
     #[test]
     fn a_text_edit_carries_both_the_text_and_the_range_to_replace() {
         let with_edit = json::parse(
@@ -1810,8 +1563,7 @@ mod tests {
         assert_eq!(found[0].edit, Some(((3, 4), (3, 9))));
         assert_eq!(found[0].insert, "std::fmt");
 
-        // InsertReplaceEdit names two ranges; `insert` is the
-        // conservative one, since it does not eat what follows.
+        // `InsertReplaceEdit`: `insert`, which doesn't eat what follows.
         let insert_replace = json::parse(
             r#"[{"label":"x","textEdit":{"insert":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}},
                 "replace":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},"newText":"xy"}}]"#,
@@ -1820,30 +1572,26 @@ mod tests {
         assert_eq!(completions(&insert_replace)[0].edit, Some(((1, 0), (1, 2))));
     }
 
-    // A snippet is kept in its own notation and flagged, so the editor
-    // can splice it in tentatively (see `bishedit::snippet`) rather than
-    // guessing at what the user meant to fill in.
+    // A snippet is kept in its notation and flagged, for the editor to
+    // insert live (`bishedit::snippet`).
     #[test]
     fn a_snippet_completion_keeps_its_tabstops_and_says_so() {
         let snippet = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a}, ${2:b})$0","insertTextFormat":2}]"#).unwrap();
         let found = completions(&snippet);
         assert!(found[0].snippet);
         assert_eq!(found[0].insert, "foo(${1:a}, ${2:b})$0");
-        // Without the format flag it is literal text -- and unflagged,
-        // so nothing downstream reads the braces as tabstops.
+        // Without the flag it's literal text, and unflagged.
         let literal = json::parse(r#"[{"label":"foo","insertText":"foo(${1:a})"}]"#).unwrap();
         assert!(!completions(&literal)[0].snippet);
         assert_eq!(completions(&literal)[0].insert, "foo(${1:a})");
     }
 
-    // What goes into a buffer is cleaned differently from what goes into
-    // a one-line message: a multi-line snippet collapsed to one line is
-    // not the completion the server offered.
+    // Text for the buffer keeps its lines, unlike a message.
     #[test]
     fn insert_text_keeps_its_newlines_and_indentation() {
         let multi = json::parse(r#"[{"label":"fn","insertText":"fn $1() {\n\t$0\n}","insertTextFormat":2}]"#).unwrap();
         assert_eq!(completions(&multi)[0].insert, "fn $1() {\n\t$0\n}");
-        // Everything else that cannot be displayed still goes.
+        // Undisplayable characters still go.
         let control = json::parse(r#"[{"label":"x","insertText":"a\u0007b"}]"#).unwrap();
         assert_eq!(completions(&control)[0].insert, "ab");
     }
@@ -1863,9 +1611,8 @@ mod tests {
         }
     }
 
-    // The encoding is the whole difficulty: every tuple is relative to
-    // the one before it, and `deltaStart` changes meaning depending on
-    // whether the line moved.
+    // Each tuple is relative to the previous, and `deltaStart`'s meaning
+    // depends on whether the line moved.
     #[test]
     fn semantic_tokens_are_decoded_from_their_deltas() {
         let data = json::parse(
@@ -1877,24 +1624,23 @@ mod tests {
         .unwrap();
         let found = semantic_tokens(&data, &legend());
         assert_eq!(found.len(), 3);
-        // First: line 0, column 0.
+        // Line 0, column 0.
         assert_eq!((found[0].line, found[0].start, found[0].length), (0, 0, 3));
         assert_eq!(found[0].kind, "keyword");
         assert!(found[0].modifiers.is_empty());
-        // Second: same line, so its start is *relative* to the first.
+        // Same line: start relative to the first.
         assert_eq!((found[1].line, found[1].start, found[1].length), (0, 4, 4));
         assert_eq!(found[1].kind, "function");
         assert_eq!(found[1].modifiers, vec!["declaration".to_string()], "bit 0 of the modifier mask");
-        // Third: two lines down, so its start is absolute again.
+        // Two lines down: start absolute again.
         assert_eq!((found[2].line, found[2].start, found[2].length), (2, 2, 5));
         assert_eq!(found[2].kind, "parameter");
     }
 
     #[test]
     fn a_token_bish_cannot_name_is_dropped_rather_than_shifting_the_rest() {
-        // Type 9 is outside this legend, and a zero-length token is
-        // nothing to paint -- but both still advance the running
-        // position, or every token after them would be misplaced.
+        // Type 9 is outside the legend and a zero-length token paints
+        // nothing, but both advance the position.
         let data = json::parse(r#"{"data":[0,0,3,9,0, 0,4,0,0,0, 0,2,2,0,0]}"#).unwrap();
         let found = semantic_tokens(&data, &legend());
         assert_eq!(found.len(), 1);
@@ -1903,19 +1649,17 @@ mod tests {
 
     #[test]
     fn a_truncated_or_malformed_stream_keeps_what_it_can() {
-        // A trailing partial tuple: everything before it is still good.
+        // A trailing partial tuple: everything before it stands.
         let data = json::parse(r#"{"data":[0,0,3,0,0, 0,4,4]}"#).unwrap();
         assert_eq!(semantic_tokens(&data, &legend()).len(), 1);
-        // Nothing at all, and the wrong shape entirely.
+        // Nothing, and the wrong shape.
         assert!(semantic_tokens(&json::parse(r#"{"data":[]}"#).unwrap(), &legend()).is_empty());
         assert!(semantic_tokens(&json::parse(r#"{"resultId":"1"}"#).unwrap(), &legend()).is_empty());
-        // A legend with no types at all can name nothing.
+        // An empty legend names nothing.
         assert!(semantic_tokens(&json::parse(r#"{"data":[0,0,3,0,0]}"#).unwrap(), &SemanticLegend::default()).is_empty());
     }
 
-    // Read against the wrong legend, tokens are not wrong-looking --
-    // they are confidently the wrong colour everywhere. So it comes from
-    // the handshake, once, and is kept.
+    // The legend comes from the handshake, once.
     #[test]
     fn the_legend_comes_out_of_the_servers_own_capabilities() {
         let capabilities = json::parse(
@@ -1927,13 +1671,13 @@ mod tests {
         assert_eq!(legend.types, vec!["namespace".to_string(), "type".to_string()]);
         assert_eq!(legend.modifiers, vec!["static".to_string()]);
         assert!(!legend.is_empty());
-        // A server that does no semantic tokens has none of this.
+        // A server without semantic tokens has no legend.
         assert!(SemanticLegend::parse(&json::parse(r#"{"hoverProvider":true}"#).unwrap()).is_empty());
     }
 
     #[test]
     fn both_shapes_of_document_symbol_are_read_and_flattened() {
-        // The hierarchical form: no uri of its own, and children nested.
+        // Hierarchical: no uri, children nested.
         let tree = json::parse(
             r#"[{"name":"Outer","kind":23,
                  "range":{"start":{"line":0,"character":0},"end":{"line":9,"character":1}},
@@ -1946,13 +1690,12 @@ mod tests {
         let found = symbols(&tree, "file:///a.rs");
         assert_eq!(found.len(), 2);
         assert_eq!((found[0].name.as_str(), found[0].kind.as_str(), found[0].depth), ("Outer", "struct", 0));
-        // The *name*, not the whole declaration -- an outline should
-        // jump to the identifier.
+        // The name, not the declaration: where an outline jumps.
         assert_eq!(found[0].start, (0, 7));
         assert_eq!((found[1].name.as_str(), found[1].kind.as_str(), found[1].depth), ("inner", "method", 1));
         assert_eq!(found[1].uri, "file:///a.rs", "the hierarchical form names no uri of its own");
 
-        // The flat form carries a full location.
+        // The flat form has a full location.
         let flat = json::parse(
             r#"[{"name":"main","kind":12,"location":{"uri":"file:///b.rs","range":{"start":{"line":5,"character":3},"end":{"line":5,"character":7}}}}]"#,
         )
@@ -1967,13 +1710,11 @@ mod tests {
     fn a_symbol_answer_that_says_nothing_useful_yields_nothing() {
         assert!(symbols(&Value::Null, "file:///a").is_empty());
         assert!(symbols(&json::parse("[]").unwrap(), "file:///a").is_empty());
-        // No name, or no range at all: dropped, without costing the
-        // rest of the answer.
+        // Entries with no name or range are dropped, not their neighbours.
         let mixed = json::parse(r#"[{"kind":12},{"name":"ok","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":2}}}]"#)
             .unwrap();
         assert_eq!(symbols(&mixed, "file:///a").len(), 1);
-        // A kind outside the table is a server extension we have no
-        // name for, not a reason to drop the symbol.
+        // An unknown kind is a server extension, not a reason to drop it.
         let odd = json::parse(r#"[{"name":"x","kind":99,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]"#).unwrap();
         assert_eq!(symbols(&odd, "file:///a")[0].kind, "");
     }
@@ -1987,17 +1728,14 @@ mod tests {
         .unwrap();
         let found = text_edits(&edits);
         assert_eq!(found.len(), 2);
-        // A formatter's output *is* whitespace decisions, so tabs and
-        // newlines must survive -- this is the one place server text is
-        // not sanitized.
+        // A formatter's tabs and newlines survive: the one unsanitized case.
         assert_eq!(found[0].text, "\tif x {\n");
         assert_eq!((found[0].start, found[0].end), ((0, 0), (0, 4)));
-        // An empty replacement over an empty range is a legal no-op and
-        // still parses.
+        // An empty replacement of an empty range is a legal no-op.
         assert_eq!(found[1].text, "");
 
         assert!(text_edits(&Value::Null).is_empty(), "a server with nothing to change");
-        // One malformed entry does not cost the rest.
+        // One malformed entry doesn't cost the rest.
         let mixed =
             json::parse(r#"[{"newText":"no range"},{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":1}},"newText":"x"}]"#)
                 .unwrap();
@@ -2014,7 +1752,7 @@ mod tests {
         assert!(edit.unsupported.is_empty());
         assert_eq!(edit.changes[0].1[0].text, "new");
 
-        // documentChanges, which wins when both are present.
+        // `documentChanges` wins when both are present.
         let both = json::parse(&format!(
             r#"{{"changes":{{"file:///ignored.rs":[{one_edit}]}},
                  "documentChanges":[{{"textDocument":{{"uri":"file:///c.rs","version":3}},"edits":[{one_edit}]}}]}}"#
@@ -2025,11 +1763,10 @@ mod tests {
         assert_eq!(edit.changes[0].0, "file:///c.rs");
     }
 
-    // rust-analyzer renames a module's file and then edits it under its
-    // new name, so where each operation sits among the text edits is
-    // part of what is read. An operation that cannot be read is still
-    // reported rather than dropped: doing the rest without it leaves the
-    // project broken.
+    // rust-analyzer renames a module's file then edits it under the new
+    // name, so operations keep their place among the edits. An unreadable
+    // operation is reported: doing the rest without it would break the
+    // project.
     #[test]
     fn file_operations_are_read_in_their_place_among_the_text_edits() {
         let edit = workspace_edit(
@@ -2069,7 +1806,7 @@ mod tests {
     fn an_empty_or_absent_workspace_edit_is_empty_not_an_error() {
         assert_eq!(workspace_edit(&Value::Null), WorkspaceEdit::default());
         assert_eq!(workspace_edit(&json::parse(r#"{"changes":{}}"#).unwrap()), WorkspaceEdit::default());
-        // A file listed with no edits contributes nothing.
+        // A file with no edits contributes nothing.
         assert!(workspace_edit(&json::parse(r#"{"changes":{"file:///a":[]}}"#).unwrap()).changes.is_empty());
     }
 
@@ -2086,33 +1823,30 @@ mod tests {
         let found = code_actions(&actions);
         assert_eq!(found.len(), 4);
 
-        // Carries its edit up front.
+        // Its edit up front.
         assert_eq!(found[0].kind, "quickfix");
         assert_eq!(found[0].edit.as_ref().unwrap().changes.len(), 1);
 
-        // A command, which bish cannot run -- kept so the refusal can
-        // say what it is rather than "nothing happened".
+        // A command bish can't run, kept so the refusal can name it.
         assert_eq!(found[1].command.as_deref(), Some("rust-analyzer.runSingle"));
         assert!(found[1].edit.is_none());
 
-        // No edit and no command: the server means to compute one only
-        // if this action is chosen, which is what `unresolved` is for.
+        // No edit or command: computed only if chosen, hence `unresolved`.
         assert!(found[2].edit.is_none() && found[2].command.is_none());
         assert_eq!(json::query(&found[2].unresolved, ".data.id"), Ok(&Value::Number(7.0)));
 
-        // Offered but not applicable, with the server's own reason.
+        // Not applicable, with the server's reason.
         assert_eq!(found[3].disabled.as_deref(), Some("no trait in scope"));
     }
 
     #[test]
     fn the_older_bare_command_form_is_read_too() {
-        // Pre-3.8 servers answer with `Command`s, whose `command` is a
-        // string at the top level rather than an object.
+        // Pre-3.8 servers answer with `Command`s, a string at the top level.
         let bare = json::parse(r#"[{"title":"Do it","command":"server.doIt"}]"#).unwrap();
         let found = code_actions(&bare);
         assert_eq!(found[0].command.as_deref(), Some("server.doIt"));
         assert!(code_actions(&Value::Null).is_empty());
-        // A titleless entry is not an action anyone could pick.
+        // A titleless entry isn't pickable.
         assert!(code_actions(&json::parse(r#"[{"kind":"quickfix"}]"#).unwrap()).is_empty());
     }
 
@@ -2120,20 +1854,16 @@ mod tests {
         hover_lines(&json::parse(json_text).unwrap())
     }
 
-    // All three shapes are in the wild, and handling only the current
-    // one would mean no hover at all from a number of real servers.
+    // All three shapes are in the wild.
     #[test]
     fn every_shape_a_server_may_return_hover_contents_in_is_read() {
-        // MarkupContent -- the current form.
+        // MarkupContent.
         assert_eq!(hover(r#"{"contents":{"kind":"markdown","value":"a line"}}"#), Some(vec!["a line".to_string()]));
         // A bare MarkedString.
         assert_eq!(hover(r#"{"contents":"a line"}"#), Some(vec!["a line".to_string()]));
-        // A `{language, value}` MarkedString, told apart from
-        // MarkupContent only by which fields it has -- both carry
-        // `value`, which is what makes reading that field the right
-        // rule for either.
+        // `{language, value}`, which also carries `value`.
         assert_eq!(hover(r#"{"contents":{"language":"rust","value":"fn f()"}}"#), Some(vec!["fn f()".to_string()]));
-        // An array of them, joined.
+        // An array, joined.
         assert_eq!(hover(r#"{"contents":["one",{"language":"rust","value":"two"}]}"#), Some(vec!["one".to_string(), "two".to_string()]));
     }
 
@@ -2142,22 +1872,18 @@ mod tests {
         assert_eq!(hover(r#"{"contents":null}"#), None);
         assert_eq!(hover("null"), None);
         assert_eq!(hover(r#"{"contents":{"kind":"markdown","value":""}}"#), None);
-        // Whitespace and fences only: nothing left once cleaned up.
+        // Whitespace and fences only: nothing.
         assert_eq!(hover("{\"contents\":\"```rust\\n```\\n\\n\"}"), None);
     }
 
-    // A hover is most often exactly one fenced signature, and leaving
-    // the ``` in makes the useful line look like debris.
     #[test]
     fn markdown_is_flattened_to_lines_without_becoming_a_renderer() {
         let lines =
             hover("{\"contents\":{\"kind\":\"markdown\",\"value\":\"```rust\\nfn f() -> i32\\n```\\n\\n---\\n\\nReturns **a number**.\\n\\n\\n\"}}")
                 .unwrap();
         assert_eq!(lines, vec!["fn f() -> i32".to_string(), String::new(), "---".to_string(), String::new(), "Returns **a number**.".to_string()]);
-        // Runs of blank lines collapse and trailing ones go, but a
-        // single separating blank line is worth keeping. `**bold**` is
-        // left exactly as written -- half-rendering it would be worse
-        // than being honest about what it is.
+        // Blank-line runs collapse and trailing ones go; one separator stays.
+        // `**bold**` is left as written.
     }
 
     #[test]
@@ -2205,10 +1931,9 @@ mod tests {
         assert_eq!(p.findings[1].code, "");
     }
 
-    // Everything here is text from another process on its way to a
-    // terminal. The control-character case is the same bug class
-    // `url::is_safe` exists for; the newline case is subtler and just as
-    // real, since every place these are drawn is one line per finding.
+    // Server text on its way to a terminal: control characters are what
+    // `url::is_safe` guards against, and newlines would break one finding
+    // per line.
     #[test]
     fn text_from_a_server_is_made_safe_to_draw() {
         let p = published(
@@ -2236,31 +1961,24 @@ mod tests {
 
     #[test]
     fn the_awkward_shapes_a_real_server_actually_sends() {
-        // A numeric code (tsserver, and every compiler with numbered
-        // errors) is as common as a string one.
+        // A numeric code (tsserver, compilers) is as common as a string.
         let p = published(
             r#"{"uri":"file:///x","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"code":2304,"message":"m"}]}"#,
         );
         assert_eq!(p.findings[0].code, "2304");
-        // No severity at all: read as the loudest, because a hint shown
-        // as an error is an annoyance and the reverse is a missed
-        // problem.
+        // No severity: an error, the loudest reading.
         assert_eq!(p.findings[0].severity, 1);
-        // No version: the server isn't saying, so nothing can be gated
-        // on it.
+        // No version: nothing can be gated on it.
         assert_eq!(p.version, None);
 
-        // An end before its start would underline a negative width;
-        // read as an empty range at the start, keeping the finding.
+        // An end before its start: an empty range at the start.
         let backwards = published(
             r#"{"uri":"file:///x","diagnostics":[{"range":{"start":{"line":3,"character":8},"end":{"line":1,"character":0}},"message":"m"}]}"#,
         );
         assert_eq!(backwards.findings[0].start, (3, 8));
         assert_eq!(backwards.findings[0].end, (3, 8));
 
-        // A finding with no range at all is dropped, but the ones
-        // around it survive -- one malformed entry must not cost the
-        // whole publication.
+        // A finding with no range is dropped, not the rest.
         let mixed = published(
             r#"{"uri":"file:///x","diagnostics":[{"message":"no range"},{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":2}},"message":"good"}]}"#,
         );
@@ -2273,25 +1991,20 @@ mod tests {
         assert_eq!(publication(&json::parse(r#"{"diagnostics":[]}"#).unwrap()), None, "no uri");
         assert_eq!(publication(&json::parse(r#"{"uri":"file:///x"}"#).unwrap()), None, "no diagnostics");
         assert_eq!(publication(&Value::Null), None);
-        // An empty list is a real publication: it is how a server
-        // withdraws everything it previously reported.
+        // An empty list withdraws everything previously reported.
         assert_eq!(published(r#"{"uri":"file:///x","diagnostics":[]}"#).findings, vec![]);
     }
 
-    // The one that actually bites: a shell server matches on
-    // `shellscript`, so bish's own `bash` would make it ignore every
-    // file the editor opens.
+    // A shell server matches `shellscript`, so `bash` would be ignored.
     #[test]
     fn a_language_name_is_translated_only_where_lsp_uses_a_different_one() {
         assert_eq!(language_id("bash"), "shellscript");
         assert_eq!(language_id("text"), "plaintext");
-        // Almost everything already agrees, which is why this is a table
-        // of exceptions over an identity fallback.
+        // Most names already agree.
         for same in ["rust", "python", "typescript", "json", "yaml", "markdown", "ruby", "elixir"] {
             assert_eq!(language_id(same), same);
         }
-        // A name LSP has no equivalent for passes through rather than
-        // being guessed at.
+        // A name with no LSP equivalent passes through.
         assert_eq!(language_id("roff"), "roff");
     }
 
