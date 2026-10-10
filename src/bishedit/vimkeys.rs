@@ -1,11 +1,10 @@
-// Translates a sequence of editor::Key events into bishedit::motion::Motion
-// values. This layer knows vim's specific bindings and owns the state a
-// single keypress can't (an accumulating count, a pending g/f/F/t/T/m/`/'
-// prefix awaiting one more character, an in-progress search string, a
-// macro recording/replay queue -- see `next_key`'s own doc comment) -- but
-// it never touches a Buffer, and only ever reaches a terminal through a
-// caller-supplied read callback (`next_key`), never directly. Motions
-// themselves are applied by the caller via bishedit::motion::apply_motion.
+// Turns `editor::Key` events into `motion::Motion`s and other outcomes.
+// This layer knows vim's bindings and holds the state one key can't: a
+// count, a pending prefix (`g`, `f`, `m`, ...) awaiting another key, a
+// search being typed, macro recording and replay (see `next_key`). It
+// never touches a Buffer, and reads the terminal only through the
+// caller's `next_key` callback; callers apply motions with
+// `motion::apply_motion`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -14,33 +13,26 @@ use super::motion::{Motion, TextObjectKind};
 use super::registers::RegisterShape;
 use crate::editor::Key;
 
-/// Which "where is this" question `KeyOutcome::GotoDefinition` is
-/// asking.
-///
-/// Four separate language-server requests that differ only in which one
-/// is sent: each takes a position, each answers with locations, and
-/// each is followed by the same jump. Keeping them one outcome rather
-/// than four is what makes that literally true in the code as well --
-/// the loop driving the buffer has one arm, parameterized here.
+/// Which "where is this" question `KeyOutcome::GotoDefinition` asks: four
+/// language-server requests that differ only in which is sent, each
+/// followed by the same jump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GotoKind {
     /// `gd`.
     Definition,
     /// `gy`: the definition of this thing's *type*, not of the thing.
     TypeDefinition,
-    /// The implementations of an interface/trait/abstract method.
-    /// Currently unreachable from any key -- see `feed_g`'s own note on
-    /// `gi`.
+    /// The implementations of an interface, trait or abstract method. No key
+    /// reaches it yet; see `feed_g` on `gi`.
     Implementation,
-    /// `gD`: where it was declared, which in a language that separates
-    /// the two is not where it was defined.
+    /// `gD`: where it was declared, which some languages separate from where
+    /// it's defined.
     Declaration,
 }
 
 impl GotoKind {
-    /// The request to send, and the capability that says whether the
-    /// server answers it at all -- checked first, so a question a
-    /// server never offered costs nothing instead of a timeout.
+    /// The request, and the capability saying whether the server answers it,
+    /// checked first so an unsupported request costs nothing.
     pub fn request(self) -> (&'static str, &'static str) {
         match self {
             GotoKind::Definition => ("textDocument/definition", "definitionProvider"),
@@ -50,8 +42,7 @@ impl GotoKind {
         }
     }
 
-    /// What to call the thing when there isn't one: "no type definition
-    /// found".
+    /// What to call it when there's none: "no type definition found".
     pub fn noun(self) -> &'static str {
         match self {
             GotoKind::Definition => "definition",
@@ -99,251 +90,140 @@ pub enum FoldCmd {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyOutcome {
-    /// A motion is ready to apply, with the raw count the user typed before
-    /// it (if any).
+    /// A motion to apply, with the count typed before it, if any.
     Motion(Motion, Option<usize>),
-    /// A Ctrl-W window command is ready to run, with a count. Not a
-    /// `Motion`: these act on the frontend's own window/pane state, not
-    /// on a `Buffer`, so they're a separate outcome the caller applies
-    /// however it applies window commands (repl.rs already has
-    /// `apply_window_action` for exactly this). For most `WindowCmd`
-    /// variants the count is a *repeat*, typed before `<C-w>` -- e.g.
-    /// `2<C-w>n` is `WindowCmd::Next` with count `Some(2)`, "next window,
-    /// twice". `GotoFirstWindow`/`GotoLastWindow` are the exception,
-    /// mirroring `Motion::GotoFirstLine`/`GotoLastLine`: their count is
-    /// typed *inside* the `<C-w>` sequence, after it, as an absolute
-    /// 1-indexed tab position -- `<C-w>5gg` and `<C-w>5G` both mean "go
-    /// to the 5th tab" (count `Some(5)`), while bare `<C-w>gg`/`<C-w>G`
-    /// (count `None`) default to the first/last tab respectively.
+    /// A Ctrl-W window command, applied by the caller (repl.rs's
+    /// `apply_window_action`), not to a `Buffer`. The count usually
+    /// repeats, typed before `<C-w>`: `2<C-w>n` is next window twice.
+    /// `GotoFirstWindow`/`GotoLastWindow` are like `GotoFirstLine`: the
+    /// count comes inside the sequence as an absolute tab position
+    /// (`<C-w>5gg`), and without one they go to the first or last tab.
     Window(WindowCmd, Option<usize>),
-    /// `<C-t>`: the fuzzy opener (repl.rs's `run_opener`) over the panes
-    /// that are open and the files and directories git tracks. A
-    /// frontend outcome for the same reason `Window` is -- it acts on
-    /// window/pane state, not on a `Buffer` -- but not a `<C-w>`
-    /// command, because it is not window *management*: it is a way to
-    /// get somewhere, which is why it has a key of its own.
-    ///
-    /// Takes no count. vim spends Normal-mode `CTRL-T` on the tag stack,
-    /// which bish has nothing to pop (its own "go back" is the jumplist,
-    /// `<C-o>`/`<Tab>` just below), so the key was free.
+    /// `<C-t>`: the fuzzy opener (repl.rs's `run_opener`) over open panes and
+    /// git-tracked files. Window state like `Window`, but a way to get
+    /// somewhere rather than window management, hence its own key, which vim
+    /// uses for a tag stack bish doesn't have. Takes no count.
     Opener,
-    /// `i`/`a`/`I`/`A`/`s`/`S`/`C`: vim's canonical normal-to-insert entry
-    /// commands. Not a `Motion` -- these don't move a cursor by themselves,
-    /// they tell the caller "stop navigating, resume editing text, and use
-    /// `apply_insert_cmd` (below) to work out exactly where/what changes
-    /// first" -- so, like `Window`, the caller applies this against
-    /// whatever it considers "the buffer" (which may not even be the same
-    /// `Buffer` a `Motion` was just applied to -- see apply_insert_cmd's own
-    /// doc comment). A count typed before `i`/`a`/`I`/`A` repeats the text
-    /// typed, which `VimKeys` does itself as the excursion ends (see
-    /// `capture_insert_key`), so the host never sees it; before `s`/`S`/`C`,
-    /// where vim's count says how much to change, it is dropped.
+    /// `i`, `a`, `I`, `A`, `s`, `S`, `C`: leave navigation and edit text,
+    /// with `apply_insert_cmd` deciding where and what changes first.
+    /// Applied by the caller to whatever it treats as the buffer. A count
+    /// before `i`/`a`/`I`/ `A` repeats the typed text, which `VimKeys` does
+    /// itself as the insert ends (see `capture_insert_key`); before
+    /// `s`/`S`/`C` it's dropped.
     EnterInsert(InsertCmd),
-    /// `y{motion}` -- an operator applied to a motion's resulting range.
-    /// `register` is the explicit `"x` prefix if any (`None` means "use
-    /// the unnamed register" -- see registers.rs's own doc comment on how
-    /// that resolves).
+    /// `y{motion}` and the other operators on a motion's range. `register` is
+    /// the `"x` prefix, if any (`None` is the unnamed register).
     Operator(Op, Motion, Option<usize>, Option<char>),
-    /// `yy` / `Y` -- an operator applied to the current line (and
-    /// `count - 1` more below it), linewise. Kept distinct from
-    /// `Operator` rather than inventing a synthetic `Motion` for "the
-    /// current line": vim's own double-tap-the-operator shorthand isn't a
-    /// cursor motion at all, it's defined operationally as "this
-    /// operator, this line" (see `motion::whole_lines`'s own doc comment).
+    /// `yy`, `Y`, `dd`: an operator on this line and `count - 1` more,
+    /// linewise. Not an `Operator` with a made-up motion: vim defines the
+    /// doubled form as "this operator, this line" (see
+    /// `motion::whole_lines`).
     OperatorLines(Op, Option<usize>, Option<char>),
-    /// `p` / `P` -- put the named (or unnamed) register's contents after
-    /// (`before: false`) or before (`before: true`) the cursor, `count`
-    /// times.
+    /// `p`/`P`: put the register's contents after or before the cursor,
+    /// `count` times.
     Put { before: bool, count: Option<usize>, register: Option<char> },
-    /// `x` -- delete `count` characters forward from the cursor. Not an
-    /// `Operator(Op::Delete, Motion::Right, ...)`: `Motion::Right`'s own
-    /// clamping refuses to move onto/past the line's last character, so
-    /// that would wrongly no-op exactly where vim's `x` still deletes.
-    /// `X` (delete backward) has no such edge case -- `Motion::Left`
-    /// already clamps correctly at column 0 -- so it stays a plain
-    /// `Operator` and needs no variant of its own.
+    /// `x`: delete `count` characters forward. Not `d` with `Motion::Right`,
+    /// which won't move past the last character, so it would do nothing where
+    /// `x` still deletes. `X` has no such edge, so it is a plain `Operator`.
     DeleteCharForward { count: Option<usize>, register: Option<char> },
-    /// `J`/`gJ` -- join `count` lines (minimum 2, matching vim: a bare `J`
-    /// or an explicit `1J` both just join the current line with the next
-    /// one). Not a `Motion` (it mutates rather than moves) or an
-    /// `Operator` (there's no motion/target to combine with) -- its own
-    /// outcome, same tier as `Put`/`DeleteCharForward`. `with_space`
-    /// selects vim's default whitespace-aware join (`J`, strips the next
-    /// line's leading whitespace and inserts one space) vs. `gJ`'s raw
-    /// concatenation.
+    /// `J`/`gJ`: join `count` lines (at least 2). `with_space` is `J`'s
+    /// whitespace-aware join; `gJ` concatenates.
     Join { count: Option<usize>, with_space: bool },
-    /// `v`/`V`: enters Visual mode, charwise (`RegisterShape::Char`) or
-    /// linewise (`RegisterShape::Line`), anchored at the buffer's current
-    /// cursor. Reuses `registers::RegisterShape` rather than a dedicated
-    /// enum -- charwise/linewise is exactly the same two-way distinction a
-    /// yank's own result shape already needs, and this selection's shape
-    /// *becomes* that yank shape once it's committed. The caller must
-    /// immediately call `begin_visual` with the buffer's own current
-    /// cursor as the anchor -- this crate never touches a `Buffer` itself
-    /// (see this file's own module doc comment), so it can't read that
-    /// position on its own.
+    /// `v`/`V`: enter Visual mode, charwise or linewise. Uses `RegisterShape`
+    /// because the selection's shape becomes the yank's. The caller must call
+    /// `begin_visual` with the cursor as anchor, since this layer can't read
+    /// the buffer.
     EnterVisual(RegisterShape),
-    /// `gv` -- reselects the last Visual selection, if any (`vk.last_
-    /// visual()`'s own doc comment on when there is one). The caller must
-    /// call `buf.set_cursor(cursor)` then `vk.begin_visual(shape, anchor)`
-    /// with that tuple (this crate can't touch a `Buffer` itself -- same
-    /// reasoning as `EnterVisual`'s own doc comment); a no-op if there's
-    /// nothing to reselect yet.
+    /// `gv`: reselect the last Visual selection, if any (see
+    /// `last_visual`). The caller sets the cursor, then calls
+    /// `begin_visual` with the shape and anchor.
     ReselectVisual,
-    /// Visual `o` -- puts the cursor on the other end of the selection
-    /// and the anchor where the cursor was, so the end that moves is the
-    /// one that was standing still.
-    ///
-    /// Split the same way `EnterVisual`/`ReselectVisual` are, and for
-    /// the same reason: the anchor lives here, the cursor lives in the
-    /// buffer, and this crate never touches a `Buffer`. The caller reads
-    /// `visual_anchor()`, sets the cursor to that anchor, and calls
-    /// `set_visual_anchor` with where the cursor just was.
+    /// Visual `o`: the cursor goes to the other end and the anchor to where
+    /// the cursor was. The anchor lives here and the cursor in the buffer, so
+    /// the caller reads `visual_anchor()`, moves the cursor there, and calls
+    /// `set_visual_anchor` with where it was.
     SwapVisualEnds,
-    /// `gd`: ask whatever knows about this language where the thing
-    /// under the cursor is defined, and go there.
-    ///
-    /// Real vim's `gd` is a *local* declaration search -- a backwards
-    /// scan for the identifier in the current function -- and this is
-    /// the binding every editor with a language server has since given
-    /// to go-to-definition, for the same reason `K` became hover: the
-    /// key already means "tell me about this thing", and a server just
-    /// knows the answer better. Emitted here, resolved by whoever is
-    /// driving the buffer; a frontend with no server simply doesn't
-    /// wire it, the same "enforced by omission" the debugger's
-    /// read-only subset already relies on.
+    /// `gd`: go to where the thing under the cursor is defined, as the
+    /// language server knows it. vim's `gd` searches back for a local
+    /// declaration; a server answers the same question better. A frontend
+    /// with no server just doesn't handle it.
     GotoDefinition(GotoKind),
-    // (`GotoKind` itself is below, next to `KeyOutcome`.)
-    /// `gr`: everywhere the thing under the cursor is used.
-    ///
-    /// Unlike `GotoDefinition` there is no "the" answer to go to --
-    /// references are many by nature -- so this is what fills the
-    /// location-list pane rather than moving the cursor.
+    /// `gr`: everywhere the thing under the cursor is used, listed in the
+    /// location-list pane, since there are many answers.
     GotoReferences,
-    /// `gO`: an outline of this file -- what it declares, in order,
-    /// nested. Neovim's own binding for the same thing, and vim's `gO`
-    /// already means "show me an outline of what I'm looking at" in
-    /// help and man pages, so the key is not being repurposed so much
-    /// as extended to code.
+    /// `gO`: an outline of what this file declares, nested. vim's `gO`
+    /// already means an outline in help and man pages.
     DocumentSymbols,
-    /// `ga`: what the language server offers to do to the code here --
-    /// a quick fix for a diagnostic, a refactor, an import to add.
-    ///
-    /// Real vim's `ga` prints the character under the cursor's numeric
-    /// value, which this codebase has never implemented, so nothing is
-    /// being taken away. Neovim's own default for this is `gra`, which
-    /// bish cannot use: `gr` already emits references and never waits
-    /// for a third key.
+    /// `ga`: what the language server offers to do here: a quick fix, a
+    /// refactor, an import. vim's `ga` (a character's code) isn't
+    /// implemented, and `gr` can't take a third key.
     CodeActions,
-    /// `zo`, `zc`, `za`, `zR`, `zM`, `zd`, `zE`, `zi` and the rest: a
-    /// change to which lines are folded, applied by whoever owns the
-    /// buffer's folds. `zf{motion}` is not one of these -- it takes a
-    /// motion, so it is `Operator(Op::Fold, ..)` -- and neither are `zj`,
-    /// `zk`, `[z` and `]z`, which move the cursor and are motions.
+    /// `zo`, `zc`, `za`, `zR`, `zM`, `zd`, `zE`, `zi` and the rest, applied
+    /// by the buffer's owner. Not `zf{motion}`, which is
+    /// `Operator(Op::Fold, ..)`, nor `zj`, `zk`, `[z`, `]z`, which are
+    /// motions.
     Fold(FoldCmd, Option<usize>),
-    /// `Ctrl-O`/`Ctrl-I` -- step backward/forward through the jump list.
-    /// The caller must call `vk.jump_back(buf.cursor())`/`vk.jump_forward
-    /// (buf.cursor())` (this crate owns the jump-list state -- see
-    /// `push_jump`'s own doc comment -- but never a `Buffer`) and, if it
-    /// returns `Some`, move the cursor there; a no-op at either end of the
-    /// list.
+    /// `Ctrl-O`/`Ctrl-I`: step through the jump list. The caller calls
+    /// `jump_back`/`jump_forward` with the cursor and moves there on `Some`.
     Jump { forward: bool },
-    /// `u` / `[count]u` -- undo `count` (default 1) changes. The caller
-    /// owns whatever undo tree actually exists (this crate never touches
-    /// a `Buffer`, same reasoning as every other outcome here) -- see
-    /// `bishedit::undo::UndoTree` and `TextBuffer::undo`/`redo` for the
-    /// one place that's actually implemented today.
+    /// `u`: undo `count` changes, default 1, in the caller's undo tree (see
+    /// `TextBuffer::undo`).
     Undo(Option<usize>),
-    /// `Ctrl-R` / `[count]Ctrl-R` -- redo `count` (default 1) changes.
+    /// `Ctrl-R`: redo `count` changes, default 1.
     Redo(Option<usize>),
-    /// `g-` / `g+` / `[count]g-` / `[count]g+` -- real vim's own undo-tree
-    /// time travel: step `count` (default 1) positions backward
-    /// (`forward: false`) or forward (`forward: true`) through the tree's
-    /// flat *creation* history, which can reach a branch plain `u`/
-    /// `Ctrl-R` alone can't (see `bishedit::undo::UndoTree::time_travel_
-    /// back`/`forward`'s own doc comment for exactly which one).
+    /// `g-`/`g+`: step `count` positions through the undo tree's creation
+    /// history, reaching branches `u` and `Ctrl-R` can't (see
+    /// `UndoTree::time_travel_back`).
     UndoSeq { forward: bool, count: Option<usize> },
-    /// `ys{motion}{ch}` / `yss{ch}` / Visual-mode `S{ch}` -- vim-surround's
-    /// own "wrap this in a delimiter pair" command. `target` names what to
-    /// wrap (a resolved motion's own range, or -- `yss`'s own shorthand --
-    /// the current line from its first non-blank through its true end);
-    /// `ch` is the delimiter character that was actually pressed (`(` and
-    /// `)` both name the same pair but insert differently padded --
-    /// `motion::surround_delims` resolves that). Visual-mode `S` never
-    /// reaches this crate as a `Motion`-typed target at all (same reason
-    /// `EnterVisual`'s own doc comment gives for `y`/`d`/`c`/`p` there): a
-    /// caller that intercepts `S` itself builds a `SurroundTarget::Motion`
-    /// wrapping a synthetic range instead, or applies the wrap directly.
-    /// Not an `Operator`: nothing here is a real motion target lookup the
-    /// way `y{motion}` is -- resolving one still needs one more raw key
-    /// (this delimiter character) that no `Motion`/`Op` alone carries, so
-    /// this outcome only appears once that key has already been read (see
-    /// `Pending::SurroundChar`'s own doc comment for how the two-stage
-    /// resolution gets there).
+    /// `ys{motion}{ch}`, `yss{ch}` and Visual `S{ch}`: vim-surround's wrap.
+    /// `target` is a motion's range or, for `yss`, the line from its first
+    /// non-blank to its end. `ch` is the key pressed: `(` and `)` name one
+    /// pair but pad differently (`motion::surround_delims`). Visual `S` is
+    /// handled by the caller. Not an `Operator`: it needs the delimiter key
+    /// too, so it appears only once that's read (see
+    /// `Pending::SurroundChar`).
     AddSurround { target: SurroundTarget, ch: char },
-    /// `ds{ch}`: removes the nearest enclosing delimiter pair named by
-    /// `ch` (`motion::surround_target_kind`'s own doc comment lists which
-    /// characters name which pair), stripping one adjacent padding space
-    /// too for a bracket pair (quotes never pad -- see `motion::
-    /// surround_delete_spans`'s own doc comment). A no-op if no such pair
-    /// encloses the cursor, or if `ch` doesn't name a valid target.
+    /// `ds{ch}`: removes the nearest enclosing pair `ch` names (see
+    /// `motion::surround_target_kind`), with one padding space inside a
+    /// bracket pair (`motion::surround_delete_spans`). A no-op with no such
+    /// pair.
     DeleteSurround { ch: char },
-    /// `cs{ch}{replacement}`: like `DeleteSurround`, but replaces the
-    /// found pair's own two delimiter characters with `replacement`'s
-    /// pair (`motion::surround_delims`) instead of removing them --
-    /// unlike `ds`, never touches any padding around them.
+    /// `cs{ch}{replacement}`: swaps the pair's delimiters for
+    /// `replacement`'s, leaving padding alone.
     ChangeSurround { ch: char, replacement: char },
-    /// `r{ch}`: replaces `count` characters starting at the cursor with
-    /// `ch` each, staying in Normal mode -- vim's own single-character
-    /// replace. The caller refuses (no-op) if fewer than `count`
-    /// characters remain on the line from the cursor onward, matching
-    /// vim: `r` never crosses a line break or extends the buffer.
+    /// `r{ch}`: replace `count` characters with `ch`, staying in Normal
+    /// mode. The caller does nothing if fewer than `count` remain on the
+    /// line, as in vim.
     ReplaceChar { ch: char, count: Option<usize> },
-    /// `R`: enters Replace mode at the cursor -- like Insert mode, but
-    /// each typed character overwrites the one already there (extending
-    /// the line once past its end) instead of shifting it rightward.
-    /// Not an `EnterInsert(InsertCmd)`: no repositioning is needed first
-    /// (`R` always starts exactly at the cursor), and the *typing*
-    /// itself behaves differently for as long as the mode lasts, which
-    /// `InsertCmd` has no way to express (it only ever describes a
-    /// one-time starting position/deletion, resolved once before an
-    /// ordinary insert loop begins).
+    /// `R`: Replace mode, where typing overwrites (extending the line past
+    /// its end) instead of inserting. Not an `EnterInsert`: there's no
+    /// repositioning, and the typing itself behaves differently for the whole
+    /// mode, which `InsertCmd` can't express.
     EnterReplace,
-    /// `~`: toggles the case of `count` characters starting at the
-    /// cursor (default 1), then advances the cursor to just past the
-    /// last one toggled -- clamped to the line's own last character if
-    /// that would run past it, matching vim: never crosses a line break,
-    /// never extends past what's already there.
+    /// `~`: toggle the case of `count` characters (default 1) and move past
+    /// them, clamped to the line's last character, as in vim.
     ToggleCase { count: Option<usize> },
-    /// `Ctrl-A`/`Ctrl-X`: adds `delta` (already signed -- positive for
-    /// `Ctrl-A`, negative for `Ctrl-X`, magnitude `count`) to the decimal
-    /// number found at or after the cursor on the current line (see
-    /// `motion::find_number`'s own doc comment for exactly how that's
-    /// found). A no-op if there's no number on the line from the cursor
-    /// onward.
+    /// `Ctrl-A`/`Ctrl-X`: add `delta` (signed, magnitude `count`) to the
+    /// number at or after the cursor on this line (see
+    /// `motion::find_number`). A no-op without one.
     AdjustNumber { delta: i64 },
-    /// `o`/`O`: opens a fresh blank line below (`above: false`) or above
-    /// (`above: true`) the current one and enters Insert mode there. Not
-    /// an `EnterInsert(InsertCmd)`: every existing `InsertCmd` describes
-    /// where to start editing on a line that already exists -- this one
-    /// needs to *create* a line first, which only a caller backed by a
-    /// real multi-line buffer can do (see `KeyOutcome::Join`'s own doc
-    /// comment for the same "single-line `LineBuffer` has no next/
-    /// previous line" reasoning -- a no-op there, same as `Join`). Any
-    /// count typed before it is discarded, same simplification
-    /// `EnterInsert`'s own doc comment already documents for `3i`.
+    /// `o`/`O`: open a blank line below or above and insert there. Not an
+    /// `EnterInsert`, which only positions on an existing line: this
+    /// creates a line, which only a multi-line buffer can (a no-op on the
+    /// prompt, like `Join`). A count is dropped.
     OpenLine { above: bool },
-    /// The key was consumed as part of an in-progress sequence (a count
-    /// digit, or a prefix awaiting its next character); no motion yet.
+    /// The key was part of a sequence still in progress (a count digit, a
+    /// prefix); no outcome yet.
     Pending,
-    /// The key isn't part of any recognized motion sequence. Any
-    /// in-progress count/prefix is discarded, matching vim's behavior of
-    /// dropping a pending command on an invalid continuation.
+    /// The key isn't part of any binding. A pending count or prefix is
+    /// dropped, as vim drops a command on an invalid continuation.
     None,
 }
 
-/// An operator awaiting a motion (`y{motion}`/`d{motion}`/`c{motion}`) or
-/// its own double-tap shorthand (`yy`/`dd`/`cc`).
+/// The default width of one indent, before the `shiftwidth`/`tabstop`
+/// bishopts or an `.editorconfig` say otherwise (see
+/// `TextBuffer::shiftwidth`). The prompt's `LineBuffer` uses it as is: a
+/// command line has no file for an `.editorconfig` to be about.
 // The *default* width of one indent -- what a buffer starts with before
 // the `shiftwidth`/`tabstop` bishopts or a project's `.editorconfig`
 // have said anything (see `TextBuffer::shiftwidth`, and repl.rs's own
@@ -358,52 +238,34 @@ pub enum KeyOutcome {
 // a setting nobody asked for.
 pub const INDENT_WIDTH: usize = 4;
 
+/// An operator awaiting a motion (`y{motion}`, `d{motion}`, `c{motion}`)
+/// or its doubled form (`yy`, `dd`, `cc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Yank,
     Delete,
-    /// `c{motion}`/`cc` -- like `Delete`, but the caller also enters
-    /// insert mode at the deletion point afterward (skipped if the
-    /// motion target was invalid/empty, same as any other failed
-    /// operator -- see `KeyOutcome::Operator`'s own doc comment on that).
+    /// `c{motion}`/`cc`: like `Delete`, then insert at the deletion point,
+    /// unless the motion failed.
     Change,
-    /// `gu{motion}`/`guu` -- lowercases every character in the target.
-    /// Reached via `feed_g` (see its own `u` arm), not `feed_fresh`
-    /// directly -- these three are vim's own `g`-prefixed operators, the
-    /// same tier as `gJ`, just taking a motion instead of resolving
-    /// immediately. Never writes a register (neither yanks nor deletes
-    /// anything); a caller's `Operator`/`OperatorLines` handling for
-    /// these three simply ignores whatever register accompanies them.
+    /// `gu{motion}`/`guu`: lowercase the target. Reached through `feed_g`.
+    /// Writes no register; callers ignore the register given with these.
     Lowercase,
     /// `gU{motion}`/`gUU` -- uppercases every character in the target.
     Uppercase,
-    /// `g~{motion}`/`g~~` -- toggles the case of every character in the
-    /// target (vim's own per-character `~`, generalized to a motion).
+    /// `g~{motion}`/`g~~`: toggle the case of the target.
     CaseToggle,
-    /// `>{motion}`/`>>` -- shifts every line the target touches right by
-    /// one shiftwidth. Like real vim, `>`/`<` always act linewise
-    /// regardless of the motion's own natural shape (unlike `d`/`c`/`y`/
-    /// the `g`-prefixed case operators above, which all respect it) --
-    /// a caller's `Operator`/`OperatorLines` handling for these two is
-    /// expected to always treat the target as whole lines, not consult
-    /// `motion::motion_shape` the way it might for any other operator.
+    /// `>{motion}`/`>>`: shift the lines the target touches right by one
+    /// shiftwidth. Always linewise, as in vim, whatever the motion's shape.
     Indent,
-    /// `<{motion}`/`<<` -- shifts every line the target touches left by
-    /// up to one shiftwidth (a line indented less than that just loses
-    /// whatever leading whitespace it has).
+    /// `<{motion}`/`<<`: shift left by up to one shiftwidth.
     Outdent,
-    /// `zf{motion}` -- a closed fold over every line the target touches.
-    /// Changes no text, so it writes no register and leaves no undo step.
+    /// `zf{motion}`: a closed fold over the lines the target touches. Changes
+    /// no text, so no register and no undo step.
     Fold,
 }
 
-/// `KeyOutcome::AddSurround`'s own target: either a motion's resolved
-/// range (`ys{motion}`, carrying whatever count applied to it, mirroring
-/// `KeyOutcome::Operator`'s own `(Motion, Option<usize>)` shape) or the
-/// current line (`yss`'s own count -- `yss`/`2yss` wrap `count` lines
-/// starting at the cursor, the same "this operator, this line, `count`
-/// of them" shape `OperatorLines`'s own doc comment already establishes
-/// for `yy`/`dd`/`cc`).
+/// `AddSurround`'s target: a motion's range (`ys{motion}`, with its count)
+/// or `count` lines from the cursor's (`yss`), like `OperatorLines`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SurroundTarget {
     Motion(Motion, Option<usize>),
@@ -411,37 +273,28 @@ pub enum SurroundTarget {
 }
 
 impl Op {
-    /// The key that both arms this operator and, pressed again at a fresh
-    /// dispatch point, triggers its whole-line shorthand (`yy`/`dd`/`cc`).
+    /// The key that arms this operator and, pressed again, doubles it (`yy`).
     fn trigger_char(self) -> char {
         match self {
             Op::Yank => 'y',
             Op::Delete => 'd',
             Op::Change => 'c',
-            // The character right after the `g` that armed these, not
-            // `g` itself -- `guu`/`gUU`/`g~~` repeat *that* key, matching
-            // real vim (mirrors `ys`'s own `s`-not-`y` trigger for the
-            // same reason: whatever key resolved the arming, not the
-            // leader in front of it).
+            // The key after the `g`, as vim's `guu` repeats it, not `g`
+            // itself.
             Op::Lowercase => 'u',
             Op::Uppercase => 'U',
             Op::CaseToggle => '~',
             Op::Indent => '>',
             Op::Outdent => '<',
-            // `zf` has no doubled form -- `zfj` folds two lines and `zF`
-            // folds by count -- so nothing that can be typed repeats it.
+            // `zf` has no doubled form (`zfj` folds two lines; `zF` takes a
+            // count).
             Op::Fold => '\0',
         }
     }
 }
 
-// `[count1]`, typed before the operator, and `[count2]`, typed before the
-// motion (or as `yy`'s own repeat, `y[count2]y`), multiply together --
-// matching vim (`2y3w` yanks 6 words). `None` stands in for "1" on both
-// sides so a bare count on just one side is used as-is rather than being
-// multiplied against a phantom 1 that would've been fine anyway; the
-// `saturating_mul` just guards against a pathological huge-count product
-// panicking rather than being a realistic scenario.
+// The count before the operator and the one before the motion multiply,
+// as in vim (`2y3w` yanks 6 words). `None` means 1.
 fn combine_counts(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     match (a, b) {
         (None, None) => None,
@@ -450,11 +303,10 @@ fn combine_counts(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     }
 }
 
-/// `i`/`a`/`I`/`A`/`s`/`S`/`C` -- see `KeyOutcome::EnterInsert`'s own doc
-/// comment for why these are a distinct outcome rather than `Motion`s.
+/// `i`, `a`, `I`, `A`, `s`, `S`, `C` (see `KeyOutcome::EnterInsert`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertCmd {
-    /// `i` -- insert before the cursor (i.e. resume exactly where it is).
+    /// `i`: insert before the cursor.
     Before,
     /// `a` -- insert after the cursor.
     After,
@@ -468,29 +320,17 @@ pub enum InsertCmd {
     SubstituteLine,
     /// `C` -- delete from the cursor to the end of the line, insert there.
     ChangeToEnd,
-    /// `gi` -- insert at wherever Insert mode last ended (vim's own `^`
-    /// mark). Unlike every other `InsertCmd`, resolving this needs a
-    /// buffer's own marks, which `apply_insert_cmd` (below) has no access
-    /// to -- see its own doc comment on why it works over a bare `[char]`
-    /// slice. `apply_insert_cmd` treats it the same as `Before` (insert
-    /// right where the cursor already is): a reasonable fallback for the
-    /// single-line contexts that call it (the shell's own line editor,
-    /// the pane-scrollback Ctrl+G excursion), where "the last insert
-    /// position" isn't a concept those contexts track. `fileeditor.rs`'s
-    /// own `TextBuffer`-aware `resolve_insert_start` resolves it for
-    /// real, via `Buffer::get_mark('^')`.
+    /// `gi`: insert where Insert mode last ended (vim's `^` mark). Needs
+    /// the buffer's marks, which `apply_insert_cmd` doesn't have, so there
+    /// it acts like `Before`; fileeditor.rs's `resolve_insert_start`
+    /// resolves it with `Buffer::get_mark('^')`.
     LastInsertPos,
 }
 
-/// The actual text/cursor transformation for one `InsertCmd`, against a
-/// plain `[char]` slice -- deliberately not tied to any particular `Buffer`
-/// impl (unlike `Motion`/`apply_motion`, `Buffer` has no mutation methods
-/// yet -- see bishedit's own module doc comment) or to `editor::LineEditor`
-/// specifically, so every frontend that wants real insert-entry semantics
-/// (editor.rs's own line-local Ctrl-E mode, applied to the *live* cursor;
-/// repl.rs's full-pane Ctrl+G mode, applied to a *frozen original*
-/// cursor a navigation excursion doesn't move) shares this one
-/// implementation instead of each re-deriving the same seven cases.
+/// What one `InsertCmd` does to a `[char]` line and cursor, shared by
+/// every frontend that enters insert mode on one line: the prompt's Ctrl-E
+/// mode on the live cursor, and repl.rs's Ctrl+G mode on a cursor the
+/// excursion didn't move.
 pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<char>, usize) {
     let cursor = cursor.min(text.len());
     match cmd {
@@ -515,18 +355,10 @@ pub fn apply_insert_cmd(text: &[char], cursor: usize, cmd: InsertCmd) -> (Vec<ch
     }
 }
 
-/// `p`/`P`: splices `insert_text` into `text` at the cursor, `count` times
-/// back-to-back. Mirrors `apply_insert_cmd`'s own shape exactly (a plain
-/// `[char]` slice in, a new one out -- no `Buffer` involved, matching how
-/// every real mutation in this crate works so far). `before` puts at the
-/// cursor itself (`P`); otherwise one column after it (`p`), matching
-/// vim's own after-the-cursor placement. The cursor ends on the last
-/// inserted character, vim's own rule -- repeating the same char run
-/// `count` times back-to-back rather than, say, leaving gaps, matches
-/// vim's `3p` inserting three concatenated copies as a single block.
-/// `insert_text` is expected to already be flattened to a single line by
-/// the caller (see `RegisterValue::flatten_to_single_line`) -- this
-/// function has no line concept of its own to preserve.
+/// `p`/`P`: splices `insert_text` at the cursor (`P`) or one past it
+/// (`p`), `count` copies back to back, as vim's `3p` does. The cursor ends
+/// on the last inserted character. `insert_text` must already be one line
+/// (see `RegisterValue::flatten_to_single_line`).
 pub fn apply_put(text: &[char], cursor: usize, insert_text: &str, before: bool, count: usize) -> (Vec<char>, usize) {
     let insert_chars: Vec<char> = insert_text.chars().collect();
     if insert_chars.is_empty() || count == 0 {
@@ -544,15 +376,10 @@ pub fn apply_put(text: &[char], cursor: usize, insert_text: &str, before: bool, 
     (new_text, new_cursor)
 }
 
-/// `x`: deletes up to `count` characters starting at the cursor, clamped
-/// to the end of the line -- vim's own primitive, not quite reducible to
-/// `d{count}l`: `l`'s own motion refuses to move onto/past the last
-/// character, so `dl` there is a no-op, but `x` on the last character
-/// still deletes it (this clamps the *starting* cursor to the last valid
-/// index first, rather than refusing to move past it the way a motion
-/// would). Returns the deleted text too, so the caller can write it to a
-/// register the same way `y`/`d{motion}` do -- empty text (nothing to
-/// delete: an empty buffer) is the caller's own signal to skip that.
+/// `x`: deletes up to `count` characters from the cursor, clamped to the
+/// line. Not `d{count}l`: `l` won't move past the last character, so `dl`
+/// there does nothing, while `x` deletes it. Returns the deleted text for
+/// the register; empty means there was nothing to delete.
 pub fn apply_delete_forward(text: &[char], cursor: usize, count: usize) -> (Vec<char>, usize, String) {
     if text.is_empty() || count == 0 {
         return (text.to_vec(), cursor, String::new());
@@ -566,10 +393,9 @@ pub fn apply_delete_forward(text: &[char], cursor: usize, count: usize) -> (Vec<
     (new_text, new_cursor, deleted)
 }
 
-/// `<C-w>{cmd}`: the same single-letter window shortcuts the shell's own
-/// `window` command exposes (see exec.rs's `run_window`), minus the size
-/// commands (`+`/`-`/`size`) and `fg <id>` (needs an argument beyond a
-/// single letter+count) -- matching plan.md's own scoping for this.
+/// `<C-w>{cmd}`: the single-letter shortcuts of the `window` command (see
+/// exec.rs's `run_window`), without the size commands or `fg <id>`, which
+/// need more than a letter and a count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowCmd {
     Next,
@@ -582,22 +408,19 @@ pub enum WindowCmd {
     FocusDown,
     FocusUp,
     FocusRight,
-    /// `<C-w>z` (tmux's letter) and `<C-w>o` (vim's) -- the focused
-    /// pane fills the window until the next press puts the split back.
+    /// `<C-w>z` and `<C-w>o`: the focused pane fills the window until the
+    /// next press restores the split.
     Zoom,
-    /// `<C-w><Space>` -- the next named layout. tmux's own key for it
-    /// (`prefix Space`); vim has no equivalent to borrow from.
+    /// `<C-w><Space>`: the next named layout.
     NextLayout,
-    /// `<C-w>x` -- exchange this pane with the next one, vim's own key
-    /// and vim's own meaning.
+    /// `<C-w>x`: exchange this pane with the next, as in vim.
     SwapPane,
-    /// `<C-w>T` -- move this pane out to a tab of its own. Also vim's
-    /// key, where a tab holds windows exactly as a tab here holds panes.
+    /// `<C-w>T`: move this pane to a tab of its own, as vim does with a
+    /// window.
     BreakPane,
     Balance,
-    /// `<C-w> _` -- shrink this pane to its divider. Focus moves to a
-    /// neighbour, since a pane showing one row is not somewhere to be;
-    /// focusing it again brings it back.
+    /// `<C-w>_`: shrink this pane to its divider. Focus moves to a neighbour;
+    /// focusing it again restores it.
     Minimize,
     /// `<C-w>gg` / `<C-w>{N}gg`: go to the first tab, or tab N.
     GotoFirstWindow,
