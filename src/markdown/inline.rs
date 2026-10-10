@@ -1,15 +1,9 @@
-// Inline parsing, CommonMark §6 plus GFM strikethrough and autolinks.
-//
-// Emphasis is why this can't be a simple scan. Whether `*` opens, closes,
-// both or neither depends on the characters on *both* sides of it, and a
-// run of them may have to be split between an opener and a closer -- so
-// the spec's algorithm collects delimiter runs first and resolves them
-// afterwards, from a stack, which is what this does.
-//
-// Every span this produces is a char offset into the original document,
-// not into the text being scanned. Those differ: a block quote's content
-// has its `> ` markers stripped and its lines joined, so `Content` keeps
-// a source offset per character to map back.
+// Inline parsing: CommonMark §6, GFM strikethrough and autolinks.
+// Whether `*` opens or closes depends on both neighbours, and a run may
+// be split between an opener and a closer, so delimiter runs are
+// collected first and resolved from a stack, as the spec does. Spans are
+// char offsets into the document, not into the scanned text, which for
+// a block quote has its `> ` markers stripped; `Content` maps back.
 
 use std::ops::Range;
 
@@ -31,9 +25,8 @@ impl Content {
         Content { chars, offsets }
     }
 
-    // Several lines joined by newlines, each remembering where it began
-    // -- the mapping that makes a span in a block quote point at the
-    // right place in the file rather than at the stripped text.
+    // Lines joined by newlines, each remembering its start, so a span in a
+    // block quote points at the file, not the stripped text.
     pub fn from_lines(lines: &[(String, usize)]) -> Content {
         let mut chars = Vec::new();
         let mut offsets = Vec::new();
@@ -129,12 +122,9 @@ impl<'a> InlineParser<'a> {
         }
         let text = self.c.text(from, to);
         let span = self.c.span(from, to);
-        // Deliberately *not* merged into the previous text node here: a
-        // delimiter run is also a text node, and the emphasis algorithm
-        // addresses it by index. Merging would fold `*` and the word
-        // after it into one node and invalidate every index the
-        // delimiter stack holds. Adjacent text is coalesced once, at the
-        // end, when no index still matters (see `coalesce`).
+        // Not merged into the previous text node yet: the emphasis algorithm
+        // addresses delimiter runs, which are text nodes, by index. Adjacent
+        // text is coalesced at the end (`coalesce`).
         self.out.push(Inline::Text { text, span });
     }
 
@@ -169,8 +159,8 @@ impl<'a> InlineParser<'a> {
     }
 }
 
-// ASCII punctuation, per the spec's own definition -- what a backslash
-// may escape, and what counts as punctuation for the flanking rules.
+// ASCII punctuation, as the spec defines it: what a backslash may
+// escape, and what the flanking rules count.
 fn is_punctuation(c: char) -> bool {
     c.is_ascii_punctuation() || (!c.is_alphanumeric() && !c.is_whitespace() && !c.is_control())
 }
@@ -198,10 +188,9 @@ impl InlineParser<'_> {
         }
     }
 
-    // A code span is delimited by equal-length backtick runs. Its
-    // content has one leading and trailing space stripped when both are
-    // present and it isn't all spaces -- the rule that lets `` ` `` hold
-    // a literal backtick.
+    // A code span, between equal-length backtick runs. One leading and
+    // trailing space are stripped when both are present and it isn't all
+    // spaces, so `` ` `` holds a backtick.
     fn code_span(&mut self, text_start: usize) -> bool {
         let open_len = self.run_len(self.pos, '`');
         let mut i = self.pos + open_len;
@@ -235,9 +224,8 @@ impl InlineParser<'_> {
         self.c.chars[from..].iter().take_while(|&&x| x == c).count()
     }
 
-    // A delimiter run's flanking, §6.2: whether it can open or close
-    // depends on the characters on both sides, which is why this can't
-    // be decided by a scan alone.
+    // A delimiter run's flanking (§6.2): whether it can open or close
+    // depends on both sides.
     fn delimiter_run(&mut self, text_start: usize) -> bool {
         let c = self.at(self.pos).expect("called only on a delimiter character");
         let count = self.run_len(self.pos, c);
@@ -249,8 +237,8 @@ impl InlineParser<'_> {
         let after = self.at(self.pos + count).unwrap_or(' ');
         let left_flanking = !after.is_whitespace() && (!is_punctuation(after) || before.is_whitespace() || is_punctuation(before));
         let right_flanking = !before.is_whitespace() && (!is_punctuation(before) || after.is_whitespace() || is_punctuation(after));
-        // `_` is stricter than `*`: it can't open or close inside a
-        // word, so `snake_case_names` stays one word.
+        // `_` can't open or close inside a word, so `snake_case_names` stays
+        // one word.
         let (can_open, can_close) = match c {
             '_' => (left_flanking && (!right_flanking || is_punctuation(before)), right_flanking && (!left_flanking || is_punctuation(after))),
             _ => (left_flanking, right_flanking),
@@ -276,8 +264,8 @@ impl InlineParser<'_> {
         true
     }
 
-    // `]` -- the point where a link may turn out to exist, which is why
-    // brackets are stacked rather than matched as they're seen.
+    // `]`, where a link may turn out to exist, which is why brackets are
+    // stacked rather than matched as seen.
     fn close_bracket(&mut self, text_start: usize) -> bool {
         let Some(bracket) = self.brackets.pop() else { return false };
         if !bracket.active {
@@ -296,8 +284,8 @@ impl InlineParser<'_> {
             return true;
         };
 
-        // Everything after the opening bracket's own node is the link's
-        // content, with emphasis inside it resolved first.
+        // Everything after the opening bracket's node is the link's content,
+        // emphasis resolved first.
         self.resolve_emphasis(bracket.node + 1);
         let content: Vec<Inline> = self.out.drain(bracket.node + 1..).collect();
         self.out.truncate(bracket.node);
@@ -306,8 +294,8 @@ impl InlineParser<'_> {
         if bracket.image {
             self.out.push(Inline::Image { dest, title, alt: content, span });
         } else {
-            // Links may not contain links, so any `[` still open is
-            // deactivated -- the rule that stops `[a[b](c)](d)` nesting.
+            // Links can't contain links, so any open `[` is deactivated:
+            // `[a[b](c)](d)` doesn't nest.
             for b in self.brackets.iter_mut() {
                 if !b.image {
                     b.active = false;
@@ -340,19 +328,19 @@ impl InlineParser<'_> {
         Some((dest, title, i + 1))
     }
 
-    // `[text][label]`, `[text][]` and `[text]` -- all three resolve
-    // against the document's link reference definitions.
+    // `[text][label]`, `[text][]` and `[text]`, resolved against the
+    // document's link reference definitions.
     fn reference_destination(&self, open: usize, label_end: usize, after: usize) -> Option<(String, String, usize)> {
         let (label, end) = match self.at(after) {
             Some('[') => match self.matching_bracket(after) {
                 Some(close) if close == after + 1 => {
-                    // `[text][]` -- the text is the label.
+                    // `[text][]`: the text is the label.
                     (self.c.text(open + 1, label_end), close + 1)
                 }
                 Some(close) => (self.c.text(after + 1, close), close + 1),
                 None => return None,
             },
-            // A shortcut reference: `[text]` on its own.
+            // A shortcut reference: `[text]` alone.
             _ => (self.c.text(open + 1, label_end), after),
         };
         let normalized = normalize_label(&label);
@@ -414,9 +402,9 @@ impl InlineParser<'_> {
                     continue;
                 }
                 '(' => depth += 1,
-                // The paren that closes the whole `](...)` is not part
-                // of the destination -- stopping *before* decrementing
-                // is what leaves the balance check meaningful.
+                // The paren closing `](...)` isn't part of the destination;
+                // stopping before decrementing keeps the balance check
+                // meaningful.
                 ')' => {
                     if depth == 0 {
                         break;
@@ -459,8 +447,8 @@ impl InlineParser<'_> {
         None
     }
 
-    // A newline inside a paragraph: two trailing spaces (or a backslash,
-    // handled above) make it a hard break, anything else a soft one.
+    // A newline in a paragraph: after two spaces (or a backslash, above) a
+    // hard break, else soft.
     fn line_break(&mut self, text_start: usize) -> bool {
         let mut end = self.pos;
         let mut spaces = 0;
@@ -494,8 +482,8 @@ impl InlineParser<'_> {
     }
 }
 
-// `&amp;`, `&#65;`, `&#x41;` -- resolved through the HTML parser's own
-// table, so markdown and HTML can't disagree about what an entity means.
+// `&amp;`, `&#65;`, `&#x41;`, through the HTML parser's table, so the two
+// agree on what an entity means.
 fn decode_entity(rest: &str) -> Option<(String, usize)> {
     let chars: Vec<char> = rest.chars().collect();
     if chars.first() != Some(&'&') {
@@ -531,8 +519,7 @@ pub fn normalize_label(label: &str) -> String {
 }
 
 impl InlineParser<'_> {
-    // `<https://x>`, `<a@b.c>`, and raw inline HTML -- three things that
-    // all start with `<`, distinguished by what follows.
+    // `<https://x>`, `<a@b.c>`, and raw inline HTML, all starting with `<`.
     fn autolink_or_html(&mut self, text_start: usize) -> bool {
         if let Some((dest, end, is_email)) = self.autolink() {
             self.push_text(text_start, self.pos);
@@ -559,9 +546,8 @@ impl InlineParser<'_> {
         false
     }
 
-    // An absolute URI or an email address between angle brackets --
-    // §6.5's own grammar, which is deliberately narrow (no spaces, a
-    // real scheme) so that `<not a link>` isn't one.
+    // An absolute URI or an email address in angle brackets, by §6.5's
+    // narrow grammar (no spaces, a real scheme), so `<not a link>` isn't.
     fn autolink(&self) -> Option<(String, usize, bool)> {
         let close = self.c.chars[self.pos..].iter().position(|&c| c == '>')? + self.pos;
         let inner = self.c.text(self.pos + 1, close);
@@ -581,10 +567,9 @@ impl InlineParser<'_> {
         None
     }
 
-    // Inline raw HTML: an open tag, close tag, comment, processing
-    // instruction, declaration or CDATA section. Recognized by the same
-    // grammar the HTML tokenizer uses, so what markdown calls HTML and
-    // what crate::html parses are the same thing.
+    // Inline raw HTML: a tag, comment, processing instruction, declaration
+    // or CDATA section, by the HTML tokenizer's grammar, so markdown and
+    // crate::html agree on what HTML is.
     fn raw_html(&self) -> Option<usize> {
         let rest: String = self.c.chars[self.pos..].iter().collect();
         html_span(&rest).map(|len| self.pos + len)
@@ -713,11 +698,10 @@ pub fn is_complete_tag_line(line: &str) -> bool {
 }
 
 impl InlineParser<'_> {
-    // §6.2's "process emphasis": walk the delimiter stack forward
-    // looking for a closer, then back from it for the nearest opener
-    // that may pair with it. The "rule of three" (a run that can both
-    // open and close only pairs when the lengths don't sum to a multiple
-    // of three) is what makes `*a**b*` come out the way it does.
+    // §6.2's "process emphasis": walk forward for a closer, then back for
+    // the nearest opener that pairs with it. The "rule of three" (a run that
+    // can open and close pairs only when lengths don't sum to a multiple of
+    // three) shapes `*a**b*`.
     fn resolve_emphasis(&mut self, floor: usize) {
         let mut closer_idx = 0;
         while closer_idx < self.delims.len() {
@@ -742,15 +726,14 @@ impl InlineParser<'_> {
                 break;
             }
             let Some(opener_idx) = opener_idx else {
-                // No opener: this run can never close anything, so stop
-                // reconsidering it.
+                // No opener: this run can never close anything.
                 self.delims[closer_idx].can_close = false;
                 closer_idx += 1;
                 continue;
             };
             let taken = if closer.c == '~' {
-                // GFM strikethrough is all-or-nothing: `~~` pairs with
-                // `~~`, `~` with `~`.
+                // Strikethrough is all-or-nothing: `~~` with `~~`, `~` with
+                // `~`.
                 if self.delims[opener_idx].count != closer.count {
                     self.delims[closer_idx].can_close = false;
                     closer_idx += 1;
@@ -765,9 +748,8 @@ impl InlineParser<'_> {
             self.wrap_emphasis(opener_idx, closer_idx, taken);
             // Everything between the two is now inside the new node.
             self.delims.retain(|d| d.active);
-            // Both ends may have shrunk or vanished, so the search
-            // starts over rather than trying to keep an index valid
-            // across a splice.
+            // Both ends may have shrunk or gone, so the search restarts
+            // rather than keep an index valid across a splice.
             closer_idx = 0;
         }
         // Whatever is left never paired: its text stays as it is.
@@ -778,11 +760,9 @@ impl InlineParser<'_> {
         let opener = self.delims[opener_idx].clone();
         let closer = self.delims[closer_idx].clone();
 
-        // Shorten both runs' own text nodes by what this pair consumed.
-        // The content sits between the *consumed* delimiters, which are
-        // the innermost ones -- so it starts where the opener run ended
-        // and ends where the closer run began, both read before either
-        // is shortened.
+        // Shorten both runs' text nodes by what this pair used. The content
+        // lies between the consumed (innermost) delimiters: from where the
+        // opener run ended to where the closer began, read before shortening.
         let (open_span_end, close_span_start) = {
             let open_span_end = match &mut self.out[opener.node] {
                 Inline::Text { text, span } => {
@@ -806,11 +786,9 @@ impl InlineParser<'_> {
         };
 
         let content: Vec<Inline> = self.out[opener.node + 1..closer.node].to_vec();
-        // The span covers the *whole* construct, delimiters included --
-        // the same convention `Code` and `Link` already follow, and what
-        // a highlighter needs in order to colour the `**` along with
-        // what's between them. The content's own extent is the children's
-        // spans.
+        // The span covers the whole construct, delimiters included, as `Code`
+        // and `Link` do, so a highlighter colours the `**` with the text; the
+        // content's extent is the children's spans.
         let span = (open_span_end - taken)..(close_span_start + taken);
         let node = match (closer.c, taken) {
             ('~', _) => Inline::Strikethrough { content, span },
@@ -820,10 +798,9 @@ impl InlineParser<'_> {
         // Replace the range between the delimiters with the new node.
         self.out.splice(opener.node + 1..closer.node, [node]);
 
-        // Every delimiter between the two is gone, and every node after
-        // the splice moves by however much the splice changed the
-        // length -- which is *negative* when the two runs were adjacent
-        // and the new node made the vector longer.
+        // Delimiters between the two are gone, and nodes after the splice
+        // move by the length change, negative when the runs were adjacent
+        // and the new node lengthened the vector.
         let replaced = closer.node - opener.node - 1;
         let shift = replaced as isize - 1;
         for d in self.delims.iter_mut() {
@@ -859,8 +836,8 @@ impl InlineParser<'_> {
     }
 }
 
-// Adjacent text nodes become one, recursively -- run after the emphasis
-// algorithm, which needs them separate (see `push_text`).
+// Merges adjacent text nodes, recursively, after the emphasis algorithm,
+// which needs them separate.
 fn coalesce(inlines: Vec<Inline>) -> Vec<Inline> {
     let mut out: Vec<Inline> = Vec::with_capacity(inlines.len());
     for inline in inlines {
@@ -880,8 +857,7 @@ fn coalesce(inlines: Vec<Inline>) -> Vec<Inline> {
             _ => out.push(inline),
         }
     }
-    // An empty text node left behind by a consumed delimiter is not
-    // content.
+    // An empty text node left by a consumed delimiter isn't content.
     out.retain(|i| !matches!(i, Inline::Text { text, .. } if text.is_empty()));
     out
 }
