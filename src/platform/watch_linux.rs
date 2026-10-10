@@ -1,10 +1,6 @@
-//! Watching a directory with inotify(7).
-//!
-//! One descriptor for the whole set, and the kernel names the entry that
-//! changed, so there is nothing to work out: an event arrives already
-//! saying which directory and which name in it. `watch.rs` owns the
-//! policy above this -- which names a caller asked about, and what to
-//! make of an event about one.
+//! Watching a directory with inotify(7): one descriptor for everything,
+//! and each event already names the directory and entry. `watch.rs` owns
+//! the policy above this.
 
 use super::{RawChange, RawEvent, WatchId};
 use std::io;
@@ -20,16 +16,14 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-// `inotify_init1` flags, which are the `open(2)` ones under different
-// names. Private, like every constant belonging to a call only this OS
-// has.
+// `inotify_init1` flags, the `open(2)` ones renamed; private, as for any
+// call only this OS has.
 const IN_NONBLOCK: i32 = 0o4000;
 const IN_CLOEXEC: i32 = 0o2000000;
 
-// The events worth asking for. `IN_CLOSE_WRITE` rather than `IN_MODIFY`
-// for content: a program writing a file in chunks produces a `MODIFY`
-// per chunk, so acting on those means reading a file mid-write, while
-// `CLOSE_WRITE` arrives once and after the writer let go.
+// The events wanted. `IN_CLOSE_WRITE` rather than `IN_MODIFY` for content:
+// a chunked write gives a `MODIFY` per chunk, which would mean reading a
+// file mid-write; `CLOSE_WRITE` comes once, after the writer is done.
 const IN_ATTRIB: u32 = 0x0000_0004;
 const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 const IN_MOVED_FROM: u32 = 0x0000_0040;
@@ -62,14 +56,10 @@ impl DirWatch {
         self.fd
     }
 
-    /// Watches `dir`. The same directory added twice gives the same id,
-    /// which is the kernel's own behaviour here and the contract the
-    /// macOS side has to keep too.
-    ///
-    /// `file` is the entry the caller is after, if it is after one.
-    /// Nothing here needs it: a directory watch already reports writes
-    /// to every file in it, by name. It is macOS's kqueue that does not
-    /// -- see watch_darwin.rs.
+    /// Watches `dir`; the same directory twice gives the same id, the
+    /// kernel's behaviour and the macOS side's contract. `file` isn't needed
+    /// here: a directory watch reports writes to every file by name, unlike
+    /// kqueue (see watch_darwin.rs).
     pub(crate) fn add(&mut self, dir: &Path, _file: Option<&std::ffi::OsStr>) -> io::Result<WatchId> {
         let mut c_path: Vec<u8> = dir.as_os_str().as_bytes().to_vec();
         c_path.push(0);
@@ -84,15 +74,12 @@ impl DirWatch {
         unsafe { inotify_rm_watch(self.fd, watch) };
     }
 
-    /// Everything waiting, right now. Never blocks: the descriptor is
-    /// non-blocking, so an empty answer means nothing has happened, not
-    /// that nothing will.
+    /// Everything waiting now. Non-blocking, so empty means nothing yet.
     pub(crate) fn drain(&mut self) -> Vec<RawEvent> {
-        // The buffer has to hold at least one whole event, name
-        // included, or the read fails with EINVAL rather than returning
-        // a partial one. inotify's own documented minimum is
-        // `sizeof(struct inotify_event) + NAME_MAX + 1`; this is
-        // comfortably past it and reads many events per call.
+        // The buffer must hold a whole event with its name, or the read
+        // fails with EINVAL. inotify's documented minimum is
+        // `sizeof(struct inotify_event) + NAME_MAX + 1`; this is well past
+        // it and reads many per call.
         let mut buf = [0u8; 8192];
         let mut out: Vec<RawEvent> = Vec::new();
         loop {
@@ -106,16 +93,16 @@ impl DirWatch {
                 let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().expect("four bytes"));
                 let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().expect("four bytes")) as usize;
                 let name_bytes = &buf[at + 16..(at + 16 + len).min(buf.len())];
-                // The name is NUL-padded to an alignment boundary, so
-                // the first NUL ends it.
+                // The name is NUL-padded to alignment, so the first NUL
+                // ends it.
                 let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
                 let name = std::ffi::OsStr::from_bytes(&name_bytes[..name_end]);
                 at += 16 + len;
 
                 let change = match mask {
                     _ if mask & IN_Q_OVERFLOW != 0 => RawChange::Overflowed,
-                    // The watch itself went away: the directory was
-                    // deleted or moved, and the descriptor is dead.
+                    // The watch went away: the directory was deleted or
+                    // moved.
                     _ if mask & IN_IGNORED != 0 => RawChange::Dropped,
                     _ if mask & (IN_DELETE | IN_MOVED_FROM | IN_DELETE_SELF | IN_MOVE_SELF) != 0 => RawChange::Gone,
                     _ => RawChange::Touched,
