@@ -456,6 +456,9 @@ impl Server {
     /// `service`, which is why the returned server starts out
     /// `Initializing` rather than usable.
     pub fn start(id: u64, command: &[String], display: &str, root: &Path, apply_edits: ApplyEdits, settings: Value) -> Result<Server, String> {
+        if !cfg!(feature = "lsp") {
+            return Err("language servers are not part of this build".to_string());
+        }
         let Some((program, args)) = command.split_first() else {
             return Err("no command to run".to_string());
         };

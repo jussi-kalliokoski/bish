@@ -580,6 +580,9 @@ impl HexSession {
     // open_one_edit_target). Always read-only: those bytes came out of a
     // decompressor, and nothing here can put them back.
     pub fn from_bytes(bytes: Vec<u8>, path: &Path, rect: Rect) -> io::Result<HexSession> {
+        if !cfg!(feature = "hexedit") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "hex editing is not part of this build"));
+        }
         let layout = compute_layout(rect.rows, rect.cols, 0, None, true);
         let mut buf = HexBuffer::from_bytes(bytes, layout.bytes_per_row, layout.rows);
         buf.path = Some(path.to_path_buf());
@@ -588,6 +591,9 @@ impl HexSession {
     }
 
     pub fn open(path: Option<&Path>, rect: Rect, readonly: bool) -> io::Result<HexSession> {
+        if !cfg!(feature = "hexedit") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "hex editing is not part of this build"));
+        }
         let layout = compute_layout(rect.rows, rect.cols, 0, None, true);
         let mut buf = HexBuffer::open(path, layout.bytes_per_row, layout.rows)?;
         buf.readonly = readonly;

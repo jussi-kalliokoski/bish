@@ -437,6 +437,10 @@ impl Default for Server {
 /// keep. This module's own doc comment is the documentation until that
 /// changes, and `PROTOCOL_VERSION` tells anything connecting the same.
 pub fn run(args: &[String]) -> i32 {
+    if !cfg!(feature = "mcp") {
+        eprintln!("bish tool mcp-server: the MCP server is not part of this build");
+        return 2;
+    }
     let mut session = None;
     let mut rest = args;
     // `--session NAME` and `--session=NAME`, and nothing else. There is

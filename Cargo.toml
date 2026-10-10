@@ -24,3 +24,24 @@ codegen-units = 1
 [profile.web]
 inherits = "release"
 opt-level = "z"
+
+# Subsystems a build can leave out. All on by default; the browser build
+# turns them off (`--no-default-features`), since none of them can work
+# there. Each is switched at its entry points with `cfg!`, not `#[cfg]`:
+# the code is still compiled and type-checked either way, so a build
+# without one cannot rot, and the optimizer drops whatever is left
+# unreachable behind a refusal.
+[features]
+default = ["lsp", "dap", "mcp", "hexedit", "browser", "sessions"]
+# Language-server clients in the editor, and `bish tool lsp-server`.
+lsp = []
+# Debug adapters and the built-in script debugger.
+dap = []
+# `bish tool mcp-server`.
+mcp = []
+# The hex editor.
+hexedit = []
+# The file browser.
+browser = []
+# `bish session ...` and the socket bish listens on for its panes.
+sessions = []

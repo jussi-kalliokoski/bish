@@ -79,6 +79,10 @@ struct Server {
 /// arrives, answering each. The return value is this process's exit
 /// code.
 pub fn run(args: &[String]) -> i32 {
+    if !cfg!(feature = "lsp") {
+        eprintln!("bish tool lsp-server: the language server is not part of this build");
+        return 2;
+    }
     if let Some(arg) = args.first() {
         match arg.as_str() {
             "-h" | "--help" => {

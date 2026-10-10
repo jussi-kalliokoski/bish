@@ -193,6 +193,9 @@ impl Browser {
     // -- an unreadable start directory is a plain error, same as any
     // other failed `:` command).
     pub(crate) fn open(start: &Path) -> Result<Self, String> {
+        if !cfg!(feature = "browser") {
+            return Err("the file browser is not part of this build".to_string());
+        }
         let cwd = canonical(start)?;
         let mut b = Browser {
             cwd,

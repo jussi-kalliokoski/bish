@@ -109,6 +109,9 @@ impl Session {
     /// `mode`), and inventing a common shape over them would only be a
     /// second thing to get wrong.
     pub fn start(command: &[String], cwd: &Path, launch_arguments: Value) -> Result<Session, String> {
+        if !cfg!(feature = "dap") {
+            return Err("debug adapters are not part of this build".to_string());
+        }
         let Some((program, args)) = command.split_first() else {
             return Err("no command to run".to_string());
         };

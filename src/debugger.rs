@@ -93,6 +93,9 @@ impl DebugSession {
     // `:dbg` handling, `TextBuffer::set_readonly`), so there's no live-
     // editing story to go stale against.
     pub fn attach(path: &Path) -> std::io::Result<DebugSession> {
+        if !cfg!(feature = "dap") {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "the debugger is not part of this build"));
+        }
         let src = std::fs::read_to_string(path)?;
         let mut shell = Shell::new();
         shell.set_script_args(path.to_string_lossy().to_string(), Vec::new());

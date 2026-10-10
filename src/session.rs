@@ -1370,6 +1370,9 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
 /// Nothing answers on it, so the next one to start sweeps it up -- asked
 /// by connecting rather than by pid, which the kernel reuses.
 pub fn listen_here() -> io::Result<PathBuf> {
+    if !cfg!(feature = "sessions") {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "detachable sessions are not part of this build"));
+    }
     let dir = ensure_socket_dir()?;
     remove_unanswered_ide_sockets(&dir);
     let path = ide_socket_path(crate::platform::process_id());

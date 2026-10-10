@@ -103,6 +103,10 @@ fn main() {
     // binary with it) -- not documented as user-facing here for that
     // reason, though nothing stops a user from invoking it directly.
     if args.get(1).map(String::as_str) == Some("session") {
+        if !cfg!(feature = "sessions") {
+            eprintln!("bish: detachable sessions are not part of this build");
+            std::process::exit(2);
+        }
         let code = match args.get(2).map(String::as_str) {
             // `-A` is tmux's own spelling for "attach to it if it is
             // already there, create it if it is not".
