@@ -1,23 +1,18 @@
-// Nothing drives this yet: the pipeline stages that will be are the
-// next commit. Everything here is exercised by its own tests, over real
-// pipes; the allow goes when the shell starts calling it.
+// `Scheduler::add` is used only by the tests.
 #![allow(dead_code)]
 
-// Running several coroutines until they are all finished, switching
-// between them when one cannot make progress.
+// Runs several coroutines to completion, switching when one can't make
+// progress.
 //
-// `coroutine` knows how to stop one execution and start another, and
-// nothing about why. This is the why: a pipeline stage that has filled
-// the pipe it writes, or emptied the one it reads, must hand the thread
-// to whichever stage can unblock it. That is the whole of the
-// scheduling policy -- there is no fairness to tune and no preemption,
-// because the only reason a stage ever stops is that it is waiting for
-// a descriptor, and the only thing that can help is another stage.
+// `coroutine` can stop one execution and start another; this decides
+// when. A pipeline stage that filled the pipe it writes, or emptied the
+// one it reads, hands the thread to whichever stage can unblock it. No
+// fairness and no preemption: a stage only stops to wait for a
+// descriptor, and only another stage can help.
 //
-// The loop is therefore: run everything that can run, and when nothing
-// can, sleep in `poll(2)` until the kernel says one of them can. That
-// last part is what makes this a scheduler rather than a spin: with two
-// stages both blocked, the process should be idle, not burning a core.
+// So: run whatever can run, and when nothing can, sleep in `poll(2)`
+// until one can, so two blocked stages leave the process idle rather
+// than spinning.
 
 use std::cell::Cell;
 use std::os::fd::RawFd;
@@ -36,14 +31,10 @@ pub enum Park {
 }
 
 thread_local! {
-    /// Filled in by the `park_*` calls just before yielding, read by
-    /// the scheduler just after the yield comes back.
-    ///
-    /// A side channel rather than a return value because the yield can
-    /// happen arbitrarily deep inside an evaluator that has no idea it
-    /// is running as a coroutine -- which is the property that lets the
-    /// shell's own I/O paths park without every caller in between
-    /// having to thread a reason back out.
+    /// Set by the `park_*` calls before yielding, read by the scheduler
+    /// after. A side channel, as the yield can happen deep inside an
+    /// evaluator that doesn't know it's a coroutine, so the shell's I/O
+    /// paths park without every caller threading a reason out.
     static REASON: Cell<Park> = const { Cell::new(Park::Ready) };
 }
 
@@ -67,25 +58,18 @@ pub fn park_writable(fd: RawFd) {
 }
 
 thread_local! {
-    /// Whether a scheduler is already driving a coroutine on this
-    /// thread.
+    /// Whether a scheduler is already driving a coroutine on this thread.
     ///
-    /// Both entry points below begin by recording fd 0 and fd 1 as "the
-    /// shell's own", to install per task and to restore at the end. If
-    /// one runs while another has a task's pipes installed, it records
-    /// *those* as the shell's -- then hands them to every task with
-    /// none of its own, and restores them when it finishes. The shell
-    /// is left with a pipeline stage's pipe as its stdout, and three
-    /// descriptors on one pipe, which is what a hung shell was found
-    /// holding.
+    /// Both entry points below record fd 0 and fd 1 as the shell's own, to
+    /// install per task and restore at the end. Nested inside another, one
+    /// would record a task's pipes as the shell's, hand them to tasks with
+    /// none of their own and restore them at the end, leaving the shell
+    /// writing into a stage's pipe and hanging.
     ///
-    /// It happens when a pipeline stage pumps: the stage is driven by
-    /// one scheduler, and `Shell::pump_coroutines` reaches for the
-    /// shared background one -- a different object, so not excluded by
-    /// borrowing. Nesting is never wanted anyway: the outer scheduler
-    /// is already giving this thread's coroutines their turns. Only
-    /// showed up under load, which is when a stage pumps often enough
-    /// to land inside one.
+    /// It happens when a stage pumps: `Shell::pump_coroutines` reaches for
+    /// the shared background scheduler, a different object, so borrowing
+    /// doesn't exclude it. Nesting is never wanted: the outer scheduler is
+    /// already giving this thread's coroutines turns.
     static DRIVING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -101,47 +85,33 @@ fn release_driving() {
 struct Task {
     co: Box<Coroutine>,
     park: Park,
-    /// What this task's fd 0 and fd 1 are, installed for the duration
-    /// of each of its turns.
+    /// This task's fd 0 and fd 1, installed for each of its turns.
     ///
-    /// A pipeline stage that is its own process gets its pipes *as*
-    /// stdin and stdout, and everything downstream of that -- `exec
-    /// {fd}<&0`, an external command inheriting the rest of the input,
-    /// a builtin writing to fd 1 -- works because they are the real
-    /// descriptors. Handing a stage a side channel instead breaks all
-    /// of it, so the descriptors are swapped rather than the code that
-    /// uses them. Two `dup2`s per switch, and switches only happen when
+    /// A stage gets its pipes as its real stdin and stdout, so `exec
+    /// {fd}<&0`, an external inheriting the rest of the input, or a builtin
+    /// writing to fd 1 all work. The descriptors are swapped rather than the
+    /// code using them: two `dup2`s per switch, and switches happen only when
     /// a stage blocks.
     stdin: Option<std::os::fd::OwnedFd>,
     stdout: Option<std::os::fd::OwnedFd>,
-    /// This task's own broken-pipe watch, swapped in around each resume
-    /// -- see `exec::swap_broken_pipe` for why it cannot just be the
-    /// thread's.
+    /// This task's broken-pipe flag, swapped in around each resume; see
+    /// `exec::swap_broken_pipe` for why it can't be the thread's.
     broken: Option<bool>,
-    /// Set when nothing will read this task's output any more. It is
-    /// never resumed again -- see `cancel_running`.
+    /// Set when nothing will read this task's output; it's never resumed
+    /// again (see `cancel_running`).
     cancelled: bool,
-    /// Whether `cancel_running` may stop this one.
-    ///
-    /// A `<( )` producer may: once the command reading it has finished,
-    /// anything more it produces goes nowhere. A `>( )` consumer may
-    /// not -- when the enclosing command ends, the consumer has just
-    /// been *handed* its input and has not written its answer yet, so
-    /// stopping it there is the one thing that loses the output
-    /// entirely.
+    /// Whether `cancel_running` may stop this one. A `<( )` producer may:
+    /// once its reader finished, more output goes nowhere. A `>( )` consumer
+    /// may not: when the command ends it has just been handed its input and
+    /// hasn't written its answer yet.
     cancellable: bool,
 }
 
 impl Task {
-    /// The descriptor a parked task actually meant.
-    ///
-    /// A stage parks on the number it was using -- 0 for its input, 1
-    /// for its output -- and those numbers mean whatever was last
-    /// installed on them, which is some *other* stage's pipe as soon as
-    /// one runs. Waiting on the number rather than on this task's own
-    /// descriptor waits for the wrong thing: sometimes one that is
-    /// always ready, which spins, and sometimes one that never will be,
-    /// which hangs. Both were observed before this existed.
+    /// The descriptor a parked task meant. A stage parks on the number it
+    /// used (0 for input, 1 for output), which means whatever was installed
+    /// last, another stage's pipe once one runs. Waiting on the number
+    /// could wait on one always ready (a spin) or one never ready (a hang).
     fn own_fd(&self, parked: std::os::fd::RawFd) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         match parked {
@@ -177,9 +147,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Adds a coroutine that runs with `stdin`/`stdout` as its own fd 0
-    /// and fd 1 -- see `Task::stdin`. `None` leaves that descriptor as
-    /// whatever the shell running the scheduler had.
+    /// Adds a coroutine with `stdin`/`stdout` as its fd 0 and fd 1 (see
+    /// `Task::stdin`). `None` leaves the shell's own.
     pub fn add_with_fds(
         &mut self,
         body: impl FnOnce() + 'static,
@@ -196,19 +165,12 @@ impl Scheduler {
         self.tasks.iter().all(|t| t.co.state() == State::Done || t.cancelled)
     }
 
-    /// Gives every runnable coroutine one turn and returns, rather than
-    /// running to completion.
+    /// Gives each runnable coroutine one turn and returns, for constructs
+    /// outliving their command: a `<( )` producer must progress while the
+    /// shell waits for the command consuming it, outside `run`. Called where
+    /// the shell would otherwise sit idle (see `Shell::pump_coroutines`).
     ///
-    /// This is what a construct that outlives its command needs: a
-    /// `<( )` producer has to make progress while the shell is waiting
-    /// for the command *consuming* it, and that shell is not inside
-    /// `run`. It is called from the places the shell would otherwise
-    /// sit idle in the kernel -- see `Shell::pump_coroutines` -- so a
-    /// live coroutine costs nothing and gets time wherever there was
-    /// none being used.
-    ///
-    /// Blocking here would be wrong in a way it is not in `run`: the
-    /// caller has its own reason to come back.
+    /// Never blocks, unlike `run`: the caller has its own reason to return.
     pub fn step(&mut self) {
         if self.is_idle() || !take_driving() {
             return;
@@ -235,23 +197,16 @@ impl Scheduler {
         release_driving();
     }
 
-    /// Stops every task that is still running: nothing is going to read
-    /// what it produces.
+    /// Stops every task still running: nothing will read its output. What
+    /// the shell does once the command consuming a `<( )` finished. Stopped
+    /// rather than its descriptor closed: `None` for `stdout` means the
+    /// shell's own, so a producer kept going would write to the terminal
+    /// (`head -3 <(while true; do echo x; done)` printed x's forever).
     ///
-    /// What the shell does once the command consuming a `<( )` has
-    /// finished. Stopping rather than closing the descriptor, because
-    /// "no output" has no descriptor to name: leaving `stdout` as
-    /// `None` means "the shell's own", so a producer that kept going
-    /// wrote its remaining output *to the terminal* --
-    /// `head -3 <(while true; do echo x; done)` printed x's for as long
-    /// as it was pumped.
-    ///
-    /// A cancelled task is never resumed again and is dropped by
-    /// `retire_finished`, which unmaps its stack. Whatever that stack
-    /// still owned is leaked rather than dropped -- see `Coroutine`'s
-    /// own `Drop` -- which is the price of stopping something in the
-    /// middle, and is what a real shell gets for free by having the
-    /// kernel kill a process.
+    /// A cancelled task is never resumed, and `retire_finished` drops it and
+    /// unmaps its stack. What the stack owned is leaked (see `Coroutine`'s
+    /// `Drop`): the price of stopping something midway, which a process gets
+    /// free from the kernel.
     pub fn cancel_running(&mut self) {
         for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done && t.cancellable) {
             task.cancelled = true;
@@ -260,24 +215,19 @@ impl Scheduler {
         }
     }
 
-    /// Drops every finished task, so a long-lived shell does not
-    /// accumulate them.
+    /// Drops finished tasks, so a long-lived shell doesn't accumulate them.
     pub fn retire_finished(&mut self) {
         self.tasks.retain(|t| t.co.state() != State::Done && !t.cancelled);
     }
 
-    /// Runs every coroutine until all of them have finished.
-    ///
-    /// Returns whether any of them panicked -- which the caller has to
-    /// decide about, since a panicking pipeline stage is not something
-    /// this can sensibly recover from on its own.
+    /// Runs every coroutine until all have finished. Returns whether any
+    /// panicked, for the caller to decide about.
     pub fn run(&mut self) -> bool {
         if !take_driving() {
             return false;
         }
-        // Restored before returning, and while sleeping in `poll`: the
-        // shell that started this still owns fd 0 and fd 1 whenever no
-        // task is running on them.
+        // Restored before returning and while sleeping in `poll`: the shell
+        // owns fd 0 and fd 1 whenever no task runs on them.
         let saved = crate::exec::save_fd012_for_scheduler();
         let panicked = self.run_tasks(saved);
         crate::exec::restore_fd012_for_scheduler(saved);
@@ -295,9 +245,8 @@ impl Scheduler {
                 if !self.can_run(index) {
                     continue;
                 }
-                // Cleared before the resume so that a coroutine which
-                // finishes, rather than parking, does not leave the
-                // previous reason behind for the scheduler to believe.
+                // Cleared before resuming, so a coroutine that finishes
+                // rather than parks doesn't leave a stale reason.
                 REASON.with(|r| r.set(Park::Ready));
                 let outer = crate::exec::swap_broken_pipe(self.tasks[index].broken);
                 install_fds(&self.tasks[index], shells_own);
@@ -305,17 +254,13 @@ impl Scheduler {
                 self.tasks[index].broken = crate::exec::swap_broken_pipe(outer);
                 self.tasks[index].park = REASON.with(|r| r.get());
                 if self.tasks[index].co.state() == State::Done {
-                    // A finished stage must stop holding its pipes, or
-                    // the stage on the other end waits on something
-                    // this scheduler is keeping alive. Three references
-                    // to drop, not two: the task's own pair, *and* the
-                    // copies `install_fds` left on fd 0 and fd 1. Those
-                    // last are the subtle ones -- they are only
-                    // replaced when some other task is installed, and
-                    // `can_run` is asked before that happens. A
-                    // finished reader's fd 0 therefore made its pipe
-                    // still look like it had a reader, so the producer
-                    // was never woken to discover otherwise.
+                    // A finished stage must let go of its pipes, or the
+                    // stage on the other end waits on something kept alive
+                    // here. Three references: the task's pair and the
+                    // copies `install_fds` left on fd 0 and fd 1. Those are
+                    // replaced only when another task is installed, after
+                    // `can_run` asks, so a finished reader's fd 0 kept its
+                    // pipe looking read and the producer was never woken.
                     self.tasks[index].stdin = None;
                     self.tasks[index].stdout = None;
                     install_shell_fds(shells_own);
@@ -325,18 +270,14 @@ impl Scheduler {
             if ran_something {
                 continue;
             }
-            // Everything still running is waiting for a descriptor.
-            // Sleeping here rather than spinning is the difference
-            // between an idle process and a busy one.
-            // Everything is blocked, which may be on the pane's own
-            // pty filling up -- and this thread is the only thing that
-            // empties it. See exec::PIPELINE_DRAIN.
+            // Everything is waiting for a descriptor, maybe the pane's own
+            // pty filling, which only this thread empties (see
+            // `exec::PIPELINE_DRAIN`).
             crate::exec::drain_pipeline_output();
             if !self.wait_for_any() {
-                // Nothing to wait for and nothing ran: no descriptor
-                // will ever become ready, so the remaining coroutines
-                // cannot proceed. Letting them run once more turns a
-                // hang into whatever they do about a closed pipe.
+                // Nothing to wait for and nothing ran: nothing can become
+                // ready. One more run turns a hang into whatever they do
+                // about a closed pipe.
                 for task in self.tasks.iter_mut().filter(|t| t.co.state() != State::Done && !t.cancelled) {
                     task.park = Park::Ready;
                 }
@@ -370,11 +311,8 @@ impl Scheduler {
         if !any {
             return false;
         }
-        // One at a time is enough here: a pipeline is a handful of
-        // stages, and whichever is waited for first either becomes
-        // ready or the timeout expires and the loop tries the rest.
-        // A single `poll` over all of them would be better with many
-        // more tasks than a pipeline ever has.
+        // One at a time is enough for a handful of stages: each wait ends
+        // when ready or on the timeout, then the rest are tried.
         for task in self.tasks.iter().filter(|t| t.co.state() != State::Done && !t.cancelled) {
             let ready = match task.park {
                 Park::Ready => true,
@@ -389,45 +327,36 @@ impl Scheduler {
     }
 }
 
-/// Points fd 0 and fd 1 at this task's own pipes for the duration of
-/// its turn.
-/// Puts fd 0 and fd 1 back to the shell's own, releasing whatever a
-/// task had installed on them.
+/// Puts fd 0 and fd 1 back to the shell's own, releasing what a task had
+/// installed.
 fn install_shell_fds(shells_own: [i32; 3]) {
     crate::platform::duplicate_onto(shells_own[0], 0);
     crate::platform::duplicate_onto(shells_own[1], 1);
 }
 
+/// Points fd 0 and fd 1 at this task's pipes for its turn.
 fn install_fds(task: &Task, shells_own: [i32; 3]) {
     use std::os::fd::AsRawFd;
-    // Both, every time, and `None` means the shell's own rather than
-    // "leave it alone": whatever the previous task installed is still
-    // there otherwise, so the last stage of `a | b` would write into
-    // the pipe `a` was writing to instead of to the terminal.
+    // Both, every time, and `None` means the shell's own, not "leave it":
+    // otherwise the last stage of `a | b` would write into `a`'s pipe.
     let stdin = task.stdin.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[0]);
     let stdout = task.stdout.as_ref().map(|f| f.as_raw_fd()).unwrap_or(shells_own[1]);
     crate::platform::duplicate_onto(stdin, 0);
     crate::platform::duplicate_onto(stdout, 1);
 }
 
-/// How long to wait on one descriptor before trying the next.
-///
-/// Only reached when every stage is blocked, so this is a bound on how
-/// long the process sleeps before rechecking, not a poll interval: the
-/// wait ends as soon as the descriptor is ready.
+/// How long to wait on one descriptor before trying the next. Reached
+/// only when every stage is blocked, and ends as soon as it's ready.
 const POLL_SLICE_MS: i32 = 20;
 
-/// `poll_one`, for writability.
+/// Whether `fd` can be written within `timeout_ms`.
 fn poll_writable(fd: RawFd, timeout_ms: i32) -> bool {
     use crate::platform::{POLL_ERROR, POLL_HUNG_UP, POLL_WRITABLE, PollFd};
     let mut watched = [PollFd::watching(fd, POLL_WRITABLE)];
-    // A pipe whose reader has gone is not `POLLOUT` -- it is `POLLERR`.
-    // Waiting for writability alone therefore waits for ever on a
-    // descriptor whose next write would return `EPIPE` immediately,
-    // which is precisely how a producer learns to stop:
-    // `while true; do echo x; done | { read v; echo "$v"; }` printed
-    // its line and then hung. The same mistake as watching for
-    // `POLLIN` without `POLLHUP` on the reading side.
+    // A pipe whose reader is gone reports `POLLERR`, not `POLLOUT`, and its
+    // next write fails with `EPIPE`, which is how a producer learns to stop.
+    // Waiting for `POLLOUT` alone hung
+    // `while true; do echo x; done | { read v; echo "$v"; }`.
     crate::platform::wait_for_ready(&mut watched, timeout_ms).is_ok_and(|ready| ready > 0)
         && watched[0].reported() & (POLL_WRITABLE | POLL_ERROR | POLL_HUNG_UP) != 0
 }
@@ -471,9 +400,8 @@ mod tests {
         assert_eq!(*log.borrow(), "A0B0A1B1");
     }
 
-    // The case the whole thing exists for: one coroutine cannot finish
-    // until another does something, and the scheduler has to work that
-    // out from the descriptors rather than from being told.
+    // One coroutine can't finish until another acts, and the scheduler
+    // works that out from the descriptors.
     #[test]
     fn a_reader_waits_for_a_writer_through_a_real_pipe() {
         let (read_end, write_end) = crate::exec::make_pipe_for_test().unwrap();
@@ -481,8 +409,7 @@ mod tests {
         let got = Rc::new(std::cell::RefCell::new(String::new()));
 
         let mut s = Scheduler::new();
-        // The reader goes first and blocks immediately: nothing has
-        // been written yet, and the writer has not run at all.
+        // The reader goes first and blocks at once: the writer hasn't run.
         let out = Rc::clone(&got);
         let read_fd = std::os::fd::AsRawFd::as_raw_fd(&read_end);
         s.add(move || {
@@ -515,10 +442,8 @@ mod tests {
         assert_eq!(*got.borrow(), "hello");
     }
 
-    // A writer that fills the pipe must hand over to the reader rather
-    // than spin, and the two together must move more than a pipe
-    // buffer's worth -- which is the thing a single-threaded shell
-    // could not do at all before this.
+    // A writer filling the pipe hands over to the reader rather than spin,
+    // and together they move more than a pipe buffer.
     #[test]
     fn a_writer_blocked_on_a_full_pipe_hands_over_to_the_reader() {
         let (read_end, write_end) = crate::exec::make_pipe_for_test().unwrap();
@@ -526,8 +451,7 @@ mod tests {
         crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&write_end));
         let read_fd = std::os::fd::AsRawFd::as_raw_fd(&read_end);
         let write_fd = std::os::fd::AsRawFd::as_raw_fd(&write_end);
-        // Comfortably more than any pipe buffer, so the writer is
-        // guaranteed to block and to need the reader to continue.
+        // More than any pipe buffer, so the writer must block on the reader.
         const TOTAL: usize = 1024 * 1024;
         let received = Rc::new(Cell::new(0usize));
 
