@@ -9141,38 +9141,25 @@ impl Shell {
         Some(i)
     }
 
-    // Applies one `name=(...)`/`name+=(...)` array literal's elements to
-    // self.arrays/self.assoc_arrays (whichever `name` already is -- an
-    // indexed array unless self.assoc_names already contains it,
-    // matching how a bracketed key is interpreted the same way
-    // array_set_index already decides). Honors per-element `[index]=
-    // value` syntax alongside plain positional elements: a positional
-    // element continues from a running "next index" counter that a
-    // keyed element ahead of it bumps forward, matching bash (`(1
-    // [5]=x 2)` -> indices 0, 5, 6). Only meaningful for an indexed
-    // array -- an associative one has no positional-index concept at
-    // all, so a plain (unkeyed) element there is keyed by its own
-    // running counter's string form as a last resort (real bash errors
-    // on this instead; rare enough in practice that erroring isn't
-    // worth the extra plumbing here).
+    // Applies a `name=(...)` or `name+=(...)` literal to `arrays` or
+    // `assoc_arrays`, by what `name` already is. `[index]=value` elements
+    // and positional ones mix: a positional element continues from a
+    // running index that a keyed one moves, as in bash (`(1 [5]=x 2)` gives
+    // 0, 5, 6). In an associative array an unkeyed element is keyed by the
+    // counter's text, where bash errors.
     pub(crate) fn apply_array_literal(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> bool {
-        // Same guard, and the same message, as a scalar write -- see
-        // assign_var_impl. Without it `readonly a=(1); a+=(2)` went
-        // through, which is the one thing `readonly` promises not to.
+        // The scalar write's guard and message (see `assign_var_impl`), so
+        // `readonly a=(1); a+=(2)` is refused.
         if self.name_is_readonly(name) {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
             return false;
         }
         let is_assoc = self.assoc_names.contains(name);
-        // Everything on the right is expanded *before* the old value is
-        // thrown away. `a=("${a[@]}" 3)` has to see the array it is
-        // replacing, and clearing first meant it saw an empty one: the
-        // array became whatever was literal in the list, so the
-        // idiomatic `a=("${a[@]/x/y}")` emptied it outright.
-        //
-        // One *field* per element, not one word of source text:
-        // `b=("${a[@]}")` has to copy the array, and `c=($unquoted)`
-        // has to split.
+        // The right side is expanded before the old value goes:
+        // `a=("${a[@]}" 3)` has to see the array it replaces, so
+        // `a=("${a[@]/x/y}")` rewrites in place. One field per element, not
+        // per source word: `b=("${a[@]}")` copies, and `c=($unquoted)`
+        // splits.
         enum Staged {
             Positional(Vec<String>),
             Keyed(String, String),
@@ -9220,17 +9207,11 @@ impl Shell {
         true
     }
 
-    // Reconstructs a display string for one `name=(...)`/`name+=(...)`
-    // array literal -- used only for `set -x` tracing when this appears
-    // as a later word of a declare/local/export/readonly/typeset
-    // command (see SimpleCommand::array_word_assigns's own doc
-    // comment); the actual application uses the structured items
-    // directly (apply_array_literal), never re-parses this text. Each
-    // element's expanded value is single-quote-escaped
-    // (crate::serialize::quote_literal) so embedded whitespace stays
-    // visually unambiguous; an element's own `[index]=` key (if any) is
-    // shown as its raw, unevaluated source text, matching bash's own
-    // xtrace output for an unresolved index expression.
+    // A display string for an array literal in a `declare`-family command,
+    // for `set -x` only (see `SimpleCommand::array_word_assigns`); applying
+    // it uses the structured items. Values are single-quoted
+    // (`serialize::quote_literal`); a `[index]=` key shows its raw source,
+    // as bash's xtrace does.
     fn array_literal_display(&mut self, name: &str, mode: AssignMode, items: &[ArrayLiteralItem]) -> String {
         let op = if mode == AssignMode::Append { "+=" } else { "=" };
         let mut parts = Vec::new();
@@ -9243,33 +9224,24 @@ impl Shell {
         format!("{name}{op}({})", parts.join(" "))
     }
 
-    // Bash word-splitting: unquoted expansion results are split on
-    // whitespace (IFS, hardcoded to the default here) into separate fields;
-    // literal text (whether from quotes or plain source) never splits, since
-    // unquoted literal whitespace would already have ended the word at the
-    // lexer level. Only used where splitting actually applies (command
-    // argv, `for` word-lists) -- assignment RHS, case words, redirect
-    // targets, etc. still go through plain expand_word.
-    // Returns (fields, patterns): `fields` is the word-split display text,
-    // exactly as before; `patterns` is an index-aligned second copy of the
-    // same fields but with every *quoted* chunk's contribution escaped via
-    // glob::escape (unquoted chunks -- including their expansion results,
-    // e.g. an unquoted `$var` whose value happens to contain `*` -- stay
-    // raw glob syntax). expand_words glob-expands each field against its
-    // paired pattern, falling back to the literal field text when the
-    // pattern has no metachars or no filesystem matches. Building both in
-    // one pass (rather than a second, expand_regex_operand-style walk)
-    // matters here specifically because this function's expansions can
-    // have side effects (command substitution, ${x:=default}, `$((x++))`)
-    // that must not run twice.
+    // Word splitting: unquoted expansion results split on IFS into fields;
+    // literal text never splits (unquoted whitespace already ended the
+    // word). Only where splitting applies (argv, `for` lists); assignment
+    // values, case words and redirect targets use plain `expand_word`.
+    //
+    // Each field comes with a pattern copy in which quoted chunks are
+    // escaped with `glob::escape` and unquoted ones (an unquoted `$var`
+    // holding `*` included) stay glob syntax, for `expand_words` to glob
+    // against. Built in one pass, since expansions can have side effects
+    // (`$( )`, `${x:=default}`, `$((x++))`) that mustn't run twice.
     fn expand_word_split(&mut self, w: &Word) -> Vec<Field> {
         let ifs = self.get_ifs();
         let mut fields: Vec<Field> = Vec::new();
         let mut current: Option<FieldBuilder> = None;
         for c in &w.chunks {
             match c {
-                // The expanded home directory is text, not a pattern:
-                // a `~user` whose home holds a `*` must not glob.
+                // The expanded home directory is text: a home holding `*`
+                // mustn't glob.
                 Chunk::Tilde { name } => {
                     let name = name.clone();
                     let home = self.expand_tilde(&name);
@@ -9279,19 +9251,14 @@ impl Shell {
                     current.get_or_insert_with(FieldBuilder::default).push(t);
                 }
                 Chunk::LiteralStr(t, _) => {
-                    // Quoted or backslash-escaped source text -- always
-                    // escaped for the pattern copy, whatever characters it
-                    // contains, so it can never itself act as a wildcard.
+                    // Quoted or escaped source text: always escaped in the
+                    // pattern copy.
                     current.get_or_insert_with(FieldBuilder::default).push_inert(t);
                 }
                 Chunk::Var { name, quoted, .. } => {
-                    // "$@" is a special case even when quoted: it expands
-                    // to one field per positional parameter (as if each
-                    // were individually double-quoted), not one joined
-                    // string -- unlike "$*", which does join. Unquoted $@
-                    // falls through to the normal joined-then-split path,
-                    // matching bash (both $@ and $* behave the same
-                    // unquoted).
+                    // Quoted `"$@"` expands to one field per positional
+                    // parameter, unlike `"$*"`, which joins. Unquoted, both
+                    // join and split, as in bash.
                     if name == "@" && *quoted {
                         let parts = self.arg_frames.last().cloned().unwrap_or_default();
                         append_parts(&mut fields, &mut current, &parts);
@@ -9312,8 +9279,8 @@ impl Shell {
                         Ok(n) => n.to_string(),
                         Err(e) => {
                             sh_eprintln!(self, "bish: {}: {}", raw, e);
-                            // A `$(( ))` that does not parse is fatal
-                            // in bash, unlike the `(( ))` *command*.
+                            // A `$(( ))` that doesn't parse is fatal,
+                            // unlike the `(( ))` command.
                             self.expansion_failed = true;
                             String::new()
                         }
@@ -9323,9 +9290,8 @@ impl Shell {
                 Chunk::VarExpand { name, op, quoted } => {
                     let name = name.clone();
                     let op = op.clone();
-                    // A slice of `$@` is a list, and a quoted one is
-                    // one field per element -- the same rule `"$@"`
-                    // itself follows.
+                    // A quoted slice of `$@` is one field per element, as
+                    // `"$@"` is.
                     if let Some(sliced) = self.list_slice(&name, None, &op) {
                         let items = self.reported_slice(sliced);
                         if name == "@" && *quoted {
@@ -9340,10 +9306,9 @@ impl Shell {
                     append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayVar { name, index, quoted } => {
-                    // "${arr[@]}" is the array analog of "$@": one field per
-                    // element even though it's quoted. "${arr[*]}" (quoted
-                    // or not) and unquoted "${arr[@]}" join with a space
-                    // first, like $*.
+                    // `"${arr[@]}"` is one field per element, like `"$@"`;
+                    // `"${arr[*]}"` and unquoted `${arr[@]}` join with a
+                    // space first, like `$*`.
                     if index == "@" && *quoted {
                         let items = self.array_all(name);
                         append_parts(&mut fields, &mut current, &items);
@@ -9386,8 +9351,7 @@ impl Shell {
                     append_splittable(&mut fields, &mut current, &v, *quoted, &ifs);
                 }
                 Chunk::ArrayKeys { name, quoted } => {
-                    // Same @-vs-* / quoted-vs-not splitting rules as
-                    // ${arr[@]}: "@" quoted is one field per key.
+                    // As for `${arr[@]}`: quoted `@` is one field per key.
                     if *quoted {
                         let items = self.array_keys(name);
                         append_parts(&mut fields, &mut current, &items);
@@ -9398,11 +9362,8 @@ impl Shell {
                     }
                 }
                 Chunk::VarNamesMatchingPrefix { prefix, at, quoted } => {
-                    // Same splitting rules as ${!arr[@]}/${!arr[*]} above,
-                    // but the '@'-vs-'*' distinction is actually tracked
-                    // here (unlike ArrayKeys, which collapses both into
-                    // one shape) -- only the true "@" quoted spelling gets
-                    // one field per name.
+                    // The same rules as `${!arr[@]}`, with `@` and `*` told
+                    // apart: only quoted `@` gives one field per name.
                     let names = self.var_names_with_prefix(prefix);
                     if *at && *quoted {
                         append_parts(&mut fields, &mut current, &names);
@@ -9429,56 +9390,33 @@ impl Shell {
         fields
     }
 
-    // The default IFS (" \t\n") when the variable is truly unset; its
-    // actual value (which may be empty, meaning "don't split at all")
-    // whenever it's been assigned, even to "".
-    /// `FIGNORE` split into the suffixes completion should leave out.
-    /// Empty entries are dropped, so a stray `:` cannot turn into a
-    /// suffix that matches everything.
+    // `FIGNORE` split into the suffixes completion leaves out, without empty
+    // entries, so a stray `:` can't match everything.
     pub fn fignore_suffixes(&self) -> Vec<String> {
         self.raw_var_lookup("FIGNORE").split(':').filter(|s| !s.is_empty()).map(str::to_string).collect()
     }
 
+    // The default IFS (space, tab, newline) when unset; its value, which may
+    // be empty (no splitting), when assigned.
     fn get_ifs(&mut self) -> String {
         if self.var_is_set("IFS") { self.lookup_var("IFS") } else { " \t\n".to_string() }
     }
 
-    // Re-lexes and expands a captured raw operand (the "word"/"pattern"
-    // half of a ${...} expansion), so it can itself contain further $
-    // expansions. Parsed as a single word (see parse_expansion_word) --
-    // unlike a command line, unquoted whitespace inside it is literal
-    // content, not a field separator.
-    // Arithmetic over text that may contain a command substitution.
-    // bash expands `$( )` and backticks in an arithmetic context before
-    // evaluating, and arith.rs has no way to run a command -- so
-    // `$(( $(echo 2) + 3 ))` was "bad substitution in arithmetic
-    // expression".
-    //
-    // Only when there is actually a substitution to run: `$x` and
-    // `${x}` are already arith.rs's own job, and a bare `x` has to stay
-    // a *name* so `x=y; y=2; echo $((x))` still resolves through to 2.
+    // Arithmetic over text that may contain a substitution: bash expands
+    // `$( )` and backticks first, and arith.rs can't run commands. Only when
+    // there's one: arith.rs reads `$x` and `${x}` itself, and a bare `x` must
+    // stay a name so `x=y; y=2; echo $((x))` gives 2.
     pub(crate) fn eval_arith(&mut self, raw: &str) -> Result<i64, String> {
-        // `${...}` joins `$( )` and backticks here. arith.rs reads a
-        // bare `x` and a plain `${x}` itself, but every parameter
-        // expansion with an operator in it -- `${x:-5}`, `${#x}`,
-        // `${#a[@]}` -- was reaching its lexer unexpanded and coming
-        // out as 0. That is how `f() { f $((${1:-0}+1)); }` came to
-        // recurse forever passing 1 each time: not a runaway function,
-        // an argument that could not change.
-        // Nothing to evaluate is zero, both as written (`$(( ))`) and
-        // after expanding to nothing (`$(( ${unset} ))`). bash answers
-        // 0 to both; bish used to answer 0 to neither, reporting
-        // "unexpected token in arithmetic expression: Eof".
+        // `${...}` expands here too: arith.rs reads plain `${x}` but not
+        // ones with an operator (`${x:-5}`, `${#x}`), which would come out
+        // as 0. Nothing to evaluate is 0, written or after expansion
+        // (`$(( ${unset} ))`), as in bash.
         if raw.trim().is_empty() {
             return Ok(0);
         }
-        // Any `$` at all, not just `$(`/`${`. A bare `$x` was left for
-        // arith.rs to read as a variable, which works where it stands
-        // alone -- and not where it is part of a larger token:
-        // `$((10#$x))`, the idiom for forcing base ten on a
-        // zero-padded number, reached the lexer as `10#$x` and failed
-        // with "invalid integer constant". bash expands the whole
-        // expression before evaluating any of it.
+        // Any `$`, not only `$(` and `${`: a bare `$x` inside a larger token
+        // (`$((10#$x))`) can't be read by arith.rs. bash expands the whole
+        // expression before evaluating.
         if raw.contains('$') || raw.contains('`') {
             let expanded = self.expand_raw(raw);
             if expanded.trim().is_empty() {
@@ -9503,27 +9441,20 @@ impl Shell {
         }
     }
 
-    // `PS4`, the string `set -x` puts in front of each traced line.
-    // bash's default is `+ `, and the first character is repeated once
-    // per level of nesting -- only the flat default is reproduced here,
-    // since nothing in this shell tracks a trace depth.
+    // `PS4`, which `set -x` puts before each traced line, `+ ` by default.
+    // bash repeats its first character per nesting level; nothing here tracks
+    // a trace depth, so it's flat.
     fn xtrace_prefix(&mut self) -> String {
         if !self.var_is_set("PS4") {
             return String::new();
         }
-        // Expanded, not printed as written. PS4 is nearly always set to
-        // something with an expansion in it -- `PS4='+$LINENO '` is the
-        // reason anyone sets it at all -- and printing the text meant
-        // every traced line was prefixed with a literal `+$LINENO`.
-        // bash expands parameters, command substitutions and the
-        // prompt escapes, in that order, which is what `${v@P}`
-        // already does here.
+        // Expanded, as bash does (parameters, substitutions, prompt
+        // escapes, as `${v@P}` does): `PS4='+$LINENO '` is why anyone sets
+        // it.
         let raw = self.lookup_var("PS4");
-        // With tracing off for the duration. A `$( )` in PS4 runs a
-        // command, and tracing *that* command expands PS4 again to
-        // print its prefix -- which runs the substitution again. It
-        // recursed until the nesting guard stopped it, printing a few
-        // hundred traced lines on the way.
+        // With tracing off meanwhile: a `$( )` in PS4 would be traced,
+        // expanding PS4 again, recursing until the nesting guard stopped
+        // it.
         let tracing = std::mem::replace(&mut self.opt_xtrace, false);
         let expanded = self.expand_raw(&raw);
         let prefix = self.expand_prompt_string(&expanded);
@@ -9531,6 +9462,9 @@ impl Shell {
         prefix
     }
 
+    // Relexes and expands a `${...}` operand, so it can hold expansions.
+    // Parsed as one word (`parse_expansion_word`): unquoted whitespace in it
+    // is content, not a separator.
     fn expand_raw(&mut self, raw: &str) -> String {
         if expands_to_itself(raw) {
             return raw.to_string();
@@ -9539,17 +9473,11 @@ impl Shell {
         self.expand_word(&Word { chunks, globbable: false })
     }
 
-    /// `expand_raw` for the *pattern* half of `${v#pat}`, `${v%pat}`,
+    /// `expand_raw` for the pattern of `${v#pat}`, `${v%pat}`,
     /// `${v/pat/repl}` and `${v^pat}`, where quoting decides whether a
-    /// metacharacter is syntax or text: `${x//\*/Y}` replaces a literal
-    /// asterisk, `${x//*/Y}` replaces everything.
-    ///
-    /// Plain `expand_raw` performs quote removal and hands back a
-    /// `String` that can no longer tell the two apart, so an escaped `*`
-    /// still globbed. Going through the chunks instead is the same trick
-    /// `expand_glob_pattern_operand` already plays for `[[ x == pat ]]`
-    /// -- and it is literally that function, since a pattern operand is
-    /// a pattern operand wherever it was written.
+    /// metacharacter is syntax: `${x//\*/Y}` replaces a literal asterisk,
+    /// `${x//*/Y}` everything. It's `expand_glob_pattern_operand`, working on
+    /// chunks, which still know what was quoted.
     fn expand_glob_pattern_raw(&mut self, raw: &str) -> String {
         if expands_to_itself(raw) {
             return raw.to_string();
@@ -9558,18 +9486,11 @@ impl Shell {
         self.expand_glob_pattern_operand(&Word { chunks, globbable: false })
     }
 
-    /// `expand_raw` for a `${v/pat/repl}` replacement, which has one
-    /// character of syntax left after expansion: `&` stands for the
-    /// matched text.
-    ///
-    /// So the difference between an `&` the user typed and one that
-    /// arrived inside a variable has to survive quote removal, and by
-    /// then a plain `String` cannot say which it was. The chunks still
-    /// can -- an escaped or quoted `&` is a `LiteralStr`, a bare one is
-    /// a `Str` -- so this re-escapes the literal ones on the way out and
-    /// `expand_replacement` unescapes them at the very end. It is the
-    /// same trick, and for the same reason, as
-    /// `expand_glob_pattern_operand` does for glob metacharacters.
+    /// `expand_raw` for a `${v/pat/repl}` replacement, where `&` stands for
+    /// the match. Whether an `&` was typed or came from a variable has to
+    /// survive quote removal: an escaped or quoted `&` is a `LiteralStr`, so
+    /// it's re-escaped here and `expand_replacement` unescapes it at the end,
+    /// as `expand_glob_pattern_operand` does for metacharacters.
     fn expand_replacement_operand(&mut self, raw: &str) -> String {
         if expands_to_itself(raw) {
             return raw.to_string();
@@ -9578,8 +9499,7 @@ impl Shell {
         let mut out = String::new();
         for chunk in &chunks {
             match chunk {
-                // Typed with a backslash or inside quotes: whatever it
-                // is, it is text.
+                // Escaped or quoted: text, whatever it is.
                 crate::lexer::Chunk::LiteralStr(t, _) => {
                     for c in t.chars() {
                         if c == '&' || c == '\\' {
@@ -9588,8 +9508,7 @@ impl Shell {
                         out.push(c);
                     }
                 }
-                // Everything else -- bare text, and the result of any
-                // expansion -- keeps its `&` special, which is what
+                // Bare text and expansion results keep `&` special, which
                 // `r='&'; ${s//X/$r}` relies on.
                 other => out.push_str(&self.expand_word(&Word { chunks: vec![other.clone()], globbable: false })),
             }
@@ -9600,9 +9519,7 @@ impl Shell {
     fn eval_var_op(&mut self, name: &str, op: &VarOp) -> String {
         let cur = self.lookup_var(name);
         match op {
-            // `${#@}` and `${#*}` are `$#` -- how many positional
-            // parameters there are, not how long they are once joined.
-            // Every other name measures its value.
+            // `${#@}` and `${#*}` are `$#`, a count, not the joined length.
             VarOp::Length if name == "@" || name == "*" => self.arg_frames.last().map(Vec::len).unwrap_or(0).to_string(),
             VarOp::Length => cur.chars().count().to_string(),
             VarOp::Default { word, colon } => {
@@ -9622,14 +9539,13 @@ impl Shell {
             VarOp::ErrorIfUnset { word, colon } => {
                 let trigger = if *colon { cur.is_empty() } else { !self.var_is_set(name) };
                 if trigger {
-                    // bash's own wording when `${x:?}` carries no
-                    // message of its own.
+                    // bash's wording when `${x:?}` has no message.
                     let msg = match self.expand_raw(word) {
                         m if m.is_empty() => "parameter null or not set".to_string(),
                         m => m,
                     };
                     sh_eprintln!(self, "bish: {}: {}", name, msg);
-                    // The whole point of `${x:?}` is to stop.
+                    // Stopping is the point of `${x:?}`.
                     self.expansion_failed = true;
                     String::new()
                 } else {
@@ -9653,8 +9569,8 @@ impl Shell {
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
-                // An omitted offset is zero -- `${x::3}` -- and the
-                // evaluator does not read an empty string as one.
+                // An omitted offset (`${x::3}`) is 0; the evaluator rejects
+                // an empty string.
                 let off = match offset.trim().is_empty() {
                     true => 0,
                     false => self.eval_arith(offset).unwrap_or(0),
@@ -9679,26 +9595,13 @@ impl Shell {
         }
     }
 
-    // Same operators as eval_var_op, but reading (and, for :=, writing)
-    // one array element instead of a scalar variable. "@"/"*" indices are
-    // treated as the joined-all-elements string, matching how they behave
-    // as a plain (non-splitting-aware) expansion elsewhere.
-    // The list `${a[@]:off:len}` and `${@:off:len}` slice.
-    //
-    // `:off:len` is the one operator whose meaning changes when what it
-    // is applied to is a list: everywhere else in `${...}` the elements
-    // are joined first and the operator works on that text, but a slice
-    // of a list counts *elements*. `${a[@]:1:2}` is two elements, not
-    // two characters of `"1 2 3 4"`.
-    //
-    // `None` when this is not that -- an ordinary variable, or any
-    // other operator -- and the caller falls through to the text path.
+    // `${a[@]:off:len}` and `${@:off:len}`: a slice of a list counts
+    // elements (`${a[@]:1:2}` is two elements, not two characters), where
+    // every other operator works on the joined text. `None` when it isn't
+    // that, and the caller falls through to the text path.
     fn list_slice(&mut self, name: &str, index: Option<&str>, op: &VarOp) -> Option<Result<Vec<String>, String>> {
-        // `${a[@]@Q}` and friends transform *each element*, and the
-        // result is a list of that many words -- `"${a[@]@Q}"` is how a
-        // script re-quotes an array for `eval`. Applying the transform
-        // to the joined string instead produced one word holding
-        // `'a b'` where bash gives `'a' 'b'`.
+        // `${a[@]@Q}` and friends transform each element into a word of its
+        // own: `"${a[@]@Q}"` is how a script requotes an array for `eval`.
         if let VarOp::Transform(
             kind @ (TransformKind::Quote | TransformKind::Upper | TransformKind::UpperFirst | TransformKind::Lower | TransformKind::Escape),
         ) = op
@@ -9709,22 +9612,18 @@ impl Shell {
         }
         let VarOp::Substring { offset, length } = op else { return None };
         let items = match index {
-            // `${a[@]:...}` / `${a[*]:...}` -- the elements in index
-            // order, which is also what bash slices for a sparse array
-            // (by position among the elements that exist, not by index).
+            // `${a[@]:...}`: the elements in index order, sliced by
+            // position among the set ones, as bash does for a sparse array.
             Some("@") | Some("*") => self.array_all(name),
             Some(_) => return None,
-            // `${@:...}` / `${*:...}` -- `$0` first, which is why
-            // `${@:0}` names the script and `${@:1}` is the first
-            // argument.
+            // `${@:...}`: `$0` first, so `${@:0}` is the script and
+            // `${@:1}` the first argument.
             None if name == "@" || name == "*" => {
                 std::iter::once(self.script_name.clone()).chain(self.arg_frames.last().cloned().unwrap_or_default()).collect()
             }
             None => return None,
         };
-        // `${a[@]::2}` -- an omitted offset is zero, and handing the
-        // arithmetic evaluator an empty string is an error rather than
-        // a default.
+        // An omitted offset (`${a[@]::2}`) is 0.
         let offset = match offset.trim().is_empty() {
             true => 0,
             false => match self.eval_arith(offset) {
@@ -9742,15 +9641,15 @@ impl Shell {
         Some(slice_elements(items, offset, length))
     }
 
-    // A slice that failed -- a negative length -- reports and yields
-    // nothing, which is what bash does with it.
+    // A failed slice (a negative length) reports and yields nothing, as in
+    // bash.
     fn reported_slice(&mut self, sliced: Result<Vec<String>, String>) -> Vec<String> {
         match sliced {
             Ok(items) => items,
             Err(e) => {
                 sh_eprintln!(self, "bish: {e}");
-                // A word that could not be expanded is fatal in a
-                // script -- see expansion_failed.
+                // A word that couldn't expand is fatal in a script; see
+                // `expansion_failed`.
                 self.expansion_failed = true;
                 Vec::new()
             }
@@ -9763,8 +9662,7 @@ impl Shell {
     }
 
     // What `"$*"` and `"${a[*]}"` put between elements: IFS's first
-    // character, a space when IFS is unset, and nothing at all when it
-    // is empty.
+    // character, a space when unset, nothing when empty.
     fn ifs_join_char(&mut self) -> String {
         match self.var_is_set("IFS") {
             false => " ".to_string(),
@@ -9772,8 +9670,8 @@ impl Shell {
         }
     }
 
-    // The ops that are purely a function of one string, so they can be
-    // applied to a scalar or to each element of an array in turn.
+    // The operators that depend only on one string, applicable to a scalar
+    // or to each element.
     fn apply_string_var_op(&mut self, cur: &str, op: &VarOp) -> String {
         match op {
             VarOp::RemovePrefix { pattern, longest } => {
@@ -9797,19 +9695,15 @@ impl Shell {
         }
     }
 
+    // `eval_var_op`'s operators on one array element, reading (and for `:=`
+    // writing) it. `@`/`*` mean the joined elements, as in a non-splitting
+    // expansion.
     fn eval_array_var_op(&mut self, name: &str, index: &str, op: &VarOp) -> String {
-        // `${a[@]OP}` applies OP to each element and rejoins, for the
-        // ops that are about a *string*. Applied to the joined text
-        // instead, the ones that act at most once per string acted once
-        // for the whole array: `${a[@]/o/0}` on `(one two)` changed
-        // only the first element, and `${a[@]%e}` looked at whether the
-        // joined text ended in `e` rather than each element. The
-        // globally-acting ones (`//`, `^^`) came out right by accident,
-        // which is why this went unnoticed.
-        //
-        // Not every op is element-wise: `${a[@]:1:2}` slices the array,
-        // `${#a[@]}` counts it, and `${a[@]:-x}` asks whether the whole
-        // thing is empty. Those are handled elsewhere or below.
+        // `${a[@]OP}` applies a string operator to each element and
+        // rejoins: on the joined text, `${a[@]/o/0}` on `(one two)` would
+        // change only the first. Not every operator is element-wise:
+        // slicing, `${#a[@]}` and `${a[@]:-x}` are about the whole array
+        // and are handled elsewhere.
         if index == "@" || index == "*" {
             let element_wise =
                 matches!(op, VarOp::RemovePrefix { .. } | VarOp::RemoveSuffix { .. } | VarOp::CaseConvert { .. } | VarOp::Replace { .. });
@@ -9871,8 +9765,7 @@ impl Shell {
                 apply_case_convert(&cur, &pattern, *upper, *all)
             }
             VarOp::Substring { offset, length } => {
-                // An omitted offset is zero -- `${x::3}` -- and the
-                // evaluator does not read an empty string as one.
+                // An omitted offset (`${x::3}`) is 0.
                 let off = match offset.trim().is_empty() {
                     true => 0,
                     false => self.eval_arith(offset).unwrap_or(0),
@@ -9887,11 +9780,9 @@ impl Shell {
             }
             VarOp::Transform(kind) => match kind {
                 TransformKind::Attributes => {
-                    // "@"/"*" (the whole array) reconstructs every
-                    // element; a specific index still shows the array's
-                    // own -a/-A attribute flag but only that one
-                    // element's value -- both confirmed against real
-                    // bash (see transform_attributes's own doc comment).
+                    // `@`/`*` reconstructs every element; a single index
+                    // shows the array's `-a`/`-A` flag with only that
+                    // element's value, as bash does.
                     if index == "@" || index == "*" { self.transform_attributes(name, None) } else { self.transform_attributes(name, Some(&cur)) }
                 }
                 TransformKind::AttributeFlags => self.attribute_flags_string(name),
@@ -9910,24 +9801,10 @@ impl Shell {
         }
     }
 
-    // Expands a simple-command's words into argv, applying filesystem
-    // pathname (glob) expansion to any word that's both glob-eligible
-    // (no quoting/escaping/expansion at all -- see Word::globbable) and
-    // actually contains metacharacters. A pattern with no filesystem
-    // matches is kept as its literal text, matching bash's default
-    // (nullglob-off) behavior.
-    // `GLOBIGNORE`: a colon-separated list of patterns, and any
-    // pathname expansion result matching one is dropped.
-    //
-    // Matched against the whole produced name, under the same pathname
-    // rules the expansion itself used: `*` does not cross a `/`. So
-    // `GLOBIGNORE='*.o'` drops `a.o` and leaves `sub/x.o` alone,
-    // because the pattern names one component and that name has two.
-    // Checked against real bash, which is the opposite of what the
-    // obvious reading of "matched against the filename" suggests.
-    //
-    // An empty or unset GLOBIGNORE filters nothing, which is the far
-    // more common case and is checked first.
+    // `GLOBIGNORE`: glob results matching one of its colon-separated
+    // patterns are dropped. Matched against the whole name with pathname
+    // rules, so `*` doesn't cross `/`: `GLOBIGNORE='*.o'` drops `a.o` but not
+    // `sub/x.o`, as in bash.
     fn apply_globignore(&mut self, matches: Vec<String>) -> Vec<String> {
         let ignore = self.lookup_var("GLOBIGNORE");
         if ignore.is_empty() {
@@ -9937,22 +9814,16 @@ impl Shell {
         matches.into_iter().filter(|m| !patterns.iter().any(|p| crate::glob::matches_path(p, m))).collect()
     }
 
-    // What `dotglob`/`nocaseglob` currently say. Read per expansion
-    // rather than cached: `shopt -s` inside a script has to take effect
-    // on the very next word, and reading two booleans is nothing next
-    // to the `read_dir` that follows.
+    // Read per expansion, not cached: `shopt -s` in a script applies to the
+    // next word.
     fn glob_options(&self) -> glob::Options {
         glob::Options { dotglob: self.shopt_is_on("dotglob"), nocaseglob: self.shopt_is_on("nocaseglob"), globstar: self.shopt_is_on("globstar") }
     }
 
-    // A pattern that matched nothing. bash's default is to leave the
-    // word as its own text -- which is why `echo *.nothing` prints
-    // `*.nothing` -- and the two shopts that change that are the whole
-    // reason anyone sets them.
-    //
-    // `failglob` reports and abandons the command, as bash does -- see
-    // expansion_failed for why that is fatal in a script and merely a
-    // failed command in an interactive session.
+    // A pattern that matched nothing: kept as its own text (`echo *.nothing`
+    // prints `*.nothing`) unless `nullglob` or `failglob` says otherwise.
+    // `failglob` abandons the command, which `expansion_failed` makes fatal
+    // in a script.
     fn unmatched_pattern(&mut self, word: &str) -> Vec<String> {
         if self.shopt_is_on("failglob") {
             sh_eprintln!(self, "bish: no match: {word}");
@@ -9965,36 +9836,25 @@ impl Shell {
         }
     }
 
+    // A simple command's words as argv, globbing each word that is
+    // `Word::globbable` and contains metacharacters.
     fn expand_words(&mut self, words: &[Word]) -> Vec<String> {
         let mut out = Vec::new();
-        // Once for the whole command, not once per field. Each of the
-        // three options is a miss in the shopt override table falling
-        // through to a linear walk of the 119 names and their defaults,
-        // and asking inside the loop meant paying for all three on every
-        // field of every command -- whether or not the field was a
-        // pattern at all, since this is an argument and so is evaluated
-        // before the call that would have ignored it.
-        //
-        // Safe to read once: nothing expanded here can change the
-        // answer. `shopt` inside a `$( )` runs in a virtual child with
-        // its own table (see new_virtual_child), which is exactly why
-        // `echo $(shopt -s nullglob) *` does not change how the `*`
-        // beside it behaves -- in bash either, for the same reason.
+        // Once per command, not per field: each lookup walks the shopt
+        // table. Nothing expanded here can change the answer, since `shopt`
+        // in a `$( )` changes the child's table.
         let opts = self.glob_options();
         for w in words {
             if w.globbable {
-                // globbable implies no quoting/expansion at all in the word
-                // (see Word::globbable), so splitting can't apply here --
-                // glob-check the single literal value as before.
+                // Globbable means nothing quoted or expanded, so no
+                // splitting.
                 let s = self.expand_word(w);
                 if !self.opt_noglob
                     && let Some(matches) = glob::expand(&s, opts, &self.cwd)
                 {
                     let kept = self.apply_globignore(matches);
-                    // Everything the pattern found was ignored, so it
-                    // found nothing -- which is the same case as a
-                    // pattern that matched nothing, and answered the
-                    // same way.
+                    // Everything matched was ignored: the same as matching
+                    // nothing.
                     if kept.is_empty() {
                         out.extend(self.unmatched_pattern(&s));
                     } else {
@@ -10011,9 +9871,6 @@ impl Shell {
                     for field in fields {
                         match glob::expand(field.pattern(), opts, &self.cwd).map(|m| self.apply_globignore(m)) {
                             Some(matches) if !matches.is_empty() => out.extend(matches),
-                            // A pattern that matched nothing. Not the
-                            // same as a word that was never a pattern,
-                            // which is the `None` arm.
                             Some(_) => out.extend(self.unmatched_pattern(&field.text)),
                             None => out.push(field.text),
                         }
@@ -10024,9 +9881,6 @@ impl Shell {
         out
     }
 
-    // Reads a name's own raw stored value, bypassing nameref redirection --
-    // used to read a nameref's target-name string, and internally by
-    // resolve_nameref while following a chain.
     /// A global's value. `_` is kept outside the map (see the field);
     /// a copy inherited from the real environment may still be sitting
     /// in `globals` under that name, so the field wins when it is set.
@@ -10037,8 +9891,7 @@ impl Shell {
         }
     }
 
-    /// Writing one. Only this and `global_remove` may touch `globals`
-    /// by name.
+    /// Writing one, `_` to its field.
     fn global_set(&mut self, name: &str, value: String) {
         match name == "_" {
             true => self.underscore = Some(value),
@@ -10086,30 +9939,21 @@ impl Shell {
         (self.alias_epoch, self.shopt_is_on("expand_aliases"))
     }
 
-    /// Point this shell's own output at the descriptors a bare `exec`
-    /// has just repointed.
+    /// Point this shell's output at the descriptors a bare `exec` has just
+    /// repointed.
     ///
-    /// `exec > file` moves the *process's* descriptors, and this shell
-    /// does not write through those: a builtin writes to `self.sink`,
-    /// and a spawned command is handed `self.stdio_override`. At the top
-    /// level neither is set and the two amount to the same thing --
-    /// which is why `exec > f; echo hi` always worked -- but inside a
-    /// `$( )` the sink is the substitution's capture, and in a pane the
-    /// pane's own plumbing answers first, and the redirect was ignored
-    /// by everything the shell printed. `v=$(exec > f; echo hi)` put
-    /// `hi` in `v` where bash puts it in the file and leaves `v` empty.
+    /// `exec > file` moves the process's descriptors, but builtins write to
+    /// `self.sink` and spawned commands get `self.stdio_override`. Inside a
+    /// `$( )` or a pane those are set, so `v=$(exec > f; echo hi)` would put
+    /// `hi` in `v` instead of the file.
     ///
-    /// Said by duplicating the descriptor rather than by clearing the
-    /// override, because "nothing overrides this" is not what happened:
-    /// a spawn asks whether stdout is already spoken for before handing
-    /// a command a pane's pty, and after this it very much is. One
-    /// `Capture` per stream, shared by the sink and the override, so
-    /// that what a builtin prints and what a spawned command prints
-    /// still share a write position and so still land in order.
+    /// The descriptor is duplicated rather than the override cleared: a spawn
+    /// in a pane checks whether stdout is already taken before handing out
+    /// the pane's pty. One `Capture` per stream, shared by sink and override,
+    /// keeps builtin and external output in order.
     ///
-    /// This shell's for good, not one command's -- that is what "bare
-    /// `exec`" means -- and discarded with the shell, so a subshell
-    /// doing it does not reach the one outside.
+    /// It lasts for this shell, and a subshell doing it doesn't affect its
+    /// parent.
     fn follow_moved_descriptors(&mut self, moved: &[i32]) {
         let out = moved.contains(&1).then(|| dup_fd_as_file(1)).flatten().map(Capture::file);
         let err = moved.contains(&2).then(|| dup_fd_as_file(2)).flatten().map(Capture::file);
@@ -10130,9 +9974,8 @@ impl Shell {
                 },
             };
         }
-        // Rebuilt rather than mutated: the override is shared with
-        // whatever handed it down, and this shell's `exec` is not
-        // theirs.
+        // Rebuilt, not mutated: the override is shared with whoever handed
+        // it down.
         let kept = self.stdio_override.as_ref().map(|o| {
             let o = o.borrow();
             (o.stdin.clone(), o.stdout.clone(), o.stderr.as_ref().and_then(|f| f.try_clone().ok()))
@@ -10166,6 +10009,8 @@ impl Shell {
         }
     }
 
+    // A name's own value, bypassing nameref redirection: a nameref's target
+    // name, and each link while `resolve_nameref` follows a chain.
     pub(crate) fn raw_var_lookup(&self, name: &str) -> String {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
@@ -10175,15 +10020,13 @@ impl Shell {
         if let Some(v) = self.global_get(name) {
             return v.clone();
         }
-        // The real environment is still consulted last, for a name
-        // something outside this table set behind its back -- the
-        // session bridge's own `XDG_RUNTIME_DIR`, or `TZ` in a test.
+        // The real environment is consulted last, for names set outside this
+        // table (the session bridge's `XDG_RUNTIME_DIR`, `TZ` in a test).
         self.inherited_var(name).unwrap_or_default()
     }
 
-    // Writes a name's own raw value, bypassing nameref redirection -- used
-    // to set a nameref's target-name string itself (assign_var, by
-    // contrast, is what a nameref's *reads/writes* get redirected through).
+    // A name's own value, bypassing nameref redirection: sets a nameref's
+    // target name itself.
     pub(crate) fn raw_var_write(&mut self, name: &str, value: String) {
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
@@ -10196,42 +10039,21 @@ impl Shell {
         self.export_to_environment(name, &value);
     }
 
-    // The real environment gets a name only while it is exported --
-    // that, and nothing else, is what a spawned child inherits.
-    //
-    // A value the environment cannot hold is simply not written there.
-    // `std::env::set_var` *panics* on an interior NUL, which is how
-    // `printf 'a\0b' | read -r -d "" v` used to kill the shell; a
-    // shell variable may hold one, a C environment string may not, and
-    // the variable is worth more than the export.
-    /// Kept as the one place that documents why nothing happens here.
-    ///
-    /// An exported variable used to be written straight into the real
-    /// process environment so a spawned child would inherit it. Children
-    /// are now built from the shell's own exported names (see
-    /// `Shell::command`), which is where the value already is -- and the
-    /// write was the only thing making one shell's variables visible to
-    /// another sharing this process, which is exactly what an in-process
-    /// pipeline stage must not do.
-    ///
-    /// The NUL check that used to live here moved to `exported_pairs`,
-    /// which is now what a value has to survive to reach a child.
+    /// Does nothing. A child's environment is built from the exported names
+    /// (`Shell::command`), and writing the real environment would leak
+    /// variables between shells sharing the process.
     fn export_to_environment(&self, _name: &str, _value: &str) {}
 
-    // Removes a name from wherever it lives: the innermost local scope
-    // holding it, the globals, and the real environment. Shared by
-    // `unset` and by the restore half of a `FOO=bar cmd` prefix.
+    // Removes a name from the innermost scope holding it, or the globals,
+    // and hides any inherited copy. Shared by `unset` and the restore after
+    // `FOO=bar cmd`.
     pub(crate) fn remove_var(&mut self, name: &str) {
         self.unset_names.insert(name.to_string());
         for scope in self.var_scopes.iter_mut().rev() {
             if let Some(slot) = scope.get_mut(name) {
-                // The shadow stays and becomes an *unset* one, rather
-                // than being removed. Removing it uncovered whatever
-                // the caller had, so `f() { local x=1; unset x; echo
-                // "${x-gone}"; }` with a global `x=outer` printed
-                // `outer` where bash prints `gone`: unsetting a local
-                // leaves the name unset for the rest of the function,
-                // it does not hand the enclosing one back.
+                // The shadow stays, unset: removing it would uncover the
+                // caller's value, but bash leaves an unset local unset for
+                // the rest of the function.
                 *slot = None;
                 return;
             }
@@ -10239,8 +10061,7 @@ impl Shell {
         Rc::make_mut(&mut self.globals).remove(name);
     }
 
-    // Whatever the real environment says about `name` -- unless this
-    // shell has unset it, in which case it says nothing.
+    // The real environment's value, unless this shell unset the name.
     fn inherited_var(&self, name: &str) -> Option<String> {
         if self.unset_names.contains(name) {
             return None;
@@ -10248,10 +10069,8 @@ impl Shell {
         std::env::var(name).ok()
     }
 
-    // Follows a `declare -n`/`local -n` chain to the final target name,
-    // capped to guard against a self-referential or circular nameref (bash
-    // detects and errors on these; bish just stops following rather than
-    // looping forever).
+    // Follows a `declare -n` chain to its final target, capped so a cycle
+    // stops instead of looping. bash reports cycles as errors.
     fn resolve_nameref(&self, name: &str) -> String {
         let mut current = name.to_string();
         let mut hops = 0;
@@ -10277,34 +10096,25 @@ impl Shell {
             "?" => self.last_status.to_string(),
             "0" => self.script_name.clone(),
             "#" => self.arg_frames.last().map(|a| a.len()).unwrap_or(0).to_string(),
-            // Joined on IFS's first character, not a space: `IFS=-;
-            // echo "$*"` is `a-b-c`. Unquoted `$*` reads the same way
-            // and is then split on IFS again, which is how bash gets
-            // separate fields out of it.
+            // Joined on IFS's first character: `IFS=-; echo "$*"` is `a-b-c`.
+            // Unquoted, the result is split on IFS again.
             "@" | "*" => {
                 let sep = self.ifs_join_char();
                 self.arg_frames.last().map(|a| a.join(&sep)).unwrap_or_default()
             }
-            // $$/$!/$RANDOM/$SECONDS/$- are always computed live, never
-            // read back from var_scopes/env, matching how bash treats them
-            // as effectively magic rather than ordinary settable
-            // variables (SECONDS is the one partial exception -- see
-            // assign_var's special-case for `SECONDS=n`).
+            // Computed live, never stored. `SECONDS=n` is the one that can be
+            // assigned; see `assign_var`.
             "$" => self.shell_pid.to_string(),
             "!" => self.jobs.borrow().last_bg_pid.map(|p| p.to_string()).unwrap_or_default(),
-            // These four read something outside the shell's own state
-            // (the RNG, the clock), so an otherwise-effectless function
-            // body that reads one is not repeating itself. Counted as
-            // effects so `check_nonproductive_recursion` cannot mistake
+            // These read the RNG or the clock, so they count as effects:
+            // otherwise `check_nonproductive_recursion` would take
             // `f() { f $SECONDS; }` for a fixed point.
             "RANDOM" => {
                 self.effects += 1;
                 self.next_random().to_string()
             }
             "LINENO" => self.current_line.to_string(),
-            // Seconds since the epoch, and the same with microseconds.
-            // bash 5's own two spellings; a script that wants a
-            // timestamp should not have to spawn `date` for it.
+            // Seconds since the epoch, and with microseconds.
             "EPOCHSECONDS" => {
                 self.effects += 1;
                 unix_now().as_secs().to_string()
@@ -10318,17 +10128,11 @@ impl Shell {
                 self.effects += 1;
                 (self.shell_start.elapsed().as_secs() as i64 + self.seconds_offset).to_string()
             }
-            // The single-letter name of every option currently on,
-            // then the letter for how the shell was invoked. bash
-            // orders them lowercase-alphabetical, then
-            // uppercase-alphabetical, then the invocation letter last:
-            // `set -e -f -u -x -C -m -T -E -a -b -v` under `-c` gives
-            // `abefhmuvxBCETc`.
-            //
-            // `h` and `B` are unconditional because they are true and
-            // not settable here: this shell hashes what it looks up on
-            // PATH and expands braces, and has no way to stop doing
-            // either. Everything else is a real option's real state.
+            // Every option that is on, by letter: lowercase, then
+            // uppercase, then the invocation letter, as bash orders them
+            // (`abefhmuvxBCETc`). `h` and `B` are always on: this shell
+            // hashes PATH lookups and expands braces, with no way to stop
+            // either.
             "-" => {
                 let mut letters: Vec<char> = vec!['h', 'B'];
                 for (on, c) in [
@@ -10367,51 +10171,35 @@ impl Shell {
                 if let Some(v) = self.global_get(name) {
                     return v.clone();
                 }
-                // A bare `$a` on an array is `${a[0]}`, for every array
-                // -- which is also what makes `$FUNCNAME` the name of
-                // the running function rather than nothing. Checked
-                // after the scopes and globals so a scalar of the same
-                // name still wins.
+                // A bare `$a` on an array is `${a[0]}`, which is also why
+                // `$FUNCNAME` names the running function. After scalars, so
+                // a scalar of the same name wins.
                 if let Some(first) = self.arrays.get(name).and_then(|m| m.values().next()) {
                     return first.clone();
                 }
-                // Indexed only: an associative array has no element 0
-                // to be, so bash's bare `$m` on one is empty.
-                // The real environment last, for a name something
-                // outside the variable table set behind its back --
-                // see raw_var_lookup, which reads the same three
-                // places in the same order.
+                // Indexed only: bare `$m` on an associative array is empty.
+                // The real environment last, as in `raw_var_lookup`.
                 if let Some(v) = self.inherited_var(name) {
                     return v;
                 }
-                // Startup-populated-in-real-bash variables: computed on
-                // demand here instead, but still overridable by a normal
-                // assignment (checked above) since that's the common bash
-                // behavior for all of these once actually set.
+                // Variables bash sets at startup, computed on demand here. An
+                // assignment (checked above) overrides them.
                 match name {
                     "BASH_VERSION" => BASH_VERSION.to_string(),
                     "PPID" => crate::platform::parent_process_id().to_string(),
                     "UID" => crate::platform::real_user().to_string(),
                     "EUID" => crate::platform::effective_user().to_string(),
                     "HOSTNAME" => get_hostname(),
-                    // The path this shell was started from. `$0` is
-                    // what it was *called* as, which is not the same
-                    // thing and is what a script reaches for `$BASH`
-                    // to avoid.
+                    // The path this shell was started from; `$0` is what it
+                    // was called as.
                     "BASH" => std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-                    // The pid of the process actually running this.
-                    // The same as `$$` here, where bash's differs
-                    // inside a subshell, because a subshell here is
-                    // not a process -- see run_in_child_shell.
-                    // The real one, not a remembered one: a subshell
-                    // that is in fact this process still reports its own.
+                    // This process, the same as `$$`: a subshell here isn't
+                    // a process (see `run_in_child_shell`).
                     "BASHPID" => crate::platform::process_id().to_string(),
                     "BASH_SUBSHELL" => self.subshell_depth.to_string(),
                     "BASH_COMMAND" => self.bash_command.to_string(),
-                    // The `set -o` and `shopt` options currently on,
-                    // colon-separated and sorted, which is how a script
-                    // asks `[[ $SHELLOPTS == *errexit* ]]` without
-                    // running `set -o` and parsing it.
+                    // The options that are on, colon-separated and sorted,
+                    // for `[[ $SHELLOPTS == *errexit* ]]`.
                     "SHELLOPTS" => {
                         let mut on: Vec<&str> = SET_O_OPTIONS.iter().copied().filter(|n| self.shell_option_enabled(n) == Some(true)).collect();
                         crate::sort::sort(&mut on);
@@ -10428,16 +10216,9 @@ impl Shell {
         }
     }
 
-    // Read-only variable lookup for the debugger's own K-hover/`:dbg print`
-    // -- deliberately `&self`, unlike lookup_var (`&mut self`, since magic
-    // vars like $RANDOM mutate on read and $SECONDS reads a live clock).
-    // Scoped to named user variables only: a plain scalar (checked in
-    // var_scopes, then the real process environment -- see raw_var_write's
-    // own doc comment for why that's where an ordinary global lives),
-    // an indexed array, or an associative array. Returns `None` for a
-    // truly-unset name *or* a magic/positional one ($?, $1, $RANDOM, ...)
-    // -- inspecting those would need `&mut self` or a real side effect,
-    // out of scope for a side-effect-free hover.
+    // Variable lookup for the debugger's hover and `:dbg print`. `&self`,
+    // unlike `lookup_var`, so magic and positional names (`$RANDOM`, `$1`)
+    // are `None` along with unset ones: reading them has side effects.
     pub(crate) fn debug_peek_var(&self, name: &str) -> Option<String> {
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
@@ -10456,34 +10237,20 @@ impl Shell {
         self.global_get(name).cloned().or_else(|| self.inherited_var(name))
     }
 
-    // pub: debugger.rs (a separate module -- see DebugHook's own doc
-    // comment for why the concrete implementation lives outside exec.rs)
-    // needs to install itself as this Shell's active debugger before
-    // calling run_program.
+    // Public so debugger.rs can install itself before `run_program`.
     pub fn set_debug_hook(&mut self, hook: Option<Rc<RefCell<dyn DebugHook>>>) {
         self.debug_hook = hook;
     }
 
-    // repl.rs's own multi-session dispatch (the only place more than one
-    // Shell ever shares this real process -- window/pane splits, all
-    // built on new_virtual_child) calls this right before running
-    // anything in this specific session, if a *different* session's
-    // Shell was the last one to run: applies this session's own
-    // remembered real cwd/env/umask onto the actual process, so that
-    // whichever session runs next sees its own variables/umask (not
-    // whatever an unrelated sibling session last left the real process
-    // in) and so that plain relative-path file I/O (open_out, a
-    // redirect's own `Redirect::In`, `source`, ...) -- which, unlike a
-    // real external-process spawn, has no explicit `.current_dir(&self.
-    // cwd)` of its own and just resolves against the real process cwd --
-    // resolves against *this* session's own cwd rather than a sibling's.
+    // Called by repl.rs before running a session other than the one that
+    // ran last: applies this session's cwd, environment and umask to the
+    // process, so relative-path file I/O and `source`, which use the
+    // process cwd, see this session's.
     pub fn sync_real_state_in(&self) {
         let _ = std::env::set_current_dir(&self.cwd);
         let current: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
-        // Deliberately the raw calls, not env_set/env_unset: this is
-        // session switching, which by construction never runs inside a
-        // subshell's env journal (see env_journal_push's own comment), and
-        // it reapplies the whole snapshot on a hot path.
+        // The raw calls, not `env_set`: session switching never runs inside a
+        // subshell's env journal.
         for k in &current {
             if !self.env_snapshot.contains_key(k) {
                 unsafe { std::env::remove_var(k) };
@@ -10495,37 +10262,20 @@ impl Shell {
         crate::platform::set_umask(self.umask_snapshot);
     }
 
-    // The other half of sync_real_state_in: called right after this
-    // session finishes running something, before a *different* session's
-    // turn (if any) -- captures whatever the real environment/umask
-    // actually are right now back into this session's own remembered
-    // state, so its own next turn (sync_real_state_in again) restores
-    // exactly what it just left behind. cwd needs no equivalent capture
-    // here: self.cwd is already kept live-accurate by run_cd itself,
-    // independently of any of this.
+    // The other half of `sync_real_state_in`: after this session runs,
+    // saves the process environment and umask for its next turn. `self.cwd`
+    // is already kept current by `run_cd`.
     pub fn sync_real_state_out(&mut self) {
         self.env_snapshot = Rc::new(std::env::vars().collect());
         self.umask_snapshot = current_umask();
     }
 
-    // Updates this session's own remembered `TERM`/`COLORTERM` --
-    // needed because a plain `std::env::set_var` from outside this
-    // session's own state (e.g. session.rs's own bridge, reacting to a
-    // `bish session` client's attach handshake) would otherwise be
-    // silently undone the very next time this session runs anything at
-    // all: `sync_real_state_in` unconditionally reapplies `env_snapshot`
-    // -- captured before that external change ever happened -- onto the
-    // real environment first thing every `run_program` call. This is
-    // the one correct way to change a session's env from outside it.
-    // `term` empty is treated as "leave TERM alone" (every real
-    // terminal sets it; an empty value here almost certainly means the
-    // client's own environment just didn't have it set, not a genuine
-    // request to unset bish's own already-known-good value).
-    // `colorterm` empty *does* unset it, matching real bash's own
-    // convention (COLORTERM is either unset or a real, nonempty value)
-    // -- deliberately asymmetric with `term`, since a reattach from a
-    // truecolor terminal to a plain one needs the stale truecolor
-    // capability to actually go away, not linger.
+    // Sets this session's `TERM`/`COLORTERM`, the way to change its
+    // environment from outside: a plain `set_var` would be undone by
+    // `sync_real_state_in` reapplying the snapshot on the next run. Empty
+    // `term` leaves `TERM` alone (the client just didn't have it); empty
+    // `colorterm` unsets it, so reattaching from a truecolor terminal to a
+    // plain one drops it.
     pub fn set_terminal_capability_env(&mut self, term: &str, colorterm: &str) {
         let snap = Rc::make_mut(&mut self.env_snapshot);
         if !term.is_empty() {
