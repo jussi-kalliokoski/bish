@@ -1,9 +1,7 @@
-//! How a POSIX system does what bish needs.
-//!
-//! Written once for every Unix: what differs between them is the
-//! numbers and layouts, which live in `sys_linux.rs`/`sys_darwin.rs`
-//! and reach this file as `sys::*`. A target that is not a Unix at all
-//! replaces this file rather than editing it -- see `mod.rs`.
+//! How a POSIX system does what bish needs, written once for every Unix:
+//! the differing numbers and layouts come from `sys_linux.rs` and
+//! `sys_darwin.rs` as `sys::*`. A non-Unix target replaces this file (see
+//! `mod.rs`).
 
 use super::sys;
 
@@ -13,18 +11,12 @@ unsafe extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
-/// `guard + usable` bytes of fresh address space, the lowest `guard`
-/// bytes of it unreadable.
-///
-/// For a stack of bish's own making: stacks grow downward, so the
-/// unreadable end is the one an overrun reaches, and it faults there
-/// rather than silently corrupting whatever was mapped next. Address
-/// space rather than memory -- pages are faulted in as they are
-/// touched, so an untouched megabyte costs a page-table entry and
-/// nothing else.
+/// `guard + usable` bytes of new address space, the lowest `guard` bytes
+/// unreadable: a stack for bish's own use, growing down, so an overrun
+/// faults rather than corrupting the next mapping. Pages fault in as
+/// touched, so an untouched megabyte costs a page-table entry.
 pub(crate) fn map_guarded_stack(guard: usize, usable: usize) -> std::io::Result<*mut u8> {
-    // POSIX says `(void *) -1`, which every Unix agrees on, so this one
-    // is not a per-OS fact.
+    // POSIX's `(void *) -1`, the same on every Unix.
     const MAP_FAILED: isize = -1;
 
     let total = guard + usable;
@@ -50,34 +42,25 @@ pub(crate) unsafe fn unmap(base: *mut u8, len: usize) {
     unsafe { munmap(base, len) };
 }
 
-/// A file with no name: created in the temp directory and unlinked
-/// before anything can look it up, so the descriptor is the only way to
-/// it and nothing is left behind if bish dies holding it.
-///
-/// `tag` only makes the (very short-lived) name recognisable to anyone
-/// watching the directory.
-///
-/// Here rather than in `darwin.rs`, which is its only caller, for one
-/// reason: every line of it is POSIX, so on this side of the port it is
-/// compiled and tested on Linux too. Code macOS will run that cannot be
-/// run until there is a Mac to hand is the thing most worth avoiding in
-/// this directory.
+/// A file with no name: created in the temp directory and unlinked at
+/// once, so the descriptor is the only way to it and nothing is left if
+/// bish dies. `tag` makes the brief name recognisable. Here rather than in
+/// `darwin.rs`, its only caller, because it's all POSIX and so compiled
+/// and tested on Linux too.
 #[allow(dead_code)]
 pub(crate) fn unlinked_temp_file(tag: &str) -> Option<std::fs::File> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // `create_new`, so a name that somehow exists already is never
-    // opened -- and then a few tries, since a collision is the only way
-    // that happens and a different name settles it.
+    // `create_new`, so an existing name is never opened; a few tries, since
+    // only a collision fails and another name settles it.
     for _ in 0..8 {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("bish-{tag}-{}-{n}", std::process::id()));
         let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) else { continue };
-        // From here the name is gone and the descriptor is all there is.
-        // A failed unlink would leave a file behind under a name nothing
-        // reuses, so the caller is told there is no anonymous file to be
-        // had rather than being handed one that litters.
+        // From here the descriptor is all there is. A failed unlink would
+        // leave a file behind, so the caller is told there's no anonymous
+        // file rather than given one that litters.
         if std::fs::remove_file(&path).is_err() {
             return None;
         }
@@ -86,18 +69,11 @@ pub(crate) fn unlinked_temp_file(tag: &str) -> Option<std::fs::File> {
     None
 }
 
-/// A temporary file that keeps its name, created so that no name planted
-/// in advance can be opened instead.
-///
-/// `unlinked_temp_file` above with the unlink left out, for the callers
-/// that need something to pass by path. `create_new` is what matters:
-/// `O_CREAT|O_EXCL` fails on a name that already exists -- a symlink
-/// included, which is the whole point -- so a pre-planted
-/// `/tmp/bish-<tag>-<pid>-<n>` makes this move to the next number rather
-/// than writing through it. An attacker who plants all eight only
-/// denies the file; they never redirect it.
-///
-/// The caller owns the name and is responsible for removing it.
+/// A temp file that keeps its name, created so that no name planted in
+/// advance can be opened instead: `create_new` (`O_CREAT|O_EXCL`) fails on
+/// an existing name, symlinks included, so a planted
+/// `/tmp/bish-<tag>-<pid>-<n>` moves this to the next number. Planting all
+/// eight denies the file but never redirects it. The caller removes it.
 pub(crate) fn exclusive_temp_file(tag: &str) -> Option<(std::fs::File, std::path::PathBuf)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -110,30 +86,19 @@ pub(crate) fn exclusive_temp_file(tag: &str) -> Option<(std::fs::File, std::path
     None
 }
 
-/// What a directory looked like at one moment: every name in it, with
-/// enough of each entry's identity to tell "changed" from "same file,
-/// looked at twice".
-///
-/// For an OS whose file-change notifications say *that* a directory
-/// changed without saying *which* name did -- kqueue, which is macOS's
-/// only answer here. Linux's inotify names the entry itself and needs
-/// none of this.
-///
-/// Here rather than in `darwin.rs` for the same reason as
-/// `unlinked_temp_file`: it is all `std::fs`, so it is compiled and
-/// tested on Linux, where there is a machine to run it on. Dead on
-/// Linux at run time for exactly that reason.
+/// A directory at one moment: every name in it with enough identity to
+/// tell changed from same. For kqueue, which says a directory changed but
+/// not which name; inotify needs none of this. Here, all `std::fs`, so
+/// it's tested on Linux, where it's unused at run time.
 #[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct DirSnapshot {
     entries: std::collections::HashMap<std::ffi::OsString, Stamp>,
 }
 
-/// The parts of an entry worth comparing. Inode included, and
-/// deliberately: the case the whole file-watching design exists for is a
-/// formatter or a branch switch replacing a file through a rename, which
-/// changes the inode and need not change the size or even the
-/// modification time.
+/// The parts of an entry worth comparing, inode included: a formatter or
+/// branch switch replaces a file by renaming, changing the inode and
+/// maybe not size or mtime.
 #[derive(PartialEq, Eq)]
 struct Stamp {
     inode: u64,
@@ -145,8 +110,8 @@ struct Stamp {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntryChange {
-    /// It appeared, or it is not the same file it was, or it was written
-    /// to. All one answer, because every caller's next move is to look.
+    /// It appeared, isn't the same file, or was written: one answer, since
+    /// every caller's next move is to look.
     Touched,
     /// It is no longer in the directory.
     Gone,
@@ -154,29 +119,26 @@ pub(crate) enum EntryChange {
 
 #[allow(dead_code)]
 impl DirSnapshot {
-    /// An unreadable or missing directory snapshots as empty, which
-    /// makes its disappearance read as every name in it going -- the
-    /// truth, as far as anyone watching a name in it is concerned.
+    /// An unreadable or missing directory snapshots as empty, so its
+    /// disappearance reads as every name going, which is true for anyone
+    /// watching one.
     pub(crate) fn of(dir: &std::path::Path) -> DirSnapshot {
         use std::os::unix::fs::MetadataExt;
         let mut entries = std::collections::HashMap::new();
         let Ok(listing) = std::fs::read_dir(dir) else { return DirSnapshot::default() };
         for entry in listing.flatten() {
-            // `symlink_metadata`, so a symlink is the thing being
-            // watched rather than whatever it points at: replacing where
-            // it points is a change to this directory, and a dangling
-            // one still has an entry.
+            // `symlink_metadata`, so the symlink itself is watched:
+            // repointing it changes this directory, and a dangling one
+            // still has an entry.
             let Ok(meta) = entry.path().symlink_metadata() else { continue };
             entries.insert(entry.file_name(), Stamp { inode: meta.ino(), size: meta.size(), modified: meta.modified().ok() });
         }
         DirSnapshot { entries }
     }
 
-    /// Every name that is not as it was in `before`.
-    ///
-    /// Names neither snapshot has, and names both have identically, are
-    /// not mentioned -- which is what keeps a sibling's business out of
-    /// a watched file's events.
+    /// Every name not as it was in `before`; names absent from both or the
+    /// same in both aren't mentioned, keeping siblings out of a watched
+    /// file's events.
     pub(crate) fn changes_since(&self, before: &DirSnapshot) -> Vec<(std::ffi::OsString, EntryChange)> {
         let mut out = Vec::new();
         for (name, stamp) in &self.entries {
@@ -223,16 +185,12 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn geteuid() -> u32;
     fn getegid() -> u32;
-    // `open(2)` is variadic -- `int open(const char *, int, ...)` -- and
-    // declared that way: rustc 1.99 refuses a non-variadic view of it
-    // outright (`invalid_runtime_symbol_definitions`), and it is right to.
-    // On Apple's arm64 ABI a variadic argument is passed differently from
-    // a fixed one, so the mode of a hypothetical `O_CREAT` call would have
-    // gone to the wrong place. Nothing here passes one, so nothing here
-    // passes a mode: that is what the `...` means.
-    //
-    // One declaration for the whole directory, too. Two differing views of
-    // the same C function is a hazard rather than a style difference.
+    // `open(2)` is variadic, `int open(const char *, int, ...)`, and
+    // declared so: rustc refuses a non-variadic view
+    // (`invalid_runtime_symbol_definitions`), rightly, since Apple's arm64
+    // ABI passes variadic arguments differently. Nothing here passes a
+    // mode. One declaration for the whole directory: two views of one C
+    // function are a hazard.
     #[link_name = "open"]
     pub(super) fn c_open(path: *const i8, flags: i32, ...) -> i32;
     fn posix_openpt(flags: i32) -> i32;
@@ -240,11 +198,9 @@ unsafe extern "C" {
     fn unlockpt(fd: i32) -> i32;
     fn ptsname_r(fd: i32, buf: *mut u8, buflen: usize) -> i32;
     fn setsid() -> i32;
-    // Variadic for the same reason `open` is, and here it is not
-    // hypothetical: on Apple's arm64 a fixed third argument goes in a
-    // register while the callee reads its variadic one off the stack, so
-    // `F_SETFL` set whatever happened to be there rather than
-    // `O_NONBLOCK`, and every ioctl's pointer was garbage.
+    // Variadic for the same reason: on Apple's arm64 a fixed third argument
+    // goes in a register while the callee reads a variadic one off the
+    // stack, so `F_SETFL` and every ioctl's pointer would get garbage.
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     pub(super) fn fcntl(fd: i32, command: i32, ...) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
@@ -256,20 +212,17 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
 }
 
-/// How a terminal is behaving: what to put back, and what to derive the
-/// next mode from.
-///
-/// Opaque on purpose. Which bits mean what is this layer's business, and
-/// a caller that could reach the flags would be a caller with a reason
-/// to know a number that differs per OS.
+/// How a terminal is behaving: what to restore and what to derive the
+/// next mode from. Opaque, since the bits differ per OS and are this
+/// layer's business.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalMode(sys::Termios);
 
 /// How `fd`'s terminal is behaving right now, or `None` if it is not a
 /// terminal at all.
 pub(crate) fn terminal_mode(fd: i32) -> Option<TerminalMode> {
-    // SAFETY: a `Termios` of zeroes is a valid one to be written over,
-    // and `tcgetattr` writes the whole of it or fails.
+    // SAFETY: zeroes are a valid `Termios` to overwrite, and `tcgetattr`
+    // writes all of it or fails.
     let mut mode: sys::Termios = unsafe { std::mem::zeroed() };
     match unsafe { tcgetattr(fd, &mut mode) } {
         0 => Some(TerminalMode(mode)),
@@ -286,26 +239,20 @@ pub(crate) fn set_terminal_mode(fd: i32, mode: &TerminalMode) -> std::io::Result
     }
 }
 
-/// Whether the line discipline is still holding typed bytes until a
-/// newline -- that is, whether the terminal is *not* in raw mode.
-///
-/// `ICANON` is the bit that decides it. On a pty the two ends share one
-/// set of these, so asking this of the *master* is how the side driving
-/// it can tell that the program on the slave has taken the terminal --
-/// which is what the vim corpus waits for before it types anything, and
-/// its only caller. A test, therefore, so a release build does not
-/// report code that is not dead but is not part of the shell either.
+/// Whether the line discipline still holds typed bytes until a newline,
+/// that is, not raw mode. On a pty both ends share these, so asking the
+/// master shows whether the program on the slave took the terminal,
+/// which the vim corpus waits for before typing. Its only caller is that
+/// test.
 #[cfg(test)]
 pub(crate) fn is_canonical(mode: &TerminalMode) -> bool {
     mode.0.c_lflag & sys::ICANON != 0
 }
 
-/// Raw mode, derived from whatever the terminal is doing now: no line
-/// buffering (`ICANON` off), no echo (bish draws the line itself), no
-/// signals from control characters (`ISIG` off -- the editor reads those
-/// as plain bytes and decides for itself), and no output post-processing
-/// (`OPOST` off, so a caller writes "\r\n" rather than relying on the
-/// terminal to translate).
+/// Raw mode from the current mode: no line buffering (`ICANON` off), no
+/// echo (bish draws the line), no signals from control characters (`ISIG`
+/// off: the editor reads them as bytes), no output processing (`OPOST`
+/// off, so callers write "\r\n").
 pub(crate) fn raw_mode(from: &TerminalMode) -> TerminalMode {
     let mut raw = from.0;
     raw.c_iflag &= !(sys::IGNBRK | sys::BRKINT | sys::PARMRK | sys::ISTRIP | sys::INLCR | sys::IGNCR | sys::ICRNL | sys::IXON);
@@ -318,20 +265,11 @@ pub(crate) fn raw_mode(from: &TerminalMode) -> TerminalMode {
     TerminalMode(raw)
 }
 
-/// Cooked mode, derived the same way -- and deliberately *not* the
-/// bit-for-bit inverse of `raw_mode`.
-///
-/// Raw mode clears `IGNCR` alongside `ICRNL` (with both off a bare CR
-/// passes through untranslated either way), but the two are not
-/// independent: POSIX has `IGNCR` take priority and discard CR entirely
-/// before `ICRNL` gets a say. Turning *both* back on -- the naive
-/// symmetric inverse, tried first and caught interactively -- silently
-/// ate every Enter: a script's `read` echoed what was typed and never
-/// saw a line terminator, hanging on something that looked like it
-/// should work. Real cooked mode leaves IGNCR/INLCR/ISTRIP/PARMRK/
-/// IGNBRK/BRKINT alone; only ICANON/ECHO/ISIG/IEXTEN, OPOST and
-/// ICRNL/IXON have to be forced back on for kernel-driven line editing
-/// and echo to behave.
+/// Cooked mode from the current mode, not the bit-for-bit inverse of
+/// `raw_mode`: POSIX has `IGNCR` discard CR before `ICRNL` acts, so turning
+/// both back on would eat every Enter (a `read` that never sees a line
+/// end). Cooked mode leaves IGNCR, INLCR, ISTRIP, PARMRK, IGNBRK and BRKINT
+/// alone and forces ICANON, ECHO, ISIG, IEXTEN, OPOST, ICRNL and IXON on.
 pub(crate) fn cooked_mode(from: &TerminalMode) -> TerminalMode {
     let mut cooked = from.0;
     cooked.c_iflag |= sys::ICRNL | sys::IXON;
@@ -340,9 +278,8 @@ pub(crate) fn cooked_mode(from: &TerminalMode) -> TerminalMode {
     TerminalMode(cooked)
 }
 
-/// The terminal exactly as it is, minus the echo -- not raw mode: the
-/// line discipline still edits and buffers a line, it just does not show
-/// it. `read -s`'s own contract.
+/// The terminal as is, minus echo: not raw mode, the line discipline
+/// still edits a line without showing it. What `read -s` needs.
 pub(crate) fn echoless_mode(from: &TerminalMode) -> TerminalMode {
     let mut silent = from.0;
     silent.c_lflag &= !sys::ECHO;
@@ -354,11 +291,8 @@ pub(crate) fn raise_signal(signal_number: i32) {
     unsafe { raise(signal_number) };
 }
 
-/// Reads whatever is there, retrying an interrupted read.
-///
-/// `Ok(0)` is end of input. A read cut short by a signal is not an
-/// answer about the file at all, so it is taken again rather than
-/// reported -- which is what every caller here would do with it.
+/// Reads what's there, retrying an interrupted read: `Ok(0)` is end of
+/// input, and a read cut short by a signal says nothing about the file.
 pub(crate) fn read_bytes(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -372,11 +306,9 @@ pub(crate) fn read_bytes(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-/// A terminal's size, in both cells and pixels.
-///
-/// `struct winsize` is four unsigned shorts in that order on every Unix
-/// bish targets, so unlike `Termios` this one layout serves both -- the
-/// `ioctl` numbers that carry it are what differ.
+/// A terminal's size in cells and pixels. `struct winsize` is four
+/// unsigned shorts in order on every Unix bish targets, so one layout
+/// serves; the `ioctl` numbers differ.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Winsize {
@@ -386,12 +318,9 @@ pub(crate) struct Winsize {
     pub(crate) ypixel: u16,
 }
 
-/// A fresh pty: the master end, and the path of the slave end.
-///
-/// Only the path, never an open slave fd -- holding one would leak it
-/// into every child spawned from this process afterwards. The master is
-/// close-on-exec for the same reason: a child that was not deliberately
-/// attached to this pty has no business inheriting either end.
+/// A new pty: the master and the slave's path. Never an open slave fd,
+/// which would leak into every later child; the master is close-on-exec
+/// for the same reason.
 pub(crate) fn open_pty() -> std::io::Result<(std::fs::File, String)> {
     use std::os::fd::FromRawFd;
 
@@ -413,7 +342,7 @@ pub(crate) fn open_pty() -> std::io::Result<(std::fs::File, String)> {
         Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
     };
     match name() {
-        // SAFETY: a fresh descriptor from posix_openpt, owned by nothing
+        // SAFETY: a fresh descriptor from `posix_openpt`, owned by nothing
         // else.
         Ok(path) => Ok((unsafe { std::fs::File::from_raw_fd(master) }, path)),
         Err(failure) => {
@@ -423,19 +352,12 @@ pub(crate) fn open_pty() -> std::io::Result<(std::fs::File, String)> {
     }
 }
 
-/// Makes `slave_path` this process's controlling terminal and its fd
-/// 0/1/2.
-///
-/// `setsid` first, and it is a precondition rather than tidiness:
-/// `TIOCSCTTY` only takes for a session leader with no controlling
-/// terminal yet. The `ioctl` is then explicit rather than relying on the
-/// first tty a session leader opens becoming its controlling terminal by
-/// itself -- true on Linux, and not something to depend on.
-///
-/// Called in two places: from a freshly forked child on its way to
-/// `exec`, and by a session daemon attaching *itself* to a pty of its own
-/// so that everything in bish which assumes a real terminal on 0/1/2
-/// keeps working untouched.
+/// Makes `slave_path` this process's controlling terminal and fds 0-2.
+/// `setsid` first: `TIOCSCTTY` works only for a session leader without a
+/// controlling terminal. The explicit `ioctl` rather than relying on the
+/// first tty opened becoming it, which is Linux behaviour. Used by a
+/// forked child before `exec`, and by a session daemon attaching itself to
+/// a pty so bish's terminal assumptions hold.
 pub(crate) fn attach_to_pty_slave(slave_path: &std::ffi::CStr) -> std::io::Result<()> {
     unsafe {
         if setsid() < 0 {
@@ -469,8 +391,8 @@ pub(crate) fn terminal_size(fd: std::os::unix::io::RawFd) -> std::io::Result<Win
     }
 }
 
-/// Tells the terminal on `fd` how big it now is -- for the pty bish owns
-/// the far end of, whose size is whatever bish says it is.
+/// Tells the terminal on `fd` its size, for the pty whose far end bish
+/// owns.
 pub(crate) fn set_terminal_size(fd: std::os::unix::io::RawFd, rows: u16, cols: u16) -> std::io::Result<()> {
     let size = Winsize { rows, cols, xpixel: 0, ypixel: 0 };
     match unsafe { ioctl(fd, sys::TIOCSWINSZ, &size as *const Winsize as usize) } {
@@ -479,11 +401,9 @@ pub(crate) fn set_terminal_size(fd: std::os::unix::io::RawFd, rows: u16, cols: u
     }
 }
 
-/// Hands the terminal on `fd` to process group `pgrp`.
-///
-/// The other half of job control: `setpgid` puts a job in its own group,
-/// and this is what makes the terminal driver send its own signals --
-/// Ctrl-C, Ctrl-Z -- to that group rather than to bish.
+/// Gives the terminal on `fd` to process group `pgrp`: with `setpgid`
+/// putting a job in its own group, this makes the terminal driver send
+/// Ctrl-C and Ctrl-Z to that group rather than bish.
 pub(crate) fn set_foreground_pgrp(fd: std::os::unix::io::RawFd, pgrp: i32) -> std::io::Result<()> {
     match unsafe { ioctl(fd, sys::TIOCSPGRP, &pgrp as *const i32 as usize) } {
         0 => Ok(()),
@@ -491,8 +411,7 @@ pub(crate) fn set_foreground_pgrp(fd: std::os::unix::io::RawFd, pgrp: i32) -> st
     }
 }
 
-/// Stops reads on `fd` from blocking -- for a loop that drains whatever
-/// has arrived and gets on with the rest of its tick.
+/// Makes reads on `fd` non-blocking, for a loop draining what arrived.
 pub(crate) fn set_nonblocking(fd: std::os::unix::io::RawFd) {
     unsafe {
         let flags = fcntl(fd, sys::F_GETFL, 0);
@@ -507,13 +426,10 @@ pub(crate) enum Access {
     Execute,
 }
 
-/// Whether this process could read, write or execute `path` -- asked of
-/// the OS rather than worked out from the mode bits, because the answer
-/// depends on the effective user, the groups it is in, and whatever the
-/// filesystem thinks on top of that.
-///
-/// `R_OK`/`W_OK`/`X_OK` are 4, 2 and 1 on every Unix bish targets, so
-/// they are here rather than in the tables.
+/// Whether this process could read, write or execute `path`, asked of the
+/// OS rather than worked out from mode bits, which depends on the
+/// effective user, groups and filesystem. `R_OK`/`W_OK`/`X_OK` are 4, 2 and
+/// 1 on every Unix bish targets.
 pub(crate) fn is_accessible(path: &str, mode: Access) -> bool {
     let mode = match mode {
         Access::Read => 4,
@@ -524,17 +440,14 @@ pub(crate) fn is_accessible(path: &str, mode: Access) -> bool {
     unsafe { access(path.as_ptr(), mode) == 0 }
 }
 
-/// Who this process is acting as, which is the question that matters for
-/// "may I" -- not who started it.
+/// Who this process acts as, which decides "may I", not who started it.
 pub(crate) fn effective_user() -> u32 {
     unsafe { geteuid() }
 }
 
-/// The owner of a file, as its metadata records it. The one place
-/// bish's ownership checks read a uid off a file, so they do it through
-/// the platform layer rather than reaching for `MetadataExt` themselves
-/// -- which is what lets a non-Unix target answer the question its own
-/// way (see `web.rs`).
+/// A file's owner from its metadata: bish's one place reading a uid off a
+/// file, through this layer so a non-Unix target answers its own way
+/// (`web.rs`).
 pub(crate) fn file_owner(metadata: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     metadata.uid()
@@ -544,31 +457,20 @@ pub(crate) fn effective_group() -> u32 {
     unsafe { getegid() }
 }
 
-/// Whether `fd` is a terminal.
-///
-/// `std::io::IsTerminal` rather than `isatty` directly: it is the same
-/// call underneath, and one fewer C declaration to keep right. The
-/// borrow is for the length of the question only -- nothing here takes
-/// ownership of the descriptor or closes it.
+/// Whether `fd` is a terminal, through `std::io::IsTerminal` (the same
+/// call as `isatty`, one fewer declaration), borrowing the fd only for the
+/// question.
 pub(crate) fn is_terminal(fd: std::os::unix::io::RawFd) -> bool {
     use std::io::IsTerminal;
-    // SAFETY: borrowed, not owned: the `BorrowedFd` is dropped at the end
-    // of this expression and `is_terminal` does not close what it is
-    // asked about.
+    // SAFETY: borrowed, not owned; `is_terminal` doesn't close it.
     unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.is_terminal()
 }
 
-/// Takes an exclusive advisory lock on `fd`, or says it could not.
-///
-/// Never waits: a caller that cannot have the lock now has something
-/// better to do than queue -- skip the compaction another bish is
-/// already doing, or refuse to be the second daemon of the same name.
-/// The lock lives with the open file and goes when the last descriptor
-/// for it closes, which is what lets a lock stand for "this process is
-/// still alive" across a crash.
-///
-/// `LOCK_EX`, `LOCK_NB` and `LOCK_UN` are 2, 4 and 8 on every Unix bish
-/// targets, so they are here rather than in the per-OS tables.
+/// Takes an exclusive advisory lock on `fd`, never waiting: a caller
+/// without the lock skips the compaction another bish is doing, or
+/// refuses to be a second daemon of the same name. The lock goes when the
+/// last descriptor closes, so it stands for "still alive" across a crash.
+/// `LOCK_EX`, `LOCK_NB`, `LOCK_UN` are 2, 4, 8 everywhere bish runs.
 pub(crate) fn lock_exclusive(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
@@ -584,14 +486,10 @@ pub(crate) fn unlock(fd: std::os::unix::io::RawFd) {
     unsafe { flock(fd, LOCK_UN) };
 }
 
-/// C's `struct tm`: POSIX's nine fields, plus the `tm_gmtoff`/`tm_zone`
-/// extension glibc and the BSDs both have, in the order they both have
-/// it.
-///
-/// One of the few kernel-adjacent layouts that is genuinely the same on
-/// Linux and macOS, so it is here rather than in the per-OS tables. It
-/// has to match the real thing size for size whatever bish reads of it:
-/// `localtime_r` writes a whole `struct tm` into the pointer it is given.
+/// C's `struct tm`: POSIX's nine fields plus the `tm_gmtoff`/`tm_zone`
+/// extension glibc and the BSDs both have, in the same order, so one
+/// layout serves. It must match in size, since `localtime_r` writes a
+/// whole one.
 #[repr(C)]
 pub(crate) struct CTm {
     pub(crate) tm_sec: i32,
@@ -632,33 +530,24 @@ pub(crate) fn epoch_seconds() -> i64 {
     now
 }
 
-/// `epoch_seconds` broken down into the local calendar, with the zone
-/// offset and abbreviation the C library has for it -- which is where
-/// bish's dates come from, there being no date crate.
+/// `epoch_seconds` in the local calendar, with the C library's offset and
+/// abbreviation: where bish's dates come from.
 pub(crate) fn local_time_at(epoch_seconds: i64) -> CTm {
     let mut broken_down = CTm::default();
     unsafe { localtime_r(&epoch_seconds as *const i64, &mut broken_down as *mut CTm) };
     broken_down
 }
 
-/// Re-reads `TZ`.
-///
-/// The C library caches the timezone, so a process that changes `TZ`
-/// after it has formatted one date is otherwise still in the old zone.
-/// A test pinning a date to UTC is the only reason bish ever changes
-/// `TZ`, so this is a test too -- a release build would otherwise report
-/// it as dead.
+/// Re-reads `TZ`, which the C library caches. Only tests pinning a date to
+/// UTC change `TZ`.
 #[cfg(test)]
 pub(crate) fn reload_timezone() {
     unsafe { tzset() };
 }
 
-/// One resource limit: what this process may have now, and the most it
-/// may raise itself to.
-///
-/// `rlim_t` is 64-bit on both OSes, so this one layout serves -- it is
-/// the resource numbers and `RLIM_INFINITY` that differ, and those are
-/// in the tables.
+/// One resource limit: the current value and the most it may be raised
+/// to. `rlim_t` is 64-bit on both OSes; resource numbers and
+/// `RLIM_INFINITY` differ (the tables).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ResourceLimit {
@@ -669,9 +558,8 @@ pub(crate) struct ResourceLimit {
 /// "No limit", as this OS spells it.
 pub(crate) const UNLIMITED: u64 = sys::RLIM_INFINITY;
 
-/// Which `ulimit` flags this OS has a limit for, and which number each
-/// one is. `None` means this OS has no such limit, and `ulimit` leaves
-/// it out of `-a` and refuses to set it -- which is what bash on that OS
+/// The `ulimit` flags this OS has limits for, and their numbers. `None`:
+/// `ulimit` leaves it out of `-a` and refuses to set it, as bash there
 /// does.
 pub(crate) fn resource_for_flag(flag: char) -> Option<i32> {
     sys::rlimit_number(flag)
@@ -692,8 +580,7 @@ pub(crate) fn set_resource_limit(resource: i32, limit: &ResourceLimit) -> std::i
     }
 }
 
-/// How much stack this process was given, or `None` when there is no
-/// limit on it to find.
+/// How much stack this process was given, or `None` with no limit.
 pub(crate) fn stack_limit() -> Option<u64> {
     let limit = resource_limit(sys::RLIMIT_STACK);
     (limit.soft != UNLIMITED && limit.soft != 0).then_some(limit.soft)
@@ -710,12 +597,9 @@ pub(crate) struct Tms {
     pub(crate) cstime: i64,
 }
 
-/// CPU used so far, in seconds: this shell's own, and everything it has
-/// waited for.
-///
-/// Seconds rather than ticks, because the divisor is the OS's business:
-/// `sysconf`'s name for the tick rate is 2 on Linux and 3 on macOS, and
-/// asking for the wrong one answers about something else entirely.
+/// CPU used so far in seconds, this shell's and its reaped children's.
+/// Seconds, since the divisor is the OS's: `sysconf`'s tick-rate name is
+/// 2 on Linux and 3 on macOS, and the wrong one asks something else.
 pub(crate) fn cpu_seconds() -> Option<(f64, f64, f64, f64)> {
     let mut spent = Tms::default();
     if unsafe { times(&mut spent as *mut Tms) } == -1 {
@@ -725,11 +609,8 @@ pub(crate) fn cpu_seconds() -> Option<(f64, f64, f64, f64)> {
     Some((spent.utime as f64 / ticks, spent.stime as f64 / ticks, spent.cutime as f64 / ticks, spent.cstime as f64 / ticks))
 }
 
-/// The current file-creation mask.
-///
-/// POSIX has no query-only read -- `umask(new)` returns the previous one
-/// and that is the only primitive -- so this sets it back immediately and
-/// leaves nothing observable behind.
+/// The current file-creation mask. POSIX has no read-only query
+/// (`umask(new)` returns the old one), so this sets it back at once.
 pub(crate) fn current_umask() -> u32 {
     let current = unsafe { umask(0) };
     unsafe { umask(current) };
@@ -741,10 +622,9 @@ pub(crate) fn set_umask(mask: u32) -> u32 {
     unsafe { umask(mask) }
 }
 
-/// One descriptor to wait on, and what the OS reported about it.
-///
-/// `struct pollfd` and the flag values are the same on Linux and macOS;
-/// the count `poll` takes is not the same width, which is in the tables.
+/// One descriptor to wait on and what the OS reported. `struct pollfd`
+/// and its flags are the same on both OSes; `poll`'s count width differs
+/// (the tables).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct PollFd {
@@ -778,13 +658,10 @@ impl PollFd {
     }
 }
 
-/// Waits until one of `fds` has something to say, or `timeout_ms` passes
-/// (negative waits indefinitely).
-///
-/// `Ok(0)` is "the timeout passed, or a signal interrupted the wait" --
-/// the two are the same answer to every caller here, since a signal worth
-/// acting on arrives through a descriptor in this set rather than through
-/// this call's return value.
+/// Waits until one of `fds` is ready or `timeout_ms` passes (negative
+/// waits forever). `Ok(0)` for a timeout or a signal: the same to every
+/// caller, since a signal worth acting on arrives through a descriptor in
+/// the set.
 pub(crate) fn wait_for_ready(fds: &mut [PollFd], timeout_ms: i32) -> std::io::Result<usize> {
     let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as sys::NFds, timeout_ms) };
     if ready >= 0 {
@@ -798,12 +675,9 @@ pub(crate) fn wait_for_ready(fds: &mut [PollFd], timeout_ms: i32) -> std::io::Re
 }
 
 /// A pipe for waking a wait: one end to register, one for a signal
-/// handler to write a byte to.
-///
-/// Both ends non-blocking -- the handler must never block, and the
-/// draining side wants to stop at "nothing left" rather than wait for
-/// more -- and both close-on-exec, since no child has any business
-/// holding either.
+/// handler to write a byte to. Non-blocking (a handler mustn't block, and
+/// the reader stops at empty) and close-on-exec (no child should hold
+/// either).
 pub(crate) fn wake_pipe() -> std::io::Result<(std::os::unix::io::RawFd, std::os::unix::io::RawFd)> {
     let mut ends = [0i32; 2];
     if unsafe { pipe(ends.as_mut_ptr()) } != 0 {
@@ -816,13 +690,9 @@ pub(crate) fn wake_pipe() -> std::io::Result<(std::os::unix::io::RawFd, std::os:
     Ok((ends[0], ends[1]))
 }
 
-/// Writes one byte to a wake pipe.
-///
-/// The only thing in this layer meant to be called from inside a real
-/// signal handler, so it does exactly one `write(2)` -- which POSIX lists
-/// as async-signal-safe -- and nothing else: no allocation, no error
-/// formatting, no locks. A full pipe means a wake-up is already queued,
-/// which is as good as having written another.
+/// Writes one byte to a wake pipe. Called from real signal handlers, so
+/// exactly one `write(2)`, async-signal-safe per POSIX: no allocation,
+/// error formatting or locks. A full pipe already holds a wake-up.
 pub(crate) fn wake(fd: std::os::unix::io::RawFd) {
     unsafe { write(fd, [0u8].as_ptr().cast(), 1) };
 }
@@ -832,25 +702,21 @@ pub(crate) fn close_fd(fd: std::os::unix::io::RawFd) {
     unsafe { close(fd) };
 }
 
-/// Points `to` at whatever `from` refers to, as a child does on its way
-/// to becoming a pipeline stage. The new descriptor is *not*
-/// close-on-exec, whatever `from` was -- which is what makes this the way
-/// to hand something to a child deliberately.
+/// Points `to` at what `from` refers to, as a child does on its way to
+/// being a pipeline stage. The new descriptor isn't close-on-exec, which
+/// is how something is handed to a child deliberately.
 pub(crate) fn duplicate_onto(from: std::os::unix::io::RawFd, to: std::os::unix::io::RawFd) -> bool {
     unsafe { dup2(from, to) >= 0 }
 }
 
-/// Installs `handler` for `signal_number`.
-///
-/// Only a handler that is itself async-signal-safe belongs here -- see
-/// `wake`, which is what bish's handlers do.
+/// Installs `handler` for `signal_number`; only an async-signal-safe one
+/// (see `wake`).
 pub(crate) fn on_signal(signal_number: i32, handler: extern "C" fn(i32)) {
     unsafe { signal(signal_number, handler as *const () as usize) };
 }
 
-/// A second descriptor for whatever `fd` refers to, at the lowest free
-/// number. `None` on a closed or invalid one, which every caller here
-/// treats as "nothing to save".
+/// A second descriptor for `fd` at the lowest free number. `None` for a
+/// closed or invalid one, which callers treat as nothing to save.
 pub(crate) fn duplicate(fd: std::os::unix::io::RawFd) -> Option<std::os::unix::io::RawFd> {
     match unsafe { dup(fd) } {
         copy if copy < 0 => None,
@@ -865,13 +731,9 @@ pub(crate) fn duplicate_as_file(fd: std::os::unix::io::RawFd) -> Option<std::fs:
     duplicate(fd).map(|copy| unsafe { std::fs::File::from_raw_fd(copy) })
 }
 
-/// A close-on-exec duplicate of `fd` numbered at or above `floor` --
-/// for putting a descriptor somewhere a redirect will not land on it.
-///
-/// Close-on-exec is the point as much as the floor is: the copy only ever
-/// exists to be the *source* of a later `dup2`, and nothing started in
-/// between has any business inheriting it. The command for that is 1030
-/// on Linux and 67 on macOS.
+/// A close-on-exec duplicate of `fd` numbered at or above `floor`, out of
+/// the way of redirects. Close-on-exec because the copy is only ever a
+/// later `dup2`'s source. The command is 1030 on Linux, 67 on macOS.
 pub(crate) fn duplicate_above(fd: std::os::unix::io::RawFd, floor: i32) -> Option<std::os::unix::io::RawFd> {
     match unsafe { fcntl(fd, sys::F_DUPFD_CLOEXEC, floor) } {
         copy if copy < 0 => None,
@@ -879,18 +741,15 @@ pub(crate) fn duplicate_above(fd: std::os::unix::io::RawFd, floor: i32) -> Optio
     }
 }
 
-/// Whether `fd` is open at all.
-///
-/// Asked rather than inferred: reading a descriptor nothing opened fails
-/// with EBADF, which from a caller's side is indistinguishable from "no
-/// input yet" -- and `read -u 9` has to tell those apart.
+/// Whether `fd` is open: reading an unopened descriptor fails with
+/// EBADF, which looks like no input, and `read -u 9` must tell them
+/// apart.
 pub(crate) fn is_open(fd: std::os::unix::io::RawFd) -> bool {
     unsafe { fcntl(fd, sys::F_GETFD, 0) != -1 }
 }
 
-/// Makes `fd` non-blocking, handing back what its flags were so a caller
-/// can put them back. `None` when the flags could not be read, in which
-/// case nothing was changed.
+/// Makes `fd` non-blocking, returning its old flags to restore; `None`
+/// when they couldn't be read, with nothing changed.
 pub(crate) fn make_nonblocking(fd: std::os::unix::io::RawFd) -> Option<i32> {
     let flags = unsafe { fcntl(fd, sys::F_GETFL, 0) };
     if flags < 0 {
@@ -900,17 +759,14 @@ pub(crate) fn make_nonblocking(fd: std::os::unix::io::RawFd) -> Option<i32> {
     Some(flags)
 }
 
-/// Puts back flags `make_nonblocking` handed over.
+/// Restores flags from `make_nonblocking`.
 pub(crate) fn restore_flags(fd: std::os::unix::io::RawFd, flags: i32) {
     unsafe { fcntl(fd, sys::F_SETFL, flags) };
 }
 
-/// Writes what it can, once.
-///
-/// Deliberately not a loop and deliberately not retrying anything:
-/// `Ok(0)`, `WouldBlock` and `Interrupted` each mean something different
-/// to a pipeline stage -- park, drain the pane, or simply go round again
-/// -- and only the caller knows which.
+/// Writes what it can, once, retrying nothing: `Ok(0)`, `WouldBlock` and
+/// `Interrupted` mean different things to a pipeline stage (park, drain
+/// the pane, go round again), and only the caller knows which.
 pub(crate) fn write_bytes(fd: std::os::unix::io::RawFd, bytes: &[u8]) -> std::io::Result<usize> {
     let written = unsafe { write(fd, bytes.as_ptr().cast(), bytes.len()) };
     match written {
@@ -919,31 +775,26 @@ pub(crate) fn write_bytes(fd: std::os::unix::io::RawFd, bytes: &[u8]) -> std::io
     }
 }
 
-/// Clears close-on-exec, so a child *does* inherit `fd`.
-///
-/// Needed even right after a `dup2`, which clears it on the new
-/// descriptor: `dup2(fd, fd)` is a no-op per POSIX and does *not* clear
-/// it, so a redirect whose source already sits on the target number
-/// would otherwise be closed by the exec it was opened for.
+/// Clears close-on-exec so a child inherits `fd`. Needed even after a
+/// `dup2`, which clears it only on a new descriptor: `dup2(fd, fd)` is a
+/// no-op, so a redirect source already on its target number would be
+/// closed by the exec.
 pub(crate) fn clear_cloexec(fd: std::os::unix::io::RawFd) {
     unsafe { fcntl(fd, sys::F_SETFD, 0) };
 }
 
-/// The process that started this one -- `$PPID`.
+/// The process that started this one: `$PPID`.
 pub(crate) fn parent_process_id() -> i32 {
     unsafe { getppid() }
 }
 
-/// Who started this process, as opposed to who it is acting as -- `$UID`
-/// against `$EUID`.
+/// Who started this process, not who it acts as: `$UID` against `$EUID`.
 pub(crate) fn real_user() -> u32 {
     unsafe { getuid() }
 }
 
-/// The device name of the terminal on `fd`, if it has one.
-///
-/// Best effort: a descriptor that is not a terminal, or a name that will
-/// not fit, gives `None` -- which is all a prompt can do with it anyway.
+/// The device name of the terminal on `fd`, if any; `None` for a
+/// non-terminal or a name too long.
 pub(crate) fn terminal_name(fd: std::os::unix::io::RawFd) -> Option<String> {
     let mut buf = [0u8; 256];
     if unsafe { ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
@@ -953,12 +804,8 @@ pub(crate) fn terminal_name(fd: std::os::unix::io::RawFd) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
-/// This machine's name.
-///
-/// `gethostname(2)` rather than a file: bish used to read
-/// `/proc/sys/kernel/hostname`, which macOS does not have at all -- so
-/// `\h` in a prompt there would have been empty but for `$HOSTNAME`
-/// happening to be set.
+/// This machine's name, from `gethostname(2)` (macOS has no
+/// `/proc/sys/kernel/hostname`).
 pub(crate) fn hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     if unsafe { gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
@@ -969,18 +816,14 @@ pub(crate) fn hostname() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-// `signal(2)`'s two special handlers, as plain numbers because that is
-// what the C declaration takes. The same on every Unix.
+// `signal(2)`'s two special handlers as numbers, as the C declaration
+// takes them; the same on every Unix.
 const HANDLER_DEFAULT: usize = 0;
 const HANDLER_IGNORE: usize = 1;
 
-/// Installs `handler` for `signal_number`, through `sigaction` rather
-/// than `signal`: it is the one with defined behaviour about what the
-/// handler inherits, and the one that can also report what the
-/// disposition was.
-///
-/// Only an async-signal-safe handler belongs here. bish's set a flag and
-/// return.
+/// Installs `handler` for `signal_number` through `sigaction`, which
+/// defines what the handler inherits and reports the old disposition.
+/// Only an async-signal-safe handler: bish's set a flag and return.
 pub(crate) fn handle_signal(signal_number: i32, handler: extern "C" fn(i32)) {
     set_disposition(signal_number, handler as *const () as usize);
 }
@@ -990,13 +833,10 @@ pub(crate) fn default_signal(signal_number: i32) {
     set_disposition(signal_number, HANDLER_DEFAULT);
 }
 
-/// Makes this process ignore `signal_number`.
-///
-/// Inherited by every forked child *and* carried through an `exec`:
-/// POSIX resets a real handler to the default across one and explicitly
-/// leaves "ignore" in place. So every site that spawns a real child has
-/// to put it back with `default_signal`, or that child silently ignores
-/// it too -- which is how a job comes to not answer Ctrl-C.
+/// Makes this process ignore `signal_number`, inherited by forked
+/// children and kept across `exec` (POSIX resets real handlers but keeps
+/// "ignore"), so every real spawn restores it with `default_signal`, or a
+/// job won't answer Ctrl-C.
 pub(crate) fn ignore_signal(signal_number: i32) {
     set_disposition(signal_number, HANDLER_IGNORE);
 }
@@ -1006,12 +846,9 @@ fn set_disposition(signal_number: i32, handler: usize) {
     unsafe { sigaction(signal_number, &action, std::ptr::null_mut()) };
 }
 
-/// Whether `signal_number` is being ignored right now.
-///
-/// POSIX: a signal ignored on entry to a shell cannot be trapped or
-/// reset, because the immunity was granted from outside -- `nohup`'s
-/// promise, and a backgrounded script's protection from a Ctrl-C aimed at
-/// the terminal. This is how bish finds out which those were.
+/// Whether `signal_number` is ignored now. POSIX: a signal ignored on
+/// entry to a shell can't be trapped or reset, being immunity granted
+/// from outside (`nohup`, a backgrounded script's shield from Ctrl-C).
 pub(crate) fn is_signal_ignored(signal_number: i32) -> bool {
     let mut previous = sys::SigAction::default();
     let asked = unsafe { sigaction(signal_number, std::ptr::null(), &mut previous) } == 0;
@@ -1023,14 +860,14 @@ pub(crate) fn send_signal(pid: i32, signal_number: i32) -> bool {
     unsafe { kill(pid, signal_number) == 0 }
 }
 
-/// Sends `signal_number` to a whole process group, which is what the
-/// terminal driver itself does for a Ctrl-C.
+/// Sends `signal_number` to a whole process group, as the terminal driver
+/// does for Ctrl-C.
 pub(crate) fn send_signal_to_group(pgid: i32, signal_number: i32) -> bool {
     unsafe { kill(-pgid, signal_number) == 0 }
 }
 
-/// Puts `pid` into process group `pgid` -- half of job control; handing
-/// the terminal to that group (`set_foreground_pgrp`) is the other.
+/// Puts `pid` in process group `pgid`, half of job control;
+/// `set_foreground_pgrp` is the other.
 pub(crate) fn set_process_group(pid: i32, pgid: i32) -> bool {
     unsafe { setpgid(pid, pgid) == 0 }
 }
@@ -1044,27 +881,21 @@ pub(crate) fn process_group() -> i32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Waited {
     Exited(i32),
-    /// Killed by a signal -- the number, not bash's 128 + n, which is the
-    /// shell's own convention and not the OS's.
+    /// Killed by a signal: the number, not bash's 128 + n.
     Killed(i32),
-    /// Stopped and still there, which `std::process::Child` cannot
-    /// observe at all: it has no way to ask for it, so a Ctrl-Z'd child
-    /// looks like one that is still running, for ever.
+    /// Stopped and still there, which `std::process::Child` can't observe:
+    /// a Ctrl-Z'd child would look like it's running forever.
     Stopped(i32),
-    /// Nothing has changed yet (only ever answered when not waiting).
+    /// Nothing changed yet (only when not waiting).
     Running,
-    /// There is nothing to wait for: already reaped, never ours, gone.
+    /// Nothing to wait for: reaped, never ours, gone.
     Gone,
 }
 
-/// Waits for one child, reporting a stop as well as an exit.
-///
-/// `block` of false asks without waiting. An interrupted wait is retried,
-/// since a signal arriving is not news about the child.
-///
-/// The status encoding -- the low seven bits for a signal, 0x7f for
-/// "stopped", the next eight for the code -- is the same on every Unix
-/// bish targets, so the decoding is here rather than in the tables.
+/// Waits for one child, reporting a stop as well as an exit; `block`
+/// false asks without waiting, and an interrupted wait is retried. The
+/// status encoding (low seven bits a signal, 0x7f stopped, the next eight
+/// the code) is the same on every Unix bish targets.
 pub(crate) fn wait_for_child(pid: i32, block: bool) -> Waited {
     const WNOHANG: i32 = 1;
     const WUNTRACED: i32 = 2;
@@ -1092,14 +923,10 @@ pub(crate) fn wait_for_child(pid: i32, block: bool) -> Waited {
     }
 }
 
-/// Creates `path` with exactly `mode`, whatever the umask says.
-///
-/// `std::fs::create_dir` cannot: it creates with 0o777 and lets the umask
-/// subtract, so a directory that must be 0700 -- one holding a socket only
-/// this user may connect to -- would depend on whatever umask happened to
-/// be in effect. `AlreadyExists` is left for the caller to judge, because
-/// "it is already there" is not the same as "the directory I meant is
-/// already there".
+/// Creates `path` with exactly `mode`, whatever the umask: `create_dir`
+/// uses 0o777 minus the umask, and a 0700 directory holding a private
+/// socket mustn't depend on that. `AlreadyExists` is the caller's to
+/// judge: something being there isn't the directory meant being there.
 pub(crate) fn create_dir_with_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -1109,21 +936,17 @@ pub(crate) fn create_dir_with_mode(path: &std::path::Path, mode: u32) -> std::io
     }
 }
 
-/// `path` and every missing parent, created `mode` -- the recursive
-/// counterpart to `create_dir_with_mode`, for a private config directory
-/// whose parents may not exist yet.
+/// `path` and its missing parents, created `mode`, for a private config
+/// directory.
 pub(crate) fn create_dir_all_with_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().recursive(true).mode(mode).create(path)
 }
 
-/// A file only its owner can read or write (`0600`), created fresh for
-/// writing. `append` keeps what is there; otherwise it is truncated.
-///
-/// The one place bish writes a private file -- history, the trust store
-/// -- so the mode is set here rather than reached for with
-/// `OpenOptionsExt` at each call, which is what lets a target without
-/// permission bits (`web.rs`) simply open the file.
+/// A fresh file only its owner can read or write (0600); `append` keeps
+/// the contents, otherwise truncated. bish's one way of writing a private
+/// file (history, the trust store), so a target without permission bits
+/// (`web.rs`) just opens it.
 pub(crate) fn create_private_file(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
@@ -1136,41 +959,35 @@ pub(crate) fn create_private_file(path: &std::path::Path, append: bool) -> std::
     options.open(path)
 }
 
-/// This process's own id. Behind the platform layer because a target
-/// with no processes (`web.rs`) has no real one and `std::process::id`
-/// aborts there -- it answers a fixed value instead.
+/// This process's id, here because `std::process::id` aborts on a target
+/// with no processes (`web.rs`), which answers a fixed value.
 pub(crate) fn process_id() -> u32 {
     std::process::id()
 }
 
-/// The signal that killed a process, if one did. Behind the platform
-/// layer because `ExitStatusExt` is Unix-only; where processes cannot be
-/// signalled (`web.rs`) the answer is always `None`.
+/// The signal that killed a process, if one did. `ExitStatusExt` is
+/// Unix-only; `web.rs` always answers `None`.
 pub(crate) fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal()
 }
 
-/// Forces `path` to exactly `mode`. Behind the platform layer because
-/// the bits are Unix's; a target without them (`web.rs`) does nothing.
+/// Forces `path` to exactly `mode`; `web.rs`, with no bits, does nothing.
 pub(crate) fn set_file_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-/// Whether a file's mode has any execute bit set. Behind the platform
-/// layer because the permission bits are Unix's; a target without them
-/// (`web.rs`) has no notion of an executable file and answers `false`.
+/// Whether a mode has an execute bit; `web.rs`, with no notion of an
+/// executable, answers `false`.
 pub(crate) fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     metadata.permissions().mode() & 0o111 != 0
 }
 
-/// The four special file kinds `test`/`[` can ask about (`-p -S -b
-/// -c`). Behind the platform layer because the trait that answers them,
-/// `FileTypeExt`, is Unix-only -- a target without these kinds (`web.rs`)
-/// answers `false`, which is what `test` should say where they cannot
-/// exist.
+/// The special file kinds `test` asks about (`-p -S -b -c`), here since
+/// `FileTypeExt` is Unix-only; `web.rs` answers `false`, right where they
+/// can't exist.
 pub(crate) fn is_fifo(file_type: &std::fs::FileType) -> bool {
     use std::os::unix::fs::FileTypeExt;
     file_type.is_fifo()
@@ -1191,10 +1008,9 @@ pub(crate) fn is_char_device(file_type: &std::fs::FileType) -> bool {
     file_type.is_char_device()
 }
 
-/// Takes group and other off an existing file, if they are set. Failure
-/// is ignored: a file on a filesystem that cannot represent the mode is
-/// still the file, and a target without modes at all (`web.rs`) does
-/// nothing here.
+/// Takes group and other off an existing file, if set. Failure is
+/// ignored: a filesystem that can't represent the mode still has the
+/// file, and `web.rs`, without modes, does nothing.
 pub(crate) fn restrict_to_owner(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(meta) = std::fs::metadata(path) else { return };
@@ -1208,8 +1024,8 @@ pub(crate) fn restrict_to_owner(path: &std::path::Path) {
 mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    // Covers what `darwin.rs`'s `anonymous_file` is, on a machine that
-    // is not a Mac: a readable, writable file that no longer has a name.
+    // What `darwin.rs`'s `anonymous_file` is, on a machine that isn't a
+    // Mac: a readable, writable file with no name.
     #[test]
     fn an_unlinked_temp_file_reads_back_what_was_written_and_has_no_path_left() {
         let before: Vec<std::path::PathBuf> = std::fs::read_dir(std::env::temp_dir())
@@ -1227,8 +1043,8 @@ mod tests {
         file.read_to_string(&mut read_back).expect("read");
         assert_eq!(read_back, "captured output");
 
-        // Nothing of it is in the directory it was made in, before the
-        // descriptor is even dropped.
+        // Nothing of it is in the directory, even before the descriptor
+        // drops.
         let left: Vec<std::path::PathBuf> = std::fs::read_dir(std::env::temp_dir())
             .expect("the temp directory is readable")
             .flatten()
@@ -1238,10 +1054,8 @@ mod tests {
         assert!(left.is_empty(), "the name should be gone while the fd is still open: {left:?}");
     }
 
-    // `DirSnapshot` is the whole of what macOS has to work out for
-    // itself, since kqueue says a directory changed without saying which
-    // name in it did. Everything it has to get right is checked here, on
-    // a machine that is not a Mac.
+    // `DirSnapshot` is what macOS must work out itself (kqueue doesn't say
+    // which name changed), checked here on a machine that isn't a Mac.
     #[test]
     fn a_directory_snapshot_notices_what_changed_and_nothing_else() {
         use super::{DirSnapshot, EntryChange};
@@ -1255,9 +1069,8 @@ mod tests {
 
         std::fs::write(dir.join("appeared.txt"), "new").unwrap();
         std::fs::write(dir.join("edited.txt"), "after it grew").unwrap();
-        // A rename over the top: the case an inode watch cannot see. The
-        // content is the same length as what it replaces, so the inode is
-        // the only thing that says anything happened.
+        // A rename over it with content of the same length: only the inode
+        // says anything happened.
         std::fs::write(dir.join("tmp"), "ABCDEF").unwrap();
         std::fs::rename(dir.join("tmp"), dir.join("replaced.txt")).unwrap();
         std::fs::remove_file(dir.join("removed.txt")).unwrap();
