@@ -179,7 +179,7 @@ fn char_offsets(text: &str, spans: &mut [HighlightSpan]) {
         return;
     }
     let mut wanted: Vec<usize> = spans.iter().flat_map(|s| [s.start, s.end]).collect();
-    wanted.sort_unstable();
+    crate::sort::sort(&mut wanted);
     wanted.dedup();
     let mut answer = vec![0usize; wanted.len()];
     let mut next = 0;

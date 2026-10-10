@@ -292,7 +292,7 @@ impl Snippet {
                 _ => None,
             })
             .collect();
-        numbers.sort_unstable();
+        crate::sort::sort(&mut numbers);
         numbers.dedup();
         if numbers.is_empty() {
             return None;

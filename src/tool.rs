@@ -371,7 +371,7 @@ fn apply_fixes<'a>(text: &str, diagnostics: &'a [Diagnostic]) -> (String, usize,
     // instead of silently vanishing from every report just because it
     // *had* a fix that didn't end up applying.
     let mut candidates: Vec<(usize, &Fix)> = diagnostics.iter().enumerate().filter_map(|(i, d)| d.fix.as_ref().map(|f| (i, f))).collect();
-    candidates.sort_by_key(|(_, f)| std::cmp::Reverse(f.start));
+    crate::sort::sort_by_key(&mut candidates, |(_, f)| std::cmp::Reverse(f.start));
 
     let mut chars: Vec<char> = text.chars().collect();
     let mut applied_indices = std::collections::HashSet::new();

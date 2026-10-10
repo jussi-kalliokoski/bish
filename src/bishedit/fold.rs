@@ -41,7 +41,7 @@ impl Folds {
     }
 
     fn sort(&mut self) {
-        self.list.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        crate::sort::sort_by(&mut self.list, |a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
         self.list.dedup_by(|later, earlier| later.start == earlier.start && later.end == earlier.end);
     }
 

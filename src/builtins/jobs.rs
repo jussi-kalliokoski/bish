@@ -168,7 +168,7 @@ pub(crate) fn run_disown(sh: &mut Shell, args: &[String]) -> i32 {
             }
         }
     }
-    idxs.sort_unstable();
+    crate::sort::sort(&mut idxs);
     idxs.dedup();
     let mut table = sh.jobs.borrow_mut();
     for idx in idxs.into_iter().rev() {

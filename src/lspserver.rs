@@ -636,7 +636,7 @@ fn number_at(value: &Value, path: &str) -> Option<usize> {
 /// descending order of start so no edit moves another's offsets.
 fn apply_fixes(text: &str, diagnostics: &[Diagnostic]) -> (String, usize, usize) {
     let mut candidates: Vec<&Fix> = diagnostics.iter().filter_map(|d| d.fix.as_ref()).collect();
-    candidates.sort_by_key(|f| std::cmp::Reverse(f.start));
+    crate::sort::sort_by_key(&mut candidates, |f| std::cmp::Reverse(f.start));
     let mut chars: Vec<char> = text.chars().collect();
     let mut applied = 0;
     let mut last_start = chars.len() + 1;

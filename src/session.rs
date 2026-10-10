@@ -1420,7 +1420,7 @@ pub fn run_ls() -> io::Result<i32> {
     };
     let mut names: Vec<String> =
         entries.flatten().filter_map(|entry| entry.file_name().to_str().and_then(|s| s.strip_suffix(".sock")).map(str::to_string)).collect();
-    names.sort();
+    crate::sort::sort(&mut names);
     let live: Vec<String> = names.into_iter().filter(|name| is_daemon_alive(name)).collect();
     if live.is_empty() {
         println!("no sessions");

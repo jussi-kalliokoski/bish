@@ -191,7 +191,7 @@ impl Opener {
                 scored.push((item.target.group(), m.score, i, m.positions));
             }
         }
-        scored.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        crate::sort::sort_by(&mut scored, |a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
         for (_, _, i, positions) in scored {
             self.view.push(i);
             self.matches.push(positions);

@@ -176,7 +176,7 @@ pub fn key_index() -> Vec<(String, String)> {
         }
         frontier = next;
     }
-    out.sort();
+    crate::sort::sort(&mut out);
     out.dedup();
     out
 }
@@ -245,7 +245,7 @@ fn walk(prefix: &[Key], root: &[(Key, String)]) -> (Vec<(String, String)>, Vec<V
     }
     rows.extend(collapse_char_arguments(prefix, resolved, ""));
     rows.extend(collapse_char_arguments(prefix, patterned, "{motion}"));
-    rows.sort();
+    crate::sort::sort(&mut rows);
     rows.dedup();
     (rows, expand)
 }

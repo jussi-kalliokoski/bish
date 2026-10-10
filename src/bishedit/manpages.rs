@@ -286,7 +286,7 @@ pub(crate) fn extract(doc: &crate::roff::Document, command: &str) -> ManPageData
             }
         }
     }
-    flags.sort();
+    crate::sort::sort(&mut flags);
     flags.dedup();
 
     let subcommands = collect_subcommands(doc, &tags, command);
@@ -380,7 +380,7 @@ fn collect_subcommands(doc: &crate::roff::Document, tags: &[(String, String)], c
             }
         }
     }
-    subs.sort();
+    crate::sort::sort(&mut subs);
     subs.dedup();
     subs.retain(|s| s != command);
     subs

@@ -1021,9 +1021,9 @@ impl TextBuffer {
                 None => vec![r.from],
             })
             .collect();
-        froms.sort();
+        crate::sort::sort(&mut froms);
         let mut ranges = self.selections.clone();
-        ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
+        crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from));
         for range in &ranges {
             self.delete_range(range);
         }
@@ -1057,7 +1057,7 @@ impl TextBuffer {
 
         let leftmost = self.selections.iter().map(|r| r.from).min().unwrap();
         let mut ranges = self.selections.clone();
-        ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
+        crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from));
         let mut cursor_at = self.cursor;
         for range in &ranges {
             self.delete_range(range);

@@ -949,7 +949,7 @@ pub(crate) fn surround_selections(buf: &mut TextBuffer, ch: char) {
         return;
     };
     let mut ranges = buf.selections.clone();
-    ranges.sort_by_key(|r| std::cmp::Reverse(r.from));
+    crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from));
     let mut leftmost_open_at = (0, 0);
     for range in &ranges {
         let (open_at, close_at) = motion::surround_insert_points(buf, range);
@@ -2296,7 +2296,7 @@ fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], tex
     let is_newline = text == "\n";
     let width = text.chars().count();
     let mut order: Vec<usize> = (0..cursors.len()).collect();
-    order.sort_by_key(|&i| cursors[i]);
+    crate::sort::sort_by_key(&mut order, |&i| cursors[i]);
     for step in 0..order.len() {
         let i = order[step];
         let (row, col) = cursors[i];
@@ -2330,7 +2330,7 @@ fn apply_insert_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)], tex
 // alone, matching the prompt's own `delete_forward` doing nothing there.
 fn apply_delete_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
     let mut order: Vec<usize> = (0..cursors.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(cursors[i]));
+    crate::sort::sort_by_key(&mut order, |&i| std::cmp::Reverse(cursors[i]));
     for step in 0..order.len() {
         let i = order[step];
         let (row, col) = cursors[i];
@@ -2370,7 +2370,7 @@ fn apply_delete_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
 // Backspace's own ordinary Insert-mode arm doing nothing there either.
 fn apply_backspace_to_all(buf: &mut TextBuffer, cursors: &mut [(usize, usize)]) {
     let mut order: Vec<usize> = (0..cursors.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(cursors[i]));
+    crate::sort::sort_by_key(&mut order, |&i| std::cmp::Reverse(cursors[i]));
     for step in 0..order.len() {
         let i = order[step];
         let (row, col) = cursors[i];
@@ -2852,7 +2852,7 @@ fn splice_inlay_hints(row: crate::bishedit::tabular::Row, buf: &TextBuffer, line
     // spliced immediately before the cell `c` starts at, which for a
     // hint past the end of the line means at the end.
     let mut pending: Vec<(usize, &str)> = hints.map(|(_, col, text)| (*col, text.as_str())).collect();
-    pending.sort_by_key(|(col, _)| *col);
+    crate::sort::sort_by_key(&mut pending, |(col, _)| *col);
     let mut next = 0usize;
     let emit = |cells: &mut Vec<char>, source_at: &mut Vec<Option<usize>>, upto: usize, next: &mut usize| {
         while *next < pending.len() && pending[*next].0 <= upto {
@@ -3193,7 +3193,7 @@ pub(crate) fn diagnostics_on_line(buf: &TextBuffer, line: usize) -> Vec<&lint::D
     let line_start = starts[line];
     let line_end = line_start + buf.line_len(line);
     let mut found: Vec<&lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.start < line_end && d.end > line_start).collect();
-    found.sort_by_key(|d| std::cmp::Reverse(d.severity));
+    crate::sort::sort_by_key(&mut found, |d| std::cmp::Reverse(d.severity));
     found
 }
 
@@ -3691,7 +3691,7 @@ pub(crate) fn apply_text_edits(buf: &mut TextBuffer, edits: &[lsp::TextEdit], en
             Resolved { from, to: to.max(from), text: edit.text.as_str() }
         })
         .collect();
-    resolved.sort_by_key(|edit| std::cmp::Reverse(edit.from));
+    crate::sort::sort_by_key(&mut resolved, |edit| std::cmp::Reverse(edit.from));
     let mut applied = 0;
     for Resolved { from, to, text } in resolved {
         let unchanged = from == to && text.is_empty();
@@ -3785,7 +3785,7 @@ pub(crate) fn apply_fix(buf: &mut TextBuffer, diagnostic: &lint::Diagnostic) -> 
 // be a much worse failure mode than silently skipping one.
 fn apply_all_fixes(buf: &mut TextBuffer, diagnostics: &[lint::Diagnostic]) -> usize {
     let mut candidates: Vec<&lint::Diagnostic> = diagnostics.iter().filter(|d| d.fix.is_some()).collect();
-    candidates.sort_by_key(|d| std::cmp::Reverse(d.fix.as_ref().unwrap().start));
+    crate::sort::sort_by_key(&mut candidates, |d| std::cmp::Reverse(d.fix.as_ref().unwrap().start));
     let mut applied = 0;
     let mut last_applied_start = usize::MAX;
     for d in candidates {

@@ -3295,7 +3295,7 @@ fn delete_selections(lb: &mut LineBuffer, registers: &mut Registers, register: O
     // never moves no matter what's removed to its right.
     let leftmost = lb.selections.iter().map(|r| r.from.1).min().unwrap_or(0);
     let mut ranges = lb.selections.clone();
-    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from.1));
     for range in &ranges {
         // Re-clamped to the buffer's *current* length on every iteration
         // (not computed once up front) -- panic-safe even against
@@ -3326,7 +3326,7 @@ fn surround_selections(lb: &mut LineBuffer, ch: char) {
         return;
     };
     let mut ranges = lb.selections.clone();
-    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from.1));
     let mut leftmost_open_at = 0;
     for range in &ranges {
         let (open_at, close_at) = motion::surround_insert_points(lb, range);
@@ -3369,7 +3369,7 @@ fn put_over_selections(lb: &mut LineBuffer, registers: &mut Registers, register:
     }
 
     let mut ranges = lb.selections.clone();
-    ranges.sort_by_key(|r| std::cmp::Reverse(r.from.1));
+    crate::sort::sort_by_key(&mut ranges, |r| std::cmp::Reverse(r.from.1));
     let mut leftmost_insert_at = 0;
     for range in &ranges {
         let len = lb.ed.buf.len();

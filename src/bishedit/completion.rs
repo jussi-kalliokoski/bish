@@ -240,7 +240,7 @@ fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
     // differently -- which for any non-empty prefix is almost always,
     // since the score largely tracks name length. `.env` came second
     // for `./` on no better grounds than being short.
-    scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)).then_with(|| a.2.display.cmp(&b.2.display)));
+    crate::sort::sort_by(&mut scored, |a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)).then_with(|| a.2.display.cmp(&b.2.display)));
     scored.into_iter().map(|(_, _, c)| c).collect()
 }
 
@@ -761,7 +761,7 @@ impl<'a> ShellCompletionProvider<'a> {
         // the spec produced them -- see as_unranked_candidates for why
         // filtering them here would be wrong.
         if !spec.opts.iter().any(|o| o == "nosort") {
-            names.sort();
+            crate::sort::sort(&mut names);
         }
         Some(as_unranked_candidates(prefix, names))
     }

@@ -3599,7 +3599,7 @@ impl Shell {
     pub(crate) fn print_functions(&mut self, names: &[String], names_only: bool) -> i32 {
         let targets: Vec<String> = if names.is_empty() {
             let mut all: Vec<String> = self.functions.keys().cloned().collect();
-            all.sort();
+            crate::sort::sort(&mut all);
             all
         } else {
             names.to_vec()
@@ -4086,7 +4086,7 @@ impl Shell {
         // Anything set directly wins over the theme, same as a bishopt.
         out.extend(self.hl.iter().map(|(k, v)| (k.clone(), v.clone())));
         let mut list: Vec<(String, String)> = out.into_iter().collect();
-        list.sort();
+        crate::sort::sort(&mut list);
         list
     }
 
@@ -4492,7 +4492,7 @@ impl Shell {
 
     pub(crate) fn print_all_completions(&mut self) {
         let mut names: Vec<&String> = self.completions.keys().collect();
-        names.sort();
+        crate::sort::sort(&mut names);
         for name in names {
             sh_println!(self, "{}", compgen::format_spec(&self.completions[name], name));
         }
@@ -8450,7 +8450,7 @@ impl Shell {
                 // as not found.
                 if argv.len() == 1 || argv[1..].iter().all(|a| a == "-p") {
                     let mut sorted: Vec<&(String, String)> = self.aliases.iter().collect();
-                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    crate::sort::sort_by(&mut sorted, |a, b| a.0.cmp(&b.0));
                     for (n, v) in sorted {
                         sh_println!(self, "alias {}={}", n, crate::serialize::quote_literal(v));
                     }
@@ -12324,7 +12324,7 @@ impl Shell {
                         letters.push(c);
                     }
                 }
-                letters.sort_by_key(|c| (c.is_ascii_uppercase(), *c));
+                crate::sort::sort_by_key(&mut letters, |c| (c.is_ascii_uppercase(), *c));
                 let mut s: String = letters.into_iter().collect();
                 if let Some(c) = self.invocation_flag {
                     s.push(c);
@@ -12391,12 +12391,12 @@ impl Shell {
                     // running `set -o` and parsing it.
                     "SHELLOPTS" => {
                         let mut on: Vec<&str> = SET_O_OPTIONS.iter().copied().filter(|n| self.shell_option_enabled(n) == Some(true)).collect();
-                        on.sort_unstable();
+                        crate::sort::sort(&mut on);
                         on.join(":")
                     }
                     "BASHOPTS" => {
                         let mut on: Vec<String> = KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| n.to_string()).filter(|n| self.shopt_is_on(n)).collect();
-                        on.sort();
+                        crate::sort::sort(&mut on);
                         on.join(":")
                     }
                     _ => String::new(),

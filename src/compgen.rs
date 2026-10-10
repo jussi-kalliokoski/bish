@@ -551,7 +551,7 @@ pub fn resolve_spec(spec: &CompgenSpec, word: &str, ctx: &ActionContext, cwd: &P
 pub fn format_spec(spec: &CompgenSpec, trailing: &str) -> String {
     let mut parts = vec!["complete".to_string()];
     let mut sorted_opts = spec.opts.clone();
-    sorted_opts.sort();
+    crate::sort::sort(&mut sorted_opts);
     for o in &sorted_opts {
         parts.push("-o".to_string());
         parts.push(o.clone());

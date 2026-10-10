@@ -55,6 +55,7 @@ mod roff;
 mod scheduler;
 mod serialize;
 mod session;
+mod sort;
 mod stackguard;
 mod suggest;
 mod tempdir;

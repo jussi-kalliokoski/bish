@@ -529,7 +529,7 @@ pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option
             }
         }
         candidates = next;
-        candidates.sort();
+        crate::sort::sort(&mut candidates);
         candidates.dedup();
     }
 
@@ -542,7 +542,7 @@ pub fn expand(pattern: &str, options: Options, root: &std::path::Path) -> Option
             false => p,
         })
         .collect();
-    found.sort();
+    crate::sort::sort(&mut found);
     found.dedup();
     Some(found)
 }
@@ -600,7 +600,7 @@ fn descend(base: &str, dirs_only: bool, root: &std::path::Path) -> Vec<String> {
     while let Some(prefix) = queue.pop() {
         let Ok(entries) = std::fs::read_dir(base.join(&prefix)) else { continue };
         let mut names: Vec<String> = entries.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect();
-        names.sort();
+        crate::sort::sort(&mut names);
         for name in names {
             if name.starts_with('.') {
                 continue;

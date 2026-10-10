@@ -192,7 +192,7 @@ impl Document {
                 // Attributes are printed sorted, as html5lib-tests does,
                 // so a tree comparison doesn't depend on source order.
                 let mut sorted: Vec<&Attr> = attrs.iter().collect();
-                sorted.sort_by(|a, b| a.name.cmp(&b.name));
+                crate::sort::sort_by(&mut sorted, |a, b| a.name.cmp(&b.name));
                 for attr in sorted {
                     out.push_str(&format!("|{indent}  {}=\"{}\"\n", attr.name, attr.value));
                 }

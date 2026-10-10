@@ -266,7 +266,7 @@ impl Stack {
     /// exactly how a nested `!` line overrides an exclusion from above.
     pub fn matched(&self, path: &Path, is_dir: bool) -> Match {
         let mut applicable: Vec<&(PathBuf, Ignore)> = self.files.iter().filter(|(base, _)| path.starts_with(base)).collect();
-        applicable.sort_by_key(|(base, _)| std::cmp::Reverse(base.components().count()));
+        crate::sort::sort_by_key(&mut applicable, |(base, _)| std::cmp::Reverse(base.components().count()));
         for (base, ignore) in applicable {
             let Ok(relative) = path.strip_prefix(base) else { continue };
             let relative = relative.to_string_lossy();

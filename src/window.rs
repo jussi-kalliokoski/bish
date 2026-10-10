@@ -880,7 +880,7 @@ fn collapsed_runs(n: usize, focused: usize) -> Vec<std::ops::Range<usize>> {
     if focused + 1 < n {
         anchors.push(focused + 1);
     }
-    anchors.sort_unstable();
+    crate::sort::sort(&mut anchors);
     anchors.dedup();
     anchors.windows(2).map(|pair| pair[0] + 1..pair[1]).filter(|run| run.len() >= 2).collect()
 }

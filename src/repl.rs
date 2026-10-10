@@ -10091,7 +10091,7 @@ fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id:
                 (hint.line, crate::lsp::from_server_column(&chars, hint.character, encoding), hint.label)
             })
             .collect();
-        hints.sort_by_key(|(line, col, _)| (*line, *col));
+        crate::sort::sort_by_key(&mut hints, |(line, col, _)| (*line, *col));
         if hints == buf.inlay_hints {
             return false;
         }
@@ -10714,7 +10714,7 @@ fn completions_from_server(
     // `sortText` is how a server puts the likely answers first, and
     // ignoring it is how a completion list ends up alphabetical and
     // useless.
-    found.sort_by(|a, b| a.sort.cmp(&b.sort));
+    crate::sort::sort_by(&mut found, |a, b| a.sort.cmp(&b.sort));
     let starts = fileeditor::line_starts_of(buf);
     found
         .into_iter()
@@ -11373,7 +11373,7 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
     merged.extend(relayed);
     // Document order, so the diagnostics pane reads top to bottom
     // however the two sources interleave.
-    merged.sort_by_key(|d| (d.start, d.end));
+    crate::sort::sort_by_key(&mut merged, |d| (d.start, d.end));
     if merged == buf.diagnostics {
         return false;
     }

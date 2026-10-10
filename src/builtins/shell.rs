@@ -334,7 +334,7 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
     }
     if names.is_empty() {
         let mut listed: Vec<&str> = KNOWN_BUILTINS.iter().copied().filter(|b| list_all || !sh.disabled_builtins.contains(*b)).collect();
-        listed.sort_unstable();
+        crate::sort::sort(&mut listed);
         for b in listed {
             let state = if sh.disabled_builtins.contains(b) { "enable -n" } else { "enable" };
             sh_println!(sh, "{state} {b}");

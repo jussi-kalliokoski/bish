@@ -193,7 +193,7 @@ impl Session {
     /// them when the moment comes, and again whenever this changes.
     pub fn set_breakpoints(&mut self, path: &Path, lines: &[usize]) {
         let mut lines = lines.to_vec();
-        lines.sort_unstable();
+        crate::sort::sort(&mut lines);
         lines.dedup();
         self.wanted.insert(path.to_path_buf(), lines);
         if matches!(self.state, State::Configured) {

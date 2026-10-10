@@ -1179,7 +1179,7 @@ pub(crate) fn run_bish_theme_list(sh: &mut Shell) -> i32 {
     // name can never match one of these, so no special case is needed.
     let active = sh.bishopt_str("theme");
     let mut declared: Vec<&String> = sh.themes.keys().collect();
-    declared.sort();
+    crate::sort::sort(&mut declared);
     let mut rows: Vec<(String, String)> = Vec::new();
     for theme in crate::theme::BUILTIN_THEMES {
         let about = match declared.iter().any(|n| n.as_str() == theme.name) {
