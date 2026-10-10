@@ -10,9 +10,8 @@ pub struct Word {
 #[derive(Debug, Clone)]
 pub enum Redirect {
     In(Word),
-    // `<>`: opens the target for both reading and writing, on fd 0 --
-    // see lexer.rs's own Tok::RedirInOut doc comment for what this is
-    // actually for (almost entirely /dev/tcp/HOST/PORT).
+    // `<>`: open the target for reading and writing on fd 0, mostly for
+    // `/dev/tcp/HOST/PORT` (see lexer.rs's `Tok::RedirInOut`).
     InOut(Word),
     Out { word: Word, append: bool, clobber: bool },
     Err { word: Word, append: bool, clobber: bool },
@@ -20,34 +19,26 @@ pub enum Redirect {
     DupErrToOut,
     HereString(Word),
     HereDoc(Word, crate::lexer::HereDocSpelling),
-    // `N<<<word` and `N<<DELIM`: the same two, on a descriptor of their
-    // own -- `{ read l <&3; } 3<<<text`. With fd 0 they are the plain
-    // forms above; these are only ever made for any other number.
+    // `N<<<word` and `N<<DELIM`: those two on another descriptor
+    // (`{ read l <&3; } 3<<<text`); with fd 0 they're the plain forms.
     FdHereString { fd: u32, word: Word },
     FdHereDoc { fd: u32, body: Word, spelling: crate::lexer::HereDocSpelling },
-    // Arbitrary-fd forms: `N>file`/`N>>file`/`N<file` and `N>&M`/`N<&M`.
-    // Only per-command (not the persistent shell-level `exec N>file` form,
-    // which would need fds kept open for the rest of the shell's life --
-    // a documented, separate gap).
+    // Any-fd forms: `N>file`, `N>>file`, `N<file`, `N>&M`, `N<&M`.
     FdOut { fd: u32, word: Word, append: bool, clobber: bool },
-    // `{name}>file`: the shell picks a free descriptor, opens `word` on
-    // it, and assigns the number to `name` -- bash's way of writing a
-    // redirect that cannot collide with a hardcoded fd.
+    // `{name}>file`: the shell picks a free descriptor, opens `word` on it,
+    // and assigns its number to `name`, so it can't collide with a
+    // hardcoded fd.
     VarFd { var: String, kind: VarFdKind, word: Word },
     FdIn { fd: u32, word: Word },
-    // `N<>file`: same as InOut above, just on an explicit fd instead of
-    // the implicit 0 -- the far more common real shape in practice
-    // (`exec 3<>/dev/tcp/host/80`, then `>&3`/`<&3` to actually use it),
-    // since a bare, unnumbered `<>` only ever gives you fd 0 back, which
-    // can't be both a request-writer and a response-reader at once in
-    // any useful way without a second fd to reach it by.
+    // `N<>file`: `InOut` on an explicit fd, the usual shape
+    // (`exec 3<>/dev/tcp/host/80`, then `>&3` and `<&3`).
     FdInOut { fd: u32, word: Word },
-    // `input`: written `<&` rather than `>&` -- the same dup2 either way,
-    // kept so it can be written back the way it was written.
+    // `input`: written `<&` rather than `>&`, the same dup2, kept to write it
+    // back as written.
     FdDup { fd: u32, target: u32, input: bool },
-    // `[N]>&WORD` / `[N]<&WORD` with a non-literal target (e.g. a variable
-    // holding an fd number, like a coproc's array entries) -- word is
-    // expanded and parsed as the target fd at redirect-resolution time.
+    // `[N]>&WORD` / `[N]<&WORD` with a non-literal target (a variable holding
+    // an fd, like a coproc's): expanded and parsed when the redirect is
+    // resolved.
     FdDupWord { fd: u32, word: Word, input: bool },
     // `[N]>&-` / `[N]<&-`: closes fd N.
     FdClose { fd: u32 },
@@ -59,15 +50,11 @@ pub enum AssignMode {
     Append,
 }
 
-// One element of an array literal's parenthesized body (`arr=(1 [5]=x
-// 2)`, `assoc=([k]=v)`). `Keyed`'s index is raw, unevaluated text (an
-// arithmetic expression for a plain/indexed array, an arbitrary string
-// for an associative one -- exec.rs's apply_array_literal decides which
-// the same way array_set_index already does, by whether the name is
-// already known-associative). A plain `Positional` element continues
-// from a running "next index" counter that a `Keyed` element ahead of
-// it in the same literal bumps forward, matching bash (`(1 [5]=x 2)` ->
-// indices 0, 5, 6).
+// One element of an array literal (`arr=(1 [5]=x 2)`, `assoc=([k]=v)`).
+// `Keyed`'s index is raw: arithmetic for an indexed array, any string for
+// an associative one; `apply_array_literal` decides which, as
+// `array_set_index` does. A `Positional` continues from a running index
+// a `Keyed` before it moves, as in bash (`(1 [5]=x 2)` is 0, 5, 6).
 #[derive(Debug, Clone)]
 pub enum ArrayLiteralItem {
     Positional(Word),
@@ -77,51 +64,34 @@ pub enum ArrayLiteralItem {
 #[derive(Debug, Clone)]
 pub struct SimpleCommand {
     pub assigns: Vec<(String, AssignMode, Word)>,
-    // `name=(word word ...)` / `name+=(word word ...)` array literals --
-    // kept separate from `assigns` since array values don't fit the scalar
-    // Word model. Only ever populated while still in the simple command's
-    // own leading assignment-prefix position (`arr=(1 2 3) cmd` -- though
-    // see array_word_assigns below for the other place one of these can
-    // appear).
+    // `name=(...)` and `name+=(...)` array literals in the leading
+    // assignment position (`arr=(1 2 3) cmd`), apart from `assigns`, since
+    // arrays don't fit the scalar `Word`. See `array_word_assigns` for the
+    // other place.
     pub array_assigns: Vec<(String, AssignMode, Vec<ArrayLiteralItem>)>,
-    // `name=(...)` array literals appearing as a *later* word of a
-    // declare/local/export/readonly/typeset command (`declare -A
-    // m=([a]=1 [b]=2)`) -- real bash gives these builtins' own grammar
-    // special recognition for this syntax anywhere in their word list,
-    // not just in prefix-assignment position. The `usize` is the index
-    // into `words` (see below) this literal conceptually sits at -- no
-    // placeholder is pushed into `words` itself for it, so exec.rs's
-    // run_single has to interleave the two back together in order when
-    // building the final argument stream (a plain string arg vs. one of
-    // these can flip which flags -- -A vs -a -- are in effect when it's
-    // reached, so the original relative order matters).
+    // Array literals as later words of declare, local, export, readonly
+    // or typeset (`declare -A m=([a]=1 [b]=2)`), which bash recognizes
+    // anywhere in those builtins' arguments. The `usize` is the position in
+    // `words` it sits at, with no placeholder there, so `run_single`
+    // interleaves them back: order matters, since a flag like `-A` before it
+    // changes what it means.
     pub array_word_assigns: Vec<(usize, String, AssignMode, Vec<ArrayLiteralItem>)>,
-    // `name[index]=value` -- index is raw text (an arithmetic expression,
-    // evaluated at assignment time), kept separate since it targets one
-    // array element rather than the whole variable.
+    // `name[index]=value`: `index` is raw arithmetic, evaluated at
+    // assignment, and the target one element, hence apart.
     pub index_assigns: Vec<(String, String, AssignMode, Word)>,
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
-    // `$BASH_COMMAND`'s text for this command, worked out the first time
-    // anything asks and kept thereafter.
-    //
-    // It has to be *this*: bash's own answer is the command written back
-    // out from its tree, not a slice of the source -- `echo    a     b`
-    // reads back as `echo a b`, and a line continuation disappears --
-    // while quoting survives, `echo "a  b"` staying as it was written. A
-    // span into the source could not produce that, so serialize.rs does,
-    // and the only thing wrong with it was doing it again on every
-    // execution of the same command. A loop body is the same node each
-    // time round, and serializing it says the same thing each time.
+    // `$BASH_COMMAND`'s text for this command, computed once and kept.
+    // bash's answer is the command written back from its tree, not a slice
+    // of source (`echo    a     b` reads back as `echo a b`, continuations
+    // gone, quoting kept), which serialize.rs produces; a loop body is the
+    // same node each time round, so once is enough.
     pub rendered: std::cell::OnceCell<Rc<str>>,
 }
 
-// Compound commands carry their own trailing redirects (e.g. `done < file`,
-// `{ ...; } > file`), parsed right after the closing keyword/brace. Applied
-// at exec time by way of `command_own_redirects`, and written back by
-// `serialize.rs` -- which for a long time matched this field with `..` and
-// dropped it, so a redirected compound inside a forwarded function body
-// quietly lost its redirect.
+// A compound command's trailing redirects (`done < file`,
+// `{ ...; } > file`), parsed after its closing keyword, applied through
+// `command_own_redirects` and written back by serialize.rs.
 #[derive(Debug, Clone)]
 pub enum Command {
     Simple(SimpleCommand),
@@ -138,9 +108,8 @@ pub enum Command {
     },
     For {
         var: String,
-        // `None` means the `in ...` clause was omitted entirely (bash
-        // iterates "$@" in that case); `Some(vec)` is an explicit list,
-        // which may itself be empty (`for x in; do ...` -- zero iterations).
+        // `None`: no `in` clause, which iterates `"$@"`; `Some` is an
+        // explicit list, possibly empty (`for x in; do` runs zero times).
         words: Option<Vec<Word>>,
         body: Program,
         redirects: Vec<Redirect>,
@@ -154,17 +123,15 @@ pub enum Command {
     },
     Select {
         var: String,
-        // Same `None` == "$@" convention as For::words.
+        // `None` is `"$@"`, as in `For::words`.
         words: Option<Vec<Word>>,
         body: Program,
         redirects: Vec<Redirect>,
     },
-    // `coproc [NAME] command`. Scoped grammar (see parse_coproc): the named
-    // form is only recognized when written as `coproc NAME { ...; }` --
-    // unambiguous since `{` can't otherwise start what NAME would mean.
-    // `coproc NAME simple_command` (no braces) isn't supported; write it
-    // with braces instead. `name: None` means the unnamed form, which
-    // populates the default `COPROC` array/PID vars.
+    // `coproc [NAME] command`. NAME is recognized only as
+    // `coproc NAME { ...; }`, unambiguous since `{` couldn't start a command
+    // NAME names; `coproc NAME simple_command` needs the braces. `name: None`
+    // is the unnamed form, which sets `COPROC`.
     Coproc {
         name: Option<String>,
         body: Box<Command>,
@@ -179,22 +146,18 @@ pub enum Command {
         name: String,
         body: Box<Command>,
     },
-    // Raw, not-yet-parsed source text of a (...) subshell -- tokenized and
-    // parsed lazily, recursively, when it actually runs (see exec.rs).
+    // The raw text of a `( )` subshell, parsed when it runs (see exec.rs).
     Subshell(String, Vec<Redirect>),
     // Standalone ((expr)) arithmetic command.
     Arith(String, Vec<Redirect>),
-    // `[[ expr ]]`. Parsed as a flat token stream rather than folded into
-    // an expression tree here -- exec.rs's evaluator does the actual
-    // precedence handling (NOT > binary tests > AND > OR), same
-    // deferred-evaluation spirit as Subshell/Arith.
+    // `[[ expr ]]`, as a flat token stream: exec.rs's evaluator handles
+    // precedence (`!`, binary tests, `&&`, `||`), as `Subshell` and `Arith`
+    // defer theirs.
     Test(Vec<TestAtom>, Vec<Redirect>),
 }
 
-// What happens after a case arm's body finishes: `;;` stops (the normal
-// case), `;&` falls through into the *next* arm's body unconditionally
-// (no pattern test), `;;&` keeps testing subsequent patterns from the top
-// (doesn't stop, but doesn't skip the pattern match either).
+// After a case arm's body: `;;` stops, `;&` runs the next arm's body
+// without testing, `;;&` goes on testing the following patterns.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaseTerm {
     Stop,
@@ -216,15 +179,13 @@ pub enum TestAtom {
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negate: bool,
-    /// `time` in front of the pipeline. A reserved word rather than a
-    /// builtin -- which is the whole reason it lives on the pipeline
-    /// and not in an argv: it times *all* of it, and a builtin could
-    /// only ever see one command's worth.
+    /// `time` before the pipeline: a reserved word, not a builtin, so it
+    /// times all of it, where a builtin would see one command.
     pub timed: Option<TimeStyle>,
 }
 
-/// Which shape `time` reports in. `-p` is POSIX's, plain seconds on
-/// three unadorned lines; the default is bash's own `0m0.000s`.
+/// Which shape `time` reports: `-p` is POSIX's three plain lines; the
+/// default is bash's `0m0.000s`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeStyle {
     Shell,
@@ -253,27 +214,16 @@ pub enum Sep {
 pub struct ListItem {
     pub and_or: AndOr,
     pub sep: Sep,
-    // 1-based source line the statement started on -- captured once,
-    // where the *real* Parser first begins parsing this ListItem
-    // (parse_list_until), unlike the separate tokenize_spanned/lint/
-    // format/highlight span machinery, which never fed into this AST at
-    // all. Used by the debugger (exec.rs's run_program) to match against
-    // breakpoints and report the currently-executing line. `0` for a
-    // synthetically re-serialized ListItem (declare -f's print_functions,
-    // functions_preamble) that was never really parsed from source.
+    // The 1-based line the statement started on, captured where the parser
+    // begins this `ListItem` (`parse_list_until`), for the debugger's
+    // breakpoints and current line. `0` for a `ListItem` built rather than
+    // parsed (`declare -f`, `functions_preamble`).
     pub line: usize,
-    // The line the statement *ended* on -- the last token of its and-or
-    // list, before whatever separated it from the next one. `line` and
-    // `end_line` differ for anything spanning lines, a `for ... done` or
-    // a quoted argument with a newline in it.
-    //
-    // What it answers is whether a newline separates this statement from
-    // the next, which is the granularity at which a newly defined alias
-    // starts applying: bash reads a whole statement before running any
-    // of it, so `alias hi=...; hi` does not expand while
-    // `alias hi=...<newline>hi` does. Comparing start lines cannot tell
-    // those apart -- `for ... done; hi` has the two on different start
-    // lines with no newline between them. See run_program.
+    // The line the statement ended on, its and-or list's last token.
+    // Whether a newline separates it from the next decides when a new alias
+    // applies: bash reads a whole statement before running it, so
+    // `alias hi=...; hi` doesn't expand and `alias hi=...<newline>hi` does.
+    // Start lines can't tell (`for ... done; hi`). See `run_program`.
     pub end_line: usize,
 }
 
@@ -281,14 +231,12 @@ pub type Program = Vec<ListItem>;
 
 pub struct Parser {
     toks: Vec<Tok>,
-    // Parallel to `toks` -- lines[i] is the source line toks[i] started
-    // on. See ListItem::line's own doc comment.
+    // Parallel to `toks`: `lines[i]` is where `toks[i]` started. See
+    // `ListItem::line`.
     lines: Vec<usize>,
     pos: usize,
-    // Whether the list just parsed ended with a real `;`/newline/`&`
-    // rather than simply running into its stop token. A brace group
-    // needs to know: `{ : }` is a syntax error in bash, and `{ :; }`
-    // is not.
+    // Whether the list ended with a real `;`, newline or `&` rather than its
+    // stop token: `{ : }` is a syntax error in bash, `{ :; }` isn't.
     list_ended_with_separator: bool,
 }
 
@@ -298,9 +246,8 @@ impl Parser {
         Parser { toks, lines, pos: 0, list_ended_with_separator: false }
     }
 
-    // The source line the token at the parser's current position started
-    // on -- `0` (matching ListItem::line's own "not really parsed"
-    // convention) once every token has been consumed.
+    // The source line of the current token, or `0` (as for unparsed
+    // `ListItem`s) once every token is consumed.
     fn current_line(&self) -> usize {
         self.lines.get(self.pos).copied().unwrap_or(0)
     }
@@ -339,14 +286,9 @@ impl Parser {
         Ok(prog)
     }
 
-    // Parses a list of ListItems until the next token (after skipping
-    // separators) matches one of `stops`, or (if `stops` is empty) until
-    // end of input. Does not consume the stop token.
-    // `parse_list_until` for the places a shell grammar requires at
-    // least one command: every condition, and every loop or `if` body.
-    // bash rejects `if true; then fi` and `while true; do done`, and
-    // `while; do :; done` -- an *empty condition*, which bish read as
-    // "true" and then looped on forever.
+    // `parse_list_until` where the grammar needs at least one command:
+    // conditions and loop and `if` bodies. bash rejects `if true; then fi`,
+    // `while true; do done` and `while; do :; done`.
     fn parse_required_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
         let list = self.parse_list_until(stops)?;
         if list.is_empty() {
@@ -355,13 +297,14 @@ impl Parser {
         Ok(list)
     }
 
+    // ListItems until the next token, past separators, is one of `stops`
+    // (or the end of input when it's empty). The stop isn't consumed.
     fn parse_list_until(&mut self, stops: &[Tok]) -> Result<Program, String> {
         let mut items = Vec::new();
-        // Newlines only, here and after each item: a `;` where a command
-        // is expected is a syntax error, not an empty statement. bash
-        // rejects `; echo a`, `echo a; ; echo b` and `{ ; echo a; }`
-        // alike, and each one reaches this loop with a `;` in front of
-        // it. Blank lines are the thing that really is skippable.
+        // Newlines only: a `;` where a command is expected is a syntax
+        // error, not an empty statement (bash rejects `; echo a`,
+        // `echo a; ; echo b`, `{ ; echo a; }`). Blank lines really are
+        // skippable.
         self.skip_newlines();
         while !self.at_any(stops) {
             if self.peek().is_none() {
@@ -373,8 +316,8 @@ impl Parser {
             }
             let line = self.current_line();
             let and_or = self.parse_and_or()?;
-            // Read before the separator is consumed, so it is the last
-            // token of the statement itself.
+            // Read before the separator is consumed: the statement's last
+            // token.
             let end_line = self.lines.get(self.pos.wrapping_sub(1)).copied().unwrap_or(line);
             self.list_ended_with_separator = true;
             let sep = match self.peek() {
@@ -386,11 +329,9 @@ impl Parser {
                     self.advance();
                     Sep::Seq
                 }
-                // Nothing separated this command from whatever comes
-                // next. A *simple* command consumes its own arguments,
-                // so this only happens after a compound one --
-                // `f() { :; } f() { :; }`, two definitions with no `;`
-                // between them, which used to parse as two commands.
+                // Nothing separated this command from the next. A simple
+                // command takes its own arguments, so this follows a
+                // compound one: `f() { :; } f() { :; }` is an error.
                 _ if !self.at_any(stops) && self.peek().is_some() => {
                     return Err(format!("near unexpected token `{}'", self.offending_token_text()));
                 }
@@ -439,11 +380,9 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
-        // `time [-p]` and `!`, in either order: the grammar puts `time`
-        // first but bash takes `! time true` too. Recognized by their
-        // text, like `!` always has been here, because both are only
-        // keywords where a command could start -- `echo time` is a
-        // word.
+        // `time [-p]` and `!` in either order: the grammar puts `time` first,
+        // but bash takes `! time true`. Recognized by text, since both are
+        // keywords only where a command starts (`echo time` is a word).
         let mut timed = None;
         let mut negate = false;
         loop {
@@ -477,8 +416,8 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Word(chunks, _)) if matches!(chunks.as_slice(), [Chunk::Str(s)] if s == text))
     }
 
-    // How to name the token a syntax error is about, the way bash does
-    // -- the keyword or the word itself, not its Debug spelling.
+    // The token a syntax error names, as bash does: the keyword or word, not
+    // its Debug spelling.
     fn offending_token_text(&self) -> String {
         match self.peek() {
             Some(tok) => describe_token(tok),
@@ -487,20 +426,14 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> Result<Command, String> {
-        // Every nesting level of a compound command -- an `if` body, a
-        // loop body, a `{ }` group, a function -- comes back through
-        // here, so this is the one place to notice the stack running
-        // out. Without it a script nested a few thousand deep (~15KB of
-        // `if true; then ... fi`) overflowed the stack and aborted the
-        // whole process; bash parses the same input and runs it. The
-        // guard bites at two-thirds of the stack (stackguard's budget),
-        // which leaves room both for the error to unwind and for the
-        // partially built tree to drop -- drop frames are smaller than
-        // these parse frames, so what the parser could build, it can
-        // also tear back down. `( )` and `$(( ))` do not recurse here:
-        // the lexer captures their interior raw (see the `Subshell`/
-        // `Arith` arms below), so their depth is an execution-time
-        // concern, guarded where they are re-entered.
+        // Every nesting level of a compound command (an `if` or loop body,
+        // a group, a function) comes through here, so this is where a deep
+        // script (a few thousand `if`s) would overflow the stack; bash runs
+        // it. The guard bites at two thirds of the stack (stackguard),
+        // leaving room to unwind and drop the partial tree, whose drop
+        // frames are smaller. `( )` and `$(( ))` don't recurse here: the
+        // lexer captures their text, and their depth is checked when they
+        // run.
         if crate::stackguard::nearly_exhausted() {
             return Err("too deeply nested".to_string());
         }
@@ -536,11 +469,9 @@ impl Parser {
         }
     }
 
-    // `[[ expr ]]`. Collects a flat TestAtom stream up to the matching
-    // `]]`, treating `&&`/`||`/a bare `!` word as test-expression operators
-    // instead of the shell-level combinators/pipeline-negation they'd
-    // normally be -- this is what actually keeps `[[ a && b ]]` from being
-    // split into two separate commands by the outer AndOr grammar.
+    // `[[ expr ]]`: a flat `TestAtom` stream up to the matching `]]`, with
+    // `&&`, `||` and a bare `!` as test operators rather than the shell's,
+    // so `[[ a && b ]]` isn't split into two commands.
     fn parse_double_bracket(&mut self) -> Result<Command, String> {
         self.advance(); // KwLBracket2
         let atoms = self.parse_test_atoms()?;
@@ -583,21 +514,16 @@ impl Parser {
                     let w = self.expect_word()?;
                     atoms.push(TestAtom::Word(w));
                 }
-                // A keyword-shaped operand (e.g. `[[ $x == function ]]`) --
-                // KwRBracket2 already has its own arm above, so anything
-                // else keyword_text recognizes here is unambiguously an
-                // ordinary operand word, not the test's own closing `]]`.
-                // See expect_word's own doc comment.
+                // A keyword-shaped operand (`[[ $x == function ]]`): `]]`
+                // has its own arm above, so it's an ordinary word. See
+                // `expect_word`.
                 Some(tok) if keyword_text(tok).is_some() => {
                     let w = self.expect_word()?;
                     atoms.push(TestAtom::Word(w));
                 }
-                // `<`/`>` inside `[[ ]]` are bash's lexicographic string
-                // comparison operators, not redirects -- but the lexer
-                // still tokenizes them as Tok::RedirIn/RedirOut
-                // unconditionally (it has no notion of "inside `[[ ]]`"),
-                // so they're translated back into literal "<"/">" words
-                // here instead.
+                // `<` and `>` in `[[ ]]` are string comparisons, but the
+                // lexer, which doesn't know it's inside `[[ ]]`, makes them
+                // redirect tokens, so they're turned back into words here.
                 Some(Tok::RedirIn) => {
                     self.advance();
                     atoms.push(TestAtom::Word(Word { chunks: vec![Chunk::Str("<".to_string())], globbable: false }));
@@ -624,11 +550,8 @@ impl Parser {
         false
     }
 
-    // A function body is a *compound* command -- a brace group, a
-    // subshell, a loop, an `if`, a `case`, `(( ))` or `[[ ]]`. bash
-    // rejects `f() echo hi`, and so must this: read as a simple command
-    // it defined a function whose body was `echo`, silently, with `hi`
-    // vanishing.
+    // A function body is a compound command: a group, subshell, loop, `if`,
+    // `case`, `(( ))` or `[[ ]]`. bash rejects `f() echo hi`.
     fn parse_function_body(&mut self) -> Result<Command, String> {
         let compound = matches!(
             self.peek(),
@@ -754,7 +677,7 @@ impl Parser {
             }
             words = Some(list);
         }
-        // No "in ...": bash iterates "$@" here (words stays None).
+        // No `in`: bash iterates `"$@"` (`words` stays `None`).
         self.skip_terminators();
         self.expect(Tok::KwDo)?;
         let body = self.parse_required_list_until(&[Tok::KwDone])?;
@@ -763,10 +686,8 @@ impl Parser {
         Ok(Command::For { var, words, body, redirects })
     }
 
-    // `select var [in word...]; do body; done` -- identical grammar to
-    // `for`'s in-list form (see parse_for above), just a different keyword
-    // and runtime behavior (a numbered menu + read loop instead of plain
-    // iteration).
+    // `select var [in word...]; do body; done`: `for`'s grammar, with a
+    // numbered menu and read loop at run time.
     fn parse_select(&mut self) -> Result<Command, String> {
         self.advance(); // KwSelect
         let var = match self.advance() {
@@ -792,15 +713,10 @@ impl Parser {
         Ok(Command::Select { var, words, body, redirects })
     }
 
-    // `for`/`select`'s shared `in word...` wordlist -- keyword-shaped
-    // items included unconditionally (no "first item" gating the way
-    // parse_simple_command's own fix needs): confirmed against real bash,
-    // `for x in if while do done; do echo "[$x]"; done` prints each of
-    // those words verbatim, since none of them are in a position that
-    // could plausibly open a *new* construct -- the wordlist only ever
-    // ends at a `;`/newline (checked by the caller right after this
-    // returns), never by this loop itself recognizing a keyword. See
-    // keyword_text's own doc comment.
+    // `for` and `select`'s `in word...` list, keyword-shaped words included,
+    // as in bash (`for x in if while do done; ...`): none can open a
+    // construct here, and the list ends at `;` or a newline, checked by the
+    // caller. See `keyword_text`.
     fn parse_word_list(&mut self) -> Vec<Word> {
         let mut list = Vec::new();
         loop {
@@ -821,11 +737,9 @@ impl Parser {
         list
     }
 
-    // `coproc [NAME] command`. Only recognizes NAME when the token right
-    // after it is `{` (see the Command::Coproc doc comment for why that's
-    // the only unambiguous case handled) -- otherwise the word right after
-    // `coproc` is the start of the command itself, same as the unnamed
-    // form.
+    // `coproc [NAME] command`. NAME only when `{` follows it (see
+    // `Command::Coproc`); otherwise the word starts the command, as in the
+    // unnamed form.
     fn parse_coproc(&mut self) -> Result<Command, String> {
         self.advance(); // KwCoproc
         let name = if let (Some(Tok::Word(chunks, true)), Some(Tok::LBrace)) = (self.toks.get(self.pos), self.toks.get(self.pos + 1)) {
@@ -848,14 +762,10 @@ impl Parser {
 
         let mut arms = Vec::new();
         while !matches!(self.peek(), Some(Tok::KwEsac)) {
-            // POSIX allows an arm to open with `(`, and plenty of real
-            // scripts use it -- it is what makes a `case` inside a
-            // `$( )` readable to an editor counting parens. The lexer
-            // has already folded `(a*|b*)` into one `Subshell` token by
-            // the time it gets here, since nothing there knows it is in
-            // a case: so the patterns are recovered by lexing that
-            // token's own text, and there is no `)` left to expect
-            // afterwards because it went into the token too.
+            // POSIX allows an arm to open with `(`, which scripts use so a
+            // `case` in `$( )` balances its parens. The lexer has already
+            // folded `(a*|b*)` into one `Subshell` token, so the patterns
+            // come from lexing its text, and there's no `)` left to expect.
             let patterns = match self.peek() {
                 Some(Tok::Subshell { .. }) => {
                     let Some(Tok::Subshell { raw, .. }) = self.advance() else { unreachable!("just peeked") };
@@ -886,8 +796,8 @@ impl Parser {
                     self.advance();
                     CaseTerm::Continue
                 }
-                // No explicit terminator before `esac` (the last arm may
-                // omit `;;` entirely) -- behaves like `;;`.
+                // No terminator before `esac` (the last arm may omit `;;`):
+                // `;;`.
                 _ => CaseTerm::Stop,
             };
             self.skip_terminators();
@@ -901,10 +811,8 @@ impl Parser {
     fn parse_group(&mut self) -> Result<Command, String> {
         self.advance(); // LBrace
         let body = self.parse_required_list_until(&[Tok::RBrace])?;
-        // `{ : }` is a syntax error in bash and `{ :; }` is not -- the
-        // last command in a brace group has to be terminated. Reading
-        // the `}` as just another word is also why `{ echo }` printed
-        // a brace instead of complaining.
+        // The last command in a brace group must be terminated: `{ : }` is a
+        // syntax error, and `{ echo }` doesn't print a brace.
         if !self.list_ended_with_separator {
             return Err("near unexpected token `}'".to_string());
         }
@@ -989,8 +897,8 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::FdClose { fd });
                 }
-                // `N<<<` / `N<<`: the descriptor, then the operator it
-                // belongs to (see Tok::RedirFdHere).
+                // `N<<<` / `N<<`: the descriptor, then its operator (see
+                // `Tok::RedirFdHere`).
                 Some(Tok::RedirFdHere { fd }) => {
                     let fd = *fd;
                     self.advance();
@@ -1056,18 +964,12 @@ impl Parser {
                         }
                         in_assign_phase = false;
                     } else if is_declare_family_command(&words) {
-                        // `declare -A m=([a]=1 [b]=2)` -- real bash's own
-                        // grammar recognizes NAME=(...) as an array
-                        // literal anywhere in one of these five builtins'
-                        // word list, not just in leading-prefix-
-                        // assignment position (see array_word_assigns's
-                        // own doc comment on SimpleCommand). Confirmed
-                        // against real bash that an ordinary command
-                        // (`echo bar=(1 2 3)`) doesn't get this treatment
-                        // at all -- it's a syntax error there, which this
-                        // doesn't attempt to replicate (falls through to
-                        // being read as a plain word here instead, a
-                        // pre-existing, narrower divergence left alone).
+                        // `declare -A m=([a]=1 [b]=2)`: bash takes
+                        // `NAME=(...)` as an array literal anywhere in
+                        // these five builtins' arguments (see
+                        // `array_word_assigns`). In an ordinary command
+                        // (`echo bar=(1 2 3)`) bash calls it a syntax
+                        // error, which here falls through as a word.
                         if let Some((name, mode, items)) = self.try_array_literal_assignment(&w)? {
                             array_word_assigns.push((words.len(), name, mode, items));
                             continue;
@@ -1075,36 +977,18 @@ impl Parser {
                     }
                     words.push(w);
                 }
-                // A keyword-shaped argument word (e.g. `echo function`), or
-                // one right after a leading assignment prefix (`FOO=bar
-                // if` -- confirmed against real bash: this really does run
-                // a command literally named "if", not open an if-block;
-                // an assignment prefix suppresses reserved-word status for
-                // the word after it) -- gated on "this isn't the very
-                // first token of the whole simple command" so a genuinely
-                // bare, unexpected `then`/`do`/`in`/... (no assignment, no
-                // preceding word at all) still falls through to the
-                // default arm below and errors, matching real bash's own
-                // "unexpected token" syntax error there instead of
-                // silently accepting it as a command named "then". By
-                // construction this is never itself a NAME=value/
-                // NAME[i]=value assignment (none of these fixed literals
-                // contain '='), so there's no need to run it through
-                // word_as_assignment/word_as_index_assignment at all --
-                // just ends the assignment phase (if still active) and
-                // becomes an ordinary argument word. See expect_word's own
-                // doc comment on why the lexer produces a keyword token
-                // here in the first place.
-                // `x=1 (echo y)`, `arr= (a b)`: a subshell cannot be a
-                // command's argument, and after an assignment prefix
-                // there is no command for it to *be*. bash calls this a
-                // syntax error; bish used to read `arr= (a b)` as the
-                // array assignment `arr=(a b)`, which is the leniency
-                // that let the formatter emit the broken spelling
-                // unnoticed (see try_array_literal_assignment).
+                // `x=1 (echo y)`, `arr= (a b)`: a subshell can't be an
+                // argument, and after an assignment prefix there's no
+                // command for it to be: a syntax error, as in bash.
                 Some(Tok::Subshell { .. }) if !assigns.is_empty() || !array_assigns.is_empty() || !index_assigns.is_empty() || !words.is_empty() => {
                     return Err("near unexpected token `('".to_string());
                 }
+                // A keyword-shaped argument (`echo function`), or the word
+                // after an assignment prefix (`FOO=bar if` runs a command
+                // named `if`, as in bash), is an ordinary word. Only not as
+                // the very first token, where a stray `then` stays a syntax
+                // error. Never an assignment itself, since no keyword
+                // contains `=`. See `expect_word`.
                 Some(tok)
                     if keyword_text(tok).is_some()
                         && (!assigns.is_empty() || !array_assigns.is_empty() || !index_assigns.is_empty() || !words.is_empty()) =>
@@ -1186,8 +1070,8 @@ impl Parser {
                     self.advance();
                     redirects.push(Redirect::FdClose { fd });
                 }
-                // `N<<<` / `N<<`: the descriptor, then the operator it
-                // belongs to (see Tok::RedirFdHere).
+                // `N<<<` / `N<<`: the descriptor, then its operator (see
+                // `Tok::RedirFdHere`).
                 Some(Tok::RedirFdHere { fd }) => {
                     let fd = *fd;
                     self.advance();
@@ -1225,22 +1109,14 @@ impl Parser {
         Ok(SimpleCommand { assigns, array_assigns, array_word_assigns, index_assigns, words, redirects, rendered: std::cell::OnceCell::new() })
     }
 
-    // Shared by parse_simple_command's prefix-assignment path and its
-    // later-word declare-family path: if `w` is a `name=`/`name+=`-
-    // shaped word immediately followed by a `Tok::Subshell` (the
-    // lexer's raw capture of `(...)`, with no space allowed between
-    // `=`/`+=` and `(`, matching bash's own syntax rule), consumes that
-    // Subshell token and returns the parsed (name, mode, items);
-    // otherwise returns None having consumed nothing beyond `w` itself
-    // (which the caller already owns either way).
+    // For the prefix-assignment and declare-family paths: if `w` is
+    // `name=` or `name+=` directly followed by a `Tok::Subshell` (no space
+    // between, as bash requires), consumes it and returns the parsed
+    // literal; else `None`, consuming nothing past `w`.
     fn try_array_literal_assignment(&mut self, w: &Word) -> Result<Option<(String, AssignMode, Vec<ArrayLiteralItem>)>, String> {
         let Some((name, mode, val)) = word_as_assignment(w) else { return Ok(None) };
-        // `attached`: `arr=(a b)` is an array assignment, `arr= (a b)`
-        // is a syntax error in bash -- the space is the whole
-        // difference, and without checking it this shell did the
-        // assignment either way. (That is what let the formatter emit
-        // the broken spelling for months: bish's own round-trip could
-        // not see the damage.)
+        // `attached`: `arr=(a b)` is an array assignment, `arr= (a b)` a
+        // syntax error in bash; the space is the difference.
         if !is_empty_word(&val) || !matches!(self.peek(), Some(Tok::Subshell { attached: true, .. })) {
             return Ok(None);
         }
@@ -1251,13 +1127,10 @@ impl Parser {
         Ok(Some((name, mode, split_array_literal_words(&raw)?)))
     }
 
-    // Also accepts a keyword token, converting it back into the literal
-    // word it stands for (see keyword_text's own doc comment) -- every
-    // call site here is already past the point where a bare word could
-    // legitimately start a new command (a redirect target, a case
-    // pattern/subject, an operand inside `[[ ]]`, ...), so a keyword token
-    // showing up here unambiguously means the lexer over-eagerly
-    // keyword-matched an ordinary literal.
+    // Also takes a keyword token as the word it stands for (see
+    // `keyword_text`): every caller is past where a new command could start
+    // (a redirect target, a case pattern or subject, a `[[ ]]` operand), so
+    // a keyword here is an over-eager lexer match.
     fn expect_word(&mut self) -> Result<Word, String> {
         match self.advance() {
             Some(Tok::Word(chunks, globbable)) => Ok(Word { chunks, globbable }),
@@ -1270,12 +1143,8 @@ impl Parser {
     }
 }
 
-/// A token as something to put in front of a user. `{:?}` on a `Tok`
-/// spells its Rust shape -- `Some(Subshell { raw: "a*", attached:
-/// false })` was a real parser error message -- which describes this
-/// program's insides rather than the script that was written.
-/// `describe_token` for a token that may not be there at all, which is
-/// what `advance()` hands back at the end of the input.
+/// `describe_token` for a token that may be missing, as at the end of
+/// input.
 fn describe_next(tok: Option<&Tok>) -> String {
     match tok {
         Some(tok) => describe_token(tok),
@@ -1283,15 +1152,15 @@ fn describe_next(tok: Option<&Tok>) -> String {
     }
 }
 
+// A token as a user should see it, not its Rust shape (`{:?}` would
+// show `Subshell { raw: "a*", attached: false }`).
 fn describe_token(tok: &Tok) -> String {
     match tok {
         Tok::Word(chunks, _) => word_to_plain_name(chunks).unwrap_or_else(|| "word".to_string()),
         Tok::Subshell { raw, .. } => format!("({raw})"),
-        // The operators, which `keyword_text` does not cover and should
-        // not: its job is turning a keyword back into the *word* it can
-        // also be, and `;;` is never a word. An error message wants
-        // them spelled anyway -- "found `;;'" is the whole of what went
-        // wrong in `case a in ;; esac`.
+        // The operators, which `keyword_text` rightly doesn't cover, since
+        // `;;` is never a word; an error message still spells them ("found
+        // `;;'" in `case a in ;; esac`).
         Tok::DSemi => ";;".to_string(),
         Tok::SemiAmp => ";&".to_string(),
         Tok::DSemiAmp => ";;&".to_string(),
@@ -1304,9 +1173,7 @@ fn describe_token(tok: &Tok) -> String {
         Tok::LBrace => "{".to_string(),
         Tok::RBrace => "}".to_string(),
         Tok::Newline => "newline".to_string(),
-        // Redirect operators, spelled as written. They all used to come
-        // out as the word "token", which says nothing about which one
-        // the parser did not expect.
+        // Redirect operators, spelled as written.
         Tok::RedirIn => "<".to_string(),
         Tok::RedirOut { append, .. } => if *append { ">>" } else { ">" }.to_string(),
         Tok::RedirInOut => "<>".to_string(),
@@ -1327,17 +1194,13 @@ fn describe_token(tok: &Tok) -> String {
 }
 
 /// The patterns of a `(a*|b*)` case arm, from the text between its
-/// parens.
-///
-/// Lexed rather than split on `|` directly: a pattern is a word, and a
-/// `|` inside quotes or a bracket expression (`[a|b]`) is a character
-/// and not a separator. The lexer already knows which is which.
+/// parens. Lexed rather than split on `|`: inside quotes or a bracket
+/// expression (`[a|b]`) a `|` is a character.
 fn parse_case_patterns(raw: &str) -> Result<Vec<Word>, String> {
     let toks = crate::lexer::Lexer::new(raw).tokenize()?;
     let mut patterns = Vec::new();
     let mut expecting = true;
-    // The lexer pairs each token with the line it came from; a pattern
-    // list has no use for that.
+    // The line each token came from isn't needed here.
     for (tok, _line) in toks {
         match tok {
             Tok::Word(chunks, globbable) if expecting => {
@@ -1345,13 +1208,11 @@ fn parse_case_patterns(raw: &str) -> Result<Vec<Word>, String> {
                 expecting = false;
             }
             Tok::Pipe if !expecting => expecting = true,
-            // A newline inside the parens is layout, not a pattern --
-            // `(\n  a*\n)` is legal and means what it looks like.
+            // A newline inside the parens is layout: `(\n  a*\n)` is legal.
             Tok::Newline => {}
             other => match keyword_text(&other) {
-                // `case x in (in) ...` -- a keyword is an ordinary word
-                // in pattern position, exactly as it is outside the
-                // parens.
+                // `case x in (in) ...`: a keyword is an ordinary word in
+                // pattern position.
                 Some(text) if expecting => {
                     patterns.push(Word { chunks: vec![Chunk::Str(text.to_string())], globbable: true });
                     expecting = false;
@@ -1374,22 +1235,18 @@ pub(crate) fn word_as_assignment(w: &Word) -> Option<(String, AssignMode, Word)>
         if is_valid_ident(name) {
             let mut rest_chunks = vec![Chunk::Str(s[eq + 1..].to_string())];
             rest_chunks.extend(w.chunks[1..].iter().cloned());
-            // Assignment RHS is never glob-expanded in bash, regardless of
-            // whether the original word would have been.
+            // An assignment's value is never glob-expanded in bash.
             return Some((name.to_string(), mode, Word { chunks: rest_chunks, globbable: false }));
         }
     }
     None
 }
 
-// `name[index]=value` -- the whole `name[index]=` prefix must be made up of
-// literal text (a run of leading Str/LiteralStr chunks; a `$`-containing
-// index like `arr[$i]=x` isn't recognized here, falls through to being read
-// as a plain word instead), but that text no longer has to land in a
-// single chunk -- a quoted piece of the index (`arr["a b"]=x`) now lexes as
-// its own LiteralStr chunk rather than merging into its neighbors, so the
-// leading run is flattened into one string to search across, and the split
-// point after `=` is mapped back onto real chunk boundaries for the value.
+// `name[index]=value`. The `name[index]=` prefix must be literal text (a
+// run of `Str`/`LiteralStr` chunks; `arr[$i]=x` falls through as a
+// word), but may span chunks: a quoted index piece (`arr["a b"]=x`) is
+// its own chunk, so the run is flattened to search, and the split after
+// `=` mapped back onto chunks.
 fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Word)> {
     let mut flat = String::new();
     let mut bounds: Vec<(usize, usize, bool)> = Vec::new(); // (start_in_flat, chunk_idx, is_literal)
@@ -1407,8 +1264,8 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Wor
     if !is_valid_ident(name) {
         return None;
     }
-    // The *matching* `]`, not the first one: `a[b[0]]=9` is a real
-    // subscript with a subscript in it.
+    // The matching `]`, not the first: `a[b[0]]=9` is a subscript in a
+    // subscript.
     let after_bracket = &flat[bracket + 1..];
     let mut depth = 1;
     let mut close_rel = None;
@@ -1428,9 +1285,7 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Wor
     let close_rel = close_rel?;
     let index = after_bracket[..close_rel].to_string();
     let close = bracket + 1 + close_rel;
-    // `m[k]+=v` appends to the element, the way `x+=v` appends to a
-    // scalar -- it was not recognised as an assignment at all before,
-    // so the whole word ran as a command.
+    // `m[k]+=v` appends to the element, as `x+=v` to a scalar.
     let after_close = &flat[close + 1..];
     let (mode, value_start) = match after_close.strip_prefix("+=") {
         Some(rest) => (AssignMode::Append, rest),
@@ -1439,8 +1294,8 @@ fn word_as_index_assignment(w: &Word) -> Option<(String, String, AssignMode, Wor
     let value_pos = flat.len() - value_start.len();
 
     let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
-    // The tail of a split chunk keeps the spelling the whole one had:
-    // half of a `'...'` is still single-quoted text.
+    // The tail of a split chunk keeps its spelling: half a `'...'` is still
+    // single-quoted.
     let (chunk_text, quoting) = match &w.chunks[chunk_idx] {
         Chunk::Str(s) => (s, Quoting::Single),
         Chunk::LiteralStr(s, q) => (s, *q),
@@ -1462,12 +1317,10 @@ fn is_empty_word(w: &Word) -> bool {
     matches!(w.chunks.as_slice(), [Chunk::Str(s)] if s.is_empty()) || w.chunks.is_empty()
 }
 
-// Re-lexes the raw captured text of an array literal's `(...)` body as a
-// plain whitespace-separated word list, classifying each one as a plain
-// positional element or a `[index]=value` keyed one (see
-// ArrayLiteralItem's own doc comment). Reuses the general word tokenizer
-// (rather than a bespoke splitter) so quoting/expansions inside the literal
-// (`arr=("$x" 'lit' $(cmd))`) work exactly like anywhere else.
+// Re-lexes an array literal's `(...)` body as words, each positional or
+// `[index]=value` (see `ArrayLiteralItem`), through the general
+// tokenizer so quoting and expansions work as anywhere
+// (`arr=("$x" 'lit' $(cmd))`).
 fn split_array_literal_words(raw: &str) -> Result<Vec<ArrayLiteralItem>, String> {
     let toks = Lexer::new(raw).tokenize()?;
     let mut items = Vec::new();
@@ -1487,15 +1340,10 @@ fn split_array_literal_words(raw: &str) -> Result<Vec<ArrayLiteralItem>, String>
     Ok(items)
 }
 
-// `[index]=value` -- one element of an array literal's body written with
-// an explicit key (`arr=([2]=x [5]=y)`, `assoc=([k]=v)`). Mirrors
-// word_as_index_assignment's own bracket/equals-splitting logic minus the
-// leading name (an array literal's own elements have no name prefix,
-// just the bracketed index itself) -- same literal-chunks-only
-// restriction on the "[index]=" prefix (an index containing a bare `$`
-// expansion, e.g. `[$i]=x`, isn't recognized here and is instead kept as
-// a plain positional element -- rare enough in practice, and matches
-// word_as_index_assignment's own precedent).
+// `[index]=value`, an array literal element with a key
+// (`arr=([2]=x [5]=y)`, `assoc=([k]=v)`). `word_as_index_assignment`'s
+// splitting without the name, with the same literal-only prefix: `[$i]=x`
+// stays a positional element.
 fn array_literal_item_as_index(w: &Word) -> Option<(String, Word)> {
     let mut flat = String::new();
     let mut bounds: Vec<(usize, usize, bool)> = Vec::new(); // (start_in_flat, chunk_idx, is_literal)
@@ -1516,8 +1364,7 @@ fn array_literal_item_as_index(w: &Word) -> Option<(String, Word)> {
     let value_pos = flat.len() - value_start.len();
 
     let &(start, chunk_idx, is_lit) = bounds.iter().rfind(|&&(start, _, _)| start <= value_pos)?;
-    // The tail of a split chunk keeps the spelling the whole one had:
-    // half of a `'...'` is still single-quoted text.
+    // The tail of a split chunk keeps its spelling.
     let (chunk_text, quoting) = match &w.chunks[chunk_idx] {
         Chunk::Str(s) => (s, Quoting::Single),
         Chunk::LiteralStr(s, q) => (s, *q),
@@ -1544,10 +1391,8 @@ fn word_to_plain_name(chunks: &[Chunk]) -> Option<String> {
     None
 }
 
-// declare/local/export/readonly/typeset: the five builtins real bash's
-// own grammar gives special recognition for a `NAME=(...)` array literal
-// appearing as a later word, not just in leading-prefix-assignment
-// position -- see array_word_assigns's own doc comment on SimpleCommand.
+// declare, local, export, readonly, typeset: the builtins where bash
+// takes `NAME=(...)` anywhere (see `array_word_assigns`).
 fn is_declare_family_command(words: &[Word]) -> bool {
     let Some(first) = words.first() else { return false };
     matches!(word_to_plain_name(&first.chunks).as_deref(), Some("declare" | "local" | "export" | "readonly" | "typeset"))
@@ -1587,8 +1432,7 @@ mod line_tracking_tests {
 
     #[test]
     fn a_multi_line_compound_statement_reports_the_line_it_started_on() {
-        // The whole `if ... fi` is one ListItem -- its line is where `if`
-        // itself sits, not where the block ends.
+        // The whole `if ... fi` is one `ListItem`, on the `if`'s line.
         assert_eq!(lines_of("if true\nthen\n  echo yes\nfi\necho after\n"), vec![1, 5]);
     }
 
@@ -1596,9 +1440,8 @@ mod line_tracking_tests {
     fn two_statements_on_one_line_share_that_line() {
         assert_eq!(lines_of("echo a; echo b\necho c\n"), vec![1, 1, 2]);
     }
-    /// A word's literal text, quoting undone -- `word_to_plain_name`
-    /// will not do: it answers "is this an identifier?", and `a*` is
-    /// not one.
+    /// A word's text, quoting undone; `word_to_plain_name` answers whether
+    /// it's an identifier, and `a*` isn't.
     fn literal_text(chunks: &[Chunk]) -> String {
         chunks
             .iter()
@@ -1610,8 +1453,7 @@ mod line_tracking_tests {
             .collect()
     }
 
-    /// The patterns of an arm, as plain text -- enough to see how a
-    /// `(a*|b*)` was split without asserting on the whole AST.
+    /// An arm's patterns as text, enough to see how `(a*|b*)` split.
     fn case_patterns(src: &str) -> Vec<Vec<String>> {
         let toks = crate::lexer::Lexer::new(src).tokenize().expect("lexes");
         let prog = Parser::new(toks).parse_program().expect("parses");
@@ -1627,16 +1469,14 @@ mod line_tracking_tests {
             .collect()
     }
 
-    // POSIX's optional `(` before a case pattern. The lexer folds
-    // `(a*)` into a Subshell before the parser sees it, so the arm has
-    // to put it back -- and an arm written without the paren must go on
-    // parsing exactly as it did.
+    // POSIX's optional `(` before a case pattern: the lexer folds `(a*)`
+    // into a `Subshell`, so the arm puts it back, and an arm without the
+    // paren parses as before.
     #[test]
     fn a_case_arm_may_open_with_a_paren() {
         assert_eq!(case_patterns("case x in (a*) :;; (b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
         assert_eq!(case_patterns("case x in a*) :;; b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
-        // Both spellings in one statement, which is legal and is what a
-        // half-converted script looks like.
+        // Both spellings in one statement, as a half-converted script has.
         assert_eq!(case_patterns("case x in (a*) :;; b*) :;; esac"), vec![vec!["a*"], vec!["b*"]]);
     }
 
@@ -1645,18 +1485,15 @@ mod line_tracking_tests {
         assert_eq!(case_patterns("case x in (a*|b*|c) :;; esac"), vec![vec!["a*", "b*", "c"]]);
     }
 
-    // A `|` is only a separator between patterns. Inside a bracket
-    // expression or a quoted word it is a character, which is why the
-    // patterns are lexed rather than split on the byte.
+    // A `|` separates patterns only outside brackets and quotes, hence
+    // lexing.
     #[test]
     fn a_pipe_that_is_not_a_separator_stays_in_its_pattern() {
         assert_eq!(case_patterns(r#"case x in ("a|b") :;; esac"#), vec![vec!["a|b"]]);
         assert_eq!(case_patterns(r#"case x in (a\|b) :;; esac"#), vec![vec!["a|b"]]);
     }
 
-    // A keyword is an ordinary word in pattern position -- `case $x in
-    // (in)` is not a syntax error outside the parens and must not
-    // become one inside them.
+    // A keyword is a word in pattern position, inside the parens too.
     #[test]
     fn a_keyword_is_a_pattern_like_any_other_word() {
         assert_eq!(case_patterns("case x in (in) :;; (esac) :;; esac"), vec![vec!["in"], vec!["esac"]]);
@@ -1669,9 +1506,7 @@ mod line_tracking_tests {
         assert!(e.contains("needs a pattern"), "{e}");
     }
 
-    // A parser error names what was written, not what this program
-    // calls it internally: `Some(Subshell { raw: "a*", attached: false
-    // })` was a real message a user could see.
+    // A parser error names what was written, not the token's Rust shape.
     #[test]
     fn a_syntax_error_does_not_print_rust_debug_output() {
         let toks = crate::lexer::Lexer::new("case a in ;; esac").tokenize().expect("lexes");
@@ -1682,43 +1517,29 @@ mod line_tracking_tests {
         }
     }
 
-    // Deeply nested input must come back as an error, not overflow the
-    // stack and abort the process. This test is itself the proof: with
-    // no depth guard in `parse_command` the overflow is a `SIGABRT`,
-    // which takes the whole test binary down -- so if this test runs to
-    // its assertion at all, the guard fired. ~5000 levels of `if` is
-    // well past where the stack would have gone, and ~15KB of source,
-    // the size of a hostile paste rather than anything a person writes.
-    //
-    // `note_base` so the stack budget is measured from somewhere,
-    // rather than the zero a test binary starts with (which would make
-    // `nearly_exhausted` either always or never true); harmless to call
-    // more than once, since it only records an address.
+    // Deep nesting is an error, not a stack overflow aborting the process:
+    // an overflow would be a `SIGABRT` taking the test binary down, so
+    // reaching the assertion proves the guard fired. `note_base` gives the
+    // stack budget a starting point (a test binary has none); calling it
+    // again only records an address.
     #[test]
     fn deeply_nested_input_errors_instead_of_overflowing_the_stack() {
-        // On a thread whose stack matches what `stackguard` assumes (it
-        // reads the main thread's `ulimit -s`, ~8 MiB; a default test
-        // thread gets 2 MiB, less than the budget, so the guard could
-        // not bite before that smaller stack overflowed). In bish the
-        // parser only ever runs on the main thread, so this is the
-        // production shape, reproduced.
+        // On a thread with the stack `stackguard` assumes (the main
+        // thread's `ulimit -s`, about 8 MiB; a test thread's default 2 MiB
+        // would overflow before the guard). In bish the parser runs on the
+        // main thread.
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 crate::stackguard::note_base();
-                // ~5000 levels of `if`: well past where the stack would
-                // have gone, ~15 KiB of source -- a hostile paste, not
-                // anything a person writes. If the guard did not fire
-                // this would abort the whole test binary, so reaching
-                // the assertion at all is the proof.
+                // About 5000 levels of `if`, some 15 KiB: a hostile paste,
+                // not anything written.
                 let deep = format!("{}echo hi{}", "if true; then ".repeat(5000), " ;fi".repeat(5000));
                 let toks = crate::lexer::Lexer::new(&deep).tokenize().expect("the lexer is iterative");
                 let err = Parser::new(toks).parse_program().expect_err("too deep to parse");
                 assert!(err.contains("too deeply nested"), "{err}");
 
-                // ...and real code, which never nests anywhere near this
-                // far, still parses -- the guard protects against a
-                // paste without rejecting a program.
+                // Real code, nowhere near that deep, still parses.
                 let ok = format!("{}echo hi{}", "if true; then ".repeat(50), " ;fi".repeat(50));
                 let toks = crate::lexer::Lexer::new(&ok).tokenize().expect("lexes");
                 assert!(Parser::new(toks).parse_program().is_ok(), "50-deep is well within budget");
