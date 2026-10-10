@@ -2,36 +2,21 @@
 # Writes src/bishedit/unicode_tables.rs from the Unicode character
 # database this machine already has.
 #
-# Every other table in this project is derived from something that was
-# read: a spec, a man page, bash's own behaviour. These two modules --
-# unicode_width.rs and grapheme.rs -- were the exception, and said so:
-# their ranges were written from memory as a "deliberately trimmed,
-# high-confidence subset", which is a polite way of saying nobody could
-# check them. That method had already produced one real bug (0xE0100
-# sorted after 0x1F3FB, found only because a test asserted the tables
-# were sorted).
+# Perl ships the full UCD with a documented API, so the tables come from
+# the system, as signal names and terminfo do, rather than from a crate
+# vendoring the same numbers. Python's `unicodedata` carries the same
+# database; the East Asian widths are read from both and compared, and
+# this stops if they disagree.
 #
-# The data was never the hard part. Perl ships the full UCD and a
-# documented API onto it, and has since 5.8 -- so the tables come from
-# the system, exactly as the shell's own signal names, terminfo and
-# locale data do, rather than from a crate that would vendor the same
-# numbers behind a version bound. Python's `unicodedata` carries the
-# same database; the East Asian widths are read from both and compared,
-# and this script stops if they disagree, so a table can only be wrong
-# if two independent copies of the UCD are wrong the same way.
-#
-# Run it when the tables should follow a newer Unicode, and commit what
-# it writes:
+# Run it when the tables should follow a newer Unicode, and commit the
+# output:
 #
 #     perl tools/gen-unicode-tables.pl > src/bishedit/unicode_tables.rs && cargo fmt
 #
-# (`cargo fmt` because it puts the short tables back on one line, and a
-# file that is not formatted the way the rest of the tree is would show
-# up as a diff every time anyone else ran it.)
+# (`cargo fmt` puts short tables back on one line, matching the tree.)
 #
-# It is not a build step and must never become one: the output is
-# checked in and read like any other source file, so building bish
-# needs a Rust compiler and nothing else.
+# Not a build step: the output is checked in, so building bish needs only
+# a Rust compiler.
 
 use strict;
 use warnings;
@@ -41,20 +26,15 @@ my $VERSION = Unicode::UCD::UnicodeVersion();
 
 # --- reading the database --------------------------------------------
 #
-# `prop_invmap` returns an inversion map: a list of range starts, and
-# what the property is for each range up to the next start. Turning that
-# into "the ranges where the property is one of these values" is the
-# only shape this script needs.
+# `prop_invmap` returns an inversion map: range starts, and the
+# property's value for each range up to the next start. This turns it
+# into the ranges where the property is one of some values.
 
-# Perl reports Grapheme_Cluster_Break with the Indic-conjunct and
-# emoji-pictographic distinctions folded into the value, so `Extend`
-# arrives as `InCB_Extend_EX` and `Other` as `ExtPict_XX`. The
-# decoration is a prefix and the real value is the abbreviation it ends
-# with; a value with no such suffix is already the value itself.
-#
-# `check` below is what makes this safe to assume: a spelling this does
-# not recognise produces an empty table, and an empty table stops the
-# script rather than being written out.
+# Perl folds the Indic-conjunct and emoji-pictographic distinctions into
+# Grapheme_Cluster_Break values, so `Extend` arrives as `InCB_Extend_EX`
+# and `Other` as `ExtPict_XX`. The real value is the abbreviation it ends
+# with; a value with no such suffix is the value itself. An unrecognised
+# spelling gives an empty table, which `check` below refuses.
 my %GCB_ABBREVIATION = (EX => 'Extend', XX => 'Other', CN => 'Control', PP => 'Prepend', SM => 'SpacingMark');
 
 sub gcb_value {
@@ -77,9 +57,8 @@ sub ranges_where {
     return merge(@out);
 }
 
-# An inversion list is a flat list of alternating start/end-exclusive
-# boundaries: the property holds from element 0 up to element 1, from
-# element 2 up to element 3, and so on.
+# An inversion list alternates start and end-exclusive boundaries: the
+# property holds from element 0 to 1, from 2 to 3, and so on.
 sub ranges_from_invlist {
     my @list = @_;
     my @out;
@@ -90,9 +69,9 @@ sub ranges_from_invlist {
     return merge(@out);
 }
 
-# Adjacent and overlapping ranges become one. Rust's own table is
-# binary-searched, so the ranges have to be sorted and disjoint -- and
-# fewer of them is a smaller table for free.
+# Adjacent and overlapping ranges merge: the Rust table is
+# binary-searched, so ranges must be sorted and disjoint, and fewer is
+# smaller.
 sub merge {
     my @in = sort { $a->[0] <=> $b->[0] } @_;
     my @out;
@@ -135,14 +114,13 @@ my @hangul_v = ranges_where($gcb_starts, $gcb_values, ['V'], \&gcb_value);
 my @hangul_t = ranges_where($gcb_starts, $gcb_values, ['T'], \&gcb_value);
 my @pictographic = ranges_from_invlist(prop_invlist('Extended_Pictographic'));
 
-# What occupies no column. Grapheme_Extend is the combining marks and
-# everything that behaves like one; the format characters (Cf) are the
-# joiners, direction marks and the byte-order mark, which a terminal
-# draws nothing for; and Hangul V and T are the medial and final jamo,
-# which compose into the syllable the leading jamo already started.
+# What takes no column: Grapheme_Extend (combining marks and their
+# kin); format characters (Cf: joiners, direction marks, the byte-order
+# mark), which terminals draw nothing for; and Hangul V and T, the
+# medial and final jamo that compose into the leading jamo's syllable.
 #
-# U+00AD, the soft hyphen, is the one exception carved out: it is a Cf
-# but every terminal gives it a column, and so does wcwidth.
+# Except U+00AD, the soft hyphen: a Cf, but terminals and wcwidth give it
+# a column.
 my ($gc_starts, $gc_values) = prop_invmap('General_Category');
 my @cf = ranges_where($gc_starts, $gc_values, ['Cf']);
 my @grapheme_extend = ranges_from_invlist(prop_invlist('Grapheme_Extend'));
@@ -151,11 +129,9 @@ my @zero_width = merge(@grapheme_extend, @cf, @hangul_v, @hangul_t);
 
 # --- does what came back look like the Unicode everyone else has? -----
 #
-# A property spelled differently by a future Perl would otherwise
-# produce an empty table and no complaint at all -- which is how the
-# first run of this script quietly emitted three ranges for Extend
-# instead of four hundred. Every table is checked against a character
-# whose membership is not in question.
+# A property spelled differently by a future Perl would give an empty
+# table silently, so every table is checked against a character whose
+# membership isn't in question.
 
 sub check {
     my ($name, $ranges, $cp, $description) = @_;
@@ -181,8 +157,8 @@ check('HANGUL_V',              \@hangul_v,      0x1160,  'hangul jungseong fille
 check('HANGUL_T',              \@hangul_t,      0x11A8,  'hangul jongseong kiyeok');
 check('EXTENDED_PICTOGRAPHIC', \@pictographic,  0x1F600, 'a grinning face');
 
-# `subtract` is only ever asked to remove the soft hyphen, and a table
-# that still has it means the carve-out silently stopped working.
+# `subtract` only removes the soft hyphen; a table still holding it
+# means the carve-out stopped working.
 die "U+00AD is still zero width\n" if grep { $_->[0] <= 0x00AD && 0x00AD <= $_->[1] } @zero_width;
 
 # --- cross-check against the other copy of the database ---------------
