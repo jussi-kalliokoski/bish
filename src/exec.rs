@@ -10249,8 +10249,6 @@ impl Shell {
     pub fn sync_real_state_in(&self) {
         let _ = std::env::set_current_dir(&self.cwd);
         let current: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
-        // The raw calls, not `env_set`: session switching never runs inside a
-        // subshell's env journal.
         for k in &current {
             if !self.env_snapshot.contains_key(k) {
                 unsafe { std::env::remove_var(k) };
@@ -11328,22 +11326,14 @@ impl Job {
     }
 }
 
-// An opaque handle to a pty-attached job, handed to repl.rs by
-// Shell::take_pending_fg once run_fg bubbles ExecResult::Fg. repl.rs is
-// what owns the session/window/grid state a redraw needs (see that
-// variant's doc comment for why exec.rs can't hold a reference to it),
-// and -- once the Frame::Job stack lets a job keep running while another
-// window is focused -- repl.rs is also what needs to keep polling it
-// across separate main-loop iterations, not just for the duration of one
-// blocking call into exec.rs. Wrapping Job (whose fields, like
-// std::process::Child, this module deliberately doesn't want to expose
-// directly) rather than making Job itself pub keeps that boundary intact
-// while still letting repl.rs hold and drive one.
+// A pty-attached job handed to repl.rs by `Shell::take_pending_fg` once
+// `run_fg` returns `ExecResult::Fg`. repl.rs owns the session and grid
+// state a redraw needs and keeps polling the job across main-loop
+// iterations. Wrapping `Job` keeps its fields private.
 pub struct FgJob(Job);
 
-// How FgJob::poll_untraced found the job. Named distinctly from the
-// module-private JobWaitOutcome (same shape) since this one crosses the
-// module boundary into repl.rs's public API surface.
+// How `FgJob::poll_untraced` found the job: the public counterpart of
+// `JobWaitOutcome`.
 pub enum FgWait {
     Running,
     Exited(i32),
@@ -11355,54 +11345,27 @@ impl FgJob {
         self.0.wait()
     }
 
-    // Always Some: FgJob only ever exists for a job that had
-    // Job::pty_master.is_some() at the point run_fg bubbled it (see that
-    // function's own pty_master check).
+    // `run_fg` only makes an `FgJob` from a job with a pty.
     pub fn pty_master(&mut self) -> &mut std::fs::File {
         self.0.pty_master.as_mut().expect("FgJob always has a pty_master")
     }
 
-    // Explicitly signals this job to stop, rather than relying on
-    // forwarding a raw Ctrl-Z byte into its pty and letting ISIG
-    // generate SIGTSTP the way SIGINT/Ctrl-C already does. That natural
-    // path doesn't work here: pty::spawn_attached's pre_exec makes the
-    // job its own session leader (setsid -- required for TIOCSCTTY to
-    // succeed at all, so the pty can be its controlling terminal), which
-    // means its process group is *orphaned* relative to bish's own
-    // session (its parent isn't a member of that new session). Confirmed
-    // empirically (not just from the spec): a job in this state doesn't
-    // stop for a *default-disposition* SIGTSTP no matter how it's sent
-    // -- forwarded through the pty (ISIG), or even an unrelated `kill
-    // -TSTP` from a completely separate shell outside bish entirely all
-    // silently do nothing, while `kill -STOP` on the exact same process
-    // stops it immediately. That's the real rule (broader than "only
-    // line-discipline-generated stop signals get discarded" -- it's
-    // POSIX/Linux discarding *any* uncaught SIGTSTP/SIGTTIN/SIGTTOU
-    // delivery to an orphaned group, regardless of source), and it's
-    // exactly why Ctrl-C already worked here (SIGINT isn't subject to
-    // it) while Ctrl-Z silently didn't. SIGSTOP sidesteps this --
-    // uncatchable, so the same orphan-discard doesn't apply -- at the
-    // cost of not giving a job with its own SIGTSTP handler (a
-    // full-screen program like vim/less, saving/restoring terminal
-    // state around a stop) any chance to run it first. Accepted
-    // trade-off: every job spawned via run_single's simple-external-
-    // command path (the only thing that reaches this pty-attachment
-    // mechanism at all) is orphaned this same way, so there's no way to
-    // reach a job with such a handler AND deliver a real SIGTSTP to it
-    // in this architecture regardless.
+    // Stops the job with SIGSTOP. A Ctrl-Z byte through the pty doesn't
+    // work: `spawn_attached` makes the job a session leader (`setsid`, so
+    // the pty can be its controlling terminal), which orphans its process
+    // group, and the kernel discards a default-disposition SIGTSTP sent to
+    // an orphaned group from any source. SIGINT isn't affected, which is
+    // why Ctrl-C works. The cost is that a program with its own SIGTSTP
+    // handler (vim, less) doesn't get to restore the terminal first, but
+    // every pty job is orphaned this way, so it could never get one.
     pub fn send_stop(&mut self) {
         if let Some(&pid) = self.0.pids.first() {
             send_signal_to_pgrp(pid, SIGSTOP);
         }
     }
 
-    // Non-blocking, WUNTRACED-aware poll -- unlike the plain Job::poll
-    // (which wraps Child::try_wait and can never observe anything but
-    // exited/still-running), this can tell repl.rs's drive_fg_job that
-    // the job has *stopped* (Ctrl-Z forwarded into its own pty, or an
-    // explicit `kill -STOP`) instead of leaving it looking like it's
-    // still running forever -- the same M11 gap Job::poll has for the
-    // non-pty foreground path, fixed here for the pty-attached one.
+    // Non-blocking and `WUNTRACED`-aware: unlike `Job::poll`, this tells
+    // `drive_fg_job` that the job stopped (Ctrl-Z, `kill -STOP`).
     pub fn poll_untraced(&mut self) -> FgWait {
         match crate::platform::wait_for_child(self.0.pids[0] as i32, false) {
             crate::platform::Waited::Running => FgWait::Running,
@@ -11414,20 +11377,16 @@ impl FgJob {
     }
 }
 
-// `echo -e`'s escapes, and `printf %b`'s, which are nearly the same
-// set. The bool is `\c`: it means "stop here, and stop the caller too".
-//
-// Assembled as bytes and decoded once at the end, because `\0303\0244`
-// names the two bytes of `ä` rather than two Latin-1 characters --
-// the same reason `$'...'` and the printf format are built this way.
+// `echo -e`'s escapes. The bool is `\c`, which stops the output and the
+// caller. Built as bytes and decoded at the end: `\0303\0244` is the
+// two bytes of `ä`, not two Latin-1 characters.
 pub(crate) fn echo_expand_escapes(s: &str) -> (String, bool) {
     backslash_escapes(s, false)
 }
 
-// The same, for `%b`, which takes a bare `\nnn` as octal where
-// `echo -e` reads it as text. That difference is bash's, checked
-// against it: `echo -e 'a\101b'` prints `a\101b` and
-// `printf '%b' 'a\101b'` prints `aAb`.
+// The same for `printf %b`, which also takes a bare `\nnn` as octal, as
+// bash does: `echo -e 'a\101b'` prints `a\101b`, `printf '%b' 'a\101b'`
+// prints `aAb`.
 pub(crate) fn printf_b_escapes(s: &str) -> (String, bool) {
     backslash_escapes(s, true)
 }
@@ -11464,8 +11423,7 @@ fn backslash_escapes(s: &str, bare_octal: bool) -> (String, bool) {
             Some('r') => push_char(&mut buf, '\r'),
             Some('t') => push_char(&mut buf, '\t'),
             Some('v') => push_char(&mut buf, '\u{b}'),
-            // `\0nnn` in both, and a bare `\nnn` only where the caller
-            // says so.
+            // `\0nnn` in both, a bare `\nnn` only when the caller says so.
             Some('0') => {
                 let first = chars.peek().and_then(|c| c.to_digit(8)).map(|d| {
                     chars.next();
@@ -11499,21 +11457,12 @@ fn backslash_escapes(s: &str, bare_octal: bool) -> (String, bool) {
     (String::from_utf8_lossy(&buf).into_owned(), false)
 }
 
-// `printf %q`: the argument written as text a shell reads back as
-// exactly this string. Bash's rules, byte for byte, because the whole
-// point of the output is to survive being pasted somewhere else --
-// including through something that does not know the encoding.
-//
-// Two forms. While every byte is printable ASCII, the shell-special
-// ones each get a backslash. As soon as one is not -- a control
-// character, or anything with the high bit set -- the whole string goes
-// into `$'...'` and those bytes are written as octal escapes: `ä`
-// becomes `$'\303\244'`, its own UTF-8 bytes, which is the spelling
-// least likely to arrive somewhere as something else.
-//
-// `shell_quote` next door does the always-single-quote form instead,
-// which is what `${v@Q}` wants. Bash draws the same distinction between
-// the two.
+// `printf %q`: the argument as text a shell reads back as the same
+// string, byte for byte as bash writes it. While every byte is printable
+// ASCII, shell-special ones get a backslash; otherwise the whole string
+// goes in `$'...'` with those bytes as octal escapes (`ä` is
+// `$'\303\244'`), the spelling that survives encoding changes.
+// `shell_quote` is the single-quote form, for `${v@Q}`.
 pub(crate) fn printf_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
@@ -11524,8 +11473,8 @@ pub(crate) fn printf_quote(s: &str) -> String {
     }
     let mut out = String::with_capacity(bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
-        // `#` opens a comment and `~` names a home directory only at
-        // the front of a word, and bash escapes them only there.
+        // `#` and `~` are special only at the front of a word, and bash
+        // escapes them only there.
         let front_only = matches!(b, b'#' | b'~');
         if BACKSLASH_QUOTED.contains(&b) && (!front_only || i == 0) {
             out.push('\\');
@@ -11535,14 +11484,10 @@ pub(crate) fn printf_quote(s: &str) -> String {
     out
 }
 
-// Every ASCII character bash puts a backslash in front of. `%`, `+`,
-// `-`, `.`, `/`, `:`, `=`, `@`, `_` and the alphanumerics are the ones
-// it leaves alone.
+// The ASCII characters bash backslash-escapes.
 const BACKSLASH_QUOTED: &[u8] = b" !\"#$&'()*,;<>?[\\]^`{|}~";
 
-// The `$'...'` form. Only `'` and `\` are special inside it -- `$`,
-// `"` and a backtick are all literal there, which is most of why bash
-// reaches for it.
+// The `$'...'` form. Only `'` and `\` are special inside it.
 fn dollar_quote(bytes: &[u8]) -> String {
     let mut out = String::from("$'");
     for &b in bytes {
@@ -11554,7 +11499,7 @@ fn dollar_quote(bytes: &[u8]) -> String {
             0x0b => out.push_str("\\v"),
             0x0c => out.push_str("\\f"),
             b'\r' => out.push_str("\\r"),
-            // `\E`, not `\e`: bash writes the one every shell reads.
+            // `\E`, which every shell reads, as bash writes it.
             0x1b => out.push_str("\\E"),
             b'\'' => out.push_str("\\'"),
             b'\\' => out.push_str("\\\\"),
@@ -11566,9 +11511,8 @@ fn dollar_quote(bytes: &[u8]) -> String {
     out
 }
 
-// Wraps `s` in single quotes, escaping any embedded single quote as
-// '\'' (close, escaped-quote, reopen) -- the standard POSIX-shell-safe
-// quoting form, and what printf's own %q conversion produces.
+// Wraps `s` in single quotes, with an embedded `'` as `'\''`. What
+// `${v@Q}` produces.
 pub(crate) fn shell_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -11588,9 +11532,8 @@ mod time_format_tests {
 
     fn formatted(style: TimeStyle, format: Option<&str>, real: f64, user: f64, sys: f64) -> String {
         let mut shell = super::Shell::new();
-        // A global lives in the real process environment, so it
-        // outlives the `Shell` that set it and would leak into the next
-        // case here.
+        // Removed from the real environment too, so an inherited `TIMEFORMAT`
+        // can't change the default case.
         match format {
             Some(f) => {
                 shell.assign_var("TIMEFORMAT", f.to_string());
@@ -11600,9 +11543,8 @@ mod time_format_tests {
         shell.format_times(style, real, user, sys)
     }
 
-    // The numbers are what a corpus case cannot pin, so they are
-    // pinned here instead. Every expectation was read off real bash
-    // with the same inputs.
+    // Numbers a corpus case can't pin, each read off bash with the same
+    // inputs.
     #[test]
     fn the_default_shape_is_bashs_own() {
         assert_eq!(formatted(TimeStyle::Shell, None, 0.0, 0.0, 0.0), "\nreal\t0m0.000s\nuser\t0m0.000s\nsys\t0m0.000s\n");
@@ -11646,22 +11588,20 @@ mod did_you_mean_tests {
         out
     }
 
-    // The wiring, not the algorithm -- `suggest`'s own tests cover
-    // which name is closest. What matters here is that the shell
-    // actually says it, on the paths where a name is nearly right.
+    // That the shell suggests a near name on each path; `suggest`'s own
+    // tests cover which name.
     #[test]
     fn a_mistyped_builtin_is_named() {
         assert!(stderr_of("ecoh hi\n").contains("did you mean 'echo'?"), "{}", stderr_of("ecoh hi\n"));
         assert!(stderr_of("expor X=1\n").contains("did you mean 'export'?"));
-        // A name that is not nearly anything gets no guess.
+        // A name not near anything gets no guess.
         let miss = stderr_of("nosuchcommand_at_all\n");
         assert!(miss.contains("nosuchcommand_at_all"), "{miss}");
         assert!(!miss.contains("did you mean"), "{miss}");
     }
 
-    // `win` is a builtin on the editor's colon line and nowhere else. So
-    // anywhere else it is not found -- `type` agrees -- and what is worth
-    // saying is the spelling that works there, not `win` itself.
+    // `win` is a builtin only on the editor's colon line, so elsewhere it's
+    // not found, and the useful suggestion is the spelling that works there.
     #[test]
     fn win_outside_the_colon_line_says_what_to_use_instead() {
         let err = stderr_of("type win; win split\n");
@@ -11683,8 +11623,7 @@ mod did_you_mean_tests {
         assert!(stderr_of("bishopt gitignor\n").contains("did you mean 'gitignore'?"));
     }
 
-    // The "expected:" list and the suggestion read from the same array,
-    // so a subcommand cannot exist in one and not the other.
+    // The "expected:" list and the suggestion read the same array.
     #[test]
     fn the_expected_list_is_the_list_that_is_searched() {
         let listed = stderr_of("::bish qqqq\n");
@@ -11696,13 +11635,8 @@ mod did_you_mean_tests {
 
 #[cfg(test)]
 mod subshell_inheritance_tests {
-    // A subshell sees what the shell that made it sees. Everything
-    // *around* the positional parameters was already inherited --
-    // functions, arrays, aliases, the directory stack -- which is what
-    // made `$(... "$1" ...)` coming back empty look like a lookup
-    // problem rather than two fields left blank in one constructor.
-    //
-    // Every expectation here was checked against real bash first.
+    // A subshell sees what its parent sees, positional parameters
+    // included. Expectations checked against bash.
     fn output(script: &str, args: &[&str]) -> String {
         let mut shell = super::Shell::new();
         shell.arg_frames = vec![args.iter().map(|s| s.to_string()).collect()];
@@ -11760,8 +11694,7 @@ mod subshell_inheritance_tests {
     fn a_command_substitution_inside_a_function_sees_that_functions_arguments() {
         let script = "f() { printf '%s' \"$(printf '%s' \"$1-$2-$#\")\"; }\nf a b\n";
         assert_eq!(output(script, &["outer"]), "a-b-2");
-        // ...and what `shift` left behind, not what the call started
-        // with.
+        // ...and what `shift` left, not what the call started with.
         let shifted = "f() { shift; printf '%s' \"$(printf '%s' \"$1\")\"; }\nf one two\n";
         assert_eq!(output(shifted, &[]), "two");
     }
@@ -11781,16 +11714,9 @@ mod subshell_inheritance_tests {
 
 #[cfg(test)]
 mod quoting_round_trip_tests {
-    // `%q` exists so a string can be carried somewhere else and read
-    // back as itself. Bash's spelling is what bish writes -- including
-    // `$'\303\244'` for a non-ASCII string, which is octal *bytes* and
-    // therefore cannot be re-encoded into something else on the way --
-    // so the two halves are checked separately: that bish writes what
-    // bash writes, and that bish reads its own writing back.
-    //
-    // The values go to bash as arguments rather than inside the script,
-    // which is the only way to hand it a control character without
-    // needing the very quoting under test.
+    // `%q` output must match bash's and read back as itself in bish; the
+    // two are checked separately. The values go to bash as arguments, the
+    // only way to pass a control character without the quoting under test.
     fn nasty() -> Vec<String> {
         let mut out: Vec<String> = [
             "", "abc", "a b", "a'b", "a\"b", "a$b", "a\\b", "a`b", "#abc", "~abc", "a#b", "a~b", "a,b", "a^b", "a{b}c", "a[b]c", "a(b)c", "a?b",
@@ -11845,26 +11771,16 @@ mod quoting_round_trip_tests {
 
 #[cfg(test)]
 mod printf_conversion_tests {
-    // Checked against real `bash`, on the same specs and the same
-    // values, because C's conversions have more corners than anyone's
-    // reading of them: `%.0f` of 2.5 is 2 and of 3.5 is 4 (round half
-    // to even), `%g` picks its form from the exponent *after*
-    // rounding, `%e` writes at least two exponent digits, zero padding
-    // goes after the sign but not around an infinity, precision on an
-    // integer means minimum digits rather than digits after the point
-    // (and silences the `0` flag), `010` is octal, and an argument is
-    // read as far as it parses rather than all-or-nothing, so `3.9abc`
-    // is 3.9 and `12 34` is 12.
+    // Checked against bash with the same specs and values, since C's
+    // conversions have many corners: `%.0f` rounds half to even, `%g` picks
+    // its form after rounding, `%e` writes at least two exponent digits,
+    // zero padding goes after the sign but not around an infinity, integer
+    // precision means minimum digits and silences `0`, `010` is octal, and
+    // an argument is read as far as it parses (`3.9abc` is 3.9).
     //
-    // Precision stays at or below 17 significant digits on purpose:
-    // bash converts through `long double` and bish through `f64`, so
-    // the two genuinely diverge past what a double can represent, and
-    // there is no fixing that without an 80-bit float.
-    //
-    // `LC_ALL=C`, or this measures the machine's decimal separator
-    // rather than the formatting -- a Finnish `bash` writes `3,14`.
-    // Skipped where there is no bash, the same way the git and inflate
-    // tests skip.
+    // Precision stays at 17 significant digits or fewer: bash converts
+    // through `long double`, bish through `f64`. `LC_ALL=C`, or a Finnish
+    // bash writes `3,14`. Skipped without bash.
     fn cases() -> Vec<(String, String)> {
         let specs = [
             "%f", "%.0f", "%.2f", "%8.3f", "%-8.3f", "%05.2f", "%08.3f", "%+f", "% f", "%012.4f", "%e", "%E", "%.0e", "%.2e", "%012.1e", "%+.3e",
@@ -11885,14 +11801,13 @@ mod printf_conversion_tests {
     #[test]
     fn conversions_agree_with_bash() {
         let cases = cases();
-        // Separated by SOH rather than by newline: `%b` can expand an
-        // escape into a newline and `%c` of nothing at all is a NUL, so
-        // one-result-per-line is not a protocol either side can keep.
+        // Separated by SOH: `%b` can produce a newline and `%c` of nothing
+        // is a NUL, so lines can't delimit results.
         let script: String = cases
             .iter()
             .map(|(spec, value)| {
-                // `'A` is one of the values, so the values cannot go
-                // into the script unescaped.
+                // `'A` is one of the values, so they're escaped for the
+                // script.
                 let (spec, value) = (spec.replace('\'', "'\\''"), value.replace('\'', "'\\''"));
                 format!("printf '{spec}' '{value}'; printf '\\001'\n")
             })
@@ -11902,8 +11817,8 @@ mod printf_conversion_tests {
         if !out.status.success() {
             return;
         }
-        // bash writes "invalid number" to stderr for a value it cannot
-        // read and then uses 0, which is what bish does silently.
+        // bash also writes "invalid number" to stderr before using 0; bish
+        // just uses 0.
         let printed = String::from_utf8_lossy(&out.stdout).into_owned();
         let want: Vec<&str> = printed.split('\u{1}').collect();
         assert_eq!(want.len(), cases.len() + 1, "one result per case, plus the empty tail");
@@ -11917,22 +11832,10 @@ mod printf_conversion_tests {
     }
 }
 
-// `printf`'s own idea of an integer, which is C's `strtoll` with base 0:
-// the longest valid prefix of the argument, in whatever base it
-// announces. `3.9` is 3 and `1e3` is 1 -- both stop at the first
-// character that cannot continue the number rather than failing -- while
-// `010` is octal 8 and `0x10` is hexadecimal 16. Anything with no valid
-// prefix at all is 0, and an overflow saturates, both of which bash
-// warns about and then does anyway.
-//
-// `'A` (or `"A`) is bash's own extension on top of that: a quote
-// followed by a character means that character's code point.
-// Whether printf's own number reading consumed the whole argument --
-// which is what bash means by "invalid number". Leading whitespace is
-// skipped, the way strtol does; anything left over after the digits is
-// not, so `12 ` and `1e3` are both rejected for an integer conversion
-// while ` 12` is fine. bash's `'X` (the character's code point) is a
-// number by this measure too.
+// Whether printf's number reading consumed the whole argument, which is
+// what bash calls a valid number. Leading whitespace is skipped, as by
+// `strtol`, trailing isn't: ` 12` is fine, `12 ` and (for an integer)
+// `1e3` aren't. `'X` counts.
 fn printf_number_complete(arg: &str, float: bool) -> bool {
     let text = arg.trim_start();
     if text.starts_with(['\'', '"']) {
@@ -11955,6 +11858,10 @@ fn printf_number_complete(arg: &str, float: bool) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix))
 }
 
+// printf's integer: C's `strtoll` with base 0, the longest valid prefix
+// in whatever base it announces. `3.9` is 3, `1e3` is 1, `010` is 8,
+// `0x10` is 16. No valid prefix is 0 and an overflow saturates; bash
+// warns about both. `'A` (or `"A`) is the code point of `A`, as in bash.
 fn printf_int(arg: &str) -> i64 {
     let text = arg.trim();
     if let Some(rest) = text.strip_prefix(['\'', '"']) {
@@ -11969,18 +11876,17 @@ fn printf_int(arg: &str) -> i64 {
     match i64::from_str_radix(&digits[..valid], radix) {
         Ok(v) if negative => -v,
         Ok(v) => v,
-        // No digits at all reads as zero; too many of them saturate at
-        // whichever end, which is what `strtoll` does with ERANGE.
+        // No digits reads as 0; too many saturate, as `strtoll` does on
+        // ERANGE.
         Err(_) if valid == 0 => 0,
         Err(_) if negative => i64::MIN,
         Err(_) => i64::MAX,
     }
 }
 
-// The same, for the conversions that read their argument as unsigned:
-// `%u`, `%o`, `%x`, `%X`. A negative argument wraps (`-42` is
-// `ffffffffffffffd6`), and anything too large for 64 bits saturates
-// whichever sign it had.
+// The same for `%u`, `%o`, `%x`, `%X`: a negative argument wraps (`-42`
+// is `ffffffffffffffd6`), and an overflow saturates in its sign's
+// direction.
 fn printf_uint(arg: &str) -> u64 {
     let text = arg.trim();
     if let Some(rest) = text.strip_prefix(['\'', '"']) {
@@ -12000,8 +11906,8 @@ fn printf_uint(arg: &str) -> u64 {
     }
 }
 
-// The base an argument announces: `0x` for hexadecimal, a leading `0`
-// for octal, decimal otherwise -- `strtol`'s base 0.
+// The base an argument announces (`0x` hex, `0` octal, else decimal),
+// as `strtol`'s base 0.
 fn int_radix(rest: &str) -> (u32, &str) {
     match rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
         Some(hex) => (16, hex),
@@ -12012,11 +11918,8 @@ fn int_radix(rest: &str) -> (u32, &str) {
     }
 }
 
-// The `%d`/`%x`/`%o` family's own reading of precision: a *minimum*
-// number of digits, zero-filled, rather than the "digits after the
-// point" it means for a float. Zero printed at precision zero is
-// nothing at all -- `%.0d` of 0 is the empty string, which is how a C
-// programmer writes "this column is blank when there is nothing in it".
+// Integer precision is a minimum digit count, zero-filled. Zero at
+// precision zero prints nothing: `%.0d` of 0 is empty.
 fn pad_integer_digits(piece: String, precision: usize) -> String {
     let (sign, digits) = match piece.starts_with('-') {
         true => piece.split_at(1),
@@ -12029,12 +11932,11 @@ fn pad_integer_digits(piece: String, precision: usize) -> String {
     format!("{sign}{}{digits}", "0".repeat(fill))
 }
 
-// `printf`'s own idea of a number, which is C's `strtod`: a decimal or
-// exponent form, a `0x` integer, surrounding space, `inf`/`nan`. `None`
-// for anything else, which every caller renders as zero.
+// printf's float: C's `strtod`, the longest valid prefix (decimal or
+// exponent form, `0x`, `inf`/`nan`, surrounding space). No prefix is 0.
 fn printf_float(arg: &str) -> f64 {
     let text = arg.trim();
-    // bash's `'X` extension is not just for the integer conversions.
+    // bash's `'X` applies to float conversions too.
     if let Some(rest) = text.strip_prefix(['\'', '"']) {
         return rest.chars().next().map(|c| c as u32 as f64).unwrap_or(0.0);
     }
@@ -12054,10 +11956,9 @@ fn printf_float(arg: &str) -> f64 {
     text[..float_prefix_len(text)].parse::<f64>().unwrap_or(0.0)
 }
 
-// How much of `text` is a number, the way `strtod` measures it: an
-// optional sign, digits with an optional point among them, and an
-// optional exponent that only counts if it has digits of its own. `12
-// 34` is 12 and `3.9abc` is 3.9; `.` and `abc` are nothing.
+// How much of `text` is a number, as `strtod` measures it: sign,
+// digits with an optional point, and an exponent only if it has digits.
+// `12 34` is 12, `3.9abc` is 3.9; `.` and `abc` are nothing.
 fn float_prefix_len(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -12089,22 +11990,20 @@ fn float_prefix_len(text: &str) -> usize {
         while j < bytes.len() && bytes[j].is_ascii_digit() {
             j += 1;
         }
-        // An `e` with nothing after it is not part of the number.
+        // An `e` with nothing after it isn't part of the number.
         i = if j > digits_start { j } else { mantissa_end };
     }
     i
 }
 
-// Precision on a string conversion is a maximum length. Cut on a
-// character rather than a byte: `String::truncate` panics on a boundary
-// it does not own, and `printf '%.1s'` on a string of two-byte
-// characters used to take the whole shell down with it.
+// String precision is a maximum length, cut on a character:
+// `String::truncate` panics inside one.
 fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-// `inf`/`nan` print as themselves, in the case the conversion asked
-// for, with no digits and no precision applied.
+// `inf`/`nan` print as themselves, in the conversion's case, ignoring
+// precision.
 fn non_finite(v: f64, upper: bool) -> Option<String> {
     if v.is_finite() {
         return None;
@@ -12117,14 +12016,12 @@ fn non_finite(v: f64, upper: bool) -> Option<String> {
     Some(if upper { word.to_uppercase() } else { word.to_string() })
 }
 
-// `%f`.
 fn format_fixed(v: f64, precision: usize, upper: bool) -> String {
     non_finite(v, upper).unwrap_or_else(|| format!("{v:.precision$}"))
 }
 
-// `%e`. Rust's own `{:e}` is close but not the same: it writes
-// `3.14159e4` where C writes `3.141590e+04` -- an explicit sign, and at
-// least two exponent digits.
+// `%e`. Rust's `{:e}` writes `3.14159e4` where C writes
+// `3.141590e+04`, with a sign and at least two exponent digits.
 fn format_exponential(v: f64, precision: usize, upper: bool) -> String {
     if let Some(word) = non_finite(v, upper) {
         return word;
@@ -12137,15 +12034,10 @@ fn format_exponential(v: f64, precision: usize, upper: bool) -> String {
     if upper { out.to_uppercase() } else { out }
 }
 
-// `%g`: whichever of `%e` and `%f` is shorter for this value, with
-// trailing zeros removed. Precision counts *significant* digits here
-// rather than digits after the point, and 0 means 1.
-//
-// The choice is made on the exponent the value has *after* rounding to
-// that many significant digits, not before -- which is why 999999.5 at
-// the default precision is `1e+06` and not `1000000`. Asking Rust for
-// the `%e` form first and reading the exponent back off it is the
-// cheapest way to get that right.
+// `%g`: the shorter of `%e` and `%f`, trailing zeros removed. Precision
+// counts significant digits, and 0 means 1. The choice uses the
+// exponent after rounding to that precision (999999.5 is `1e+06`), so
+// the `%e` form is computed first and its exponent read back.
 fn format_general(v: f64, precision: usize, upper: bool) -> String {
     if let Some(word) = non_finite(v, upper) {
         return word;
@@ -12160,9 +12052,8 @@ fn format_general(v: f64, precision: usize, upper: bool) -> String {
     trim_trailing_zeros(&out)
 }
 
-// The `%g` cleanup, applied to the digits only: `1.230000e-05` becomes
-// `1.23e-05`, `100.000` becomes `100`, and a point left with nothing
-// after it goes too.
+// `%g`'s cleanup of the digits: `1.230000e-05` to `1.23e-05`, `100.000`
+// to `100`.
 fn trim_trailing_zeros(text: &str) -> String {
     let (digits, suffix) = match text.find(['e', 'E']) {
         Some(at) => text.split_at(at),
@@ -12175,21 +12066,13 @@ fn trim_trailing_zeros(text: &str) -> String {
     format!("{digits}{suffix}")
 }
 
-// Runs FORMAT once against `values[*idx..]`, advancing `*idx` past
-// however many of them it actually consumed, and appending the result
-// to `out` -- see run_printf's own doc comment for the conversions and
-// flags supported. Split out from run_printf so the caller can call
-// this repeatedly to cycle FORMAT over more arguments than it has
-// conversions for.
-// One character as its UTF-8 bytes, for a buffer that is assembled as
-// bytes so a `\nnn` escape can name one.
+// One character's UTF-8 bytes, into a byte buffer.
 fn push_char(buf: &mut Vec<u8>, c: char) {
     let mut bytes = [0u8; 4];
     buf.extend_from_slice(c.encode_utf8(&mut bytes).as_bytes());
 }
 
-// Up to `max` hexadecimal digits. Fewer is fine -- `\x7` is a complete
-// escape -- which is why this peeks rather than demands.
+// Up to `max` hex digits; fewer is fine (`\x7` is complete).
 fn read_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) -> u32 {
     let mut value = 0u32;
     for _ in 0..max {
@@ -12204,30 +12087,26 @@ fn read_hex_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: us
     value
 }
 
-// What one pass over a printf format produced besides its output.
-// Collected rather than printed here because this is a free function
-// with no shell to print through -- run_printf reports them in order.
+// What a pass over a printf format produced besides output, for
+// `run_printf` to report: there's no shell to print through here.
 #[derive(Default)]
 pub(crate) struct PrintfOutcome {
-    // Stop rerunning the format over the remaining arguments: either a
-    // `\c` in a `%b` argument, or an error that ended the pass.
+    // Stop cycling the format: a `\c` in a `%b` argument, or an error.
     pub(crate) stop: bool,
     pub(crate) errors: Vec<String>,
     pub(crate) status: i32,
 }
 
-// The C length modifiers. bash skips them -- every integer here is
-// already 64-bit -- but a format that carries one (`%zu`, `%lld`) has
-// to reach the conversion character behind it rather than reading the
-// modifier *as* the conversion. `q` (C's quad) is deliberately absent:
-// `%q` is bash's own shell-quoting conversion, and that is what a
-// script writing it means.
+// C length modifiers, skipped (every integer here is 64-bit) so `%zu`
+// and `%lld` reach their conversion. `q` is left out: `%q` is bash's
+// quoting conversion.
 const PRINTF_LENGTH_MODIFIERS: &str = "hlLjzt";
 
+// Runs the format once over `values[*idx..]`, advancing `*idx` past what
+// it consumed and appending to `out`. `run_printf` repeats it until the
+// arguments run out.
 pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usize, out: &mut String) -> PrintfOutcome {
-    // Assembled as bytes and decoded once at the end, because `\303\244`
-    // has to mean the two bytes of `ä` rather than two Latin-1
-    // characters -- the same reason `$'...'` is built this way.
+    // Bytes, decoded at the end, so `\303\244` is the two bytes of `ä`.
     let mut buf: Vec<u8> = Vec::new();
     let mut outcome = PrintfOutcome::default();
     let mut chars = format.chars().peekable();
@@ -12244,9 +12123,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 Some('t') => push_char(&mut buf, '\t'),
                 Some('v') => push_char(&mut buf, '\u{b}'),
                 Some('"') => push_char(&mut buf, '"'),
-                // `\nnn` names a *byte*, in octal, up to three digits
-                // counting the one just read. `\0nnn` is the same thing
-                // -- `0` is an octal digit.
+                // `\nnn` is a byte in octal, up to three digits including
+                // this one. `\0nnn` is the same, `0` being an octal digit.
                 Some(d @ '0'..='7') => {
                     let mut value = d.to_digit(8).unwrap();
                     for _ in 0..2 {
@@ -12261,8 +12139,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     buf.push(value as u8);
                 }
                 Some('x') => buf.push(read_hex_escape(&mut chars, 2) as u8),
-                // `\u`/`\U` name a code point rather than a byte, so
-                // they go in as UTF-8.
+                // `\u`/`\U` are a code point, written as UTF-8.
                 Some(u @ ('u' | 'U')) => {
                     let width = if u == 'u' { 4 } else { 8 };
                     match char::from_u32(read_hex_escape(&mut chars, width)) {
@@ -12288,11 +12165,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             continue;
         }
 
-        // bash's `%(FORMAT)T`: the parenthesised part is a strftime
-        // format and the argument is a Unix timestamp, with `-1` (or no
-        // argument) meaning now. Read here, before the flag/width
-        // parsing below, because `(` is where the conversion's own
-        // syntax starts and none of those flags apply to it.
+        // `%(FORMAT)T`: a strftime format and a Unix timestamp argument, `-1`
+        // or none meaning now. Read before the flags, which don't apply.
         if chars.peek() == Some(&'(') {
             chars.next();
             let mut time_fmt = String::new();
@@ -12304,16 +12178,11 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 }
                 time_fmt.push(c);
             }
-            // `%(unterminated` is not a time conversion at all; print it
-            // back the way an unknown conversion is printed back.
             if !closed || chars.next() != Some('T') {
-                // Not a time conversion after all. Print it back the way
-                // an unknown conversion is printed back -- but through
-                // the escape expander, since the characters swallowed
-                // looking for the `)` never reached the `\n`/`\t`
-                // handling at the top of this loop and would otherwise
-                // come out as a literal backslash. bash calls this an
-                // invalid time format and warns; bish just prints it.
+                // Not a time conversion: printed back like an unknown
+                // conversion, but through the escape expander, since the
+                // characters read looking for `)` skipped escape handling.
+                // bash warns about an invalid time format.
                 buf.extend_from_slice("%(".as_bytes());
                 buf.extend_from_slice(&echo_expand_escapes(&time_fmt).0.as_bytes());
                 if closed {
@@ -12326,9 +12195,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 *idx += 1;
             }
             let secs = match arg.trim().parse::<i64>() {
-                // bash: -1 is now, -2 is when the shell started. bish
-                // has no start-time to report, so both read as now --
-                // stated rather than silently wrong.
+                // In bash -1 is now and -2 is when the shell started. bish
+                // has no start time, so both mean now.
                 Ok(n) if n >= 0 => n,
                 _ => unix_now().as_secs() as i64,
             };
@@ -12350,9 +12218,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     zero_pad = true;
                     chars.next();
                 }
-                // `+` always shows a sign, ` ` shows a space where a
-                // `+` would go -- both only mean anything for a signed
-                // numeric conversion, which is where they are applied.
+                // `+` always shows a sign, ` ` a space in its place; only
+                // for signed numeric conversions.
                 '+' => {
                     plus_sign = true;
                     chars.next();
@@ -12364,10 +12231,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 _ => break,
             }
         }
-        // `%*d` takes the width from an argument, `%.*f` the
-        // precision. Both are how a script prints a column whose width
-        // it computed; neither was recognised, so `%*d` reported a
-        // missing format character.
+        // `%*d` takes the width from an argument, `%.*f` the precision.
         let mut width_digits = String::new();
         let mut star_width: Option<usize> = None;
         if chars.peek() == Some(&'*') {
@@ -12375,7 +12239,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             let v = values.get(*idx).cloned().unwrap_or_default();
             *idx += 1;
             star_width = Some(printf_int(&v).unsigned_abs() as usize);
-            // A negative `*` width means left-aligned, as `-` does.
+            // A negative `*` width left-aligns, as `-` does.
             if printf_int(&v) < 0 {
                 left_align = true;
             }
@@ -12413,9 +12277,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 precision = Some(p.parse().unwrap_or(0));
             }
         }
-        // C's length modifiers (`%zu`, `%lld`): skipped, since every
-        // integer here is already 64-bit -- but skipped rather than
-        // mistaken for the conversion character itself.
+        // C length modifiers (`%zu`, `%lld`), skipped; see
+        // `PRINTF_LENGTH_MODIFIERS`.
         let mut modifiers = String::new();
         while let Some(&m) = chars.peek() {
             if PRINTF_LENGTH_MODIFIERS.contains(m) {
@@ -12449,8 +12312,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             spec
         };
         let Some(conv) = chars.next() else {
-            // `printf '%'` / `printf '%5'`: a conversion that never
-            // named what to convert. bash reports it and stops.
+            // `printf '%'`, `printf '%5'`: no conversion character. bash
+            // reports it and stops.
             outcome.errors.push(format!("`{}': missing format character", spec_so_far("")));
             outcome.status = 1;
             outcome.stop = true;
@@ -12458,9 +12321,7 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             return outcome;
         };
         if !"sbqcdiuoxXfFeEgG".contains(conv) {
-            // An unrecognized conversion is the whole format being
-            // wrong, not a character to print back -- bash abandons
-            // the printf there, and so does this now.
+            // An unknown conversion abandons the printf, as in bash.
             outcome.errors.push(format!("`{}': missing format character", spec_so_far(&conv.to_string())));
             outcome.status = 1;
             outcome.stop = true;
@@ -12473,31 +12334,26 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
             *idx += 1;
             v
         };
-        // Collected beside `outcome` rather than into it: `next_arg`
-        // already holds a mutable borrow across this match.
+        // Collected apart from `outcome`: `next_arg` holds a mutable borrow
+        // across this match.
         let mut errors: Vec<String> = Vec::new();
         let mut status = 0;
-        // What zero-padding and the sign flags apply to. Floats are in
-        // both; `u`/`o`/`x`/`X` take the padding but not a sign, which
-        // is what C does with them.
+        // What zero padding and the sign flags apply to; `u`/`o`/`x`/`X` take
+        // padding but no sign, as in C.
         let numeric = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
         let signed = matches!(conv, 'd' | 'i' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
-        // Zero padding needs digits to sit beside; an infinity or a
-        // NaN has none, so C pads those with spaces however the flags
-        // read. Decided from the value rather than from the text --
-        // `1.0e+20` and `ff` both have letters in them and both pad
-        // with zeros perfectly happily.
+        // An infinity or NaN has no digits, so C pads it with spaces whatever
+        // the flags say. Decided from the value, not the text: `1.0e+20` and
+        // `ff` pad with zeros.
         let mut zero_pad_ok = true;
         let mut piece = match conv {
-            // The three that precision measures in characters rather
-            // than in digits.
+            // Precision counts characters for these three.
             's' => truncate_chars(&next_arg(), precision.unwrap_or(usize::MAX)),
             'b' => {
                 let (expanded, stop) = printf_b_escapes(&next_arg());
                 let piece = truncate_chars(&expanded, precision.unwrap_or(usize::MAX));
                 if stop {
-                    // `\c` in a `%b` argument ends the output -- all of
-                    // it, not just this conversion.
+                    // `\c` in a `%b` argument ends all the output.
                     buf.extend_from_slice(piece.as_bytes());
                     out.push_str(&String::from_utf8_lossy(&buf));
                     outcome.stop = true;
@@ -12506,13 +12362,12 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                 piece
             }
             'q' => truncate_chars(&printf_quote(&next_arg()), precision.unwrap_or(usize::MAX)),
-            // An empty argument is still a character: bash writes the
-            // NUL it read, and so does this.
+            // An empty argument is still a character: bash writes a NUL.
             'c' => next_arg().chars().next().unwrap_or('\0').to_string(),
             'd' | 'i' | 'u' | 'o' | 'x' | 'X' => {
                 let arg = next_arg();
-                // bash still prints whatever prefix of the argument
-                // *was* a number (`%d` of `1x` is 1) -- but it says so.
+                // bash prints the numeric prefix (`%d` of `1x` is 1) and
+                // complains.
                 if !printf_number_complete(&arg, false) {
                     errors.push(format!("{}: invalid number", arg));
                     status = 1;
@@ -12525,12 +12380,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     _ => format!("{:X}", printf_uint(&arg)),
                 }
             }
-            // The floating-point family. Precision defaults to 6, as C
-            // does, and an argument that is not a number reads as 0 --
-            // the same silent fallback `%d` above already makes (bash
-            // warns and then uses 0; bish has never warned for `%d`
-            // either, and one behaviour for both is worth more here
-            // than half-matching).
+            // The float conversions. Precision defaults to 6, as in C. A
+            // non-number reads as 0 without a warning, unlike bash.
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
                 let arg = next_arg();
                 if !printf_number_complete(&arg, true) {
@@ -12546,12 +12397,10 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
                     _ => format_general(value, precision, conv == 'G'),
                 }
             }
-            // Excluded by the check above.
             other => unreachable!("unhandled printf conversion {other:?}"),
         };
-        // Precision on an integer means minimum digits, and having asked
-        // for those the `0` flag has nothing left to say -- C ignores it
-        // there, so `%08.5d` of 42 is `   00042` rather than `00000042`.
+        // Integer precision is minimum digits, and C ignores `0` with it:
+        // `%08.5d` of 42 is `   00042`.
         let integer = matches!(conv, 'd' | 'i' | 'u' | 'o' | 'x' | 'X');
         if integer && let Some(p) = precision {
             piece = pad_integer_digits(piece, p);
@@ -12567,10 +12416,8 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
         let len = piece.chars().count();
         if len < width {
             let pad = width - len;
-            // Zero padding goes *after* the sign -- `%05d` of -42 is
-            // `-0042`, not `00-42` -- and C does not zero-pad an
-            // infinity or a NaN at all, since there are no digits for
-            // the zeros to be part of.
+            // Zero padding goes after the sign (`%05d` of -42 is `-0042`),
+            // and never on an infinity or NaN.
             let padded_with_zeros = zero_pad && numeric && zero_pad_ok;
             if left_align {
                 piece.push_str(&" ".repeat(pad));
@@ -12594,18 +12441,10 @@ pub(crate) fn printf_format_once(format: &str, values: &[String], idx: &mut usiz
     outcome
 }
 
-// `read`'s view of a file descriptor: never reads a byte it was not
-// asked for.
-//
-// Any buffering here is visible behaviour, not an implementation
-// detail. `{ read -r x; cat; }` must give the first line to `read` and
-// the rest to `cat`, and `cat` is a different process inheriting the
-// same fd -- so anything `read` pulled into a userspace buffer is gone.
-// `BufReader::new(stdin())` lost it at the end of the call;
-// `stdin().lock()` kept it inside this process, which is right for a
-// `while read` loop in one shell and still wrong the moment the fd is
-// handed on. bash reads a byte at a time from a pipe for exactly this
-// reason, and so does this.
+// `read`'s view of a file descriptor, which never reads a byte it wasn't
+// asked for: in `{ read -r x; cat; }` the rest belongs to `cat`, another
+// process on the same fd, so anything buffered here would be lost.
+// bash reads a pipe a byte at a time for the same reason.
 struct UnbufferedFd {
     fd: i32,
     byte: [u8; 1],
@@ -12617,10 +12456,8 @@ impl UnbufferedFd {
         UnbufferedFd { fd, byte: [0], filled: false }
     }
 
-    // Whether the descriptor is open at all. `read -u 9` on a fd
-    // nothing opened has to say so; reading it just returns EBADF, and
-    // an unread line and a closed fd are otherwise the same "no input"
-    // from the caller's side.
+    // Whether the descriptor is open: `read -u 9` on an unopened fd must
+    // say so, where reading would look like no input.
     fn is_open(fd: i32) -> bool {
         crate::platform::is_open(fd)
     }
@@ -12644,16 +12481,13 @@ impl std::io::Read for UnbufferedFd {
 impl std::io::BufRead for UnbufferedFd {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if !self.filled {
-            // Straight to the fd, not through `std::io::stdin()`, whose
-            // own shared buffer is the thing being avoided.
+            // Straight to the fd: `std::io::stdin()`'s shared buffer is
+            // what's being avoided.
             loop {
-                // Asked before reading rather than made non-blocking
-                // around it. This reads exactly one byte, so "the
-                // descriptor has something" is precisely the condition
-                // under which a blocking read cannot block -- one
-                // syscall to find out instead of the three it takes to
-                // set the flag and put it back, on the hottest path
-                // there is: `while read` comes through here per byte.
+                // Polled before reading rather than made non-blocking
+                // around the read: reading one byte can't block when the fd
+                // is readable, and this is one syscall instead of three on
+                // `while read`'s per-byte path.
                 if crate::coroutine::in_coroutine() {
                     while !crate::poll::poll_readable_or_eof(self.fd, 0) {
                         crate::scheduler::park_readable(self.fd);
@@ -12668,11 +12502,9 @@ impl std::io::BufRead for UnbufferedFd {
                     Err(e) => e,
                 };
                 match e.kind() {
-                    // Nothing there *yet*: the stage upstream has not
-                    // written it, and that stage is a coroutine sharing
+                    // Nothing yet: the upstream stage is a coroutine on
                     // this thread. Only a pipe between two in-process
-                    // stages is ever non-blocking, so outside one of
-                    // those this never happens.
+                    // stages is non-blocking.
                     std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(self.fd),
                     std::io::ErrorKind::Interrupted => {}
                     _ => return Err(e),
@@ -12689,14 +12521,9 @@ impl std::io::BufRead for UnbufferedFd {
     }
 }
 
-// bash's exit-status convention for a process killed by a signal is
-// 128+signum (ExitStatus::code() returns None in that case -- there's no
-// normal exit code to report -- so this falls back to the signal via
-// ExitStatusExt, matching what `$?`/`wait`/`fg` should actually show).
 // `${list:off:len}` over elements. A negative offset counts from the
-// end; a negative *length* is an error for a list, where for a string
-// bash reads it as "stop this far from the end" -- one of the few
-// places the two genuinely disagree, and this follows bash on both.
+// end; a negative length is an error for a list, though for a string
+// bash reads it as a distance from the end.
 fn slice_elements(items: Vec<String>, offset: i64, length: Option<i64>) -> Result<Vec<String>, String> {
     let count = items.len() as i64;
     let start = match offset < 0 {
@@ -12711,10 +12538,8 @@ fn slice_elements(items: Vec<String>, offset: i64, length: Option<i64>) -> Resul
     Ok(items.into_iter().skip(start as usize).take((end - start).max(0) as usize).collect())
 }
 
-// The CPU a shell's children have used so far, in seconds. `times(2)`
-// rather than `getrusage`, because it is the same call the `times`
-// builtin already makes and it reports exactly the two numbers `time`
-// wants.
+// The CPU time a shell's children have used, in seconds, from
+// `times(2)`, as the `times` builtin reads it.
 fn child_cpu_times() -> (f64, f64) {
     match crate::platform::cpu_seconds() {
         Some((_, _, child_user, child_system)) => (child_user, child_system),
@@ -12722,23 +12547,20 @@ fn child_cpu_times() -> (f64, f64) {
     }
 }
 
+// A process killed by a signal reports 128+signum, as in bash.
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| crate::platform::exit_signal(&status).map(|s| 128 + s).unwrap_or(1))
 }
 
-// Shared by the `read` builtin's two sources (a Box<dyn BufRead> from
-// read_input_source, or a borrowed coproc fd via `-u`) -- factored out
-// specifically so the `-u` path's borrow of self.coproc_fds can end right
-// after this call, before the caller needs `&mut self` again for
-// assign_var. Real bash: a line/char-count read that runs into EOF before
-// seeing its delimiter (or before nchars is reached) still populates the
-// variable(s) with whatever partial data it got, but returns non-zero --
-// `clean` (the bool) tracks which case this was.
-// `raw` is `read` *without* `-r`, where a backslash escapes the next
-// character -- including the delimiter, which then continues the line
-// rather than ending it. The escapes themselves are removed later (see
-// unescape_read_line), because the splitting has to know which
-// characters they protected.
+// `read`'s line or character count from `reader`, shared by its two
+// sources, so `-u`'s borrow of `coproc_fds` ends before `assign_var`.
+// Hitting EOF before the delimiter or the count still yields the
+// partial data, with `false`, as in bash.
+//
+// `raw` is `read` without `-r`: a backslash escapes the next character,
+// the delimiter included, which continues the line. The escapes are
+// removed later (`unescape_read_line`), because splitting must know
+// which characters they protected.
 fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, delim: u8, raw: bool) -> (Option<String>, bool) {
     if let Some(n) = nchars {
         let mut buf = Vec::with_capacity(n);
@@ -12775,8 +12597,7 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
                             buf.pop();
                         }
                     }
-                    // A line ending in an *unescaped* backslash is not
-                    // finished: the backslash escaped the delimiter, so
+                    // A line ending in an unescaped backslash continues:
                     // both go and the next line joins this one.
                     let trailing = buf[before..].iter().rev().take_while(|b| **b == b'\\').count();
                     if !raw && hit_delim && trailing % 2 == 1 {
@@ -12792,10 +12613,9 @@ fn read_line_or_chars(reader: &mut dyn std::io::BufRead, nchars: Option<usize>, 
     }
 }
 
-// Removes `read`'s backslash escapes, and says which characters they
-// protected: `escaped[i]` is true for a character that a backslash
-// preceded, and such a character is never a field separator however it
-// looks. `read a b <<< 'x\ y z'` gives a=`x y`, b=`z`.
+// Removes `read`'s backslash escapes and marks the characters they
+// protected, which are never field separators:
+// `read a b <<< 'x\ y z'` gives a=`x y`, b=`z`.
 fn unescape_read_line(line: &str) -> (String, Vec<bool>) {
     let mut out = String::with_capacity(line.len());
     let mut mask = Vec::with_capacity(line.len());
@@ -12814,23 +12634,15 @@ fn unescape_read_line(line: &str) -> (String, Vec<bool>) {
     (out, mask)
 }
 
-/// The three `trap` targets that are not signals -- the interpreter
-/// fires each itself, at a point it already passes through.
-/// bash's own name for it, spelled exactly as bash spells it -- a
-/// distribution's integration script defines this name and no other.
+/// bash's name for it, which distributions' integration scripts define.
 const COMMAND_NOT_FOUND_HANDLER: &str = "command_not_found_handle";
 
-/// The three `trap` targets that are not signals -- the interpreter
-/// fires each itself, at a point it already passes through.
-// Wall-clock time since the epoch. `SystemTime` can technically be
-// before it if the clock is badly wrong; that reads as 0 rather than
-// panicking, since a shell variable is not the place to raise it.
+// Time since the epoch; a clock set before it reads as 0.
 fn unix_now() -> std::time::Duration {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
 }
 
-/// The three `trap` targets that are not signals -- the interpreter
-/// fires each itself, at a point it already passes through.
+/// The `trap` targets that aren't signals, fired by the interpreter.
 #[derive(Clone, Copy, PartialEq, Eq)]
 // The discriminants index pseudo_trap_depth.
 #[repr(usize)]
@@ -12846,69 +12658,21 @@ enum TrapAction {
     Run(String),
 }
 
-// dup2(1, 2) in the child, after fork but before exec -- so fd 2 becomes a
-// genuine duplicate of whatever fd 1 was just set up to be (Command's own
-// stdio setup runs before pre_exec hooks). A single async-signal-safe
-// syscall with no allocation, which is exactly what's safe to do in this
-// narrow post-fork window; declared directly via extern "C" rather than
-// pulling in the `libc` crate, since libc is already linked into any
-// dynamically-linked Unix binary regardless.
-/// The platform layer's, re-exported under the name the rest of this
-/// file has always used: POSIX has no query-only umask read, and what
-/// that costs is the layer's business.
+/// The platform layer's, under the name this file uses.
 pub(crate) use crate::platform::current_umask;
 
-// run_in_child_shell's own snapshot/restore for fd 0/1/2, the real
-// process's own stdin/stdout/stderr -- see its own call site's doc
-// comment for why a bare `exec > file` (persistent, no-fork redirect)
-// needs this. `dup` (not dup2) gives each a fresh, arbitrary-numbered
-// duplicate fd that keeps pointing at whatever 0/1/2 currently mean,
-// regardless of what the child does to 0/1/2 themselves afterward; `-1`
-// (dup failed -- an exhausted fd table, most likely) is carried through
-// as "nothing to restore" rather than erroring, matching how a swallowed
-// `save`/`restore` failure elsewhere in this codebase degrades rather
-// than aborting the whole call.
-// The lowest descriptor at or above 10 that nothing has open. bash
-// allocates `{name}` redirects from 10 up, deliberately clear of the
-// 0-9 a script may name directly.
+// The lowest fd from 10 up that nothing has open: bash allocates
+// `{name}` redirects there, clear of the 0-9 a script names.
 fn next_free_fd() -> i32 {
     (10..256).find(|fd| !UnbufferedFd::is_open(*fd)).unwrap_or(10)
 }
 
-// The real process environment is shared by every in-process construct
-// (`$( )`, `( )`, `<( )`, a redirected compound command), so a foreground
-// subshell that exports a variable must not leave it behind for the
-// enclosing shell -- a real fork got that isolation from the kernel.
-//
-// It used to be bought with a full `std::env::vars()` snapshot before and
-// a full replay after *every* in-process child, which cost O(env) to take
-// and O(env^2) to restore (glibc `setenv` scans `environ` linearly, called
-// once per variable). On a 375-variable environment that was ~1ms per
-// `$( )` -- worse than the fork it exists to avoid.
-//
-// An undo journal instead: while a child is running, the handful of places
-// that write to the real environment record the pre-image of the name they
-// are about to touch, and the restore replays that list backwards. The
-// overwhelmingly common case -- a child that exports nothing -- costs one
-// `Vec::new()` and one `is_empty()`.
-//
-// Journals nest: only the innermost frame records, which is enough,
-// because an inner frame is always fully unwound before its parent's own
-// unwind reads anything.
-// Whether a write to the current pipeline stage's own stdout has failed
-// because nothing is reading it any more, and whether anyone is asking.
-//
-// A pipeline stage that is its own process gets SIGPIPE here and dies,
-// which is what makes `while true; do echo x; done | head -2` a script
-// that terminates. A stage running *inside* this shell cannot be
-// allowed to die that way -- it would take the shell with it -- and
-// Rust's runtime sets SIGPIPE to SIG_IGN anyway, so the write simply
-// returns `EPIPE` and the loop above it runs forever.
-//
-// `None` means nobody is asking: an `EPIPE` outside a pipeline stage is
-// still ignored, exactly as before. Armed only around a stage running
-// in this shell, where the death it stands in for is a stage's, not the
-// shell's.
+// Whether a write to this pipeline stage's stdout failed because its
+// reader is gone, and whether anyone is asking. A stage that is its own
+// process dies of SIGPIPE, which is what ends
+// `while true; do echo x; done | head -2`; a stage in this shell can't
+// die, and Rust ignores SIGPIPE, so the write returns `EPIPE` instead.
+// Armed only around an in-process stage; `None` means nobody asks.
 thread_local! {
     static BROKEN_PIPE: RefCell<Option<bool>> = const { RefCell::new(None) };
 }
@@ -12931,14 +12695,9 @@ pub(crate) fn note_broken_pipe() {
     });
 }
 
-/// Swaps this thread's broken-pipe watch for another, handing back what
-/// was there.
-///
-/// The watch is per-thread, and pipeline stages share a thread -- so
-/// without this, one stage's dead reader would be reported to whichever
-/// stage happened to run next. The scheduler swaps each task's own in
-/// around every resume, which makes the thread-local a per-coroutine
-/// slot without the sink having to know that coroutines exist.
+/// Swaps this thread's broken-pipe watch for another, returning the old
+/// one. Pipeline stages share a thread, so the scheduler swaps each
+/// task's watch in around every resume.
 pub(crate) fn swap_broken_pipe(state: Option<bool>) -> Option<bool> {
     BROKEN_PIPE.with(|b| std::mem::replace(&mut *b.borrow_mut(), state))
 }
@@ -12947,9 +12706,8 @@ fn broken_pipe_seen() -> bool {
     BROKEN_PIPE.with(|b| *b.borrow() == Some(true))
 }
 
-// A cheap order-sensitive fingerprint of a call's positional parameters.
-// FNV-1a: no allocation, and the frames only ever compare it against
-// another fingerprint taken the same way.
+// An order-sensitive fingerprint of a call's positional parameters.
+// FNV-1a, with no allocation.
 fn args_fingerprint(args: &[String]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for a in args {
@@ -12979,6 +12737,9 @@ fn dup_fd_as_file(fd: i32) -> Option<std::fs::File> {
     crate::platform::duplicate_as_file(fd)
 }
 
+// Duplicates of fds 0, 1 and 2 as they are now, for `run_in_child_shell`
+// to restore after a bare `exec > file`. -1 where `dup` failed means
+// nothing to restore.
 fn save_fd012() -> [i32; 3] {
     [0, 1, 2].map(|fd| crate::platform::duplicate(fd).unwrap_or(-1))
 }
