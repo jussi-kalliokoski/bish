@@ -1,32 +1,23 @@
-// One debug adapter, running as a subprocess, and the state of the
-// session with it. The half of the Debug Adapter Protocol that owns a
-// process -- `dap.rs` is the wire format and knows nothing about one,
-// the same split `lsp.rs`/`lspclient.rs` already has.
+// One debug adapter as a subprocess, and the session with it: the half of
+// DAP that owns a process, where `dap.rs` is the wire format (as with
+// `lsp.rs` and `lspclient.rs`).
 //
-// Non-blocking pipes and no threads, for the reason lspclient.rs gives
-// at length: this is polled from the same loop that is drawing an
-// editor, and a read that blocks is a keystroke that does not land.
-// `service` is the whole engine -- it drains whatever has arrived,
-// pushes whatever is queued, and returns having advanced the session as
-// far as the bytes allowed. Nothing here ever waits.
+// Non-blocking pipes, no threads, for lspclient.rs's reason: it's polled
+// from the loop drawing the editor. `service` drains what arrived, pushes
+// what's queued, and advances the session; nothing waits.
 //
-// **The launch handshake is not the obvious order**, and getting it
-// wrong deadlocks the session. It is:
+// The launch handshake isn't the obvious order, and getting it wrong
+// deadlocks:
 //
 //   1. `initialize` request.
-//   2. Its response arrives, carrying the adapter's capabilities.
-//   3. `launch` (or `attach`) request -- whose response does *not*
-//      arrive yet.
-//   4. `initialized` *event*, which is the adapter saying it is ready
-//      to be configured.
+//   2. Its response, with the adapter's capabilities.
+//   3. `launch` (or `attach`) request, whose response doesn't come yet.
+//   4. The `initialized` event: ready to be configured.
 //   5. `setBreakpoints` for every file, then `configurationDone`.
-//   6. *Now* the `launch` response arrives, and the program runs.
+//   6. Now the `launch` response arrives, and the program runs.
 //
-// A client that waits for the launch response before configuring waits
-// for ever. That is not a reading of the specification -- it is what
-// gdb 17 does, observed, and it is why the tests here drive a real
-// adapter rather than a mock written from the same assumption as the
-// code.
+// Waiting for the launch response before configuring waits forever. This
+// is what gdb 17 does, which is why the tests drive a real adapter.
 #![allow(dead_code)]
 
 use crate::dap::{self, Message};
@@ -38,17 +29,17 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-/// How far along the handshake is. Every state but `Exited` is
-/// transient and moves on by itself as the adapter answers.
+/// How far the handshake is. Every state but `Exited` moves on by itself
+/// as the adapter answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// `initialize` sent, waiting for its answer.
     Initializing,
-    /// Launched, waiting for the `initialized` event that says the
-    /// adapter will take breakpoints.
+    /// Launched, awaiting the `initialized` event that says breakpoints can
+    /// be sent.
     Launching,
-    /// Breakpoints sent, `configurationDone` sent -- the program is
-    /// running or about to be.
+    /// Breakpoints and `configurationDone` sent: the program runs or is about
+    /// to.
     Configured,
     /// The adapter said the program ended, or the process died.
     Exited,
@@ -68,13 +59,12 @@ pub struct Session {
     stdout: ChildStdout,
     stderr: ChildStderr,
     decoder: dap::Decoder,
-    /// Whatever could not be written yet, because a non-blocking pipe
-    /// was full. Same reason lspclient.rs has one: a writer thread is
-    /// the alternative, and this is not worth a thread.
+    /// What couldn't be written yet because the pipe was full, rather than a
+    /// writer thread, as in lspclient.rs.
     outgoing: VecDeque<u8>,
     next_seq: i64,
-    /// Which command each in-flight request was, so a response can be
-    /// routed by what it answers rather than only by its number.
+    /// Which command each in-flight request was, so a response is routed by
+    /// what it answers.
     pending: HashMap<i64, String>,
     /// Answers nobody has collected yet, by request seq.
     responses: HashMap<i64, Result<Value, String>>,
@@ -84,17 +74,15 @@ pub struct Session {
     capabilities: Value,
     /// What to send once the adapter says it is ready for it.
     launch_arguments: Value,
-    /// Breakpoint lines per file, as asked for -- resent on every
-    /// change, because `setBreakpoints` replaces a file's whole set
-    /// rather than adding to it.
+    /// Breakpoint lines per file, as asked for, resent on every change since
+    /// `setBreakpoints` replaces a file's whole set.
     wanted: HashMap<PathBuf, Vec<usize>>,
     /// What the adapter made of them, keyed the same way.
     placed: HashMap<PathBuf, Vec<dap::Breakpoint>>,
     /// The program's own output, and the adapter's, kept apart.
     output: Vec<dap::Output>,
     exit_code: Option<i64>,
-    /// Everything that went wrong, for a user asking why the session is
-    /// not doing what they expected.
+    /// Everything that went wrong, for a user asking why.
     log: Vec<String>,
     stdout_eof: bool,
     stderr_partial: String,
@@ -102,12 +90,9 @@ pub struct Session {
 
 impl Session {
     /// Starts `command` as a debug adapter and begins the handshake.
-    ///
-    /// `launch_arguments` is passed through to the adapter untouched:
-    /// what a `launch` request needs is adapter-specific (gdb wants
-    /// `program`, debugpy wants `module` or `program`, delve wants
-    /// `mode`), and inventing a common shape over them would only be a
-    /// second thing to get wrong.
+    /// `launch_arguments` go to the adapter unchanged: they're
+    /// adapter-specific (gdb wants `program`, debugpy `module` or
+    /// `program`, delve `mode`).
     pub fn start(command: &[String], cwd: &Path, launch_arguments: Value) -> Result<Session, String> {
         if !cfg!(feature = "dap") {
             return Err("debug adapters are not part of this build".to_string());
@@ -120,19 +105,17 @@ impl Session {
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Piped, not null: an adapter that fails to start explains
-            // itself on stderr and then exits, and discarding that
-            // leaves a dead session with no reason. Never reading it
-            // would be worse -- a chatty adapter fills the pipe and
-            // blocks -- so it is drained every tick.
+            // Piped: an adapter that fails to start explains itself on
+            // stderr. It's drained every tick, so a chatty adapter can't
+            // fill the pipe and block.
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("{program}: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let stdout = child.stdout.take().ok_or("no stdout pipe")?;
         let stderr = child.stderr.take().ok_or("no stderr pipe")?;
-        // A child's pipes only have descriptors where a child can be
-        // spawned; where it cannot, the spawn above already failed.
+        // The pipes only have descriptors where a child can be spawned;
+        // elsewhere the spawn already failed.
         #[cfg(unix)]
         {
             crate::pty::set_nonblocking(stdout.as_raw_fd());
@@ -168,16 +151,14 @@ impl Session {
                 ("clientID", Value::Str("bish".to_string())),
                 ("clientName", Value::Str("bish".to_string())),
                 ("adapterID", Value::Str(program.rsplit('/').next().unwrap_or(program).to_string())),
-                // One-based on both axes, which is what an editor
-                // showing line numbers already counts in -- and what
-                // `debugger.rs` uses for its own breakpoints.
+                // One-based on both axes, as the editor's line numbers and
+                // `debugger.rs` count.
                 ("linesStartAt1", Value::Bool(true)),
                 ("columnsStartAt1", Value::Bool(true)),
                 ("pathFormat", Value::Str("path".to_string())),
-                // Not claimed, because it is not implemented: an
-                // adapter that believes this will ask bish to run the
-                // program in a terminal and wait for an answer that
-                // never comes.
+                // Not claimed, because not implemented: an adapter that
+                // believed it would ask bish to run the program in a
+                // terminal and wait forever.
                 ("supportsRunInTerminalRequest", Value::Bool(false)),
                 ("supportsProgressReporting", Value::Bool(false)),
             ]),
@@ -185,12 +166,9 @@ impl Session {
         Ok(session)
     }
 
-    /// Where a breakpoint should be, before the adapter has had a say.
-    ///
-    /// Recorded rather than sent immediately: an adapter will not take
-    /// breakpoints until it has sent `initialized`, and a session that
-    /// is still starting has nowhere to put them yet. `service` sends
-    /// them when the moment comes, and again whenever this changes.
+    /// Where a breakpoint should be, before the adapter has its say.
+    /// Recorded rather than sent: an adapter takes breakpoints only after
+    /// `initialized`. `service` sends them then, and again on every change.
     pub fn set_breakpoints(&mut self, path: &Path, lines: &[usize]) {
         let mut lines = lines.to_vec();
         crate::sort::sort(&mut lines);
@@ -201,10 +179,8 @@ impl Session {
         }
     }
 
-    /// What the adapter made of the breakpoints in one file. Empty
-    /// until it has answered -- and an entry that is `verified: false`
-    /// is a breakpoint that will not be hit, which is worth showing
-    /// differently rather than pretending.
+    /// What the adapter made of one file's breakpoints; empty until it
+    /// answers. An unverified one won't be hit, so it's shown differently.
     pub fn breakpoints(&self, path: &Path) -> &[dap::Breakpoint] {
         self.placed.get(path).map_or(&[], |v| v.as_slice())
     }
@@ -233,8 +209,7 @@ impl Session {
         &self.log
     }
 
-    /// Everything the program (and the adapter) has printed, oldest
-    /// first.
+    /// Everything the program and the adapter printed, oldest first.
     pub fn output(&self) -> &[dap::Output] {
         &self.output
     }
@@ -243,21 +218,16 @@ impl Session {
         std::mem::take(&mut self.output)
     }
 
-    // -----------------------------------------------------------------
     // Driving the program
-    // -----------------------------------------------------------------
 
-    /// Resume. `thread` is which one, for an adapter that stops them
-    /// individually; every adapter accepts the id of the thread that
-    /// stopped.
+    /// Resume. `thread` is which one, for adapters that stop threads
+    /// separately; all accept the stopped thread's id.
     pub fn resume(&mut self, thread: i64) -> i64 {
         self.execution = Execution::Running;
         self.request("continue", object(vec![("threadId", Value::Number(thread as f64))]))
     }
 
-    /// Over the next line, into the next call, or out of this one --
-    /// the three steps every debugger has and every adapter names the
-    /// same way.
+    /// Over the next line, into the next call, or out of this one.
     pub fn step_over(&mut self, thread: i64) -> i64 {
         self.step("next", thread)
     }
@@ -295,9 +265,8 @@ impl Session {
         self.request("variables", object(vec![("variablesReference", Value::Number(reference as f64))]))
     }
 
-    /// A watch expression, or what a hover should say. `context` is the
-    /// adapter's own hint -- `hover`, `watch`, `repl` -- and some
-    /// adapters answer differently for each.
+    /// A watch expression, or a hover. `context` (`hover`, `watch`, `repl`)
+    /// is a hint some adapters answer differently for.
     pub fn evaluate(&mut self, expression: &str, frame: Option<i64>, context: &str) -> i64 {
         let mut args = vec![("expression", Value::Str(expression.to_string())), ("context", Value::Str(context.to_string()))];
         if let Some(frame) = frame {
@@ -306,10 +275,9 @@ impl Session {
         self.request("evaluate", object(args))
     }
 
-    /// Ends the session, politely if the adapter said it can be. The
-    /// process is not waited for here -- `is_dead` and `service` notice
-    /// it going, and blocking on a subprocess that has decided not to
-    /// leave is exactly what an editor's redraw loop must not do.
+    /// Ends the session, politely if the adapter supports it. Not waited for:
+    /// `is_dead` and `service` notice the exit, and the redraw loop mustn't
+    /// block on a process that won't leave.
     pub fn terminate(&mut self) {
         match self.supports("supportsTerminateRequest") {
             true => {
@@ -321,9 +289,8 @@ impl Session {
         }
     }
 
-    /// The answer to a request, once it has come back. Taken rather
-    /// than borrowed: a caller asks once and gets it once, which is
-    /// what stops a stale answer being read as a fresh one.
+    /// A request's answer once it's back. Taken, not borrowed, so a stale
+    /// answer can't be read as fresh.
     pub fn take_response(&mut self, seq: i64) -> Option<Result<Value, String>> {
         self.responses.remove(&seq)
     }
@@ -332,14 +299,11 @@ impl Session {
         matches!(self.state, State::Exited) || self.child.try_wait().ok().flatten().is_some()
     }
 
-    // -----------------------------------------------------------------
     // The engine
-    // -----------------------------------------------------------------
 
-    /// One tick: write what is queued, read what has arrived, and
-    /// advance the session by whatever it said. Returns the events that
-    /// the caller may want to react to -- everything else is absorbed
-    /// into this session's own state.
+    /// One tick: write what's queued, read what arrived, advance the
+    /// session. Returns the events a caller may react to; the rest is
+    /// absorbed into this session's state.
     pub fn service(&mut self) -> Vec<Message> {
         self.flush();
         self.drain_stderr();
@@ -351,8 +315,7 @@ impl Session {
                     break;
                 }
                 Ok(n) => self.decoder.feed(&buf[..n]),
-                // Nothing to read right now, which is the ordinary case
-                // and not a failure.
+                // Nothing to read now: the ordinary case.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -377,8 +340,7 @@ impl Session {
                 }
             }
         }
-        // An adapter whose stdout has closed is an adapter that has
-        // gone, whatever it said last.
+        // An adapter whose stdout closed is gone, whatever it said last.
         if self.stdout_eof && !matches!(self.state, State::Exited) {
             self.state = State::Exited;
         }
@@ -396,17 +358,16 @@ impl Session {
                 match (command.as_str(), result) {
                     ("initialize", Ok(body)) => {
                         self.capabilities = body.clone();
-                        // The launch goes out now and its answer comes
-                        // back much later -- see this module's own
-                        // header for why that is not a bug.
+                        // The launch goes out now and its answer comes much
+                        // later; see the module header.
                         let arguments = self.launch_arguments.clone();
                         self.request("launch", arguments);
                         self.state = State::Launching;
                     }
                     ("setBreakpoints", Ok(body)) => {
-                        // Which file this answers is not in the reply,
-                        // so it is remembered from the request -- see
-                        // `send_breakpoints`.
+                        // The reply doesn't say which file it answers, so
+                        // that's remembered from the request (see
+                        // `send_breakpoints`).
                         if let Some(path) = self.pending.remove(&-request_seq).map(PathBuf::from) {
                             self.placed.insert(path, dap::breakpoints(body));
                         }
@@ -417,9 +378,8 @@ impl Session {
                 self.responses.insert(*request_seq, result.clone());
             }
             Message::Event { event, body } => match event.as_str() {
-                // The adapter is ready to be configured. This is the
-                // moment breakpoints become sendable, and the reason
-                // they are recorded before it rather than sent.
+                // Ready to be configured: breakpoints can be sent now,
+                // which is why they're recorded until then.
                 "initialized" => {
                     for path in self.wanted.keys().cloned().collect::<Vec<_>>() {
                         self.send_breakpoints(&path);
@@ -429,10 +389,9 @@ impl Session {
                 }
                 "stopped" => self.execution = Execution::Stopped(dap::stopped(body)),
                 "continued" => self.execution = Execution::Running,
-                // An adapter revising a breakpoint it could not place
-                // earlier. gdb sends one of these for every breakpoint
-                // once the program loads, which is the only way any of
-                // them ever becomes verified.
+                // A revised breakpoint. gdb sends one for every breakpoint
+                // once the program loads, the only way any becomes
+                // verified.
                 "breakpoint" => {
                     if let Some(updated) = dap::breakpoint_event(body) {
                         self.update_breakpoint(updated);
@@ -448,10 +407,9 @@ impl Session {
                 "terminated" => self.state = State::Exited,
                 _ => {}
             },
-            // An adapter may ask *us* things -- `runInTerminal` is the
-            // one that matters, and `initialize` said we cannot do it.
-            // Refusing plainly is better than silence, which leaves the
-            // adapter waiting.
+            // An adapter may ask us things; `runInTerminal` matters, and
+            // `initialize` said we can't. A plain refusal beats leaving it
+            // waiting.
             Message::Request { seq, command, .. } => {
                 let refusal =
                     Message::Response { request_seq: *seq, command: command.clone(), result: Err(format!("bish does not implement {command}")) };
@@ -460,16 +418,15 @@ impl Session {
         }
     }
 
-    /// Slots a revised breakpoint into whichever file it belongs to.
-    /// Matched by id where the adapter gave one, since the line it
-    /// reports may have moved from the line that was asked for.
+    /// Slots a revised breakpoint into its file, matched by id where given,
+    /// since the reported line may differ from the one asked for.
     fn update_breakpoint(&mut self, updated: dap::Breakpoint) {
         for (path, placed) in self.placed.iter_mut() {
             if let Some(existing) = placed.iter_mut().find(|b| b.id.is_some() && b.id == updated.id) {
                 *existing = updated;
                 return;
             }
-            // No id to match on, so fall back to the file it names.
+            // No id, so match on the file it names.
             if updated.source_path.as_deref() == path.to_str()
                 && let Some(existing) = placed.iter_mut().find(|b| b.line == updated.line)
             {
@@ -486,9 +443,8 @@ impl Session {
             "setBreakpoints",
             object(vec![("source", object(vec![("path", Value::Str(path.to_string_lossy().into_owned()))])), ("breakpoints", Value::Array(lines))]),
         );
-        // The reply says nothing about which file it is for, so the
-        // path rides along under the negated seq -- one map, and no way
-        // for the two halves to drift apart.
+        // The reply doesn't name the file, so the path is stored under the
+        // negated seq: one map, so the halves can't drift.
         self.pending.insert(-seq, path.to_string_lossy().into_owned());
     }
 
@@ -505,9 +461,8 @@ impl Session {
         self.flush();
     }
 
-    /// Pushes as much of the queue as the pipe will take. What is left
-    /// stays queued for the next tick, which is what makes a full pipe
-    /// a delay rather than a block.
+    /// Pushes as much of the queue as the pipe takes; the rest waits for the
+    /// next tick, so a full pipe delays rather than blocks.
     fn flush(&mut self) {
         while !self.outgoing.is_empty() {
             let (front, _) = self.outgoing.as_slices();
@@ -527,9 +482,8 @@ impl Session {
         }
     }
 
-    /// An adapter's stderr is where it explains itself when it cannot
-    /// start. Read every tick whether anyone is looking or not, because
-    /// a pipe nobody empties eventually stops the writer.
+    /// An adapter's stderr explains why it couldn't start. Drained every tick
+    /// regardless, since an unemptied pipe eventually stops the writer.
     fn drain_stderr(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
@@ -556,10 +510,9 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// A debug adapter left running holds the debuggee with it -- a
-    /// stopped process nobody can reach, and on some systems a
-    /// terminal that never comes back. So the child is killed rather
-    /// than orphaned.
+    /// A running adapter holds the debuggee: a stopped process nobody can
+    /// reach, and sometimes a terminal that never comes back. So the child is
+    /// killed, not orphaned.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -574,15 +527,9 @@ fn object(fields: Vec<(&str, Value)>) -> Value {
 mod tests {
     use super::*;
 
-    /// A debug session needs three things this machine may not have: a
-    /// C compiler, a debugger that speaks DAP, and permission to
-    /// ptrace. Every test here skips rather than fails without them --
-    /// the same courtesy the bash corpus extends to a machine with no
-    /// bash.
-    ///
-    /// gdb learned `-i=dap` in version 14. Older ones fail the
-    /// handshake, which this notices as a session that never leaves
-    /// `Initializing`.
+    /// A debug session needs a C compiler, a DAP-speaking debugger and
+    /// permission to ptrace; without them the tests skip. gdb has had
+    /// `-i=dap` since version 14; older ones never leave `Initializing`.
     fn adapter() -> Option<Vec<String>> {
         let ok = Command::new("gdb").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().ok()?.success();
         ok.then(|| vec!["gdb".to_string(), "-i=dap".to_string()])
@@ -600,10 +547,9 @@ mod tests {
         }
     }
 
-    /// A small program with a function worth stepping into and a local
-    /// worth reading, compiled with debug info and no optimisation --
-    /// an optimised build has no `total` to look at, which would make
-    /// the test about the compiler rather than about this client.
+    /// A small program with a function to step into and a local to read,
+    /// compiled with debug info and no optimisation, which would remove
+    /// `total`.
     fn fixture(name: &str) -> Option<Fixture> {
         let dir = std::env::temp_dir().join(format!("bish-dap-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -620,9 +566,8 @@ mod tests {
         built.success().then_some(Fixture { dir, source, program })
     }
 
-    /// Polls until `done` says so, or gives up. Every wait in a real
-    /// debug session is like this: the adapter answers when it answers,
-    /// and how quickly is a fact about the machine.
+    /// Polls until `done` holds, or gives up. The adapter answers when it
+    /// answers; how quickly depends on the machine.
     fn until(session: &mut Session, seconds: u64, done: impl Fn(&Session) -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         while std::time::Instant::now() < deadline {
@@ -647,16 +592,14 @@ mod tests {
         }
     }
 
-    /// The whole point of building this against gdb rather than a mock:
-    /// a real adapter, a real program, a real breakpoint. Everything
-    /// the handshake gets wrong shows up here as a session that never
-    /// stops.
+    /// A real adapter, program and breakpoint: a handshake mistake shows up
+    /// as a session that never stops.
     #[test]
     fn a_real_adapter_runs_to_a_real_breakpoint() {
         let (Some(command), Some(fx)) = (adapter(), fixture("breakpoint")) else { return };
         let mut session =
             Session::start(&command, &fx.dir, object(vec![("program", Value::Str(fx.program.to_string_lossy().into_owned()))])).expect("gdb starts");
-        // Line 2 is `add`'s body, reached only by being called.
+        // Line 2 is `add`'s body, reached only by calling it.
         session.set_breakpoints(&fx.source, &[2]);
 
         assert!(
@@ -669,10 +612,8 @@ mod tests {
         assert_eq!(stop.reason, "breakpoint");
         assert!(!stop.hit_breakpoint_ids.is_empty(), "gdb says which breakpoint: {stop:?}");
 
-        // The breakpoint that came back unverified from the reply has
-        // been upgraded by the event -- which is the only way it ever
-        // becomes verified, and the thing a client reading only the
-        // reply would get wrong for ever.
+        // The breakpoint the reply left unverified has been upgraded by the
+        // event.
         let placed = session.breakpoints(&fx.source);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert!(placed[0].verified, "still unverified after the program loaded: {placed:?}");
@@ -690,8 +631,7 @@ mod tests {
 
         let seq = session.stack_trace(thread);
         let frames = dap::stack_frames(&answer(&mut session, seq, 10));
-        // Stopped inside `add`, called from `main` -- the call stack is
-        // the thing a debugger exists to show.
+        // Stopped inside `add`, called from `main`.
         assert_eq!(frames[0].name, "add", "{frames:?}");
         assert_eq!(frames[0].line, 2);
         assert!(frames.iter().any(|f| f.name == "main"), "{frames:?}");
@@ -705,7 +645,7 @@ mod tests {
         let vars = dap::variables(&answer(&mut session, seq, 10));
         let names: Vec<&str> = vars.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b"], "{vars:?}");
-        // First call: add(0, 1).
+        // First call: `add(0, 1)`.
         assert_eq!(vars[0].value, "0");
         assert_eq!(vars[1].value, "1");
     }
@@ -724,8 +664,7 @@ mod tests {
         let seq = session.evaluate("a + b", Some(frames[0].id), "hover");
         assert_eq!(dap::evaluated(&answer(&mut session, seq, 10)).result, "1");
 
-        // A refusal is an answer too, and it carries the debugger's own
-        // words rather than a shrug.
+        // A refusal is an answer, in the debugger's own words.
         let seq = session.evaluate("no_such_symbol", Some(frames[0].id), "hover");
         assert!(until(&mut session, 10, |s| s.responses.contains_key(&seq)));
         let refusal = session.take_response(seq).expect("checked").expect_err("gdb has no such symbol");
@@ -740,9 +679,8 @@ mod tests {
         session.set_breakpoints(&fx.source, &[2]);
         assert!(until(&mut session, 20, |s| matches!(s.execution(), Execution::Stopped(_))), "{:?}", session.log());
 
-        // `add` is called three times -- add(0,1), add(1,2), add(3,3)
-        // -- so the second argument counts up as the loop goes round,
-        // and the third resume runs off the end.
+        // `add` runs three times, `add(0,1)`, `add(1,2)`, `add(3,3)`: the
+        // second argument counts up, and the third resume runs off the end.
         for expected in ["2", "3"] {
             let thread = stopped_thread(&session);
             session.resume(thread);
@@ -759,8 +697,7 @@ mod tests {
         let thread = stopped_thread(&session);
         session.resume(thread);
         assert!(until(&mut session, 20, |s| s.exit_code().is_some() || matches!(s.state(), State::Exited)), "{:?}", session.log());
-        // And the program's own output came back through the adapter,
-        // kept apart from gdb's own chatter.
+        // And the program's output came back, apart from gdb's.
         let printed: String = session.output().iter().filter(|o| o.category == "stdout").map(|o| o.output.clone()).collect();
         assert!(printed.contains('6'), "0+1+2+3 = 6, printed by the program: {:?}", session.output());
     }
@@ -789,8 +726,7 @@ mod tests {
         assert_eq!(frames[0].name, "main");
     }
 
-    // The capabilities really were negotiated, over a pipe, with a
-    // process that had its own opinion about what it can do.
+    // The capabilities were negotiated with a real process.
     #[test]
     fn the_adapters_capabilities_are_read_from_the_adapter() {
         let (Some(command), Some(fx)) = (adapter(), fixture("caps")) else { return };
@@ -802,16 +738,14 @@ mod tests {
         assert!(!session.supports("supportsSomethingNobodyHas"));
     }
 
-    // A breakpoint on a line with no code is not a breakpoint, and an
-    // adapter that says so is telling the truth the user needs. gdb
-    // moves this one to the next statement rather than refusing it,
-    // which is worth knowing rather than assuming either way.
+    // A breakpoint on a line with no code: gdb moves it to the next statement
+    // rather than refusing it.
     #[test]
     fn a_breakpoint_the_adapter_moves_reports_where_it_landed() {
         let (Some(command), Some(fx)) = (adapter(), fixture("moved")) else { return };
         let mut session =
             Session::start(&command, &fx.dir, object(vec![("program", Value::Str(fx.program.to_string_lossy().into_owned()))])).unwrap();
-        // Line 3 is `int main(void) {`, whose code is really line 4.
+        // Line 3 is `int main(void) {`, whose code starts on line 4.
         session.set_breakpoints(&fx.source, &[3]);
         assert!(until(&mut session, 20, |s| matches!(s.execution(), Execution::Stopped(_))), "{:?}", session.log());
         let placed = session.breakpoints(&fx.source);
