@@ -1,39 +1,25 @@
-// Vim's register model: named storage that yank/put/delete/change read and
-// write. Macros (`q`/`@`) ended up *not* living here, despite the name --
-// see `bishedit::vimkeys::VimKeys`'s own `macros`/`recording` fields --
-// since a macro's raw `editor::Key` sequence (arrow keys, Ctrl chords, a
-// mouse event, ...) doesn't round-trip through this module's `String`-only
-// `RegisterValue`, unlike real vim's own registers, which store a
-// recorded macro as literal text. Two further deliberate deviations from
-// real vim:
+// vim's register model: named storage that yank, put, delete and change
+// read and write. Macros live in `vimkeys::VimKeys` instead: a recorded
+// `editor::Key` sequence (arrows, Ctrl chords, mouse events) doesn't fit
+// this module's text-only `RegisterValue`.
 //
-// - Registers are pluggable (`RegisterBackend`), not just a HashMap<char,
-//   String>. Today only three backends exist (plain in-memory, black-hole,
-//   system-clipboard), but a future file-backed register is meant to be a
-//   small, well-contained addition against the same trait, not a redesign.
-// - The unnamed register ("") is aliased to "+ -- the same relationship
-//   real vim has under `set clipboard=unnamedplus`. It isn't a second,
-//   independently-tracked slot that happens to mirror "+; `None` (no `"x`
-//   prefix), `Some('"')`, and `Some('+')` all resolve to the *same*
-//   `ClipboardBackend` instance, so there's nothing to keep in sync.
+// Where this differs from vim:
 //
-// Numbered registers: "0" holds the most recent yank, "1"-"9" a ring of
-// the most recent deletes/changes (newest at "1", each older one shifted
-// up, "9" falling off the end) -- populated via `record_yank`/
-// `record_delete` rather than plain `write`, and only when no explicit
-// `"x` prefix was given (matching vim: `"ayw` only ever touches "a, never
-// "0). Simplified relative to real vim in one way: every delete/change
-// shifts the ring here, not just ones vim itself would call "big enough"
-// -- real vim instead routes a small (single-line, charwise) delete to
-// a separate "- register and leaves the "1-"9 ring untouched for those.
-// Skipped as an unlikely-to-matter nuance for a shell's own editor.
+// - Storage is pluggable (`RegisterBackend`): in-memory, black hole and
+//   system clipboard.
+// - The unnamed register is the `"+` register, as under vim's
+//   `set clipboard=unnamedplus`: `None`, `Some('"')` and `Some('+')` all
+//   resolve to the same `ClipboardBackend`.
+// - Every delete or change shifts the `"1`-`"9` ring. vim sends small
+//   (single-line, charwise) deletes to `"-` instead.
 //
-// `.`/`%`/`:` are read-only (vim's own last-inserted-text/current-
-// filename/last-Ex-command registers) -- set directly by the specific
-// code paths that produce each (see `set_last_insert`/`set_last_filename`/
-// `set_last_ex_command`'s own doc comments), never through the ordinary
-// `write` path (`ReadOnlyBackend::write` is a no-op, matching vim's own
-// "can't be assigned to" rule for these three).
+// `"0` holds the latest yank, and `"1`-`"9` the latest deletes, newest at
+// `"1`. Both are written by `record_yank`/`record_delete`, and only without
+// an explicit `"x` prefix: `"ayw` touches only `"a`, as in vim.
+//
+// `.`, `%` and `:` are read-only. Each is set by the code path that
+// produces it (`set_last_insert`, `set_last_filename`,
+// `set_last_ex_command`); a `write` to one does nothing.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -44,11 +30,8 @@ use std::process::{Command, Stdio};
 pub enum RegisterShape {
     Char,
     Line,
-    /// A rectangle: `Ctrl-V`'s own selection, and what a yank of one
-    /// stores. Put back, each of its lines lands at the *same column* on
-    /// consecutive lines rather than being spliced end to end -- which is
-    /// the whole difference between a block and the same characters
-    /// yanked charwise.
+    /// A rectangle, as `Ctrl-V` selects and yanks it. Put back, each line
+    /// goes at the same column on consecutive lines instead of end to end.
     Block,
 }
 
@@ -65,14 +48,9 @@ impl Default for RegisterValue {
 }
 
 impl RegisterValue {
-    // Collapses this value down to something safe to splice into a
-    // genuinely single-line buffer (the shell's own command line -- see
-    // editor.rs's LineEditor). A Line-shaped value already carries its own
-    // trailing '\n' (motion.rs's extract_text/whole_lines both bake it in);
-    // drop exactly that one, then flatten any *other* embedded newline
-    // (e.g. a multi-line charwise yank pasted from elsewhere) to a space
-    // rather than corrupting the single-line display with a literal
-    // newline character.
+    // This value as one line, for the shell's command line. A Line value ends
+    // in `\n` (motion.rs bakes it in), which is dropped; any other newline,
+    // from a multi-line charwise yank, becomes a space.
     pub fn flatten_to_single_line(&self) -> String {
         let mut s = self.text.as_str();
         if let RegisterShape::Line = self.shape {
@@ -82,16 +60,12 @@ impl RegisterValue {
     }
 }
 
-/// The extension seam for a register's storage. Every register a name can
-/// resolve to (named letters, the clipboard-aliased unnamed/"+", the black
-/// hole) implements this the same way; a future file-backed register would
-/// too.
+/// A register's storage. Every name resolves to one of these.
 trait RegisterBackend {
     fn read(&self) -> RegisterValue;
-    /// `append`: true for an uppercase register name (`"A`, ...) -- vim's
-    /// own rule is text concatenation, and the merged shape is `Line` if
-    /// *either* side was `Line` (a linewise register stays "at least a
-    /// full line" no matter what gets appended to it).
+    /// `append` is set for an uppercase name (`"A`): the text is
+    /// concatenated, and the result is `Line` if either side was, as in
+    /// vim.
     fn write(&mut self, value: RegisterValue, append: bool);
 }
 
@@ -114,10 +88,8 @@ impl RegisterBackend for InMemoryBackend {
     }
 }
 
-// `.`/`%`/`:`'s own storage -- reads back whatever was last set directly
-// via `Registers::set_last_insert`/`set_last_filename`/`set_last_ex_command`;
-// `write` (the ordinary `"x`-prefixed operator path) is a deliberate
-// no-op, since none of these three can be assigned to in real vim either.
+// Storage for `.`, `%` and `:`, set through `Registers`'s `set_last_*`.
+// `write` does nothing: vim doesn't let them be assigned either.
 #[derive(Default)]
 struct ReadOnlyBackend(RegisterValue);
 
@@ -137,43 +109,29 @@ impl RegisterBackend for BlackHoleBackend {
     fn write(&mut self, _value: RegisterValue, _append: bool) {}
 }
 
-// A copy/paste command pair for one clipboard tool. `paste_extra_args`
-// exists solely for `wl-paste -n` (see `detect_clipboard_tool`'s own doc
-// comment on why it's needed there and nowhere else).
+// A copy and paste command pair for one clipboard tool. `paste_extra_args`
+// is for `wl-paste -n` (see `detect_clipboard_tool`).
 struct ClipboardTool {
     copy: (&'static str, &'static [&'static str]),
     paste: (&'static str, &'static [&'static str]),
 }
 
-// Tries each candidate's *both* binaries (a tool that can copy but not
-// paste, or vice versa, is useless here) via a plain PATH scan -- no `which`
-// subprocess, no probe-spawn of the real tool (which would mean actually
-// touching stdin/stdout and risking a hang or a stray clipboard write
-// before this shell has even started). Order doesn't hardcode a single
-// target OS: probing whichever binaries actually exist on PATH is robust to
-// e.g. wl-clipboard under WSLg or xclip installed via XQuartz on macOS,
-// which a `cfg(target_os)` gate would miss.
+// Each candidate needs both binaries on PATH; a tool that can only copy or
+// only paste is useless. Found by scanning PATH, without running anything,
+// which could hang or write the clipboard before the shell has started.
+// Probing what's installed rather than gating on `target_os` also finds
+// wl-clipboard under WSLg or xclip under XQuartz.
 fn detect_clipboard_tool() -> Option<ClipboardTool> {
-    // Never during a test run. `new_for_test` is the deliberate way to
-    // opt one `Registers` out, but it only covers the tests that
-    // remember to ask, and anything that builds a real one some other
-    // way -- an `App`, a `HexSession` before `attach_registers` reaches
-    // it -- talks to the machine's actual clipboard. That clobbers
-    // whatever the developer had copied, and worse: `wl-copy`
-    // daemonizes to serve the selection and keeps the stdout it
-    // inherited, so `cargo test | anything` never sees EOF and hangs
-    // after every test has already passed. Nothing in a test run has
-    // any business reaching the real clipboard, so there is nothing on
-    // PATH to find.
+    // Never during a test run: anything that builds a real `Registers` (an
+    // `App`, a `HexSession`) would use the developer's actual clipboard. And
+    // `wl-copy` daemonizes holding the stdout it inherited, so
+    // `cargo test | anything` would never see EOF.
     if cfg!(test) {
         return None;
     }
-    // ...and for a bish that something else is driving and must not have
-    // the machine's clipboard written under it. `cfg!(test)` cannot
-    // reach that case: `vimdiff`'s corpus runs a *real* `bish tool edit`
-    // through a pty, built without it, and half its cases start with
-    // `dd`. Whoever spawns such a bish is the only one who knows, so
-    // they say so.
+    // ...nor for a bish that something else drives, which `cfg!(test)`
+    // can't see: the vimdiff corpus runs a real `bish tool edit` in a pty,
+    // and half its cases start with `dd`. The spawner sets this.
     if std::env::var_os("BISH_NO_CLIPBOARD").is_some() {
         return None;
     }
@@ -181,11 +139,9 @@ fn detect_clipboard_tool() -> Option<ClipboardTool> {
         ClipboardTool { copy: ("pbcopy", &[]), paste: ("pbpaste", &[]) },
         ClipboardTool { copy: ("xclip", &["-selection", "clipboard"]), paste: ("xclip", &["-selection", "clipboard", "-o"]) },
         ClipboardTool { copy: ("xsel", &["--clipboard", "--input"]), paste: ("xsel", &["--clipboard", "--output"]) },
-        // wl-paste appends a trailing newline by default even when the
-        // clipboard content didn't have one -- `-n` suppresses that so
-        // ClipboardBackend::read's own Char-vs-Line heuristic (does the
-        // text end in '\n'?) reflects the clipboard's real content instead
-        // of an artifact of the tool itself.
+        // wl-paste adds a trailing newline by default; `-n` stops it, so
+        // `ClipboardBackend::read`'s Char-or-Line guess (does the text end in
+        // `\n`?) sees the real content.
         ClipboardTool { copy: ("wl-copy", &[]), paste: ("wl-paste", &["-n"]) },
     ];
     candidates.into_iter().find(|c| command_exists(c.copy.0) && command_exists(c.paste.0))
@@ -210,12 +166,9 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-// Backs the unnamed/"+ register. `tool: None` (no supported clipboard
-// utility found on PATH) degrades silently to `fallback`, an ordinary
-// in-memory slot -- the register still works, it just isn't backed by the
-// real system clipboard. No error, no warning: a shell without a clipboard
-// tool installed is an entirely normal environment (this project's own dev
-// container is one), not a misconfiguration worth surfacing.
+// Backs the unnamed and `"+` registers. With no clipboard tool on PATH it
+// quietly uses `fallback`, an in-memory slot: a system without one is
+// normal, not a misconfiguration.
 struct ClipboardBackend {
     tool: Option<ClipboardTool>,
     fallback: RegisterValue,
@@ -237,38 +190,29 @@ impl RegisterBackend for ClipboardBackend {
         match output {
             Ok(out) if out.status.success() => {
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
-                // A clipboard holds text and no shape, so a shape has to
-                // be inferred from the text -- and a trailing newline is
-                // all there is to go on. That reads a blockwise yank
-                // back as charwise, which is how `Ctrl-V y` then `p`
-                // pastes a rectangle as one run of text.
-                //
-                // When what comes back is exactly what was last put
-                // there, the recorded shape is the better answer: nobody
-                // else has touched the clipboard since, so nothing about
-                // it has changed except that its shape was forgotten.
-                // This is the only way blockwise survives a register
-                // that *is* the system clipboard.
+                // A clipboard holds text without a shape, so the shape is
+                // guessed from a trailing newline, which reads a blockwise
+                // yank back as charwise. When the text is exactly what was
+                // last put there, the recorded shape is used instead:
+                // nothing else touched the clipboard. That's the only way a
+                // block survives the system clipboard.
                 if text == self.fallback.text {
                     return self.fallback.clone();
                 }
                 let shape = if text.ends_with('\n') { RegisterShape::Line } else { RegisterShape::Char };
                 RegisterValue { text, shape }
             }
-            // Tool vanished from PATH, or errored (e.g. no display server
-            // to talk to) -- same graceful degrade as never having found
-            // it, rather than losing whatever was last yanked.
+            // The tool vanished or failed (no display server, say): fall
+            // back as if it was never found.
             _ => self.fallback.clone(),
         }
     }
 
     fn write(&mut self, value: RegisterValue, append: bool) {
         let merged = if append && !self.fallback.text.is_empty() {
-            // The clipboard itself has no append primitive -- read it back
-            // first (so "A appending onto a real system clipboard sees
-            // whatever's actually there, not just this backend's own
-            // possibly-stale fallback) and merge the same way InMemoryBackend
-            // does.
+            // The clipboard can't append, so read it first (`"A` should see
+            // what's really there, not a stale fallback) and merge like
+            // InMemoryBackend.
             let mut current = self.read();
             let shape =
                 if current.shape == RegisterShape::Line || value.shape == RegisterShape::Line { RegisterShape::Line } else { RegisterShape::Char };
@@ -293,26 +237,12 @@ impl RegisterBackend for ClipboardBackend {
     }
 }
 
-// OSC 52 (`\x1b]52;c;<base64>\x07`): asks the real terminal itself to
-// set the system clipboard, working even over plain SSH with nothing
-// installed on the remote end -- xclip/wl-copy/pbcopy above all affect
-// whatever machine bish is actually running *on*, which over SSH is
-// the wrong one; the terminal emulator itself is always running on the
-// user's own machine regardless. Write-only by convention: OSC 52's own
-// paste-back query form (`\x1b]52;c;?\x07`) is disabled by default in
-// most terminal emulators for security reasons (letting any program
-// silently read the system clipboard is a real information leak), so
-// this is never used for `read` -- ClipboardBackend::read keeps relying
-// on a local tool for that, unchanged. Emitted *in addition to*
-// whatever local tool exists above, not instead of it: a local tool is
-// the more reliable path when bish is running directly on the user's
-// own machine (no dependency on the terminal emulator supporting OSC
-// 52 at all), OSC 52 is what actually works when it's running
-// remotely -- doing both costs nothing and covers both cases without
-// needing to guess which one applies. No-op when stdout isn't a real
-// terminal at all (a pipe/file, or a test) -- writing a raw escape
-// sequence into redirected output would just be noise, not a clipboard
-// update.
+// OSC 52 (`\x1b]52;c;<base64>\x07`) asks the terminal to set the
+// clipboard, which works over SSH, where the local tools above would write
+// the remote machine's. Sent in addition to a local tool, so both cases
+// work without guessing which applies. Write-only: most terminals disable
+// OSC 52's read query, since it would let any program read the clipboard.
+// Not sent when stdout isn't a terminal.
 fn write_osc52(text: &str) {
     if !stdout_is_tty() {
         return;
@@ -327,9 +257,8 @@ fn stdout_is_tty() -> bool {
 
 const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// Hand-rolled, no external crate -- same spirit as glob.rs/regex.rs.
-// Standard alphabet, `=`-padded; only ever needs to encode (OSC 52 is
-// write-only here, see write_osc52's own doc comment), so no decoder.
+// Standard alphabet, `=`-padded. Encode only, since OSC 52 is write-only
+// here.
 fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
@@ -344,10 +273,8 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// The whole-shell register table -- one instance, shared globally across
-/// every window/pane/session (matching both vim, where registers are
-/// global to the editor instance rather than per-buffer, and tmux, where
-/// paste buffers are global to the server rather than per-pane).
+/// The register table, one for the whole shell, shared by every window,
+/// pane and session, as vim's registers are global to the editor.
 pub struct Registers {
     named: HashMap<char, InMemoryBackend>,
     numbered: HashMap<char, InMemoryBackend>,
@@ -371,11 +298,9 @@ impl Registers {
         }
     }
 
-    /// `name` is exactly what a `"x` prefix typed, case and all (`None` for
-    /// no prefix at all). Uppercase `'A'..='Z'` always resolves to the same
-    /// storage as its lowercase form -- the case only ever matters to
-    /// `write`'s `append` behavior, decided by the caller before calling
-    /// this (see `resolve`'s own doc comment).
+    /// `name` as the `"x` prefix typed it (`None` without one). Uppercase
+    /// names share their lowercase storage; the case only decides `append`,
+    /// which the caller handles.
     fn resolve(&mut self, name: Option<char>) -> (&mut dyn RegisterBackend, bool) {
         match name {
             None | Some('"') | Some('+') => (&mut self.unnamed, false),
@@ -386,10 +311,8 @@ impl Registers {
             Some('.') => (&mut self.last_insert, false),
             Some('%') => (&mut self.last_filename, false),
             Some(':') => (&mut self.last_ex_command, false),
-            // An unrecognized register name (shouldn't reach here --
-            // vimkeys.rs only ever admits a-z/A-Z/0-9/+/"/_/./%/: into
-            // `pending_register` in the first place) falls back to the
-            // unnamed register rather than panicking.
+            // vimkeys only admits valid names, but an unknown one falls
+            // back to the unnamed register rather than panicking.
             Some(_) => (&mut self.unnamed, false),
         }
     }
@@ -403,9 +326,8 @@ impl Registers {
         backend.write(value, append);
     }
 
-    /// `y{motion}`/`yy`/Visual `y`'s own register write: exactly `write`,
-    /// plus -- only when `name` is `None` (no explicit `"x` prefix, same
-    /// gate vim itself uses) -- also updates "0 to this same value.
+    /// The register write for `y`, `yy` and Visual `y`: `write`, and without
+    /// an explicit `"x` prefix also `"0`, as in vim.
     pub fn record_yank(&mut self, name: Option<char>, value: RegisterValue) {
         if name.is_none() {
             self.numbered.insert('0', InMemoryBackend(value.clone()));
@@ -413,10 +335,9 @@ impl Registers {
         self.write(name, value);
     }
 
-    /// `d{motion}`/`dd`/`x`/Visual `d`/`c{motion}`/`cc`'s own register
-    /// write: exactly `write`, plus -- only when `name` is `None` -- shifts
-    /// the "1-"9 ring up by one (discarding whatever was in "9") and
-    /// writes this value into the now-empty "1.
+    /// The register write for `d`, `dd`, `x`, `c` and their Visual forms:
+    /// `write`, and without a prefix also shifting the `"1`-`"9` ring and
+    /// putting this in `"1`.
     pub fn record_delete(&mut self, name: Option<char>, value: RegisterValue) {
         if name.is_none() {
             for i in (1..9).rev() {
@@ -430,28 +351,22 @@ impl Registers {
         self.write(name, value);
     }
 
-    /// `"."`: vim's own record of the text most recently typed during an
-    /// Insert-mode (or Replace-mode) session -- set by whatever consumer
-    /// owns a real typing loop at each of that loop's own exit points
-    /// (today: only `fileeditor.rs`'s `run_insert_mode`; the shell
-    /// prompt's own "Insert mode" is really just its ordinary core typing
-    /// loop, which nothing here hooks into -- see `KeyOutcome::
-    /// EnterReplace`'s own doc comment for the same "too central a loop to
-    /// touch for this" reasoning).
+    /// `".`: the text last typed in Insert or Replace mode, set at the
+    /// exits of a typing loop. Only `fileeditor.rs`'s `run_insert_mode`
+    /// sets it; the shell prompt's typing loop doesn't (see
+    /// `KeyOutcome::EnterReplace`).
     pub fn set_last_insert(&mut self, text: String) {
         self.last_insert.0 = RegisterValue { text, shape: RegisterShape::Char };
     }
 
-    /// `"%"`: vim's own record of the current file's name -- set whenever
-    /// a file editor session's own path becomes known or changes (opening
-    /// a named file, or `:w`/`:wq`/`:x` naming a previously-unnamed one).
+    /// `"%`: the current file's name, set when a file editor's path becomes
+    /// known or changes (opening a file, or `:w` naming an unnamed one).
     pub fn set_last_filename(&mut self, name: String) {
         self.last_filename.0 = RegisterValue { text: name, shape: RegisterShape::Char };
     }
 
-    /// `":"`: vim's own record of the last Ex command line entered -- set
-    /// whenever one is read, successful or not (matching vim: a failed
-    /// `:nonsense` still becomes the new `":`).
+    /// `":`: the last Ex command line, set whether or not it succeeded, as in
+    /// vim.
     pub fn set_last_ex_command(&mut self, cmd: String) {
         self.last_ex_command.0 = RegisterValue { text: cmd, shape: RegisterShape::Char };
     }
@@ -465,15 +380,9 @@ impl Default for Registers {
 
 #[cfg(test)]
 impl Registers {
-    // Forces the unnamed/"+ register to its in-memory fallback rather than
-    // whatever `detect_clipboard_tool` finds on the host running the test
-    // suite -- otherwise these tests would (a) actually read/write the
-    // real system clipboard as a side effect of `cargo test`, clobbering
-    // whatever the developer had copied, and (b) collide with each other,
-    // since unlike every other backend the real clipboard is genuinely
-    // global to the OS, not scoped to one `Registers` instance. `pub(crate)`
-    // rather than private: editor.rs's own test module needs this too (for
-    // its delete/change operator tests), not just this module's own tests.
+    // Uses the in-memory fallback for the unnamed register, so tests neither
+    // touch the real clipboard nor collide with each other through it: it's
+    // global to the OS. `pub(crate)` for editor.rs's tests too.
     pub(crate) fn new_for_test() -> Self {
         Registers {
             named: HashMap::new(),
@@ -515,7 +424,7 @@ mod tests {
         let v = regs.read(Some('a'));
         assert_eq!(v.text, "foobar");
         assert_eq!(v.shape, RegisterShape::Char);
-        // reading via the uppercase name hits the same storage
+        // The uppercase name reads the same storage.
         assert_eq!(regs.read(Some('A')).text, "foobar");
     }
 
@@ -561,7 +470,7 @@ mod tests {
         regs.write(Some('_'), char_val("gone"));
         let v = regs.read(Some('_'));
         assert_eq!(v.text, "");
-        // doesn't leak into the unnamed register either
+        // Nor does it reach the unnamed register.
         assert_eq!(regs.read(None).text, "");
     }
 
@@ -608,7 +517,7 @@ mod tests {
 
         regs.record_yank(Some('a'), char_val("into-a"));
         assert_eq!(regs.read(Some('a')).text, "into-a");
-        // an explicit register target never touches "0
+        // An explicit register never touches `"0`.
         assert_eq!(regs.read(Some('0')).text, "yanked");
     }
 
@@ -643,8 +552,7 @@ mod tests {
         for i in 1..=10 {
             regs.record_delete(None, char_val(&format!("del{i}")));
         }
-        // "1 is the most recent, "9 is the oldest still kept; "del1" (the
-        // very first delete) has fallen off the end.
+        // `"1` is the newest and `"9` the oldest kept; `del1` fell off.
         assert_eq!(regs.read(Some('1')).text, "del10");
         assert_eq!(regs.read(Some('9')).text, "del2");
     }
@@ -668,11 +576,8 @@ mod tests {
         assert_eq!(regs.read(Some('.')).text, "original");
     }
 
-    // Vacuous on a machine with no clipboard tool installed, which is
-    // exactly the machine where this never went wrong. On one that has
-    // `wl-copy`, it is the difference between a test suite that leaves
-    // the developer's clipboard and a stray daemon behind and one that
-    // does not.
+    // Vacuous without a clipboard tool. With `wl-copy` installed it keeps
+    // the developer's clipboard intact and leaves no daemon behind.
     #[test]
     fn a_test_run_never_reaches_the_real_clipboard() {
         assert!(detect_clipboard_tool().is_none(), "a test found a clipboard tool on PATH and would have used it");
@@ -686,8 +591,7 @@ mod tests {
         assert!(!command_exists("this-command-does-not-exist-anywhere-xyz"));
     }
 
-    // Checked against well-known base64 test vectors (RFC 4648's own
-    // examples), covering all three padding cases (0/1/2 `=`).
+    // RFC 4648's test vectors, covering all three padding cases.
     #[test]
     fn base64_encode_matches_known_vectors() {
         assert_eq!(base64_encode(b""), "");
