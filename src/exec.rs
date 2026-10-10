@@ -3451,22 +3451,15 @@ impl Shell {
         }
         names.extend(self.arrays.keys().cloned());
         names.extend(self.assoc_arrays.keys().cloned());
-        // The ones computed on demand rather than stored (see
-        // lookup_var's own tail): they are set as far as anything can
-        // tell, so `${!BASH*}` has to find them. Listing only what is
-        // in the tables found `BASH_VERSINFO`, which is an array and
-        // therefore real, and nothing else.
+        // Computed variables aren't in the tables (see `lookup_var`'s tail)
+        // but are set as far as anything can tell, so `${!BASH*}` lists
+        // them.
         names.extend(COMPUTED_VAR_NAMES.iter().map(|n| n.to_string()));
         names.into_iter().filter(|n| n.starts_with(prefix)).collect()
     }
 
-    // A snapshot of every bit of Shell state compgen.rs's contextual
-    // actions (alias/arrayvar/command/enabled/export/function/job/running/
-    // stopped/variable) need -- built fresh each call (compgen/complete)
-    // rather than cached, same "cheap enough, not a hot path" reasoning as
-    // functions_preamble. repl.rs builds the exact same shape once per
-    // prompt (not per keystroke) for the interactive Tab-completion path,
-    // via this same method -- see its own call site.
+    // Everything compgen.rs's contextual actions need, built per call (and
+    // once per prompt by repl.rs for Tab completion).
     pub(crate) fn action_context(&self) -> compgen::ActionContext {
         let mut arrays: Vec<String> = self.arrays.keys().cloned().collect();
         arrays.extend(self.assoc_arrays.keys().cloned());
@@ -3488,21 +3481,14 @@ impl Shell {
             jobs: jobs.jobs.iter().map(|j| j.cmd_text.clone()).collect(),
             running_jobs: jobs.jobs.iter().filter(|j| !j.stopped).map(|j| j.cmd_text.clone()).collect(),
             stopped_jobs: jobs.jobs.iter().filter(|j| j.stopped).map(|j| j.cmd_text.clone()).collect(),
-            // This session's own PATH, not the real environment's --
-            // see highlight.rs's HighlightContext::path for why the two
-            // are not the same thing (and `compgen -c` offering a
-            // command that no longer runs, or hiding one that does, is
-            // the same bug the command-validity check had).
+            // This session's PATH, not the environment's (see
+            // `HighlightContext::path`).
             path_commands: highlight::enumerate_path_matches("", Some(&self.raw_var_lookup("PATH"))),
         }
     }
 
-    // repl.rs's own owned-snapshot pattern (see its construction of
-    // shell_completion) -- read-only access to the registered completion
-    // specs bish's own interactive Tab completion consults, without
-    // exposing `completions`/`default_completion` themselves (or letting a
-    // caller mutate them directly, bypassing run_complete's own
-    // registration/removal bookkeeping).
+    // The registered specs, read-only, for repl.rs's per-prompt Tab
+    // completion snapshot; changes go through `run_complete`.
     pub(crate) fn completions_snapshot(&self) -> std::collections::HashMap<String, compgen::CompgenSpec> {
         self.completions.clone()
     }
@@ -3511,12 +3497,9 @@ impl Shell {
         self.default_completion.clone()
     }
 
-    // Prints a compgen.rs ParseError the way real bash phrases it for
-    // whichever builtin hit it (`compgen`/`complete` share this since the
-    // message shape is identical either way, just with a different own
-    // name in the "bish: NAME: ..." prefix), and picks the matching exit
-    // code (2 for every parse error, matching real bash's own usage-error
-    // convention).
+    // Prints a compgen.rs ParseError as bash words it for `compgen` or
+    // `complete` (`who` in the prefix) and returns 2, bash's usage-error
+    // status.
     pub(crate) fn report_compgen_parse_error(&mut self, who: &str, err: &compgen::ParseError) -> i32 {
         match err {
             compgen::ParseError::UnknownAction(name) => sh_eprintln!(self, "bish: {who}: {name}: invalid action name"),
@@ -3590,9 +3573,8 @@ impl Shell {
     }
 
     fn run_arith_print(&mut self, args: &[String]) -> i32 {
-        // Joined with spaces rather than evaluated per argument: the
-        // shell has already split `= 3 * (2 + 7)` into words, and it is
-        // one expression.
+        // Joined with spaces: the shell split `= 3 * (2 + 7)` into words,
+        // but it's one expression.
         let expr = args.join(" ");
         if expr.trim().is_empty() {
             sh_eprintln!(self, "bish: =: usage: = EXPRESSION");
@@ -3610,20 +3592,11 @@ impl Shell {
         }
     }
 
-    // Switches into the terminal's alternate screen buffer (mode 1049) the
-    // first time any window-family command runs, so whatever was on
-    // screen before promotion stays untouched in the real terminal's own
-    // native scrollback. Only the screen-buffer switch happens here --
-    // drawing the actual tab bar needs the real window list/cwd-per-
-    // session, which lives in repl.rs (the only thing that can hold it
-    // without an Rc<RefCell<_>> self-reference cycle, see
-    // ExecResult::Window's doc comment), so repl.rs draws it right after
-    // this, and again after every WindowAction -- which is also what
-    // knows the terminal's real size (repl.rs queries TIOCGWINSZ and
-    // pins the tab bar to the actual last row); nothing here needs to.
-    // pub(crate): also called directly by repl.rs's bishedit normal-mode
-    // entry (Ctrl+G), which bypasses run_window/the command-dispatch
-    // path entirely -- see repl.rs's ensure_promoted.
+    // Switches to the terminal's alternate screen (mode 1049) on the first
+    // window command, so what was on screen stays in the terminal's own
+    // scrollback. repl.rs draws the tab bar right after, since the window
+    // list and terminal size are its. Also called by repl.rs on Ctrl+G,
+    // which bypasses the command path (see `ensure_promoted`).
     pub(crate) fn promote_if_needed(&mut self) {
         if self.promoted.get() {
             return;
@@ -3633,31 +3606,20 @@ impl Shell {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    // POSIX has no query-only umask read -- `umask(new) -> previous` is the
-    // only syscall shape, so reading the current value means setting a
-    // throwaway mask and immediately restoring what was there. Moved here
-    // alongside run_ulimit for the same M6 sink reason.
-    /// Rebuilds `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO` from the
-    /// call stack.
-    ///
-    /// Kept as real arrays, refreshed on every push and pop, rather than
-    /// computed on lookup: `${FUNCNAME[@]}`, `${FUNCNAME[0]}` and
-    /// `${#FUNCNAME[@]}` then all work with no changes to the variable
-    /// system at all, and a call costs three small vectors.
-    ///
-    /// Index 0 is innermost, and each array is one longer than the stack
-    /// -- the extra entry is the script itself, which bash names `main`,
-    /// sources to the top-level file and gives line 0. Verified against
-    /// bash: inside `inner`, called by `outer` from a sourced library,
+    /// Rebuilds `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO` from the call
+    /// stack on every push and pop, as real arrays, so every array form
+    /// works unchanged. Index 0 is innermost, and each is one longer than
+    /// the stack: the script itself, `main`, with the top-level file and
+    /// line 0. Inside `inner`, called by `outer` from a sourced library,
+    /// bash gives
     ///
     ///   FUNCNAME=(inner outer main)
     ///   BASH_SOURCE=(./lib.sh ./lib.sh main.sh)
     ///   BASH_LINENO=(7 2 0)
     ///
-    /// so `BASH_SOURCE[i]` is where `FUNCNAME[i]` was *defined* and
-    /// `BASH_LINENO[i]` is the line in `BASH_SOURCE[i+1]` where it was
-    /// called. Those are two different files as soon as anything is
-    /// sourced, which is why the defining file is recorded separately.
+    /// so `BASH_SOURCE[i]` is where `FUNCNAME[i]` was defined and
+    /// `BASH_LINENO[i]` the line in `BASH_SOURCE[i+1]` that called it; the
+    /// defining file is recorded separately for that.
     fn refresh_call_arrays(&mut self) {
         let (mut names, mut sources, mut lines) = (Vec::new(), Vec::new(), Vec::new());
         for frame in self.call_stack.iter().rev() {
@@ -3665,19 +3627,14 @@ impl Shell {
             sources.push(self.function_sources.get(&frame.called).cloned().unwrap_or_else(|| frame.source.clone()));
             lines.push(frame.call_line.to_string());
         }
-        // The outermost frame is the script itself, which bash names
-        // `main`. It only exists when there *is* a script: `bash -c
-        // 'f(){ g; }; g(){ echo "${FUNCNAME[*]}"; }; f'` prints `g f`,
-        // where the same functions in a file print `g f main`. Checked
-        // against bash 5.3 both ways.
+        // The outer `main` frame exists only for a script: under `bash -c`
+        // the same functions print `g f`, from a file `g f main`.
         if self.running_a_script {
             names.push("main".to_string());
             lines.push("0".to_string());
         }
         sources.push(self.script_name.clone());
-        // At the top level bash has no FUNCNAME at all, and a script
-        // testing `${FUNCNAME[0]}` should see nothing rather than
-        // "main".
+        // At top level bash has no FUNCNAME at all, not `main`.
         if self.call_stack.is_empty() {
             self.arrays.remove("FUNCNAME");
             self.arrays.remove("BASH_LINENO");
@@ -3692,59 +3649,33 @@ impl Shell {
         self.arrays.insert(name.to_string(), crate::sort::btree_map(values.into_iter().enumerate()));
     }
 
-    /// Whether `name` is a builtin that would actually run.
-    ///
-    /// `enable -n NAME` takes one out of service, and everything that
-    /// asks "is this a builtin" has to agree with the dispatch that
-    /// decides -- otherwise `type echo` still calls it a builtin while
-    /// `/usr/bin/echo` is what runs, and a pipeline stage still self-
-    /// execs bish to run a builtin that is not going to run. Both were
-    /// true before this; bash reports the external in both cases.
-    ///
-    /// Deliberately a method where `is_known_builtin` is a free
-    /// function: the question now depends on this shell's own state,
-    /// which a free function cannot see.
+    /// Whether `name` is a builtin that would run. `enable -n NAME` takes
+    /// one out of service, and everything asking "is this a builtin" must
+    /// agree with the dispatch: `type echo` and a pipeline stage both. A
+    /// method, unlike `is_known_builtin`, since it depends on this shell's
+    /// state.
     pub(crate) fn is_active_builtin(&self, name: &str) -> bool {
-        // `win`/`window` are builtins on the editor's colon line and
-        // nowhere else (see their arm in the dispatcher). Anywhere else
-        // `type win` said "shell builtin" about a name that was then not
-        // found.
+        // `win`/`window` are builtins only on the editor's colon line (see
+        // their dispatch arm).
         if matches!(name, "win" | "window") && !self.restrict_to_builtins {
             return false;
         }
         is_known_builtin(name) && !self.disabled_builtins.contains(name)
     }
 
-    // Moved here from a builtins.rs free function once cd needed to update
-    // self.cwd (a Shell-owned field) rather than just the OS process's
-    // cwd -- matches every other builtin that needs shell state (see
-    // run_pushd/run_declare/etc, all Shell methods for the same reason).
-    // Still delegates the actual directory change to
-    // std::env::set_current_dir so path resolution/symlink/error behavior
-    // is unchanged from before; self.cwd is read back from the OS
-    // afterward rather than computed locally, so it stays exactly in sync
-    // with what the OS considers the real cwd.
-    // repl.rs's Alt+Left/Right/Up directory-history navigation calls
-    // this directly (bypassing the `cd` builtin's own argv/`-` parsing,
-    // since it always has a concrete absolute path already in hand) to
-    // reuse run_cd's actual directory-change logic -- path resolution,
-    // OLDPWD/PWD updates, error reporting -- rather than duplicating it.
+    // For repl.rs's Alt+Left/Right/Up directory navigation, which has an
+    // absolute path: `cd`'s directory change, OLDPWD/PWD updates and error
+    // reporting, without its argument parsing.
     pub fn cd_to(&mut self, path: &std::path::Path) -> i32 {
         crate::builtins::dirs::run_cd(self, &[path.to_string_lossy().into_owned()])
     }
 
-    /// `target` resolved against `CDPATH`, and whether that is where it
-    /// came from.
-    ///
-    /// Left alone -- and `false` -- for anything `CDPATH` does not apply
-    /// to: an absolute path, one starting `.` or `..`, an unset or empty
-    /// `CDPATH`, or a name no component holds.
-    ///
-    /// An *empty* component means the current directory, per the same
-    /// convention `PATH` uses, and a hit there is the only one not
-    /// announced -- bash's rule is that a **non-empty** component
-    /// announces, so a literal `.` in `CDPATH` does print, even though
-    /// it lands exactly where a plain `cd` would have.
+    /// `target` resolved against `CDPATH`, and whether it came from there.
+    /// Unchanged, with `false`, for an absolute path, one starting `.` or
+    /// `..`, an unset or empty `CDPATH`, or a name no component holds. An
+    /// empty component means the current directory, as in `PATH`, and is
+    /// the only hit not announced: bash announces for a non-empty one, a
+    /// literal `.` included.
     pub(crate) fn resolve_cdpath(&mut self, target: String) -> (String, bool) {
         let path = std::path::Path::new(&target);
         if path.is_absolute() || target.starts_with('.') || target.is_empty() {
@@ -3755,10 +3686,8 @@ impl Shell {
             return (target, false);
         }
         for component in cdpath.split(':') {
-            // Against *this shell's* own cwd, not the process's. They
-            // are the same for whichever session last ran something, and
-            // genuinely different for any other window -- and `cd` is
-            // defined relative to the shell doing it.
+            // Against this shell's cwd, not the process's, which differs
+            // for other windows.
             let base = match std::path::Path::new(component) {
                 _ if component.is_empty() => self.cwd.clone(),
                 p if p.is_absolute() => p.to_path_buf(),
@@ -3772,29 +3701,19 @@ impl Shell {
         (target, false)
     }
 
-    // Moving this shell to another directory -- the single write path,
-    // so everything that can do it keeps `cwd`, `OLDPWD` and `PWD` in
-    // step and nothing can route around restricted mode. `cd` is one
-    // caller; the file browser's own "make this the shell's directory"
-    // (repl.rs's expand_browse_targets) is the other, and adding it was
-    // what made a shared path worth having.
+    // Moves this shell to another directory: the single path, keeping `cwd`,
+    // `OLDPWD` and `PWD` in step and enforcing restricted mode, for `cd` and
+    // the file browser's Ctrl-Y (repl.rs's `expand_browse_targets`).
     pub fn change_directory(&mut self, target: &std::path::Path) -> Result<(), String> {
         if self.opt_restricted {
             return Err(RESTRICTED.to_string());
         }
         let old = self.cwd.to_string_lossy().into_owned();
-        // The *logical* path, not what `getcwd` reports. A shell
-        // remembers the route you took: `cd link` leaves `$PWD` ending
-        // in `link` and a following `cd ..` goes back to where `link`
-        // sits, not to the parent of whatever it points at. Taking
-        // `current_dir()` here resolved every symlink instead, so the
-        // route was lost the moment it was walked -- `pwd` answered
-        // what only `pwd -P` should.
-        //
-        // Falling back to the resolved path if the lexical one cannot
-        // be entered: `..` is removed textually, which is the whole
-        // point, and on a path that has been rearranged underneath the
-        // shell that can name somewhere that no longer exists.
+        // The logical path, not `getcwd`'s: the shell remembers the route,
+        // so after `cd link`, `$PWD` ends in `link` and `cd ..` goes back
+        // to where `link` sits. Only `pwd -P` resolves symlinks. Falls back
+        // to the resolved path if the lexical one can't be entered, since
+        // removing `..` textually can name somewhere that no longer exists.
         let logical = logical_path(&self.cwd, target);
         self.note_cwd_change();
         match std::env::set_current_dir(&logical) {
@@ -3805,12 +3724,8 @@ impl Shell {
             }
         }
         let new = self.cwd.to_string_lossy().into_owned();
-        // Not written to the real environment: `PWD` and `OLDPWD` are
-        // exported shell variables, and a child gets them the way it
-        // gets every other one.
-        // ...and into the variable table, which is what `$PWD` actually
-        // reads now. Both are exported in bash, so they stay in the
-        // real environment too, above.
+        // Into the variable table, which `$PWD` reads. Both are exported, so
+        // children get them like any exported variable.
         let globals = Rc::make_mut(&mut self.globals);
         globals.insert("OLDPWD".to_string(), old.clone());
         globals.insert("PWD".to_string(), new.clone());
@@ -3818,14 +3733,10 @@ impl Shell {
         exported.insert("OLDPWD".to_string());
         exported.insert("PWD".to_string());
         {}
-        // ...and into this session's own remembered environment, not
-        // just the real one. `sync_real_state_in` reapplies that
-        // snapshot before every command, so a raw `set_var` made outside
-        // a command -- which is exactly what the file browser's Ctrl-Y
-        // does -- survives until the next command and is then silently
-        // reverted. (`cd` itself never saw this: it runs inside a
-        // command, and `sync_real_state_out` captures the real
-        // environment right afterwards.) Same trap, and the same fix, as
+        // And into this session's remembered environment:
+        // `sync_real_state_in` reapplies it before every command, so a
+        // change made outside a command (the file browser's Ctrl-Y) would
+        // otherwise be reverted at the next one. The same as
         // `set_terminal_capability_env` below.
         let snap = Rc::make_mut(&mut self.env_snapshot);
         snap.insert("OLDPWD".to_string(), old);
@@ -3862,11 +3773,10 @@ impl Shell {
     pub(crate) fn apply_shell_flag(&mut self, c: char, on: bool) {
         match c {
             'e' => self.opt_errexit = on,
-            // Discarded outright when an interactive shell is the one
-            // running it, which is what bash does: `set +o` there still
-            // reports `noexec` off afterwards, and `$-` never grows an
-            // `n`. An invocation `-n` is applied before any prompt
-            // exists and so is kept -- also bash's answer.
+            // Discarded in an interactive shell, as bash does: `set +o`
+            // still shows `noexec` off and `$-` gains no `n`. A `-n` given
+            // at invocation applies before any prompt and is kept, as in
+            // bash.
             'n' if !self.interactive => self.opt_noexec = on,
             'T' => self.opt_functrace = on,
             'E' => self.opt_errtrace = on,
@@ -3875,23 +3785,16 @@ impl Shell {
             'f' => self.opt_noglob = on,
             'm' => self.opt_monitor = on,
             'C' => self.opt_noclobber = on,
-            // One-way latch: `set +r` is simply ignored rather than
-            // turning it back off (see opt_restricted's own doc
-            // comment). Real bash instead makes `set +r` itself a hard
-            // "invalid option" error -- not replicated here, since no
-            // other flag in this shell errors on an unrecognized/
-            // disallowed combination either; the net behavioral
-            // guarantee (restricted mode can't be turned off) is the
-            // part that actually matters.
+            // One-way: `set +r` is ignored, so restricted mode can't be
+            // turned off. bash makes `set +r` an error instead; the
+            // guarantee is what matters.
             'r' if on => self.opt_restricted = true,
             _ => {}
         }
     }
 
-    // The read side of apply_shell_option, for `set -o`/`set +o`'s own
-    // listing. `None` for a name this shell doesn't gate anything on --
-    // see SET_O_OPTIONS' doc comment for why that list is shorter than
-    // real bash's.
+    // The read side of `apply_shell_option`, for `set -o`/`set +o` listings.
+    // `None` for a name this shell doesn't act on (see SET_O_OPTIONS).
     pub(crate) fn shell_option_enabled(&self, name: &str) -> Option<bool> {
         Some(match name {
             "pipefail" => self.opt_pipefail,
@@ -3931,30 +3834,14 @@ impl Shell {
         self.arg_frames = vec![args];
     }
 
-    // Runs any trapped signal's handler code for signals that arrived
-    // since the last check (see the comment on PENDING_SIGNALS for why
-    // this poll-at-checkpoints approach exists instead of running trap
-    // code directly from the signal handler). Called once per top-level
-    // statement in run_program -- frequent enough to feel responsive for
-    // real scripts, without needing signal-safety anywhere outside the
-    // one-line handler itself.
-    /// `Some(Exit)` when a handler called `exit` -- which the caller
-    /// must propagate rather than carry on.
+    /// Runs the handlers of trapped signals that arrived since the last check
+    /// (see PENDING_SIGNALS for why traps run at checkpoints, not in the
+    /// handler), once per top-level statement in `run_program`.
     ///
-    /// This used to return `()` and drop what `run_source_here` gave
-    /// back, so `trap "exit 1" TERM` ran its body and then let the
-    /// script continue. Against a loop that was not merely a wrong
-    /// status: the loop ran to completion, and against `while :;` it
-    /// never stopped at all -- the signal that was supposed to end the
-    /// program was the one thing that could not. `exit` inside a trap
-    /// is *the* way a shell script arranges to be interruptible, so it
-    /// is worth the return type.
-    ///
-    /// Only `Exit` propagates. A trap body is its own execution
-    /// context, not part of whatever it interrupted, so a `break` or
-    /// `continue` in one has no loop of the interrupted script's to
-    /// act on -- letting those out would make a handler able to break
-    /// a loop it never entered.
+    /// Returns `Some(Exit)` when a handler called `exit`, which the caller
+    /// must propagate: `trap "exit 1" TERM` is how a script makes itself
+    /// interruptible. Only `Exit`: a trap body is its own context, so a
+    /// `break` in one has no loop of the interrupted script's to break.
     #[must_use]
     fn check_pending_signals(&mut self) -> Option<ExecResult> {
         let pending = PENDING_SIGNALS.swap(0, std::sync::atomic::Ordering::SeqCst);
@@ -3967,11 +3854,9 @@ impl Shell {
                 continue;
             }
             if let Some(TrapAction::Run(code)) = self.traps.get(&sig).cloned() {
-                // Every pending handler still runs, even once one has
-                // asked to exit: they arrived before the decision did,
-                // and a handler skipped here is one that never runs at
-                // all. The first `exit` is the one that counts, the
-                // same way the first of several `exit`s in a row does.
+                // Every pending handler still runs once one has asked to
+                // exit, since they arrived first. The first `exit` counts,
+                // as with consecutive `exit`s.
                 if let ExecResult::Exit(code) = self.run_source_here(&code, "trap")
                     && exit.is_none()
                 {
@@ -3982,9 +3867,8 @@ impl Shell {
         exit
     }
 
-    /// `run_program` for a top-level source, which is the one place a
-    /// statement can change how the rest of the file reads. See
-    /// run_program_rereadable.
+    /// `run_program` for a top-level source, where a statement can change how
+    /// the rest reads; see `run_program_rereadable`.
     pub fn run_program_of_source(&mut self, prog: &Program, src: &str) -> ExecResult {
         self.run_program_rereadable(prog, Some((src, None)))
     }
@@ -3993,68 +3877,47 @@ impl Shell {
         self.run_program_rereadable(prog, None)
     }
 
-    /// `run_program`, able to read the rest of its source again.
+    /// `run_program`, able to reread the rest of its source. A statement
+    /// defining an alias changes what the following statements mean, but
+    /// they were already read: bash reads one statement at a time, while
+    /// bish reads the whole source first. With `source` given, a statement
+    /// that changes the alias table sends the remaining text back through
+    /// the lexer.
     ///
-    /// A statement that defines an alias changes what the statements
-    /// after it mean, and they were read before it ran. bash has no such
-    /// problem because it reads one statement at a time; bish reads the
-    /// whole source up front, which is faster and is why
-    /// `alias ll="ls -d"` on one line and `ll /` on the next did nothing
-    /// at all here. When `source` is `Some`, a statement that leaves the
-    /// alias table different from how it found it sends the remaining
-    /// text back through the lexer with the new table in hand.
-    ///
-    /// Only where a *newline* separates the two, which is exactly bash's
-    /// own granularity: it reads a whole statement before running any of
-    /// it, so `alias hi=...; hi` does not expand and
-    /// `alias hi=...<newline>hi` does. `end_line` is what tells those
-    /// apart -- see ListItem.
-    ///
-    /// The re-read runs the whole source through the lexer again rather
-    /// than a slice of it, so every line number stays the absolute one
-    /// the debugger and `$LINENO` already report, and the statements
-    /// already run are skipped by line. It costs a lexing pass, and only
-    /// on a source that really did change its own aliases.
+    /// Only across a newline, bash's granularity: `alias hi=...; hi`
+    /// doesn't expand, `alias hi=...<newline>hi` does (`end_line` tells
+    /// them apart; see ListItem). The whole source is relexed, keeping line
+    /// numbers absolute for the debugger and `$LINENO`, skipping statements
+    /// already run, at the cost of a lexing pass only when aliases changed.
     fn run_program_rereadable(&mut self, prog: &Program, source: Option<(&str, Option<&str>)>) -> ExecResult {
         let mut result = ExecResult::Status(self.last_status);
         let Some(last_item) = prog.last() else { return result };
-        // What the alias table looked like when this tree was read. Any
-        // statement may leave it different, and the difference then
-        // stands until the next newline boundary, which is where a
-        // re-read can take effect -- so this is compared against once
-        // per statement rather than being reset each time.
+        // The alias table when this tree was read. A statement may change it,
+        // which takes effect at the next newline, so it's compared per
+        // statement, not reset.
         let parsed_with = source.is_some().then(|| self.alias_epoch());
         for (index, item) in prog.iter().enumerate() {
             self.current_line = item.line;
-            // `set -n`. Everything has already been parsed -- which is
-            // the whole of what this flag asks for -- so there is
-            // nothing left to do but not run it. Ahead of the signal
-            // check and the debug hook deliberately: a trap handler is
-            // code, and `-n` means no code.
-            //
-            // `break` rather than `continue` because nothing can turn
-            // it off from here: `set +n` would have to run first. The
-            // status left behind is whatever the statement before it
-            // produced, which for `bish -n` is the 0 this started with.
+            // `set -n`: everything is parsed, which is all it asks, so
+            // nothing runs. Before the signal check and debug hook, since a
+            // trap handler is code too. `break`, since `set +n` couldn't
+            // run to undo it; the status is the previous statement's (0 for
+            // `bish -n`).
             if self.opt_noexec && !self.interactive {
                 break;
             }
             if let Some(exit) = self.check_pending_signals() {
                 return exit;
             }
-            // Nothing is reading this stage's output any more. A stage
-            // that was its own process would already be dead of
-            // SIGPIPE; this is where the in-process one stops instead,
-            // with the status that signal would have given it.
+            // Nothing reads this stage's output any more. A separate
+            // process would have died of SIGPIPE; the in-process stage
+            // stops here with that status.
             if broken_pipe_seen() {
                 return ExecResult::Exit(128 + 13);
             }
-            // Clone the Rc (not borrow self.debug_hook directly) before
-            // calling into it: on_statement takes `&Shell`, and the hook
-            // itself may call back into read-only Shell methods (variable
-            // inspection for the debugger's own hover/print) -- holding a
-            // live borrow of `self.debug_hook`'s own RefCell across that
-            // call would panic the moment it tried.
+            // The Rc is cloned rather than borrowed: the hook may call back
+            // into Shell methods (the debugger's hover and print), and a
+            // live borrow of `debug_hook` would panic then.
             if let Some(hook) = self.debug_hook.clone() {
                 let depth = DebugDepth { subshell_depth: self.subshell_depth, call_depth: self.var_scopes.len() };
                 match hook.borrow_mut().on_statement(item.line, depth, self) {
@@ -4067,50 +3930,34 @@ impl Shell {
             }
             let background = matches!(item.sep, Sep::Background);
             result = self.run_and_or(&item.and_or, background);
-            // Same reasoning as the `&&` chain: `a; b` must still run
-            // `b`, so only the final statement of a program may hand a
-            // pty-backed job off to be driven somewhere else.
-            //
-            // ...and not even then, when this shell is about to ask
-            // what the status was. `Fg` reports 0 because the command
-            // has not run yet, so the ERR check below saw a success
-            // that had not happened: `trap ... ERR; grep -q zz
-            // /dev/null` never fired the trap in a pane. Where a trap
-            // or `set -e` is armed, knowing the answer matters more
-            // than the interactivity that handing the job off buys.
+            // Only the last statement may hand a pty-backed job off to be
+            // driven elsewhere, since `a; b` must still run `b`. And not
+            // even it when a trap or `set -e` needs the status: `Fg`
+            // reports 0 before the command runs, so an ERR trap would miss
+            // a failure.
             let must_know_the_status = self.err_trap.is_some() || self.opt_errexit;
             if !std::ptr::eq(item, last_item) || must_know_the_status {
                 result = self.settle_fg(result);
             }
             self.last_status = result.status();
-            // Backstop for a `set -u` violation from an expansion site
-            // run_single's own check doesn't cover (a `for`/`case` list, an
-            // arithmetic expansion, ...) -- see pending_exit's own doc
-            // comment. A no-op the vast majority of the time: run_single's
-            // check already turns the common case into `result` being
-            // ExecResult::Exit directly, which is_signal() below catches,
-            // leaving nothing here left to take.
+            // A `set -u` violation from an expansion `run_single` doesn't
+            // check (a `for` or `case` list, arithmetic); see
+            // `pending_exit`. Usually `run_single` already returned
+            // `ExecResult::Exit`.
             if let Some(exit) = self.take_pending_exit() {
                 return exit;
             }
-            // Cloned rather than moved at each use: `ExecResult` stopped
-            // being `Copy` when `WindowAction` grew a name to carry.
+            // Cloned: `ExecResult` isn't `Copy` since `WindowAction`
+            // carries a name.
             if result.is_signal() {
                 return result;
             }
-            // `set -e`: abort on any failing top-level statement, except
-            // while suppressed (if/while/until conditions, negated
-            // pipelines -- POSIX exempts those explicitly). Checking once
-            // per ListItem here (the *overall* and-or result) rather than
-            // per-pipeline also naturally exempts non-last commands in a
-            // &&/|| chain, since only the chain's final status reaches here.
-            // ERR fires under exactly `errexit`'s own rules -- not in a
-            // condition, not behind `!`, not for a non-final command of
-            // a `&&`/`||` chain -- because that is what bash means by
-            // it, and this is already the one place those rules are
-            // decided. It fires whether or not `errexit` is *on*, which
-            // is the point: a script traps ERR precisely so it does not
-            // have to exit.
+            // `set -e` aborts on a failing top-level statement, except
+            // where POSIX exempts it (conditions, negated pipelines).
+            // Checking each ListItem's overall and-or status also exempts
+            // the non-final commands of a `&&`/`||` chain. ERR fires under
+            // exactly those rules, as bash means it, whether or not errexit
+            // is on: a script traps ERR so as not to exit.
             let exempt = std::mem::take(&mut self.errexit_exempt);
             if self.suppress_errexit == 0 && !exempt && result.status() != 0 {
                 self.run_pseudo_trap(PseudoTrap::Err);
@@ -4119,10 +3966,9 @@ impl Shell {
                 self.run_exit_trap();
                 return ExecResult::Exit(result.status());
             }
-            // This statement changed what the ones after it say. Read
-            // them again, and carry on at the first statement not yet
-            // run -- which is the one starting the next line, since only
-            // a newline boundary gets here.
+            // This statement changed what the following ones say: reread
+            // them and continue at the first not yet run, which starts the
+            // next line.
             if let Some((src, label)) = source
                 && let Some(parsed_with) = parsed_with
                 && parsed_with != self.alias_epoch()
@@ -4143,12 +3989,9 @@ impl Shell {
 
     fn run_and_or(&mut self, and_or: &AndOr, background: bool) -> ExecResult {
         // Every member but the last is exempt from `set -e`, and the
-        // exemption reaches *inside* it: `set -e; f() { false; }; f &&
-        // echo ok` carries on in bash, because `f`'s own failing body
-        // is part of a chain whose result is being tested. Checking
-        // only the chain's overall status at the ListItem level was not
-        // enough -- the function body has ListItems of its own, and one
-        // of those was aborting the shell.
+        // exemption reaches inside it: in bash
+        // `set -e; f() { false; }; f && echo ok` carries on, so `f`'s
+        // failing body mustn't abort the shell.
         let last = and_or.rest.len();
         if last > 0 {
             self.suppress_errexit += 1;
@@ -4156,16 +3999,12 @@ impl Shell {
         let mut result = self.run_pipeline(&and_or.first, background);
         if last > 0 {
             self.suppress_errexit -= 1;
-            // Something follows, so a foreground pty job cannot be
-            // bubbled out to be driven elsewhere -- the rest of the
-            // chain would go with it. See settle_fg.
+            // Something follows, so a foreground pty job can't be bubbled
+            // out to be driven elsewhere; see `settle_fg`.
             result = self.settle_fg(result);
         }
-        // Set *after* the member runs, not before: a function body
-        // contains and_or lists of its own, and each one writes this
-        // field on its way out.
-        //
-        // A single pipeline is its own final command; in a chain, only
+        // Set after the member runs, since a function body's lists write it
+        // too. A single pipeline is its own final command; in a chain only
         // the member after the last `&&`/`||` is.
         self.errexit_exempt = last > 0;
         self.last_status = result.status();
@@ -4212,12 +4051,10 @@ impl Shell {
         self.run_pipeline_untimed(pipeline, background)
     }
 
-    // `time`'s own report. bash's default is a blank line and then
-    // three `0m0.000s` rows; `-p` is POSIX's three bare seconds.
-    // `TIMEFORMAT` replaces the first of those -- the subset of its
-    // language anyone writes: `%R`/`%U`/`%S` for the three numbers,
-    // `%P` for the percentage, an `l` for the `0m0.000s` spelling, a
-    // digit for the precision, and `%%` for a literal one.
+    // `time`'s report: bash's default is a blank line and three `0m0.000s`
+    // rows; `-p` is POSIX's three bare seconds. `TIMEFORMAT` replaces it with
+    // the subset people write: `%R`, `%U`, `%S`, `%P` for the percentage, `l`
+    // for the `0m0.000s` form, a precision digit, and `%%`.
     fn format_times(&mut self, style: TimeStyle, real: f64, user: f64, sys: f64) -> String {
         let format = match style {
             TimeStyle::Posix => "real %2R\nuser %2U\nsys %2S".to_string(),
@@ -4265,9 +4102,8 @@ impl Shell {
                 }
             };
             match long {
-                // `0m0.000s`: whole minutes, then the rest of the
-                // seconds. No padding on the integer part -- 65 seconds
-                // is `1m5.000s`.
+                // `0m0.000s`: whole minutes, then the seconds, unpadded: 65
+                // seconds is `1m5.000s`.
                 true => out.push_str(&format!("{}m{:.precision$}s", (value as i64) / 60, value % 60.0)),
                 false => out.push_str(&format!("{value:.precision$}")),
             }
@@ -4278,8 +4114,7 @@ impl Shell {
 
     fn run_pipeline_untimed(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.negate {
-            // POSIX exempts a `!`-negated pipeline's own failure from -e
-            // (that's usually the whole point of negating it).
+            // POSIX exempts a `!`-negated pipeline's failure from `-e`.
             self.suppress_errexit += 1;
             let result = self.run_pipeline_inner(pipeline, background);
             self.suppress_errexit -= 1;
@@ -4294,10 +4129,8 @@ impl Shell {
     fn run_pipeline_inner(&mut self, pipeline: &Pipeline, background: bool) -> ExecResult {
         if pipeline.commands.len() == 1 {
             let result = crate::builtins::shell::run_command(self, &pipeline.commands[0], background);
-            // A one-command pipeline is still a pipeline as far as
-            // `PIPESTATUS` is concerned: bash gives it a one-element
-            // array, and a script that reads `${PIPESTATUS[0]}` after a
-            // plain command expects to find `$?` there.
+            // A one-command pipeline still sets PIPESTATUS, as in bash:
+            // `${PIPESTATUS[0]}` after a plain command is `$?`.
             if let ExecResult::Status(code) = result {
                 self.set_pipestatus(&[code]);
             }
@@ -4306,18 +4139,12 @@ impl Shell {
         ExecResult::Status(self.run_multi(&pipeline.commands, background))
     }
 
-    /// Publishes `PIPESTATUS`, every stage's own exit status in order.
-    ///
-    /// The array bash gives you for `cmd | tee log` so you can still
-    /// find out whether `cmd` failed -- which is the entire reason it
-    /// exists, and the reason `$?` alone is not enough.
+    /// Publishes PIPESTATUS, each stage's status in order, so `cmd | tee log`
+    /// can still tell whether `cmd` failed.
     fn set_pipestatus(&mut self, codes: &[i32]) {
-        // Every command sets this, pipeline or not, and almost every
-        // command is one stage long -- so the overwhelmingly common
-        // call replaces one status with one status. Building a fresh
-        // name, map and value string to say that cost three allocations
-        // per command; writing over the ones already there costs none.
-        // The keys are 0..n in both, so equal lengths line up.
+        // Nearly every command is one stage, so usually one status replaces
+        // one: writing over the existing entry avoids three allocations per
+        // command. The keys are 0..n in both, so equal lengths line up.
         if let Some(existing) = self.arrays.get_mut("PIPESTATUS")
             && existing.len() == codes.len()
         {
@@ -4332,21 +4159,17 @@ impl Shell {
         self.arrays.insert("PIPESTATUS".to_string(), map);
     }
 
-    // The part of run_command that actually dispatches on `cmd`'s own
-    // variant, *after* its own redirects (if any) have already been
-    // handled -- split out so run_in_child_shell's ChildSource::Parsed
-    // case (run_compound_redirected's own in-process conversion) can run
-    // `cmd`'s content directly without re-checking command_own_redirects,
-    // which would just see the same still-attached redirects and call
-    // run_compound_redirected right back into itself, forever.
+    // Dispatches on `cmd`'s variant once its own redirects are handled.
+    // Separate so `run_in_child_shell`'s `ChildSource::Parsed` case can run
+    // a compound's content directly; going through `command_own_redirects`
+    // again would see the same redirects and recurse forever.
     pub(crate) fn run_command_body(&mut self, cmd: &parser::Command, background: bool) -> ExecResult {
         match cmd {
             parser::Command::Simple(sc) => {
                 let depth = self.underscore_pending.len();
                 let result = self.run_single(sc, background);
-                // Anything the body of this command pushed has already
-                // been taken back off by its own turn through here, so
-                // whatever sits at `depth` is this command's own.
+                // What the body pushed it has already popped, so what sits
+                // at `depth` is this command's own.
                 if self.underscore_pending.len() > depth {
                     let value = self.underscore_pending[depth].clone();
                     self.underscore_pending.truncate(depth);
@@ -4395,10 +4218,9 @@ impl Shell {
         }
     }
 
-    // `read` is a builtin, so it can't go through the normal Stdio-based
-    // redirect machinery (that's built for handing stdio to a *child*
-    // process, not reading in-process). Special-cased here since `read x
-    // <<< "..."` is too common a pattern to leave broken.
+    // `read` is a builtin and can't use the child-process Stdio redirects,
+    // so its input source is worked out here; `read x <<< "..."` is too
+    // common to leave out.
     fn read_input_source(&mut self, cmd: &SimpleCommand) -> Box<dyn std::io::BufRead> {
         for r in cmd.redirects.iter().rev() {
             match r {
@@ -4421,10 +4243,8 @@ impl Shell {
                         }
                     };
                 }
-                // `read <&3` -- fd 3 is one this shell opened with
-                // `exec 3<file`, and it is a real process fd, so the
-                // builtin can read it directly. Without this the
-                // redirect was ignored and `read` took the terminal.
+                // `read <&3`: fd 3 was opened by `exec 3<file` and is a
+                // real fd, so read it directly.
                 Redirect::FdDup { fd: 0, target, .. } => {
                     return Box::new(UnbufferedFd::new(*target as i32));
                 }
@@ -4444,48 +4264,29 @@ impl Shell {
         self.current_stdin_reader()
     }
 
-    // Where a builtin reads when the command itself carries no `<` of
-    // its own: the enclosing construct's stdin override if there is one
-    // (see StdioOverride's doc comment) -- a `while read` loop's
-    // `< file` sits on the *loop*, not on the `read`, so the read's own
-    // redirect list is empty even though stdin is not the terminal --
-    // and otherwise the real fd 0.
-    //
-    // `select` reads through here too. It used to go straight to
-    // `std::io::stdin()`, so `select ... done <<< "1"` never saw the
-    // here-string: it read the real stdin, hit end-of-file, and gave up
-    // without ever running the body.
+    // Where a builtin reads when the command has no `<` of its own: the
+    // enclosing construct's stdin override if any (a `while read` loop's
+    // `< file` is on the loop, not on `read`), else fd 0. `select` reads
+    // through here too, so `select ... done <<< "1"` sees the here-string.
     fn current_stdin_reader(&self) -> Box<dyn std::io::BufRead> {
         if let Some(o) = &self.stdio_override {
             if let Some(state) = &o.borrow().stdin {
                 return Box::new(SharedStdinReader { state: state.clone(), local: Vec::new() });
             }
         }
-        // One byte per syscall, deliberately -- see UnbufferedFd.
+        // One byte per syscall; see UnbufferedFd.
         Box::new(UnbufferedFd::new(0))
     }
 
-    // Shared by `eval`, `source`/`.`, and main.rs's own config-file loading
-    // at interactive startup -- all three run source text in the CURRENT
-    // shell (unlike command substitution/subshells, which self-exec a
-    // child process), so `eval`/sourced scripts can set variables,
-    // functions, or cwd in the calling shell. pub(crate) rather than
-    // private: main.rs lives in a sibling module and needs this exact
-    // "read then run in place" semantics for $HOME/.config/bish/
-    // config.bash, not a subprocess.
-    /// `run_source_here` for a construct whose body is re-run: the
-    /// subshell forms, which keep their body as source text and so used
-    /// to re-tokenise and re-parse it on every single execution. In
-    /// `while ...; do v=$(true); done` that is one full lex and parse of
-    /// "true" per turn of the loop, and it was the largest single cost
-    /// in a command substitution -- more than building the child shell
-    /// and more than running the body.
+    /// `run_source_here` for a body that runs repeatedly: the subshell forms
+    /// keep their body as text, and reparsing it each time (`v=$(true)` in a
+    /// loop) was a substitution's largest cost.
     pub(crate) fn run_source_cached(&mut self, src: &str, label: &str) -> ExecResult {
         self.run_source_cached_maybe_reread(src, label, true)
     }
 
-    /// The same, for a body that is not its own parse unit and so must
-    /// not be read again part-way through. See ChildBody::Enclosed.
+    /// The same for a body that isn't its own parse unit, so mustn't be
+    /// reread part-way; see `ChildBody::Enclosed`.
     fn run_source_enclosed(&mut self, src: &str, label: &str) -> ExecResult {
         self.run_source_cached_maybe_reread(src, label, false)
     }
@@ -4494,8 +4295,7 @@ impl Shell {
         let source = reread.then_some((src, Some(label)));
         match self.cached_program(src, label) {
             Ok(Some(prog)) => self.run_program_rereadable(&prog, source),
-            // Not cacheable: parse it the ordinary way, keeping the same
-            // answer about whether it may be read again.
+            // Not cacheable: parse normally, with the same rereadability.
             Ok(None) => match self.parse_source(src, Some(label)) {
                 Ok(prog) => self.run_program_rereadable(&prog, source),
                 Err(status) => status,
@@ -4504,14 +4304,12 @@ impl Shell {
         }
     }
 
-    /// The cache lookup behind `run_source_cached`. `Ok(None)` means
-    /// "not cacheable, parse it the ordinary way"; `Err` carries the
-    /// status of a body that failed to parse.
+    /// The cache lookup for `run_source_cached`. `Ok(None)`: not cacheable;
+    /// `Err`: the status of a body that failed to parse.
     fn cached_program(&mut self, src: &str, label: &str) -> Result<Option<Rc<parser::Program>>, ExecResult> {
-        // Alias expansion is the one part of turning text into a tree
-        // that reads shell state, so a cached tree is only sound while
-        // it cannot apply. This is the same condition expand_aliases
-        // itself short-circuits on.
+        // Alias expansion is the one parsing step reading shell state, so a
+        // cached tree is sound only while it can't apply, the condition
+        // `expand_aliases` itself checks.
         if self.shopt_is_on("expand_aliases") && !self.aliases.is_empty() {
             return Ok(None);
         }
@@ -4531,9 +4329,8 @@ impl Shell {
                 return Err(ExecResult::Status(2));
             }
         };
-        // A script has a handful of distinct subshell bodies, not
-        // thousands; the cap is only so that a generated one cannot grow
-        // this without bound.
+        // A script has few distinct subshell bodies; the cap only stops a
+        // generated one growing this without bound.
         let mut cache = self.parse_cache.borrow_mut();
         if cache.len() >= 512 {
             cache.clear();
@@ -4542,13 +4339,14 @@ impl Shell {
         Ok(Some(prog))
     }
 
+    // Runs source text in this shell (for `eval`, `source` and main.rs's
+    // config loading), so it can set variables, functions and the cwd here,
+    // unlike a subshell.
     pub(crate) fn run_source_here(&mut self, src: &str, label: &str) -> ExecResult {
-        // A file that sources itself is the same crash as a function
-        // that calls itself, reached without ever making a function
-        // call -- so it needs its own check rather than
-        // `call_function`'s. No `nesting_unwind` here: each level's
-        // `source` returns as soon as the one below it fails, so this
-        // unwinds on its own. Real bash dumps core on this one.
+        // A file sourcing itself crashes like a function calling itself
+        // without any function call, so it needs its own check. No
+        // `nesting_unwind`: each level's `source` returns when the one
+        // below fails. bash dumps core on this.
         if crate::stackguard::nearly_exhausted() {
             sh_eprintln!(self, "bish: {}: maximum source nesting level exceeded", label);
             if !self.interactive {
@@ -4557,17 +4355,15 @@ impl Shell {
             return ExecResult::Status(1);
         }
         match self.parse_source(src, Some(label)) {
-            // The source goes along with the tree: a statement in it may
-            // define an alias, which changes how the rest of it reads.
-            // See run_program_rereadable.
+            // With the source, since a statement may define an alias and
+            // change how the rest reads; see `run_program_rereadable`.
             Ok(prog) => self.run_program_rereadable(&prog, Some((src, Some(label)))),
             Err(status) => status,
         }
     }
 
-    /// Text to a tree, reporting a syntax error the way every caller
-    /// wants it reported. Split out because a source is read again when
-    /// one of its own statements changes the alias table.
+    /// Text to a tree, reporting a syntax error as callers want. Separate
+    /// because a source is reread when its statements change aliases.
     fn parse_source(&mut self, src: &str, label: Option<&str>) -> Result<Program, ExecResult> {
         match crate::lexer::Lexer::new(src).tokenize() {
             Ok(toks) => match crate::parser::Parser::new(self.expand_aliases(toks)).parse_program() {
@@ -4578,8 +4374,8 @@ impl Shell {
         }
     }
 
-    /// A source with a name says it; the top-level `-c`/script path
-    /// never did, and its wording is what scripts already match on.
+    /// A named source says its name; the top-level `-c` or script path
+    /// doesn't, and scripts match on that wording.
     fn report_syntax_error(&mut self, label: Option<&str>, e: &str) -> ExecResult {
         match label {
             Some(label) => sh_eprintln!(self, "bish: {}: syntax error: {}", label, e),
@@ -4588,33 +4384,27 @@ impl Shell {
         ExecResult::Status(2)
     }
 
-    // Functions and `local` variables live only in this process's memory, so
-    // a self-exec'd child (see run_subshell/run_command_substitution below)
-    // starts with no knowledge of them -- unlike a real fork, which
-    // duplicates the whole process (this is exactly why e.g. `$(fib
-    // $((n-1)))` works in bash even when `n` is a local var: the forked
-    // child inherits it for free). Re-declaring visible locals and every
-    // currently-known function at the top of the child's script closes that
-    // gap without needing unsafe fork(2) or a separate IPC channel.
+    // Functions and locals live only in this process, so a re-exec'd child
+    // starts without them, where a fork would inherit them (`$(fib $((n-1)))`
+    // with a local `n` works in bash). Redeclaring visible locals and every
+    // function at the top of the child's script closes the gap without
+    // fork(2) or an IPC channel.
     pub(crate) fn functions_preamble(&self) -> String {
         let mut s = String::new();
         let mut flattened: HashMap<&str, &str> = HashMap::new();
-        // Unexported globals. An exported one is in the child's real
-        // environment already and needs no replay; an unexported one
-        // used to travel that way too, before variables stopped living
-        // in the environment (see the `globals` field) -- without this
-        // a pipeline stage started with none of them.
+        // Unexported globals: exported ones are already in the child's
+        // environment, and without this a re-exec'd stage would start with no
+        // unexported ones.
         for (k, v) in self.globals.iter().chain(self.underscore.as_ref().map(|v| (&*UNDERSCORE, v))) {
             if !self.exported_names.contains(k) {
                 flattened.insert(k.as_str(), v.as_str());
             }
         }
-        // Locals over globals: the stage is a child of *this* frame.
+        // Locals over globals: the child belongs to this frame.
         for scope in &self.var_scopes {
             for (k, v) in scope {
-                // A declared-but-unset local has no assignment to
-                // replay; emitting `k=` would make it *set* to empty in
-                // the child, which is the distinction being kept.
+                // A declared but unset local has no assignment to replay:
+                // `k=` would make it set to empty in the child.
                 match v {
                     Some(v) => flattened.insert(k.as_str(), v.as_str()),
                     None => flattened.remove(k.as_str()),
@@ -4628,10 +4418,8 @@ impl Shell {
             s.push('\n');
         }
         for (name, items) in &self.arrays {
-            // The child seeds this one itself, from the same constant,
-            // and it is readonly there -- so re-declaring it is both
-            // redundant and refused, which turned every re-exec'd
-            // construct into a "readonly variable" error.
+            // The child seeds this one itself and makes it readonly, so
+            // redeclaring it would be refused.
             if name == "BASH_VERSINFO" {
                 continue;
             }
@@ -4678,22 +4466,13 @@ impl Shell {
                 end_line: 0,
             }]));
         }
-        // The directory stack, traps and completion specifications --
-        // the three things a re-exec'd construct could not see.
-        //
-        // This is the list the roadmap called one that "grows and is
-        // never finished", and that was the right objection to it for
-        // *pipeline stages*, which are hot and now do not re-exec at
-        // all. What is left re-execing -- a co-process, a backgrounded
-        // subshell -- starts once and lives, so the list is three items
-        // and the cost of replaying them is paid a single time. The
-        // objection was to the price, and the price is different here.
-        //
-        // Deliberately not `jobs`: bash's own co-process cannot see the
-        // job table either, and inventing entries for processes this
-        // child does not own would be worse than the gap.
-        //
-        // In reverse, because each `pushd -n` goes on the front.
+        // The directory stack, traps and completion specs, which a
+        // re-exec'd construct couldn't otherwise see. Only a coproc and a
+        // backgrounded subshell still re-exec, and they start once, so
+        // replaying these is paid once. Not `jobs`: bash's coproc can't see
+        // the job table either, and inventing entries for processes the
+        // child doesn't own would be worse. In reverse, since each
+        // `pushd -n` goes on the front.
         for dir in self.dir_stack.iter().rev() {
             s.push_str("pushd -n ");
             s.push_str(&crate::serialize::quote_literal(dir));
@@ -4714,7 +4493,7 @@ impl Shell {
             s.push_str(&crate::compgen::format_spec(spec, name));
             s.push('\n');
         }
-        // Whatever `shopt -s`/`-u` has been changed from its default.
+        // Whatever `shopt -s`/`-u` changed from its default.
         for (name, on) in &self.shopt_options {
             if shopt_default_on(name) == Some(*on) {
                 continue;
@@ -4723,10 +4502,9 @@ impl Shell {
             s.push_str(name);
             s.push('\n');
         }
-        // The `set` options go *last*: `set -e` applied any earlier
-        // would make the preamble's own assignments the thing that
-        // aborts the stage, and `set -u` would trip over a name the
-        // preamble has not reached yet.
+        // The `set` options last: an earlier `set -e` would let the
+        // preamble's own assignments abort the child, and `set -u` would
+        // trip on a name not yet assigned.
         for name in SET_O_OPTIONS {
             if self.shell_option_enabled(name) == Some(true) {
                 s.push_str("set -o ");
@@ -4734,75 +4512,49 @@ impl Shell {
                 s.push('\n');
             }
         }
-        // And `set -r` after even those, because it is the one option
-        // that makes the preamble itself illegal: `PATH` is readonly in
-        // a restricted shell, so a `set -r` written any earlier would
-        // make the child refuse the assignment that tells it where its
-        // commands are.
-        //
-        // It has no `-o` name in bash, so it is not in SET_O_OPTIONS,
-        // which is exactly how it came to be dropped: `( /bin/echo x )
-        // &`, a `coproc`, a compound forced to re-exec by a redirect --
-        // every construct that becomes a real process -- arrived
-        // unrestricted and ran whatever it liked. bash keeps restriction
-        // across all of them. The in-process children were never
-        // affected, since `new_virtual_child` copies the flag, which is
-        // why only the re-execing shapes leaked.
+        // `set -r` after even those: it makes the preamble illegal, since
+        // `PATH` is readonly in a restricted shell. It has no `-o` name, so
+        // it isn't in SET_O_OPTIONS, and without this every re-exec'd
+        // construct (`( ... ) &`, `coproc`) would run unrestricted.
+        // In-process children copy the flag in `new_virtual_child`.
         if self.opt_restricted {
             s.push_str("set -r\n");
         }
         s
     }
 
-    // Runs `source` in a fresh, in-process Shell built via
-    // new_virtual_child (see its own doc comment) instead of self-exec'ing
-    // a real OS process -- the shared primitive behind every *foreground*
-    // (...)/`$(...)`/`<(...)`/`>(...)` construct below (run_coproc and
-    // run_multi's own pipeline stages still self-exec for real: they need
-    // genuine OS-level concurrency this single-threaded interpreter
-    // doesn't have, or -- for a backgrounded subshell -- to keep running
-    // after this call returns, which an in-process call can't do either).
-    // Since new_virtual_child already deep-clones vars/arrays/functions/
-    // etc as real Rust data, no functions_preamble()-style
-    // serialize-then-reparse round-trip is needed here at all.
+    // Runs `raw` in an in-process Shell from `new_virtual_child`, the
+    // primitive behind every foreground `( )`, `$( )`, `<( )` and `>( )`:
+    // the child already has real copies of variables, arrays and functions,
+    // so no preamble is needed. A coproc and a backgrounded subshell still
+    // re-exec, since they outlive this call.
     //
-    // `stdio.stdout`, if given, is where *this* construct's own output
-    // goes (a redirect/capture belonging to this call specifically, e.g.
-    // command substitution's own capture file); if `None`, output flows
-    // to wherever the *parent* shell's own output currently goes,
-    // matching a real fork (which shares fd 1 exactly as inherited) -- a
-    // bare `(cmd)` with no `>` of its own, nested inside `$(...)`, must
-    // still land in the outer capture. Same reasoning for
-    // `stdio.stdin`/the parent's own current stdin override. `stdio.stderr`/
-    // the dup flags are only ever populated by run_compound_redirected
-    // (`{ ...; } 2> file`/`&>`/`2>&1`) -- every other caller uses
-    // ChildStdio::default() plus a stdout/stdin override.
+    // `stdio.stdout`, if given, is where this construct's output goes (a
+    // redirect or a substitution's capture); `None` means wherever the
+    // parent's goes, as a fork shares fd 1, so a bare `( cmd )` inside
+    // `$( )` lands in the outer capture. Likewise `stdio.stdin`.
+    // `stdio.stderr` and the dup flags come only from
+    // `run_compound_redirected`.
     fn run_in_child_shell(&mut self, raw: &str, stdio: ChildStdio) -> ExecResult {
         self.run_body_in_child_shell(ChildBody::Source(raw), stdio)
     }
 
-    /// `run_in_child_shell` for a `( )`, whose body is not a source of
-    /// its own -- see ChildBody::Enclosed.
+    /// `run_in_child_shell` for a `( )`, whose body isn't a source of its
+    /// own; see `ChildBody::Enclosed`.
     fn run_enclosed_in_child_shell(&mut self, raw: &str, stdio: ChildStdio) -> ExecResult {
         self.run_body_in_child_shell(ChildBody::Enclosed(raw), stdio)
     }
 
-    /// `run_in_child_shell` for something that has already been parsed.
-    ///
-    /// A pipeline stage arrives as a `parser::Command`, not as text.
-    /// Serializing it back to a string just so this could re-lex and
-    /// re-parse it would be work for nothing, and worse than nothing
-    /// where the round trip is not exact.
+    /// `run_in_child_shell` for something already parsed: a pipeline stage
+    /// arrives as a `parser::Command`, and serializing it only to reparse it
+    /// would be wasted, and lossy where the round trip isn't exact.
     fn run_command_in_child_shell(&mut self, cmd: &parser::Command, stdio: ChildStdio) -> ExecResult {
         self.run_body_in_child_shell(ChildBody::Parsed(cmd), stdio)
     }
 
-    /// A virtual child wired to `stdio`, handed back rather than run.
-    ///
-    /// `run_body_in_child_shell` builds one and runs it immediately. A
-    /// pipeline stage needs the two halves apart: every stage has to be
-    /// built and connected before *any* of them runs, because each one
-    /// blocks on a pipe the others are on the far end of.
+    /// A virtual child wired to `stdio`, returned rather than run: a pipeline
+    /// builds and connects every stage before any runs, since each blocks on
+    /// a pipe another holds.
     fn child_for_stdio(&mut self, mut stdio: ChildStdio) -> Shell {
         let mut child = self.new_virtual_child();
 
@@ -4822,10 +4574,8 @@ impl Shell {
         } else {
             None
         };
-        // No explicit stdout/stderr override => this construct has no
-        // redirect of its own, so its sink should be *exactly* the
-        // parent's current one (already fully resolved -- Real/Grid/
-        // Capture/Builtin, whatever it is), not a fresh wrapper around it.
+        // No stdout or stderr override: the child's sink is exactly the
+        // parent's current one, not a wrapper.
         child.sink = if stdio.redirects_output() {
             OutputSink::Builtin { previous: Box::new(self.sink.clone()), stdout: stdio.sink_stdout(), stderr: stdio.sink_stderr() }
         } else {
@@ -4836,94 +4586,55 @@ impl Shell {
 
     fn run_body_in_child_shell(&mut self, body: ChildBody<'_>, stdio: ChildStdio) -> ExecResult {
         let mut child = self.child_for_stdio(stdio);
-        // A *subshell* resets the traps it caught -- `$( )` and `( )`
-        // arrive here as source text -- so a DEBUG trap does not fire
-        // once per command inside a command substitution, and an ERR
-        // trap does not fire both inside `( false )` and again for the
-        // subshell itself. bash does the same, and the EXIT trap has
-        // its own version of this rule (see run_exit_trap).
-        //
-        // A pipeline stage arrives already parsed and does *not* reset
-        // them: bash fires DEBUG for each stage of `echo a | cat`, and
-        // so does this. Neither does a redirected group, which is not a
-        // subshell at all.
+        // A subshell (`$( )` and `( )`, arriving as text) resets the traps
+        // it caught, so DEBUG doesn't fire per command inside a `$( )`, and
+        // ERR not both inside `( false )` and for the subshell, as in bash
+        // (EXIT has its own rule; see `run_exit_trap`). A pipeline stage,
+        // arriving parsed, doesn't reset them: bash fires DEBUG for each
+        // stage. A redirected group isn't a subshell at all.
         if matches!(body, ChildBody::Source(_) | ChildBody::Enclosed(_)) {
             child.debug_trap = None;
             child.err_trap = None;
             child.return_trap = None;
         }
-        // A `( )` and a pipeline stage are not the login shell, though
-        // a `$( )` still is: bash's asymmetry, and the one `logout`
-        // sees. `x=$(logout 3)` leaves with 3; `( logout 3 )` refuses.
+        // A `( )` and a pipeline stage aren't the login shell, but a `$( )`
+        // is, as in bash: `x=$(logout 3)` leaves with 3, `( logout 3 )`
+        // refuses.
         if matches!(body, ChildBody::Enclosed(_) | ChildBody::Parsed(_)) {
             child.login_shell = false;
-            // ...and one bash forks, which leaves with its redirects
-            // where they are (see `run_exit_trap`).
+            // ...and one bash forks, which keeps its redirects (see
+            // `run_exit_trap`).
             child.forked_subshell = true;
         }
 
-        // The real OS cwd is process-wide, shared with the real parent,
-        // even though `child` is otherwise a fully independent Shell -- a
-        // `cd` inside this construct (`$(cd /tmp && pwd)`) must not leak
-        // back out to the real shell once this call returns. Same for the
-        // umask, and for fd 0/1/2 against a bare `exec > file` (no
-        // command word, so it applies its redirect to *this process*
-        // rather than spawning anything -- see the "exec" arm's own doc
-        // comment); `(exec > file; echo hi)` otherwise left everything
-        // printed after that subshell redirected into `file` too,
-        // confirmed the hard way.
-        //
-        // None of the three is read here any more. Snapshotting all of
-        // them up front cost a getcwd, two umask(2) and three dup(2) on
-        // every subshell, and almost no body touches any of them; each
-        // is now recorded by whatever moves it, and only what moved is
-        // put back. See ProcessRestore.
-        // Variables need nothing here any more, and the absence is
-        // deliberate. A plain `x=2` inside this construct used to write
-        // straight to the real process environment, which is shared
-        // with the parent -- so isolating it meant snapshotting the
-        // whole environment on the way in and replaying it on the way
-        // out, O(env) to take and O(env^2) to restore. `child` owns its
-        // own `globals`, and a spawned process is handed those rather
-        // than reading `environ` (see `Shell::command`), so the
-        // isolation is now a property of the data rather than something
-        // reconstructed around every construct.
+        // Nothing is snapshotted here. The cwd, umask and fds 0-2 are
+        // process-wide and shared with the parent, so a `cd` or a bare
+        // `exec > file` inside must not leak out; each is recorded by
+        // whatever moves it and only that is put back (see ProcessRestore).
+        // Variables need nothing: `child` owns its `globals`, and spawned
+        // processes get those (see `Shell::command`), not `environ`.
 
         let result = match body {
             ChildBody::Source(raw) => child.run_source_cached(raw, "subshell"),
             ChildBody::Enclosed(raw) => child.run_source_enclosed(raw, "subshell"),
             ChildBody::Parsed(cmd) => crate::builtins::shell::run_command(&mut child, cmd, false),
         };
-        // A pty-backed job may be handed back rather than waited for, so
-        // that repl.rs's compositor can drive it while staying responsive
-        // (see ExecResult::Fg). Nothing can drive this one: it belongs to
-        // `child`, which is about to be dropped, and the escape only
-        // reaches here at all because a program's *last* statement is
-        // allowed to make it -- which the last statement of a subshell
-        // body is.
-        //
-        // So it was dropped, taking the job and everything it had to say
-        // with it, and `ExecResult::Fg` answers 0 when asked for a
-        // status. In a pane, `( /bin/false )` was a success and
-        // `( /bin/echo hi )` printed nothing; with two commands in the
-        // subshell only the last one vanished, because only the last one
-        // is allowed to hand itself off.
+        // A pty-backed job may be handed back as `ExecResult::Fg` for
+        // repl.rs to drive, which a subshell's last statement is allowed to
+        // do. Nothing can drive this one: it belongs to `child`, about to
+        // be dropped, which would lose the job and report 0. So it's
+        // settled here.
         let result = child.settle_fg(result);
-        // Real bash fires a subshell's own EXIT trap when it finishes
-        // normally too, not just on an explicit `exit`/errexit (confirmed:
-        // `(trap "echo bye" EXIT; echo hi)` prints both). The re-exec'd
-        // design this replaces got this for free (main.rs's run_source
-        // unconditionally runs it after a real child process's own
-        // run_program returns) -- ExecResult::Exit's own producer already
-        // ran it before bubbling, so only run it again here for every
-        // *other* outcome, to avoid firing it twice.
+        // bash runs a subshell's EXIT trap when it finishes normally too
+        // (`(trap "echo bye" EXIT; echo hi)` prints both).
+        // `ExecResult::Exit`'s producer already ran it, so only the other
+        // outcomes run it here.
         if !matches!(result, ExecResult::Exit(_)) {
             child.run_exit_trap();
         }
 
-        // Whatever the body said it moved, and nothing else. Taken
-        // after the exit trap, which is part of the body and can move
-        // things too.
+        // What the body said it moved, taken after the EXIT trap, which can
+        // move things too.
         let moved = std::mem::take(&mut child.process_restore);
         if let Some(d) = moved.cwd {
             let _ = std::env::set_current_dir(d);
@@ -4936,27 +4647,20 @@ impl Shell {
         }
 
         match result {
-            // A subshell's own `exit`/`set -e`/`set -u` must not kill the
-            // real enclosing shell -- matches real bash's fork isolation
-            // for `(exit 3)`. The exit trap already ran wherever this was
-            // produced (see ExecResult::Exit's own doc comment).
+            // A subshell's `exit`, `set -e` or `set -u` mustn't end the
+            // enclosing shell, as with bash's fork for `(exit 3)`. The EXIT
+            // trap already ran.
             ExecResult::Exit(code) => ExecResult::Status(code),
             other => other,
         }
     }
 
-    // run_compound_redirected's own in-process primitive -- deliberately
-    // NOT run_in_child_shell/new_virtual_child, since a redirected
-    // compound command (`{ ...; } > file`, `while ...; done < file`) is
-    // *not* a subshell: unlike `(...)`/`$(...)`, real bash shares every
-    // bit of state (variables, cwd, functions, everything) between a
-    // `{ }` group and its enclosing shell -- only stdio is different for
-    // its own duration. So this runs `cmd` directly on `self`, with
-    // `self.sink`/`self.stdio_override` temporarily swapped for exactly
-    // this call and restored after -- the same "push a temporary
-    // override, run, pop it back" shape push_builtin_output_sink/
-    // pop_builtin_output_sink already use for a single builtin's own
-    // redirects, generalized here to a whole compound command.
+    // `run_compound_redirected`'s in-process primitive, not
+    // `run_in_child_shell`: a redirected compound (`{ ...; } > file`,
+    // `while ...; done < file`) isn't a subshell, and shares all state with
+    // the shell, as in bash; only its stdio differs. So `cmd` runs on
+    // `self` with `sink` and `stdio_override` swapped for the call, as
+    // `push_builtin_output_sink` does for one builtin.
     fn run_with_redirected_stdio(&mut self, cmd: &parser::Command, stdio: ChildStdio) -> ExecResult {
         let saved = self.install_redirected_stdio(stdio);
         let result = self.run_command_body(cmd, false);
@@ -4964,11 +4668,9 @@ impl Shell {
         result
     }
 
-    // The install/restore halves of run_with_redirected_stdio, split out
-    // so a *function call* can borrow them: `f > out` redirects the
-    // whole body, exactly as `{ ...; } > out` does, and routing it
-    // through the compound path is the only way a builtin inside the
-    // body and an external inside it end up in the same place.
+    // The install and restore halves of `run_with_redirected_stdio`, so a
+    // function call can use them: `f > out` redirects the whole body as
+    // `{ ...; } > out` does, builtins and externals alike.
     fn install_redirected_stdio(&mut self, mut stdio: ChildStdio) -> (OutputSink, Option<Rc<RefCell<StdioOverride>>>) {
         let saved_sink = self.sink.clone();
         let saved_stdio_override = self.stdio_override.clone();
@@ -5000,12 +4702,9 @@ impl Shell {
         (self.sink, self.stdio_override) = saved;
     }
 
-    // (...) subshells run in-process now (see run_in_child_shell's own
-    // doc comment) for the foreground case; the backgrounded case still
-    // self-execs the bish binary on the raw captured source, since it
-    // needs to keep running concurrently with whatever the parent does
-    // next, which nothing in this single-threaded interpreter can do
-    // in-process.
+    // A foreground `( )` runs in-process (see `run_in_child_shell`); a
+    // backgrounded one re-execs bish on its source, since it has to keep
+    // running alongside the parent.
     fn run_subshell(&mut self, raw: &str, background: bool) -> i32 {
         if !background {
             return self.run_enclosed_in_child_shell(raw, ChildStdio::default()).status();
@@ -5013,13 +4712,11 @@ impl Shell {
         self.spawn_background_script(raw, format!("({})", raw))
     }
 
-    /// Runs `raw` as a background job: a real child, with this shell's
-    /// functions in front of it, its own pty, and an entry in the job
-    /// table so `$!`, `jobs` and `wait` can all see it.
-    ///
-    /// What `( ) &` has always done, and what `&` on anything else that
-    /// runs in this shell -- a group, a loop, a builtin, a function --
-    /// now does too. `label` is what `jobs` shows.
+    /// Runs `raw` as a background job: a real child with this shell's
+    /// functions in front, its own pty, and a job table entry for `$!`,
+    /// `jobs` and `wait`. Used for `( ) &` and for `&` on anything else
+    /// that runs in this shell (a group, loop, builtin, function). `label`
+    /// is what `jobs` shows.
     fn spawn_background_script(&mut self, raw: &str, label: String) -> i32 {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -5031,14 +4728,11 @@ impl Shell {
         let script = self.functions_preamble() + raw;
         let mut command = self.reexec_running(exe, script);
         command.current_dir(&self.cwd);
-        // Attached to its own pty, for exactly the reason run_single's own
-        // background spawn already is (see `use_pty` there): inherited
-        // stdio writes straight onto whatever the real screen happens to
-        // show, and the compositor's next redraw -- painted from the
-        // session's grid, which never saw a byte of it -- silently wipes
-        // it. Nothing here needs the process-group isolation that would
-        // conflict with spawn_attached's own setsid, so this gets the
-        // full treatment rather than just the fds.
+        // On its own pty, as `run_single`'s background spawn is (see
+        // `use_pty`): inherited stdio writes onto the real screen, which
+        // the compositor's next redraw from the grid wipes. No
+        // process-group isolation conflicts with `spawn_attached`'s setsid
+        // here.
         let spawned = match self.background_pty() {
             Some(p) => pty::spawn_attached(command, &p.slave_path).map(|child| (child, Some(p.master))),
             None => command.spawn().map(|child| (child, None)),
@@ -5055,13 +4749,10 @@ impl Shell {
         }
     }
 
-    // `coproc [NAME] command` -- see the Command::Coproc doc comment for
-    // the (scoped) grammar this accepts. Runs `body` as a background
-    // process wired to two pipes: NAME[0] is an fd the shell can read the
-    // coprocess's stdout from, NAME[1] an fd it can write to the
-    // coprocess's stdin. NAME_PID gets the coprocess's PID. The coprocess
-    // is also registered as an ordinary background job (visible in
-    // `jobs`/`wait`, same as real bash).
+    // `coproc [NAME] command` (see `Command::Coproc` for the grammar): runs
+    // `body` in the background wired to two pipes: NAME[0] reads its stdout,
+    // NAME[1] writes its stdin, NAME_PID is its pid. Also an ordinary job in
+    // `jobs` and `wait`, as in bash.
     fn run_coproc(&mut self, name: Option<String>, body: &parser::Command) -> i32 {
         use std::os::fd::AsRawFd;
         let name = name.unwrap_or_else(|| "COPROC".to_string());
@@ -5113,22 +4804,9 @@ impl Shell {
         }
     }
 
-    // Compound commands (if/while/for/case/group) with a trailing redirect
-    // (`{ ...; } > file`, `done < file`) run in-process now (via
-    // run_in_child_shell) for the foreground, plain-fd-0/1/2 case --
-    // avoids the re-exec round-trip and, as a side effect, keeps variable/
-    // cwd mutations inside the block visible to the rest of the script
-    // (matching a real bash `{ }` group, which is *not* a subshell).
-    // Falls back to the old self-exec'd path for anything this shell has
-    // no in-process model for: a numbered-fd redirect (no real child
-    // process here to dup2 it onto -- see resolve_simple_redirects_for_
-    // compound), or a *backgrounded* run, which needs to keep going after
-    // this call returns (nothing in this single-threaded interpreter can
-    // do that in-process).
     // A numbered-descriptor redirect this process can make on itself and
-    // put back afterwards: one naming only descriptors 3 and up, so
-    // nothing the shell's own stdin, stdout and stderr handling relies
-    // on moves under it.
+    // undo: one naming only fds 3 and up, so nothing the shell's own stdio
+    // handling relies on moves.
     fn stays_in_process(r: &Redirect) -> bool {
         match r {
             Redirect::FdOut { fd, .. }
@@ -5142,20 +4820,14 @@ impl Shell {
         }
     }
 
-    // A compound command with numbered-descriptor redirects, run in this
-    // shell. The descriptors are moved on the process itself -- where
-    // every builtin and every command started inside finds them -- and
-    // put back exactly as they were when the body is done, open or
-    // closed. The 0/1/2 redirects beside them go the ordinary in-process
-    // way.
-    //
-    // It used to run in a separate bish, since there was no in-process
-    // model for these at all. That lost everything a body does to the
-    // shell: `{ x=1; } 3>f` left `x` unset, `{ cd /; } 3>f` stayed put,
-    // and `{ exit 3; } 3>f` left only the group, so the script carried on.
+    // A compound with numbered-descriptor redirects, run in this shell. The
+    // descriptors move on the process itself, where builtins and commands
+    // inside find them, and are put back as they were, open or closed. The
+    // 0-2 redirects beside them go the ordinary in-process way. In a separate
+    // bish, `{ x=1; } 3>f` would leave `x` unset.
     fn run_with_numbered_fds(&mut self, cmd: &parser::Command, numbered: &[Redirect], simple: &[Redirect]) -> ExecResult {
-        // Each target as it was: a close-on-exec copy of it when open, so
-        // nothing started inside inherits the spare, or -1 when closed.
+        // Each target as it was: a close-on-exec copy when open, so nothing
+        // started inside inherits it, or -1 when closed.
         fn save(targets: impl Iterator<Item = i32>) -> Vec<(i32, i32)> {
             let mut saved: Vec<(i32, i32)> = Vec::new();
             for fd in targets {
@@ -5200,10 +4872,9 @@ impl Shell {
         result
     }
 
-    // Closes one of the redirect scopes `run_exit_trap` waits on. When it
-    // was the last one open, and what ran inside is the shell leaving,
-    // the trap that came due in there runs now -- with every redirect
-    // that bash would have undone first already put back.
+    // Closes a redirect scope `run_exit_trap` waits on. When it's the last
+    // and the body was the shell exiting, the deferred trap runs now, with
+    // the redirects bash would undo first already restored.
     fn leave_redirect_scope(&mut self, result: &ExecResult) {
         self.redirect_scopes = self.redirect_scopes.saturating_sub(1);
         if self.redirect_scopes == 0 && std::mem::take(&mut self.exit_trap_deferred) && matches!(result, ExecResult::Exit(_)) {
@@ -5211,10 +4882,15 @@ impl Shell {
         }
     }
 
+    // A compound (`if`, `while`, `for`, `case`, a group) with a trailing
+    // redirect. Foreground with 0-2 redirects it runs in-process, so its
+    // variable and cwd changes stay visible, as a `{ }` group isn't a
+    // subshell. A numbered fd this shell can't move on itself, or a
+    // background run, falls back to a re-exec'd bish.
     pub(crate) fn run_compound_redirected(&mut self, cmd: &parser::Command, redirects: &[Redirect], background: bool) -> ExecResult {
-        // Both in-process ways of running one are a redirect scope in the
-        // sense `run_exit_trap` means. The separate-process fallback below
-        // is not: an `exit` there leaves only that process.
+        // Both in-process ways are redirect scopes in `run_exit_trap`'s
+        // sense; the separate-process fallback isn't, since an `exit` there
+        // leaves only that process.
         if !background && Self::compound_redirects_are_simple(redirects) {
             self.redirect_scopes += 1;
             let result = match self.resolve_simple_redirects_for_compound(redirects) {
@@ -5248,32 +4924,25 @@ impl Shell {
                 return ExecResult::Status(1);
             }
         };
-        // The body only: this shell has just resolved the compound's own
-        // redirects into `redirs` and is about to apply them to the
-        // child, so writing them into the child's script as well would
-        // have it apply them a second time -- and, for a compound, take
-        // this same path again and spawn another child.
+        // The body only: the compound's own redirects are applied to the
+        // child here, and writing them into its script too would apply them
+        // twice and spawn another child.
         let script = self.functions_preamble() + &crate::serialize::serialize_command_body(cmd);
         let mut command = self.reexec_running(exe, script);
         command.current_dir(&self.cwd);
-        // Whichever of this job's own streams the redirects *didn't*
-        // claim goes to a pty of its own, for the same reason run_multi's
-        // backgrounded pipelines do (see background_pty): redirecting one
-        // stream says nothing about where the others should land, and
-        // inherited they write straight onto the real screen for the next
-        // repaint to wipe -- `{ cmd; } 2>err &` lost every line of stdout
-        // exactly that way. Wired as plain fds rather than through
-        // spawn_attached, whose setsid would undo the process-group
-        // isolation set up just below.
+        // The streams the redirects didn't claim go to a pty of its own, as
+        // for `run_multi`'s background pipelines (see `background_pty`):
+        // inherited, they'd be wiped by the next repaint. Plain fds, not
+        // `spawn_attached`, whose setsid would undo the process group
+        // below.
         let bg_pty = if background { self.background_pty() } else { None };
         let bg_slave = |pty: &Option<pty::Pty>| -> Option<Stdio> {
             let p = pty.as_ref()?;
             std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok().map(Stdio::from)
         };
-        // Only the foreground case (reached here for a numbered-fd
-        // redirect this shell has no in-process model for -- see
-        // compound_redirects_are_simple's own doc comment) should honor a
-        // converted enclosing capture.
+        // Only a foreground run (here for a numbered-fd redirect with no
+        // in-process model; see `compound_redirects_are_simple`) honours an
+        // enclosing capture.
         if background {
             command.stdin(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
             command.stdout(bg_slave(&bg_pty).unwrap_or_else(Stdio::inherit));
@@ -5283,17 +4952,11 @@ impl Shell {
         }
         command.stderr(bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stderr_stdio()));
         apply_fd_redirects(&mut command, redirs.actions);
-        // Real job control isolation for a *backgrounded* redirected
-        // compound command only -- same reasoning/pattern as run_single's
-        // own pre_exec hook (set from both the child, here, and the
-        // parent right after spawn() returns, to avoid the classic job-
-        // control race) and run_multi's own identical treatment of a
-        // backgrounded pipeline: `kill %N`/`bg`'s own SIGCONT then
-        // targets this whole (single-process) group correctly, and a
-        // *foreground* run of this same construct is left with today's
-        // "no isolation, inherits bish's own group" behavior, since there's
-        // no tcsetpgrp/stop-handling machinery here to keep a foreground
-        // Ctrl-C routing to it once isolated.
+        // A process group for a backgrounded redirected compound only, set
+        // in the child and the parent after spawn to avoid the race, as
+        // `run_single` and `run_multi` do, so `kill %N` and `bg` reach it.
+        // A foreground run stays in bish's group: there's no `tcsetpgrp` or
+        // stop handling here to route Ctrl-C to it.
         if background && self.opt_monitor {
             #[cfg(unix)]
             unsafe {
@@ -5336,18 +4999,10 @@ impl Shell {
         }
     }
 
-    /// Drops every NUL byte from a command substitution's output,
-    /// saying so once if there were any -- bash's own handling, message
-    /// included.
-    ///
-    /// The byte cannot survive into a shell word whatever is done with
-    /// it: a word ends up as an argument to `execve`, which takes C
-    /// strings and stops at the first NUL. So the choice is between
-    /// dropping it quietly and dropping it out loud, and a command that
-    /// produced binary output where a string was expected is worth a
-    /// line on stderr. Roadmap 11 took NUL bytes out of the variable
-    /// path; this is the same byte arriving through a different door,
-    /// where it used to reach the user as a Rust `CString` error.
+    /// Drops every NUL from a command substitution's output, saying so
+    /// once, as bash does. A NUL can't survive into a word, which becomes
+    /// an `execve` argument that stops at the first one, and binary output
+    /// where a string was expected deserves a line on stderr.
     fn strip_nuls_from_substitution(&mut self, text: String) -> String {
         if !text.contains('\0') {
             return text;
@@ -5357,10 +5012,9 @@ impl Shell {
     }
 
     fn run_command_substitution(&mut self, raw: &str) -> String {
-        // `$(<file)`: bash's no-fork file read, and the idiomatic way a
-        // script reads a pidfile or something out of /proc. Parsed as a
-        // command substitution containing only a redirect, which ran
-        // nothing and produced nothing.
+        // `$(<file)`: bash's no-fork file read (a pidfile, something in
+        // /proc), parsed as a substitution holding only a redirect, which
+        // would run nothing.
         if let Some(path) = raw.trim().strip_prefix('<') {
             let path = self.expand_raw(path.trim());
             let mut text = match std::fs::read_to_string(&path) {
@@ -5371,25 +5025,20 @@ impl Shell {
                     return String::new();
                 }
             };
-            // The same trailing-newline stripping every substitution
-            // does.
+            // The trailing newlines every substitution strips.
             while text.ends_with('\n') {
                 text.pop();
             }
             self.last_subst_status = Some(0);
             return self.strip_nuls_from_substitution(text);
         }
-        // No file at all until one is needed. A body made only of
-        // builtins -- `$(pwd)`, `$(echo x)`, most of what scripts
-        // actually substitute -- writes through this shell's own sink
-        // and never touches the kernel; the descriptor appears only if
-        // the body spawns something. See Capture.
+        // No file until one is needed: a body of builtins (`$(pwd)`) writes
+        // through this shell's sink; a descriptor appears only if it spawns
+        // something. See Capture.
         let capture = Capture::memory();
-        // `set -e` does not reach inside `$( )` unless
-        // `shopt -s inherit_errexit` says so -- that option exists
-        // precisely because it does not. A `( )` subshell is different
-        // and does inherit it, so this is scoped to command
-        // substitution rather than to run_in_child_shell.
+        // `set -e` doesn't reach inside `$( )` unless
+        // `shopt -s inherit_errexit`, which exists for that reason. A `( )`
+        // does inherit it, so this is specific to substitutions.
         let errexit = self.opt_errexit;
         if !self.shopt_is_on("inherit_errexit") {
             self.opt_errexit = false;
@@ -5404,40 +5053,23 @@ impl Shell {
         self.strip_nuls_from_substitution(s)
     }
 
-    /// Runs `cmd` with `input` on its standard input and hands back
-    /// what it wrote to standard output, plus its exit status.
-    ///
-    /// What `:[range]!cmd` is: the editor's filter. Deliberately built
-    /// on the same `run_in_child_shell` + anonymous-file pair that
-    /// `$( )` already uses, because an external command's stdout goes
-    /// to a real descriptor and *cannot* be caught by
-    /// `OutputSink::Capture` -- that only ever sees this shell's own
-    /// builtin writes (see `exec_cmd_inside_a_subshell_does_not_kill_
-    /// the_real_process`'s own comment). A filter whose whole purpose is
-    /// `sort` and `column -t` needs the mechanism that works for a real
-    /// child, and this is it.
-    ///
-    /// Unlike `$( )` the trailing newline is kept: it is what ends the
-    /// last line, and the caller is putting lines back into a buffer,
-    /// not building a word.
-    ///
-    /// stderr comes back separately rather than being left to the real
-    /// terminal. The editor is on the alternate screen, so anything the
-    /// command printed there would flash and be painted over by the next
-    /// redraw -- and since a failed filter still replaces the range (as
-    /// it does in vim), "the buffer emptied and nothing said why" is
-    /// precisely the outcome that has to be avoided.
+    /// Runs `cmd` with `input` on stdin and returns its stdout, stderr and
+    /// status: the editor's `:[range]!cmd` filter. Built like `$( )`,
+    /// because an external's stdout goes to a real descriptor, which
+    /// `OutputSink::Capture` can't catch. The trailing newline is kept,
+    /// since these are lines going back into a buffer. stderr comes back
+    /// separately: on the alternate screen it would be painted over, and a
+    /// failed filter still replaces the range (as in vim), so it must say
+    /// why.
     pub(crate) fn filter_through_command(&mut self, cmd: &str, input: &str) -> std::io::Result<(String, String, i32)> {
         use std::io::{Seek, SeekFrom, Write};
-        // Same two-way choice `run_command_substitution` makes: an
-        // anonymous file when the kernel gives one, a named temp file
-        // when it does not.
+        // An anonymous file if the kernel provides one, else a named
+        // temporary, as in `run_command_substitution`.
         let mut stdin = match capture_file() {
             Some(f) => f,
             None => {
                 let (f, path) = crate::platform::exclusive_temp_file("procsub").ok_or_else(|| std::io::Error::other("no temporary file"))?;
-                // The name has done its job; the descriptor is what the
-                // child is handed.
+                // The name has done its job; the child gets the descriptor.
                 let _ = std::fs::remove_file(&path);
                 f
             }
@@ -5454,21 +5086,11 @@ impl Shell {
         Ok((out.read(), err.read(), result.status()))
     }
 
-    // `<(cmd)`: runs cmd to completion now, capturing its stdout into a
-    // temp file, and substitutes that file's path. Real bash streams this
-    // concurrently through a FIFO; see the ProcSubIn/ProcSubOut doc comment
-    // in lexer.rs for why this shell uses a temp file instead. The path is
-    // queued for cleanup (self.proc_sub_cleanup) once the enclosing command
-    // has finished reading it.
-    /// The single external command a `<( )` body is, if that is all it
-    /// is.
-    ///
-    /// `<(yes)`, `<(seq 1 10)`, `<(cat f)` -- the overwhelmingly common
-    /// shapes -- need no shell at all, and giving them one is what made
-    /// them hard: a coroutine that spawns a process has to wait for it,
-    /// and waiting is the one thing a coroutine cannot do. Spawned
-    /// directly they are exactly what bash produces, a real process
-    /// writing into the pipe, which ends by itself when the reader goes.
+    /// The single external command a `<( )` body is, if that's all it is.
+    /// The common shapes (`<(yes)`, `<(seq 1 10)`, `<(cat f)`) need no
+    /// shell, and a coroutine spawning a process would have to wait for it,
+    /// which a coroutine can't. Spawned directly, as bash does, it's a real
+    /// process writing into the pipe that ends when the reader goes.
     fn proc_sub_plain_command(&mut self, raw: &str) -> Option<Vec<String>> {
         let toks = crate::lexer::Lexer::new(raw).tokenize().ok()?;
         let prog = crate::parser::Parser::new(self.expand_aliases(toks)).parse_program().ok()?;
@@ -5481,8 +5103,7 @@ impl Shell {
             return None;
         }
         let parser::Command::Simple(sc) = command else { return None };
-        // A redirect or an assignment prefix is the shell's business,
-        // not a bare spawn's.
+        // A redirect or assignment prefix needs the shell.
         if !sc.redirects.is_empty() || !sc.assigns.is_empty() {
             return None;
         }
@@ -5490,6 +5111,8 @@ impl Shell {
         (!argv.is_empty()).then_some(argv)
     }
 
+    // `<(cmd)`: substitutes `/dev/fd/N` for a pipe that `cmd` writes into
+    // concurrently, as a process or a coroutine.
     fn run_proc_sub_in(&mut self, raw: &str) -> String {
         let (read_end, write_end) = match make_pipe() {
             Ok(pair) => pair,
@@ -5499,8 +5122,7 @@ impl Shell {
             }
         };
         match self.proc_sub_plain_command(raw) {
-            // A real command: a real process, as in bash. Nothing to
-            // schedule, and it ends on its own when the reader goes.
+            // A real command, a real process, as in bash.
             Some(argv) => {
                 let mut command = self.command(&argv[0]);
                 command.args(&argv[1..]);
@@ -5514,23 +5136,17 @@ impl Shell {
                     }
                 }
             }
-            // Anything that needs a shell runs as a coroutine, given
-            // time wherever this shell would otherwise be idle.
+            // Anything needing a shell runs as a coroutine, given time when
+            // this shell would otherwise wait.
             None => {
                 let mut child = self.new_virtual_child();
                 let body = raw.to_string();
                 let started = self.background_coroutines.borrow_mut().add_with_fds(
                     move || {
-                        // Armed for the same reason a pipeline stage
-                        // arms it: this body writes into a pipe whose
-                        // reader can go away, and `EPIPE` is the only
-                        // way it can find out. Without it an unbounded
-                        // producer never stops -- and since the drain
-                        // now gives bodies turns *before* cancelling
-                        // any (which a `>( )` consumer needs to write
-                        // its answer), one of those turns never
-                        // returned: the loop spun inside a single
-                        // resume with the whole thread in it.
+                        // Armed as for a pipeline stage: `EPIPE` is the
+                        // only way this body learns its reader went, and an
+                        // unbounded producer would otherwise spin forever
+                        // inside one resume.
                         arm_broken_pipe();
                         child.run_source_cached(&body, "process substitution");
                         child.run_exit_trap();
@@ -5547,39 +5163,25 @@ impl Shell {
             }
         }
 
-        // `/dev/fd/N` rather than a FIFO. Opening a FIFO blocks until
-        // the other end is opened too, and with one thread the other
-        // end is a coroutine that cannot run while this one is blocked
-        // in the kernel -- the deadlock is structural. `/dev/fd` names
-        // the pipe that already exists, so there is nothing to wait for.
-        // The consuming command opens the name below, and for an
-        // external one that means inheriting this descriptor across
-        // `exec` -- so this end, unlike every other pipe this shell
-        // makes, must not close on it. *After* the producer is started,
-        // never before: it would otherwise inherit the read end of its
-        // own output pipe and hold it open against itself.
+        // `/dev/fd/N`, not a FIFO: opening a FIFO blocks until the other
+        // end opens, and the other end is a coroutine that can't run while
+        // this one blocks. The consumer opens the name, and an external
+        // inherits this descriptor across `exec`, so it mustn't be
+        // close-on-exec. Cleared after the producer starts, or it would
+        // hold its own output pipe open.
         clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&read_end));
         let name = format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&read_end));
         self.proc_sub_pipes.push(read_end);
         name
     }
 
-    /// `child.wait()`, giving any live coroutine the time this shell
-    /// would otherwise spend blocked in the kernel.
-    ///
-    /// This is the whole reason `<( )` can stream: the command reading
-    /// the substitution is what this is waiting for, and the producer
-    /// filling it is a coroutine that has to run *while* that happens.
-    /// With nothing live it is a plain wait -- one `try_wait` more than
-    /// before, and no polling.
+    /// `child.wait()`, giving live coroutines the time otherwise spent
+    /// blocked: the command reading a `<( )` is what's waited for, and its
+    /// producer must run meanwhile. With nothing live, a plain wait.
     fn wait_pumping(&self, child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
-        // Inside a coroutine there is no such thing as waiting: this
-        // thread is shared, and blocking in the kernel takes every
-        // other stage down with it -- including whichever one would
-        // have let this child finish. `<(yes)` deadlocked exactly
-        // there: the producer blocked waiting for `yes`, so the shell
-        // never noticed `head` had exited, so nothing ever closed the
-        // pipe `yes` was writing to.
+        // A coroutine can't wait: blocking takes every stage down,
+        // including the one that would let this child finish (`<(yes)`
+        // deadlocked waiting for `yes` while `head` had exited).
         if crate::coroutine::in_coroutine() {
             loop {
                 if let Some(status) = child.try_wait()? {
@@ -5596,24 +5198,20 @@ impl Shell {
                 return Ok(status);
             }
             if !self.has_live_coroutines() {
-                // Nothing left to give time to, so go back to blocking
-                // rather than spinning on `try_wait`.
+                // Nothing left to run, so block instead of spinning on
+                // `try_wait`.
                 return child.wait();
             }
             self.pump_coroutines();
         }
     }
 
-    /// Gives any coroutine that outlives its command a turn.
-    ///
-    /// Called where the shell would otherwise be idle in the kernel --
-    /// waiting for a child, waiting for input. That is the whole of the
-    /// scheduling policy for these: they run in the gaps, which is
-    /// exactly when the thing they are feeding is not running either.
+    /// Gives coroutines that outlive their command a turn, wherever the shell
+    /// would otherwise wait in the kernel, which is when what they feed isn't
+    /// running either.
     pub(crate) fn pump_coroutines(&self) {
         let Ok(mut scheduler) = self.background_coroutines.try_borrow_mut() else {
-            // Already inside a step: a coroutine reached a point that
-            // pumps. It is already running; there is nothing to do.
+            // Already inside a step: a coroutine reached a pumping point.
             return;
         };
         scheduler.step();
@@ -5624,19 +5222,9 @@ impl Shell {
         self.background_coroutines.try_borrow().is_ok_and(|s| !s.is_idle())
     }
 
-    // `>(cmd)`: substitutes a temp file path immediately (so the enclosing
-    // command can write to it like any other file), and queues cmd to run
-    // reading that file back once the enclosing command finishes -- correct
-    // data flow, but sequential rather than concurrent (see lexer.rs).
-    /// `>(cmd)`: the mirror of `<(cmd)`. The enclosing command writes
-    /// to the name and `cmd` reads it, concurrently -- rather than the
-    /// body being queued to run over a temp file once the command has
-    /// finished.
-    ///
-    /// The old shape had the right data flow at the wrong time:
-    /// `echo hi > >(cat); echo done` printed `hi done` where bash
-    /// prints `done hi`, and a body that needed to see output as it was
-    /// produced never could.
+    /// `>(cmd)`: the mirror of `<(cmd)`. The command writes to the name
+    /// while `cmd` reads it concurrently, so `echo hi > >(cat); echo done`
+    /// can print `done hi` as bash does.
     fn run_proc_sub_out(&mut self, raw: &str) -> String {
         let (read_end, write_end) = match make_pipe() {
             Ok(pair) => pair,
@@ -5646,8 +5234,8 @@ impl Shell {
             }
         };
         match self.proc_sub_plain_command(raw) {
-            // A real command reading the pipe, as in bash. It ends on
-            // its own when the writing end closes.
+            // A real command reading the pipe, as in bash, ending when the
+            // writing end closes.
             Some(argv) => {
                 let mut command = self.command(&argv[0]);
                 command.args(&argv[1..]);
@@ -5666,16 +5254,8 @@ impl Shell {
                 let body = raw.to_string();
                 let started = self.background_coroutines.borrow_mut().add_with_fds(
                     move || {
-                        // Armed for the same reason a pipeline stage
-                        // arms it: this body writes into a pipe whose
-                        // reader can go away, and `EPIPE` is the only
-                        // way it can find out. Without it an unbounded
-                        // producer never stops -- and since the drain
-                        // now gives bodies turns *before* cancelling
-                        // any (which a `>( )` consumer needs to write
-                        // its answer), one of those turns never
-                        // returned: the loop spun inside a single
-                        // resume with the whole thread in it.
+                        // Armed as for a pipeline stage; see
+                        // `run_proc_sub_in`.
                         arm_broken_pipe();
                         child.run_source_cached(&body, "process substitution");
                         child.run_exit_trap();
@@ -5693,41 +5273,32 @@ impl Shell {
             }
         }
 
-        // As in `run_proc_sub_in`, and after the body is started for
-        // the same reason -- more sharply here: a body that inherited
-        // the write end of its own *input* pipe holds it open against
-        // itself and never reaches end-of-input at all. `>(cat)` hides
-        // that by echoing as it reads; `>(wc -l)`, which answers only
-        // at end-of-input, answers nothing.
+        // As in `run_proc_sub_in`, after the body starts: a body inheriting
+        // the write end of its own input pipe never reaches end of input,
+        // so `>(wc -l)` would never answer.
         clear_cloexec(std::os::fd::AsRawFd::as_raw_fd(&write_end));
         let name = format!("/dev/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&write_end));
         self.proc_sub_pipes.push(write_end);
         name
     }
 
-    // Runs any `>(cmd)` substitutions queued by the command that just
-    // finished, then deletes every proc-sub temp file used this round.
+    // Ends the substitutions used by the command that just finished.
     fn drain_proc_subs(&mut self) {
-        // Not while a foreground job is still waiting to be driven. On
-        // the pty path a command does not run here -- it is stashed as
-        // `pending_fg` and run by whoever owns the terminal -- so
-        // "the enclosing command has finished reading it" is not true
-        // yet, and tearing the substitution down closes the producer's
-        // pipe and spends its wind-down turns before the reader has
-        // started. `wc -l <(seq 1 20000)` counted 12773 lines in a
-        // pane, which is one pipe buffer: exactly what the producer had
-        // managed to write before being told to stop. Whoever drives
-        // the job calls this afterwards instead -- see
-        // `drive_pending_fg_inline` and repl.rs's own fg handling.
+        // Not while a foreground job is waiting to be driven: on the pty
+        // path the command hasn't run yet (it's in `pending_fg`), and
+        // tearing down now closes the producer's pipe before the reader
+        // starts (`wc -l <(seq 1 20000)` counted one pipe buffer). Whoever
+        // drives the job calls this after (see `drive_pending_fg_inline`
+        // and repl.rs's fg handling).
         if self.pending_fg.is_some() {
             return;
         }
         for path in self.proc_sub_cleanup.drain(..) {
             let _ = std::fs::remove_file(path);
         }
-        // Closing this shell's own ends is what tells both kinds of
-        // substitution that the command is over: a `<( )` producer's
-        // next write fails, and a `>( )` consumer sees end-of-input.
+        // Closing this shell's ends tells both kinds the command is over: a
+        // `<( )` producer's next write fails, a `>( )` consumer sees end of
+        // input.
         self.proc_sub_pipes.clear();
         // Then let them finish. A consumer *has* to be given this --
         // `printf x > >(wc -l)` has only just been handed its input --
