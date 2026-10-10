@@ -1,24 +1,16 @@
-// `.env` files, as dotenv and everything that grew out of it read them.
+// `.env` files. Not built on `ini.rs`, which differs where it matters:
 //
-// This looks like `ini.rs` from a distance and is deliberately not built
-// on it, because the two disagree about the things that matter:
+//   - There are no sections: `[` is an ordinary character.
+//   - `#` starts a comment mid-line, which INI can't allow (systemd and
+//     Desktop Entry files treat it as value text) but every dotenv
+//     implementation does. It needs whitespace before it, so
+//     `URL=http://x/#frag` keeps its fragment.
+//   - `$VAR` and `${VAR}` are interpolation, the one part of a line whose
+//     text isn't what it says, and most of the reason to tell the formats
+//     apart.
+//   - `export KEY=value` is ordinary, since a `.env` is often `source`d.
 //
-//   - **There are no sections.** A `[` in a `.env` file is an ordinary
-//     character in a value.
-//   - **`#` starts a comment mid-line**, where INI's does not. INI had
-//     to sit that one out because systemd and the Desktop Entry spec
-//     both say a mid-line `#` is value text; dotenv has no such
-//     constituency -- every implementation of it strips trailing
-//     comments -- so here the useful reading is also the correct one. It
-//     still needs whitespace before it, so `URL=http://x/#frag` keeps
-//     its fragment.
-//   - **`$VAR` and `${VAR}` are interpolation**, and marking them is
-//     most of the reason to know this format apart from INI at all: it
-//     is the one part of the line whose text is not what it says.
-//   - **`export KEY=value` is ordinary**, because a `.env` is so often
-//     also `source`d.
-//
-// Offsets are **char** offsets, matching `highlight::HighlightSpan`.
+// Offsets are char offsets, as in `highlight::HighlightSpan`.
 #![allow(dead_code)]
 
 use std::ops::Range;
@@ -36,9 +28,8 @@ pub enum Item {
     Blank {
         span: Range<usize>,
     },
-    /// `KEY=value`, with or without a leading `export`. `separator` is
-    /// the `=`; a key with none is a line still being typed rather than
-    /// an error worth shouting about.
+    /// `KEY=value`, with or without `export`. `separator` is the `=`; a key
+    /// without one is a line still being typed, not an error.
     Entry {
         export: Option<Range<usize>>,
         key: Range<usize>,
@@ -47,7 +38,7 @@ pub enum Item {
         comment: Option<Range<usize>>,
         span: Range<usize>,
     },
-    /// A line that is no part of any of the above.
+    /// A line that is none of the above.
     Junk {
         span: Range<usize>,
     },
@@ -57,11 +48,10 @@ pub enum Item {
 pub struct Value {
     pub span: Range<usize>,
     pub kind: ValueKind,
-    /// `\n`, `\"` and friends -- only ever inside a double-quoted value.
+    /// `\n`, `\"` and the like, only inside a double-quoted value.
     pub escapes: Vec<Range<usize>>,
-    /// `$VAR` / `${VAR}` / `${VAR:-default}`, wherever interpolation
-    /// applies. Empty inside a single-quoted value, which is exactly
-    /// what single quotes mean here.
+    /// `$VAR`, `${VAR}`, `${VAR:-default}`, wherever interpolation applies;
+    /// never inside single quotes.
     pub expansions: Vec<Range<usize>>,
 }
 
@@ -97,8 +87,8 @@ impl Parser<'_> {
         while self.pos < self.chars.len() {
             self.item();
         }
-        // A file ending in a newline has one more (empty) line, and
-        // saying so keeps the items a description of the whole file.
+        // A file ending in a newline has one more, empty line, so the items
+        // describe the whole file.
         if self.chars.last() == Some(&'\n') || self.chars.is_empty() {
             self.items.push(Item::Blank { span: self.pos..self.pos });
         }
@@ -121,13 +111,13 @@ impl Parser<'_> {
     }
 
     fn entry(&mut self, start: usize, line_end: usize) {
-        // `export KEY=...`, the form that makes a `.env` also sourceable.
+        // `export KEY=...`, which makes a `.env` sourceable.
         let mut at = start;
         let mut export = None;
         if self.word_at(at, "export") {
             let after = self.skip_blanks(at + 6, line_end);
-            // Only when a key really follows: a key literally named
-            // `export` is legal, and `export=1` is that.
+            // Only when a key follows: a key named `export` is legal
+            // (`export=1`).
             if after > at + 6 && after < line_end && is_key_char(self.chars[after]) {
                 export = Some(at..at + 6);
                 at = after;
@@ -145,8 +135,7 @@ impl Parser<'_> {
         let key = key_start..at;
         let at = self.skip_blanks(at, line_end);
         if at >= line_end || self.chars[at] != '=' {
-            // A key with nothing after it: a line halfway through being
-            // typed, not something to complain about.
+            // A key with nothing after it: a line being typed.
             self.items.push(Item::Entry { export, key, separator: None, value: None, comment: None, span: start..line_end });
             self.pos = line_end + 1;
             return;
@@ -157,9 +146,8 @@ impl Parser<'_> {
         self.pos = end + 1;
     }
 
-    // The value after `=`, plus any trailing comment, plus where the
-    // whole entry ends -- which is normally this line's end, but can be
-    // further down when a quoted value spans lines.
+    // The value after `=`, any trailing comment, and where the entry ends:
+    // this line's end, or further for a quoted value spanning lines.
     fn value(&mut self, from: usize, line_end: usize) -> (Option<Value>, Option<Range<usize>>, usize) {
         let start = self.skip_blanks(from, line_end);
         if start >= line_end {
@@ -174,7 +162,7 @@ impl Parser<'_> {
                 let expansions = if quote == '"' { self.expansions(start + 1, end) } else { Vec::new() };
                 let kind = if quote == '"' { ValueKind::Quoted } else { ValueKind::Literal };
                 let value = Value { span: start..end, kind, escapes, expansions };
-                // Whatever follows a closing quote on that same line.
+                // Whatever follows the closing quote on that line.
                 let tail_end = self.line_end(end);
                 let after = self.skip_blanks(end, tail_end);
                 let comment = (after < tail_end && self.chars[after] == '#').then_some(after..tail_end);
@@ -197,18 +185,12 @@ impl Parser<'_> {
         }
     }
 
-    // Where a quoted value ends, one past its closing quote.
-    //
-    // A double- or single-quoted value may span lines -- a PEM key in a
-    // `.env` is the usual reason -- but only until a line that looks
-    // like a new assignment. That bound is the whole design decision
-    // here, and it exists because neither unbounded answer is good: let
-    // a quote span freely and one unterminated quote restyles the rest
-    // of the file; stop it at its own line and a real multi-line value's
-    // continuation lines get read as *keys*, which is misreading content
-    // as syntax. Recovering at the next `KEY=` keeps a genuine
-    // multi-line value whole and keeps a typo's blast radius to the
-    // entry it was made in.
+    // One past a quoted value's closing quote. Quoted values may span lines
+    // (a PEM key is the usual reason), but only until a line that looks
+    // like a new assignment. Unbounded, one unterminated quote restyles the
+    // rest of the file; stopped at its own line, a real multi-line value's
+    // lines read as keys. Stopping at the next `KEY=` keeps real values
+    // whole and a typo's damage to its own entry.
     fn quoted_end(&self, start: usize, quote: char) -> usize {
         let mut at = start + 1;
         while at < self.chars.len() {
@@ -228,9 +210,9 @@ impl Parser<'_> {
         self.chars.len()
     }
 
-    // Where an unquoted value ends, and the comment (if any) after it. A
-    // `#` needs whitespace before it, so `URL=http://x/#frag` keeps its
-    // fragment and `PORT=3000 # the port` loses its comment.
+    // Where an unquoted value ends, and its comment if any. `#` needs
+    // whitespace before it: `URL=http://x/#frag` keeps its fragment,
+    // `PORT=3000 # the port` loses its comment.
     fn bare_end(&self, start: usize, line_end: usize) -> (usize, Option<Range<usize>>) {
         let mut at = start;
         while at < line_end {
@@ -250,10 +232,9 @@ impl Parser<'_> {
         (end, None)
     }
 
-    // Whether the line beginning at `at` is a fresh `KEY=` -- what ends
-    // a runaway quoted value. Deliberately strict: an indented line, or
-    // one whose key holds anything unusual, is far more likely to be
-    // part of a value than a new entry.
+    // Whether the line at `at` starts a new `KEY=`, which ends a runaway
+    // quoted value. Strict: an indented line, or an unusual key, is more
+    // likely part of a value.
     fn looks_like_assignment(&self, at: usize) -> bool {
         let mut i = at;
         if self.word_at(i, "export") && self.chars.get(i + 6).is_some_and(|c| *c == ' ') {
@@ -280,8 +261,8 @@ impl Parser<'_> {
         out
     }
 
-    // `$VAR`, `${VAR}` and `${VAR:-default}`. A `$` that opens neither
-    // is just a dollar sign.
+    // `$VAR`, `${VAR}` and `${VAR:-default}`; a `$` opening neither is a
+    // dollar sign.
     fn expansions(&self, from: usize, to: usize) -> Vec<Range<usize>> {
         let end = to.min(self.chars.len());
         let mut out = Vec::new();
@@ -333,8 +314,8 @@ impl Parser<'_> {
     }
 }
 
-// `.` and `-` are unusual but real: plenty of tools write
-// `SERVICE.PORT` or `some-key` into a `.env`.
+// `.` and `-` are unusual but real: tools write `SERVICE.PORT` and
+// `some-key`.
 fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
 }
@@ -385,7 +366,7 @@ mod tests {
         assert_eq!(text_of("export PORT=3000", key), "PORT");
     }
 
-    // ...but a key really named `export` is still a key.
+    // ...but a key named `export` is still a key.
     #[test]
     fn a_key_named_export_is_not_the_keyword() {
         let src = "export=1";
@@ -408,7 +389,7 @@ mod tests {
         assert_eq!(kind("A=/usr/bin"), ValueKind::Bare);
     }
 
-    // The rule INI had to sit out, and the one dotenv actually wants.
+    // Mid-line comments, which INI can't have.
     #[test]
     fn a_hash_after_whitespace_starts_a_comment() {
         assert_eq!(entry("PORT=3000 # the port", 0).1, "3000");
@@ -416,7 +397,7 @@ mod tests {
         assert_eq!(text_of("PORT=3000 # the port", comment.as_ref().unwrap()), "# the port");
     }
 
-    // ...and only after whitespace, so a URL keeps its fragment.
+    // ...only after whitespace, so a URL keeps its fragment.
     #[test]
     fn a_hash_inside_a_word_is_part_of_the_value() {
         assert_eq!(entry("URL=http://x/#frag", 0).1, "http://x/#frag");
@@ -435,8 +416,6 @@ mod tests {
         assert!(matches!(items("   # indented")[0], Item::Comment { .. }));
     }
 
-    // The distinctive part: the piece of the line whose text isn't what
-    // it says.
     #[test]
     fn interpolation_is_located_in_bare_and_double_quoted_values() {
         let expansions = |src: &str| match &items(src)[0] {
@@ -449,7 +428,6 @@ mod tests {
         assert_eq!(expansions("A=$A:$B"), vec!["$A", "$B"]);
     }
 
-    // Single quotes mean exactly this.
     #[test]
     fn a_single_quoted_value_interpolates_nothing() {
         let Item::Entry { value: Some(v), .. } = &items("A='$HOME'")[0] else { panic!() };
@@ -482,9 +460,8 @@ mod tests {
         assert_eq!(entry(src, 1), ("NEXT".to_string(), "1".to_string()));
     }
 
-    // ...and an unterminated one stops at the next assignment rather
-    // than swallowing the rest of the file. Neither answer is free; see
-    // quoted_end's own comment for why this is the one chosen.
+    // ...and an unterminated one stops at the next assignment (see
+    // `quoted_end`).
     #[test]
     fn an_unterminated_quote_stops_at_the_next_assignment() {
         let src = "A=\"oops\nB=2\nC=3";
@@ -493,8 +470,8 @@ mod tests {
         assert_eq!(entry(src, 2), ("C".to_string(), "3".to_string()));
     }
 
-    // An indented continuation line is value text, not a new entry --
-    // which is what keeps the recovery rule from firing on real data.
+    // An indented continuation line is value text, so recovery doesn't fire
+    // on real data.
     #[test]
     fn an_indented_line_does_not_end_a_quoted_value() {
         let src = "A=\"one\n  b=2\nstill\"\nB=1";
