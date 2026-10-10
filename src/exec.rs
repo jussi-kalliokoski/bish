@@ -8255,6 +8255,19 @@ impl Shell {
                     return ExecResult::Status(1);
                 }
                 let mut ext = self.command(&argv[i]);
+                // `-p` is POSIX's "find the standard utility, not
+                // whatever the caller's PATH points at" -- the form a
+                // careful script writes when it means the real `rm`, not
+                // a directory planted ahead of it. It had been parsed and
+                // then ignored for resolution, so `command -p rm` still
+                // searched the inherited PATH. Now it searches a fixed
+                // standard path (what `getconf PATH` reports on the
+                // systems bish runs on), for the lookup and for the
+                // command's own environment, since `std::process::Command`
+                // uses the one PATH for both.
+                if mode_p {
+                    ext.env("PATH", "/usr/bin:/bin");
+                }
                 ext.args(&argv[i + 1..]);
                 ext.current_dir(&self.cwd);
                 // Without these, `command foo` would always inherit the
@@ -18100,6 +18113,29 @@ mod tests {
         // -- but if that ever changed, the trap is what is reported.
         let listing = super::trap_signal_listing(&traps, &[int, usr1]);
         assert_eq!(listing, vec![(int, TrapAction::Ignore), (usr1, TrapAction::Run("echo t".to_string()))]);
+    }
+
+    // `command -p` has to find a standard utility against a fixed safe
+    // path, not the caller's PATH -- that is the whole reason the flag
+    // exists, and it was being parsed and then ignored for resolution.
+    // Uses `ls`, which is external (a builtin would be found whatever
+    // PATH said and prove nothing).
+    #[test]
+    fn command_dash_p_resolves_against_a_standard_path() {
+        if crate::exec::resolve_in_path("ls", "/usr/bin:/bin").is_none() {
+            return; // no `ls` in the standard place; nothing to prove against
+        }
+        let run = |line: &str| {
+            let mut sh = Shell::new();
+            let out = Rc::new(RefCell::new(String::new()));
+            sh.set_sink_capture(out.clone());
+            sh.run_source_here(line, "<test>");
+            out.borrow().clone()
+        };
+        // A broken PATH: `-p` finds `ls` anyway and runs it (exit 0).
+        assert_eq!(run("PATH=/nonexistent command -p ls / >/dev/null; echo rc=$?"), "rc=0\n");
+        // Without `-p`, the broken PATH stands and `ls` is not found.
+        assert_eq!(run("PATH=/nonexistent command ls / >/dev/null 2>&1; echo rc=$?"), "rc=127\n");
     }
 
     #[test]
