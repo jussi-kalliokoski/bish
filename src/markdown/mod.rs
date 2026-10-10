@@ -1,35 +1,21 @@
-// CommonMark + GFM, hand-rolled -- no external crate, same as the rest of
-// the parsers here. Three things use it: `:help` (which is written in
-// markdown and rendered to the terminal), markdown syntax highlighting in
-// the editor, and previewing a `.md` file.
+// CommonMark and GFM, for `:help` (markdown rendered to the terminal),
+// markdown highlighting in the editor, and previewing `.md` files.
 //
-// Those three needs are why this produces a real AST with *source spans*
-// rather than rendering straight to text. A renderer wants structure; a
-// highlighter wants to know which characters of the original are a
-// heading marker, a code fence, a link destination. One parse serves
-// both because every node remembers where it came from.
+// So it builds an AST with source spans: a renderer wants structure, a
+// highlighter wants to know which characters are a heading marker, a
+// fence or a link destination, and one parse serves both.
 //
-// The parse is the spec's own two passes, and it has to be: block
-// structure first (§4), then inlines within the leaf blocks that take
-// them (§6). They can't be one pass, because whether `- foo` starts a
-// list depends on lines that come after it, and whether `*a*` is
-// emphasis depends on characters on both sides.
-//
-// HTML found in a document goes to crate::html -- a real parse, not a
-// span of raw text -- so a preview can render what the markup means. See
-// html/mod.rs for why that's a full WHATWG parser.
-//
-// GFM extensions, on by default: tables, strikethrough, task list items,
-// and autolinks. They're what every markdown file in the wild assumes,
-// and tables in particular are what make a keybinding list in `:help`
-// worth writing.
+// Two passes, as the spec has it: block structure (§4), then inlines in
+// the leaf blocks (§6). Whether `- foo` starts a list depends on later
+// lines, and whether `*a*` is emphasis on characters on both sides. HTML
+// in a document goes to crate::html, a real parse, so a preview renders
+// what it means. GFM's tables, strikethrough, task items and autolinks
+// are on by default: every markdown file assumes them, and `:help`'s
+// keybinding lists are tables.
 
-// The parser exposes the whole document model -- every block and inline
-// kind, with the spans each came from -- and each of its three consumers
-// uses a different part: a renderer walks the tree, a highlighter reads
-// the spans, a preview does both. Kept whole rather than trimmed to
-// today's callers, the same reasoning (and the same allow) as
-// html/mod.rs and bishedit::highlight.
+// The whole document model is exposed, every block and inline kind with
+// its span, and each consumer uses a different part; kept whole, as
+// html/mod.rs and bishedit::highlight are, hence the allow.
 #![allow(dead_code)]
 
 pub mod block;
@@ -38,9 +24,8 @@ pub mod render;
 
 use std::ops::Range;
 
-// A parsed document plus the link reference definitions collected from
-// it, which inline parsing needs and which a caller may want to resolve
-// links itself.
+// A parsed document and its link reference definitions, which inline
+// parsing needs and a caller may use to resolve links.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     pub blocks: Vec<Block>,
@@ -49,30 +34,28 @@ pub struct Document {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkRef {
-    // Normalized per §4.7: case-folded and whitespace-collapsed, so
-    // `[FOO bar]` and `[foo   BAR]` are the same label.
+    // Normalized per §4.7, case-folded and whitespace-collapsed: `[FOO bar]`
+    // and `[foo   BAR]` are one label.
     pub label: String,
     pub dest: String,
     pub title: String,
     pub span: Range<usize>,
 }
 
-// `CodeBlock`/`HtmlBlock`/`BlockQuote` repeat the enum's name on
-// purpose: those are what CommonMark calls them, and matching the spec's
-// vocabulary is worth more here than avoiding the stutter -- `Block::Code`
-// would read as a code *span*, which is a different thing entirely.
+// `CodeBlock`, `HtmlBlock`, `BlockQuote` repeat the enum's name because
+// CommonMark calls them that; `Block::Code` would read as a code span.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Paragraph { content: Vec<Inline>, span: Range<usize> },
-    // `level` is 1-6. `marker` covers the `#`s (or the setext
-    // underline), which is what a highlighter colours.
+    // `level` is 1-6. `marker` covers the `#`s or the setext underline, for
+    // the highlighter.
     Heading { level: u8, content: Vec<Inline>, marker: Range<usize>, span: Range<usize> },
-    // `info` is the fence's info string ("rust", "bash frame=none"), and
-    // its first word is what picks a nested highlighter.
+    // `info` is the fence's info string ("rust", "bash frame=none"); its
+    // first word picks a nested highlighter.
     CodeBlock { info: String, literal: String, fenced: bool, info_span: Range<usize>, literal_span: Range<usize>, span: Range<usize> },
-    // Raw HTML, kept verbatim *and* parsed: `raw` is what a highlighter
-    // colours, and crate::html::parse_fragment is what a renderer walks.
+    // Raw HTML, kept verbatim and parsed: `raw` for the highlighter,
+    // `crate::html::parse_fragment` for the renderer.
     HtmlBlock { raw: String, span: Range<usize> },
     BlockQuote { blocks: Vec<Block>, span: Range<usize> },
     List(List),
@@ -84,9 +67,8 @@ pub enum Block {
 pub struct List {
     pub ordered: bool,
     pub start: u64,
-    // A "tight" list renders its items without blank lines between them
-    // -- decided by the source, not by the renderer, because it depends
-    // on where the blank lines were.
+    // A tight list renders without blank lines between items, decided by
+    // where the source had blank lines.
     pub tight: bool,
     pub items: Vec<ListItem>,
     pub span: Range<usize>,
@@ -121,18 +103,18 @@ pub struct Table {
 pub enum Inline {
     Text { text: String, span: Range<usize> },
     Code { text: String, span: Range<usize> },
-    // Spans include the delimiters (`*a*`, `**a**`, `~~a~~`), the same
-    // as `Code` and `Link` -- see inline.rs's `wrap_emphasis`.
+    // Spans include the delimiters (`*a*`, `**a**`, `~~a~~`), as `Code` and
+    // `Link` do; see inline.rs's `wrap_emphasis`.
     Emph { content: Vec<Inline>, span: Range<usize> },
     Strong { content: Vec<Inline>, span: Range<usize> },
     Strikethrough { content: Vec<Inline>, span: Range<usize> },
     Link { dest: String, title: String, content: Vec<Inline>, span: Range<usize> },
     Image { dest: String, title: String, alt: Vec<Inline>, span: Range<usize> },
-    // Inline raw HTML (`<br>`, `<span class=x>`), recognized by the same
-    // grammar the HTML tokenizer uses.
+    // Inline raw HTML (`<br>`, `<span class=x>`), recognized by the HTML
+    // tokenizer's grammar.
     Html { raw: String, span: Range<usize> },
-    // A line ending inside a paragraph: a space to a renderer, a real
-    // break only if it was two spaces or a backslash (HardBreak).
+    // A line ending in a paragraph: a space when rendered; a real break only
+    // after two spaces or a backslash (`HardBreak`).
     SoftBreak { span: Range<usize> },
     HardBreak { span: Range<usize> },
 }
@@ -153,9 +135,8 @@ impl Inline {
         }
     }
 
-    // Every character this inline and its children stand for, with the
-    // markup removed -- what a heading's own text is for an anchor, and
-    // what an image's alt text is.
+    // Every character this inline and its children stand for, markup
+    // removed: a heading's anchor text, an image's alt text.
     pub fn text_content(&self) -> String {
         match self {
             Inline::Text { text, .. } | Inline::Code { text, .. } => text.clone(),
@@ -185,10 +166,8 @@ impl Block {
     }
 }
 
-// Spans everywhere are *char* offsets into the input, not byte offsets
-// -- the editor's own highlighting indexes a `&[char]` (see
-// bishedit::highlight::compose), and every other span in this codebase
-// is already in the same units.
+// Spans are char offsets into the input, not bytes, as everywhere here:
+// highlighting indexes a `&[char]` (`bishedit::highlight::compose`).
 pub fn parse(input: &str) -> Document {
     block::parse(input)
 }
@@ -197,9 +176,9 @@ pub fn parse(input: &str) -> Document {
 mod tests {
     use super::*;
 
-    // A compact rendering of the block tree, so an expectation reads as
-    // the structure it describes. Inlines are shown with their markup
-    // reconstructed as sigils: *emph*, **strong**, `code`, [link](dest).
+    // The block tree in compact form, so an expectation reads as its
+    // structure. Inlines show their markup as sigils: *emph*, **strong**,
+    // `code`, [link](dest).
     fn tree(input: &str) -> String {
         let doc = parse(input);
         let mut out = String::new();
@@ -304,8 +283,7 @@ mod tests {
         );
     }
 
-    // `_` may not open or close inside a word, which is what keeps
-    // identifiers intact.
+    // `_` doesn't open or close inside a word, keeping identifiers intact.
     #[test]
     fn underscores_inside_a_word_are_not_emphasis() {
         assert_tree(
@@ -325,8 +303,8 @@ mod tests {
             p: `a` `b ` c` ` not closed
             "#,
         );
-        // One leading and trailing space is stripped, so a code span can
-        // hold a backtick of its own.
+        // One leading and trailing space is stripped, so a code span can hold
+        // a backtick.
         assert_tree("`` ` ``\n", "p: ```\n");
     }
 
@@ -395,8 +373,8 @@ mod tests {
         );
     }
 
-    // Lazy continuation: a paragraph inside a block quote continues even
-    // on a line with no `>`.
+    // Lazy continuation: a paragraph in a block quote continues on a line
+    // without `>`.
     #[test]
     fn a_paragraph_in_a_quote_continues_lazily() {
         assert_tree(
@@ -408,9 +386,8 @@ mod tests {
         );
     }
 
-    // A list holds items and nothing else, so anything that isn't one
-    // has to close it -- found by the `:help` document, whose whole
-    // second half sat after a bullet list and disappeared.
+    // A list holds only items, so anything else closes it: the second half
+    // of `:help` sat after a bullet list.
     #[test]
     fn a_block_after_a_list_closes_it_rather_than_vanishing_into_it() {
         assert_tree(
@@ -423,8 +400,8 @@ mod tests {
             p: text
             "#,
         );
-        // ...including out of a nested list, and including a block that
-        // opens rather than one that is complete in a line.
+        // Out of a nested list too, and for a block that opens rather than
+        // one complete in a line.
         assert_tree(
             "- a\n  - b\n\n> quoted\n",
             r#"
@@ -512,14 +489,10 @@ mod tests {
         assert_tree("~~gone~~ and ~one~\n", "p: ~~gone~~ and ~~one~~\n");
     }
 
-    /// `\|` is a literal pipe in a table cell, and the only way to
-    /// write one -- which is why GFM applies the escape at the table
-    /// level, before inline parsing, "including inside other inline
-    /// spans". A code span is exactly the case that needs it: there is
-    /// no other spelling of a pipe inside backticks, and the backslash
-    /// used to survive into the output and be shown.
-    ///
-    /// The middle row is GFM's own example for this, whose cell is
+    /// `\|` is a literal pipe in a table cell, the only way to write one,
+    /// so GFM applies the escape at the table level, before inline parsing,
+    /// "including inside other inline spans": a code span has no other way
+    /// to hold a pipe. The middle row is GFM's example,
     /// `b <code>|</code> az`.
     #[test]
     fn an_escaped_pipe_is_a_pipe_even_inside_a_code_span() {
@@ -537,8 +510,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(text(&table.head[0]), "f|oo");
-        // The backslash is gone before the code span is parsed, so the
-        // span holds the pipe itself rather than an escape of one.
+        // The backslash is gone before the code span is parsed.
         let code = |cell: &Vec<Inline>| -> String {
             cell.iter()
                 .filter_map(|i| match i {
@@ -565,8 +537,8 @@ mod tests {
         );
     }
 
-    // A table needs pipes in its header; `---` under a plain paragraph
-    // is still a setext heading.
+    // A table needs pipes in its header; `---` under a plain paragraph is a
+    // setext heading.
     #[test]
     fn a_dashed_line_under_a_plain_paragraph_is_still_a_heading() {
         assert_tree("Title\n---\n", "h2: Title\n");
@@ -599,9 +571,8 @@ mod tests {
         assert_tree("&amp; &#65; &#x41; &notarealentity;\n", "p: & A A &notarealentity;\n");
     }
 
-    // Spans are what the highlighter needs: every inline has to point at
-    // the characters it came from, including inside a block quote whose
-    // markers were stripped.
+    // Every inline points at its source characters, inside a block quote
+    // whose markers were stripped too.
     #[test]
     fn spans_point_back_at_the_source_even_through_a_block_quote() {
         let src = "> a *bee* c\n";
@@ -611,7 +582,7 @@ mod tests {
         let chars: Vec<char> = src.chars().collect();
         let emph = content.iter().find(|i| matches!(i, Inline::Emph { .. })).expect("expected emphasis");
         let span = emph.span();
-        // Delimiters included -- see Inline::Emph.
+        // Delimiters included; see `Inline::Emph`.
         assert_eq!(chars[span.start..span.end].iter().collect::<String>(), "*bee*");
     }
 
@@ -648,11 +619,9 @@ mod tests {
 mod real_world_tests {
     use super::*;
 
-    // Every markdown file in this repository and its docs, parsed and
-    // checked for the two invariants that hold for any document: every
-    // span points inside the source, and the blocks come out in source
-    // order. Real files written by hand, which is what catches a parser
-    // that only works on the examples it was written against.
+    // Every markdown file in this repository, checked for invariants any
+    // document has: spans inside the source, blocks in source order.
+    // Hand-written files catch what examples don't.
     #[test]
     fn parses_every_markdown_file_in_the_repository() {
         let mut checked = 0;
@@ -717,17 +686,10 @@ mod real_world_tests {
 mod nesting_tests {
     use super::render::{self, Options};
 
-    // Absurd nesting used to be fatal rather than merely absurd. The
-    // block parser's own container stack is iterative, but the tree it
-    // hands back gets walked recursively three separate times -- once
-    // to resolve link references, once to render, and once more when it
-    // is dropped -- so 50k nested `>` in a file overflowed the stack,
-    // and a shell that dies on *opening a document* is the worst
-    // version of this bug.
-    //
-    // A test that regresses this one does not fail politely: a stack
-    // overflow aborts the whole process, which is exactly the noise it
-    // should make.
+    // Absurd nesting must not be fatal. The container stack is iterative,
+    // but the result is walked recursively three times (link resolution,
+    // rendering, drop), so 50k nested `>` would overflow the stack on
+    // opening a document. A regression aborts the whole process.
     #[test]
     fn deeply_nested_block_quotes_are_bounded_not_fatal() {
         let doc = super::parse(&format!("{} hi\n", ">".repeat(20000)));
@@ -735,9 +697,8 @@ mod nesting_tests {
         assert!(out.contains("hi"), "the text past the markers still renders");
     }
 
-    // Same story from the HTML side, where the depth is bounded one
-    // layer further down (html::tree caps the stack of open elements)
-    // and the renderer's own walk has a floor of its own.
+    // The same from the HTML side, where html::tree caps the open-element
+    // stack and the renderer's walk has its own floor.
     #[test]
     fn deeply_nested_html_is_bounded_not_fatal() {
         let src = format!("{}hi{}\n", "<div>".repeat(20000), "</div>".repeat(20000));
