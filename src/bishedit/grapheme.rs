@@ -1,35 +1,13 @@
-// Hand-rolled Unicode extended grapheme cluster segmentation (UAX #29)
-// -- no external crate, same spirit as unicode_width.rs/glob.rs/
-// regex.rs/csscolor.rs. Groups a sequence of chars into "user-perceived
-// characters": a base character plus its combining marks, a Hangul
-// syllable assembled from Jamo, a ZWJ emoji sequence (family, couple-
-// with-heart, ...), or a regional-indicator flag pair -- all one
-// cluster, so cursor motion/deletion can treat it as a single unit
-// instead of landing or splitting mid-glyph.
+// Extended grapheme cluster segmentation (UAX #29): groups chars into
+// user-perceived characters (a base and its combining marks, a Hangul
+// syllable from Jamo, a ZWJ emoji sequence, a flag pair) so cursor motion
+// and deletion treat each as one unit. `unicode_width::str_width` uses it
+// to measure a ZWJ sequence as one cluster.
 //
-// unicode_width.rs's own doc comment already named this gap: a ZWJ
-// sequence is measured char-by-char and summed there rather than
-// treated as one cluster, "genuinely deferred to a later pass if it
-// ever turns out to matter in practice" -- this is that pass, and
-// unicode_width::str_width now calls into cluster_range below to fix
-// exactly that case (see this file's own str_width interaction test).
-//
-// Implements the UAX #29 boundary rules GB1-GB999: CR/LF, control
-// characters, Hangul syllable assembly (computed arithmetically from
-// the standard Unicode Hangul decomposition formula, not a giant
-// table), combining marks/ZWJ, emoji ZWJ sequences, regional-indicator
-// flag pairs, and -- since the tables stopped being written from
-// memory -- Prepend and SpacingMark as well.
-//
-// Those last two used to be the documented gap here, on the grounds
-// that they are near-exclusively Indic phenomena and the property
-// tables for them would have had to be recalled rather than read. That
-// was the real obstacle, and it is gone: every table this module reads
-// now comes from `unicode_tables`, generated from the Unicode
-// character database this machine already ships (see
-// tools/gen-unicode-tables.pl). Extended_Pictographic is the clearest
-// case -- the trimmed three-range guess it replaced covered the blocks
-// a common emoji sequence needs and nothing else.
+// Implements GB1-GB999. Hangul syllables are decomposed arithmetically
+// rather than from a table; every other property comes from
+// `unicode_tables`, generated from the system's Unicode character database
+// (tools/gen-unicode-tables.pl).
 
 fn in_ranges(c: u32, ranges: &[(u32, u32)]) -> bool {
     ranges
@@ -104,10 +82,9 @@ fn gcb_class(c: char) -> Gcb {
         return Gcb::T;
     }
     if c >= HANGUL_SYLLABLE.0 && c <= HANGUL_SYLLABLE.1 {
-        // Standard Unicode Hangul syllable decomposition: SIndex is this
-        // syllable's offset within the 11172-syllable block; a TIndex of
-        // 0 means no trailing consonant (an LV syllable), any other
-        // value means it has one (LVT).
+        // Unicode's Hangul decomposition: SIndex is the offset in the
+        // 11172-syllable block, and a TIndex of 0 means no trailing
+        // consonant (LV rather than LVT).
         let s_index = c - HANGUL_SYLLABLE.0;
         return if s_index % HANGUL_TCOUNT == 0 { Gcb::Lv } else { Gcb::Lvt };
     }
@@ -117,10 +94,8 @@ fn gcb_class(c: char) -> Gcb {
     Gcb::Other
 }
 
-// True if there's a grapheme-cluster boundary immediately before
-// `chars[i]` (between `chars[i-1]` and `chars[i]`). `i == 0` and
-// `i == chars.len()` are always boundaries (GB1/GB2, start/end of
-// text).
+// Whether there's a boundary just before `chars[i]`. `i == 0` and
+// `i == chars.len()` always are (GB1/GB2).
 pub fn is_boundary(chars: &[char], i: usize) -> bool {
     if i == 0 || i >= chars.len() {
         return true;
@@ -132,11 +107,11 @@ pub fn is_boundary(chars: &[char], i: usize) -> bool {
     if before == Gcb::Cr && after == Gcb::Lf {
         return false;
     }
-    // GB4: (Control|CR|LF) ÷ -- always break right after one of these.
+    // GB4: (Control|CR|LF) ÷
     if matches!(before, Gcb::Control | Gcb::Cr | Gcb::Lf) {
         return true;
     }
-    // GB5: ÷ (Control|CR|LF) -- always break right before one of these.
+    // GB5: ÷ (Control|CR|LF)
     if matches!(after, Gcb::Control | Gcb::Cr | Gcb::Lf) {
         return true;
     }
@@ -150,28 +125,25 @@ pub fn is_boundary(chars: &[char], i: usize) -> bool {
     if matches!(before, Gcb::Lvt | Gcb::T) && after == Gcb::T {
         return false;
     }
-    // GB9: x (Extend|ZWJ) -- never break before a combining mark/ZWJ.
+    // GB9: × (Extend|ZWJ)
     if matches!(after, Gcb::Extend | Gcb::ZwjClass) {
         return false;
     }
-    // GB9a: x SpacingMark -- a combining mark that *does* take a column
-    // of its own still belongs to the character before it. A Devanagari
-    // vowel sign is the everyday case: `कि` is one cluster the cursor
-    // steps over in one move, not two.
+    // GB9a: × SpacingMark. A mark that takes a column of its own still
+    // belongs to the character before it: a Devanagari vowel sign, as in
+    // `कि`.
     if after == Gcb::SpacingMark {
         return false;
     }
-    // GB9b: Prepend x -- and the mirror image, a character that belongs
-    // to whatever comes *after* it. The Arabic number sign is the one
-    // most likely to turn up.
+    // GB9b: Prepend ×. A character that belongs to what follows, such as the
+    // Arabic number sign.
     if before == Gcb::Prepend {
         return false;
     }
-    // GB11: emoji ZWJ sequences -- \p{Extended_Pictographic} Extend* ZWJ
-    // x \p{Extended_Pictographic}. Only reachable here with `before ==
-    // ZwjClass` (an Extend `before` was already handled by GB9 above),
-    // so this only needs to scan backward over any Extend run between
-    // the ZWJ and whatever Extended_Pictographic started it.
+    // GB11: \p{Extended_Pictographic} Extend* ZWJ ×
+    // \p{Extended_Pictographic}. An Extend `before` was handled by GB9, so
+    // `before` is the ZWJ here, and this scans back over any Extend run to
+    // the pictograph that started it.
     if before == Gcb::ZwjClass && after == Gcb::ExtendedPictographic {
         let zwj_index = i - 1;
         let mut k = zwj_index;
@@ -182,13 +154,9 @@ pub fn is_boundary(chars: &[char], i: usize) -> bool {
             return false;
         }
     }
-    // GB12/GB13: regional-indicator flag pairs -- sot (RI RI)* RI x RI,
-    // and [^RI] (RI RI)* RI x RI. A run of consecutive RIs pairs up two
-    // at a time (each pair is one flag); whether `chars[i-1]` is
-    // "already paired" (even count so far, so `chars[i]` starts a new
-    // pair -- break) or "still unpaired" (odd count, joins with
-    // `chars[i]` -- no break) depends only on the length of the maximal
-    // RI run ending at `chars[i-1]`.
+    // GB12/GB13: RIs pair up two at a time, one flag per pair. Whether
+    // `chars[i]` joins `chars[i-1]` depends only on the length of the RI run
+    // ending at `chars[i-1]`: odd joins, even breaks.
     if before == Gcb::RegionalIndicator && after == Gcb::RegionalIndicator {
         let mut count = 0usize;
         let mut k = i;
@@ -200,15 +168,13 @@ pub fn is_boundary(chars: &[char], i: usize) -> bool {
             return false;
         }
     }
-    // GB999: otherwise, break everywhere.
+    // GB999: otherwise, break.
     true
 }
 
-// The char-index range `[start, end)` of the grapheme cluster
-// containing `chars[at]` -- `at == chars.len()` is treated as "the
-// cluster ending right at the end of the text" (the common case: a
-// cursor sitting one-past-the-end of a line), same convention
-// unicode_width's own `col_of`/`char_at_col` already use.
+// The char range `[start, end)` of the cluster containing `chars[at]`.
+// `at == chars.len()` is the cluster ending at the end of the text, as for
+// `unicode_width`'s `col_of`.
 pub fn cluster_range(chars: &[char], at: usize) -> (usize, usize) {
     if chars.is_empty() {
         return (0, 0);
@@ -219,8 +185,7 @@ pub fn cluster_range(chars: &[char], at: usize) -> (usize, usize) {
     (start, end)
 }
 
-// The next grapheme-cluster boundary at or after `at` (clamped to
-// `chars.len()`).
+// The next boundary at or after `at`, clamped to `chars.len()`.
 pub fn next_boundary(chars: &[char], at: usize) -> usize {
     let mut i = at.min(chars.len());
     if i >= chars.len() {
@@ -233,8 +198,7 @@ pub fn next_boundary(chars: &[char], at: usize) -> usize {
     i
 }
 
-// The previous grapheme-cluster boundary strictly before `at` (clamped
-// to 0).
+// The previous boundary strictly before `at`, clamped to 0.
 pub fn prev_boundary(chars: &[char], at: usize) -> usize {
     let mut i = at.min(chars.len());
     if i == 0 {
@@ -247,10 +211,8 @@ pub fn prev_boundary(chars: &[char], at: usize) -> usize {
     i
 }
 
-// Splits `chars` into its grapheme clusters, each as a `Vec<char>` --
-// mainly for tests; real callers almost always want `cluster_range`/
-// `next_boundary`/`prev_boundary` directly against a line's own
-// `Vec<char>` instead of allocating a fresh copy per cluster.
+// Each cluster as its own `Vec<char>`, mostly for tests; callers usually
+// want `cluster_range` and the boundary functions.
 pub fn clusters(chars: &[char]) -> Vec<Vec<char>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -305,15 +267,14 @@ mod tests {
 
     #[test]
     fn hangul_syllable_assembled_from_jamo_is_one_cluster() {
-        // ㄱ(L) + ㅏ(V) -> assembles into one syllable cluster, same as
-        // typing a precomposed 가 would already be (GB6).
+        // ㄱ (L) + ㅏ (V) assemble into one syllable cluster, GB6.
         let chars = cs("\u{1100}\u{1161}");
         assert_eq!(clusters(&chars).len(), 1);
     }
 
     #[test]
     fn precomposed_hangul_syllable_plus_trailing_jamo_is_one_cluster() {
-        // 가 (a precomposed LV syllable) + ㄴ (a standalone T jamo) -> GB7.
+        // 가 (a precomposed LV syllable) + ㄴ (a T jamo), GB7.
         let chars = cs("\u{AC00}\u{11AB}");
         assert_eq!(clusters(&chars).len(), 1);
     }
@@ -334,8 +295,7 @@ mod tests {
 
     #[test]
     fn two_flags_in_a_row_are_two_separate_clusters_not_one_run() {
-        // US flag then GB flag, back to back -- GB12/13's odd/even
-        // counting must still split after the first pair.
+        // Two flags back to back split after the first pair.
         let chars = cs("\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}");
         let cl = clusters(&chars);
         assert_eq!(cl.len(), 2);
@@ -374,7 +334,7 @@ mod tests {
 
     #[test]
     fn two_plain_emoji_side_by_side_are_two_clusters() {
-        // No ZWJ between them -- must NOT merge.
+        // No ZWJ between them, so no merge.
         let chars = cs("\u{1F600}\u{1F600}");
         assert_eq!(clusters(&chars).len(), 2);
     }
@@ -415,8 +375,7 @@ mod tests {
             boundaries.push(i);
         }
         assert_eq!(*boundaries.last().unwrap(), chars.len());
-        // Walking backward from the end via prev_boundary should retrace
-        // exactly the same set of boundaries in reverse.
+        // Walking back with `prev_boundary` retraces the same boundaries.
         let mut back = vec![chars.len()];
         let mut j = chars.len();
         while j > 0 {
@@ -440,16 +399,9 @@ mod tests {
         assert_eq!(prev_boundary(&chars, 0), 0);
     }
 
-    // Caught a real bug this way, not a hypothetical one:
-    // in_ranges' binary search silently returns wrong answers for any
-    // entry after the first one that's out of order (0xE0100 was
-    // originally written before 0x1F3FB despite sorting after it
-    // numerically -- see EXTEND's own doc comment) -- a plain "does
-    // this codepoint match" test wouldn't have caught it if the probe
-    // codepoint happened to fall in a range binary search still landed
-    // on correctly, so this checks the actual sortedness invariant
-    // directly, for every table, rather than only spot-checking a few
-    // codepoints.
+    // Checks the sortedness invariant `in_ranges`' binary search relies on,
+    // for every table: an out-of-order entry gives wrong answers that a
+    // spot-check of a few codepoints can miss.
     fn assert_sorted_and_nonoverlapping(name: &str, ranges: &[(u32, u32)]) {
         for w in ranges.windows(2) {
             let (a_lo, a_hi) = w[0];
@@ -474,11 +426,8 @@ mod tests {
         assert_sorted_and_nonoverlapping("ZERO_WIDTH", ZERO_WIDTH);
     }
 
-    // GB9a. A Devanagari vowel sign takes a column of its own, so it is
-    // not an Extend -- but it still belongs to the consonant before it,
-    // and the cursor steps over the pair in one move. This rule was
-    // left out while the property table for it would have had to be
-    // recalled rather than read.
+    // GB9a: a Devanagari vowel sign takes its own column, so it isn't Extend,
+    // but it belongs to the consonant before it.
     #[test]
     fn a_spacing_mark_joins_the_character_before_it() {
         let chars: Vec<char> = "कि".chars().collect();
@@ -487,8 +436,7 @@ mod tests {
         assert!(!is_boundary(&chars, 1));
     }
 
-    // GB9b, the mirror image: a character that belongs to whatever
-    // comes after it.
+    // GB9b: a character that belongs to what follows.
     #[test]
     fn a_prepend_joins_the_character_after_it() {
         let chars: Vec<char> = "\u{0600}7".chars().collect();
@@ -496,10 +444,7 @@ mod tests {
         assert!(!is_boundary(&chars, 1));
     }
 
-    // The emoji table used to be three ranges covering the blocks a
-    // common sequence needs. A star is Extended_Pictographic and was
-    // outside all three, so this ZWJ sequence used to break in the
-    // middle.
+    // A star is Extended_Pictographic, so this ZWJ sequence is one cluster.
     #[test]
     fn a_zwj_sequence_holds_together_outside_the_blocks_that_were_guessed_at() {
         let chars: Vec<char> = "\u{2B50}\u{200D}\u{2B50}".chars().collect();
