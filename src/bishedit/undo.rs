@@ -1,23 +1,13 @@
-// A small, content-agnostic undo tree: an arena of snapshots (a plain
-// `Vec`, indexed by position -- no `Rc<RefCell<_>>` graph, same pattern
-// this codebase already uses for pane/window relationships) rather than a
-// linear undo/redo stack. The distinction only matters once you undo and
-// then make a *new* edit: a stack would silently discard whatever "future"
-// existed past the point you undid to; a tree instead appends the new
-// edit as a sibling branch, so nothing is ever lost even if `undo`/`redo`
-// alone can't reach it anymore (see `redo`'s own doc comment for exactly
-// what `undo`/`redo` alone *can* reach -- reaching an abandoned sibling
-// branch needs real vim's own g-/g+ time travel, see `time_travel_back`/
-// `time_travel_forward` below).
+// An undo tree: an arena of snapshots in a `Vec`, indexed by position. It
+// differs from an undo/redo stack once you undo and then make a new edit:
+// the new edit becomes a sibling branch instead of discarding the old
+// future. `undo`/`redo` alone can't reach an abandoned branch; vim's
+// `g-`/`g+` time travel can (`time_travel_back`/`time_travel_forward`).
 //
-// Deliberately generic over the snapshot's own content type `C` (a whole
-// multi-line buffer for `TextBuffer`, a single line for the live prompt's
-// own vi-mode) -- this module only ever needs to store/compare/clone `C`
-// wholesale, never look inside it, so there's nothing buffer-specific to
-// leak in here. Each consumer defines its own thin wrapper (see
-// `TextBuffer::checkpoint_undo`/`undo`/`redo`) that decides *when* to call
-// `checkpoint` and how to splice a restored snapshot back into its own
-// buffer/cursor fields.
+// Generic over the content `C` (a whole buffer for `TextBuffer`, one line
+// for the prompt's vi mode), which is only stored, compared and cloned.
+// Each consumer decides when to `checkpoint` and how to restore a
+// snapshot (see `TextBuffer::checkpoint_undo`).
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot<C> {
@@ -33,16 +23,12 @@ pub struct UndoTree<C> {
 struct Node<C> {
     snapshot: Snapshot<C>,
     parent: Option<usize>,
-    // Creation order -- `redo`'s own doc comment is why that's enough to
-    // know which branch it should follow, with no separate "preferred
-    // child" bookkeeping needed.
+    // In creation order, which is all `redo` needs to pick a branch.
     children: Vec<usize>,
 }
 
 impl<C: Clone + PartialEq> UndoTree<C> {
-    // `content`/`cursor`: the buffer's own state at the moment this tree
-    // is created -- e.g. a freshly opened file's content, before any edit
-    // -- becomes the root node. `undo()` can never go past this.
+    // The starting state becomes the root, which `undo` can't go past.
     pub fn new(content: C, cursor: (usize, usize)) -> Self {
         UndoTree { nodes: vec![Node { snapshot: Snapshot { content, cursor }, parent: None, children: Vec::new() }], current: 0 }
     }
@@ -51,28 +37,19 @@ impl<C: Clone + PartialEq> UndoTree<C> {
         &self.nodes[self.current].snapshot
     }
 
-    // An opaque, stable identifier for the current node -- stays valid
-    // forever (nodes are never removed or reordered), so a caller can
-    // stash it (e.g. "the node that was on-disk as of the last `:w`") and
-    // compare against it later regardless of how much undo/redo/time-
-    // travel navigation happens in between. Consumers should treat this
-    // as opaque, not as a real sequence number to do arithmetic on --
-    // `time_travel_back`/`forward`'s own doc comment is the one place
-    // that's allowed to know it happens to be the node's creation index.
+    // A stable id for the current node, valid forever since nodes are never
+    // removed or reordered: a caller can keep "the node on disk at the last
+    // `:w`" and compare later. Opaque; only time travel relies on it being
+    // the creation index.
     pub fn current_id(&self) -> usize {
         self.current
     }
 
-    // Commits `content`/`cursor` as a new child of the current node --
-    // unless `content` already equals what's already there, in which case
-    // this is a no-op. That comparison, not an explicit begin/end bracket
-    // around each command, is what defines a "group" here: a caller calls
-    // this once per logical command (see TextBuffer::checkpoint_undo's own
-    // doc comment for where that call actually lands), and it silently
-    // does nothing on a pure-navigation keystroke that never touched the
-    // buffer, or on a second call after undo/redo already made `content`
-    // match the node it just moved to. Takes `&C` specifically so the
-    // common (unchanged) case never has to clone `content` at all.
+    // Commits `content` and `cursor` as a child of the current node, unless
+    // `content` equals the current node's. That comparison defines an undo
+    // group: a caller checkpoints once per command (see
+    // `TextBuffer::checkpoint_undo`), and navigation, or a call right after
+    // undo, does nothing. Takes `&C` so the unchanged case never clones.
     pub fn checkpoint(&mut self, content: &C, cursor: (usize, usize)) {
         if *content == self.nodes[self.current].snapshot.content {
             return;
@@ -84,39 +61,28 @@ impl<C: Clone + PartialEq> UndoTree<C> {
         self.current = new_idx;
     }
 
-    // Moves to the parent, if any -- `None` (and no movement) at the root.
+    // Moves to the parent; `None` at the root.
     pub fn undo(&mut self) -> Option<&Snapshot<C>> {
         let parent = self.nodes[self.current].parent?;
         self.current = parent;
         Some(&self.nodes[self.current].snapshot)
     }
 
-    // Moves to `children.last()` -- the most recently *created* child of
-    // the current node. `checkpoint` always appends, so this is exactly
-    // "whichever branch was diverged into most recently from here," which
-    // is what makes plain `redo` retrace an `undo` you just did: `undo`
-    // moved to a parent that already had this child; nothing has been
-    // committed since, so it's still the last one. If you instead make a
-    // *new* edit right after that `undo`, `checkpoint` appends a sibling
-    // after the old child, and that new one becomes `children.last()`
-    // instead -- the old branch is still in the tree (nothing was
-    // discarded), just no longer reachable via `undo`/`redo` alone.
+    // Moves to the most recently created child. `checkpoint` appends, so
+    // right after an `undo` that's the child just left, and `redo` retraces
+    // it. A new edit after the `undo` appends a sibling, which becomes the
+    // last child; the old branch stays in the tree, reachable only by time
+    // travel.
     pub fn redo(&mut self) -> Option<&Snapshot<C>> {
         let &last = self.nodes[self.current].children.last()?;
         self.current = last;
         Some(&self.nodes[self.current].snapshot)
     }
 
-    // `g-`/`g+`: moves to the node with the next-lower/next-higher
-    // *creation* index, regardless of which branch it's on -- real vim's
-    // own undo "sequence number" is assigned in exactly this order (the
-    // order changes were made, not tree depth), and since `checkpoint`
-    // only ever appends (nodes are never reordered or removed), a node's
-    // own position in `nodes` already *is* that sequence number; nothing
-    // extra needs tracking. This is what lets these two reach a branch
-    // `undo`/`redo` alone can't (see `redo`'s own doc comment for exactly
-    // which branch that is): they walk the flat creation history, not
-    // parent/child edges.
+    // `g-`/`g+`: to the node with the next lower or higher creation index,
+    // on any branch. vim numbers changes in that order, and since nodes are
+    // only ever appended, the index is that number. Walking creation order
+    // rather than edges is what reaches branches `undo`/`redo` can't.
     pub fn time_travel_back(&mut self) -> Option<&Snapshot<C>> {
         let prev = self.current.checked_sub(1)?;
         self.current = prev;
@@ -180,9 +146,8 @@ mod tests {
         t.undo(); // back to root
         t.checkpoint(&2, (0, 0)); // root -> B(2), a sibling of A
 
-        // redo from root now follows B, the most recently created branch
-        // -- A still exists in the tree (nothing was discarded), it's
-        // just unreachable via undo/redo alone.
+        // Redo from the root follows B, the newest branch; A is still in the
+        // tree but out of undo/redo's reach.
         t.undo();
         assert_eq!(t.current().content, 0);
         let redone = t.redo().unwrap();
@@ -209,15 +174,14 @@ mod tests {
         t.checkpoint(&1, (0, 0)); // root(0) -> A(1)
         t.undo();
         t.checkpoint(&2, (0, 0)); // root(0) -> B(2), a sibling of A
-        // current is now B; redo() has nothing (B is a leaf), and undo()
-        // only ever reaches root or B, never A.
+        // At B, a leaf: `redo` has nothing, and `undo` reaches only the root.
         assert!(t.redo().is_none());
 
-        // time_travel_back walks creation order instead: B(idx 2) -> A(idx 1).
+        // Time travel walks creation order: B (index 2) to A (index 1).
         let back = t.time_travel_back().unwrap();
         assert_eq!(back.content, 1);
 
-        // and forward again reaches B.
+        // And forward again to B.
         let fwd = t.time_travel_forward().unwrap();
         assert_eq!(fwd.content, 2);
     }
