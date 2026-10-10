@@ -1,35 +1,21 @@
-// `Content-Length: N\r\n\r\n<body>` -- the framing the Language Server
-// Protocol and the Debug Adapter Protocol both use, and the only thing
-// the two have in common. What rides inside it differs completely:
-// LSP's bodies are JSON-RPC 2.0, DAP's are its own request/response/
-// event envelope with its own sequence numbers.
+// `Content-Length: N\r\n\r\n<body>` framing, shared by the Language
+// Server Protocol and the Debug Adapter Protocol; the bodies differ
+// (JSON-RPC 2.0 for LSP, DAP's own envelope).
 //
-// One implementation rather than two, because the parts worth getting
-// right are not the obvious ones. A header that arrives split across
-// two reads must not be half-consumed; a `Content-Length` that is
-// absent, unparseable or enormous has to be refused rather than
-// allocated; and a framing error is *terminal*, because the framing is
-// the only thing that ever said where a message boundary was -- once it
-// stops making sense there is nothing to resynchronise to, and emitting
-// a cascade of nonsense from a stream we have lost our place in is
-// worse than stopping.
-//
-// Deliberately knows nothing about JSON. It hands back bodies; what
-// they mean is the protocol module's own business.
+// The parts worth getting right: a header split across reads mustn't be
+// half-consumed; a `Content-Length` that's missing, unparseable or huge
+// is refused, not allocated; and a framing error is terminal, since the
+// framing is the only record of message boundaries. Knows nothing about
+// JSON.
 #![allow(dead_code)]
 
-/// A body larger than this is refused outright rather than allocated.
-/// Nothing legitimate comes close -- the biggest message in practice is
-/// a `didChange` carrying a whole file, or a completion list a few
-/// hundred KB wide -- and the length arrives as text from a process
-/// that may be malfunctioning, so the one number that drives an
-/// allocation gets a ceiling.
+/// A larger body is refused rather than allocated. Real messages (a
+/// `didChange` with a whole file, a big completion list) are far below
+/// it, and the length comes from a process that may be malfunctioning.
 pub const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
 
 pub struct Frames {
-    /// Which protocol this is framing, so an error names it. The two
-    /// look identical on the wire and a message that said only
-    /// "framing error" would leave you guessing which subprocess died.
+    /// Which protocol this frames, so an error names the subprocess.
     protocol: &'static str,
     buf: Vec<u8>,
     failed: bool,
@@ -46,14 +32,10 @@ impl Frames {
         }
     }
 
-    /// The next complete body, if the bytes fed so far contain one.
-    /// `None` means "not yet" -- call again after feeding more.
-    ///
-    /// `Err` is one of two quite different things, and the difference
-    /// is whether `is_failed` is now set: a *framing* error is terminal
-    /// and everything stops, while a body that is not UTF-8 arrived
-    /// inside a frame that was well-formed, so the stream is still
-    /// synchronised and the next message is still findable.
+    /// The next complete body, if the bytes fed so far hold one; `None`
+    /// until more is fed. `Err` is either a framing error, which sets
+    /// `is_failed` and stops everything, or a non-UTF-8 body in a well-formed
+    /// frame, after which the next message is still findable.
     pub fn take_body(&mut self) -> Option<Result<String, String>> {
         if self.failed {
             return None;
@@ -68,9 +50,8 @@ impl Frames {
             let Some((name, value)) = line.split_once(':') else {
                 return Some(Err(self.fail(&format!("header line without a colon: {line:?}"))));
             };
-            // Header names are case-insensitive; every server in
-            // practice writes `Content-Length`, but the spec doesn't
-            // promise it and matching loosely costs nothing.
+            // Header names are case-insensitive; servers write
+            // `Content-Length`, but the spec doesn't promise it.
             if name.trim().eq_ignore_ascii_case("content-length") {
                 match value.trim().parse::<usize>() {
                     Ok(n) if n <= MAX_CONTENT_LENGTH => length = Some(n),
@@ -78,19 +59,16 @@ impl Frames {
                     Err(_) => return Some(Err(self.fail(&format!("unparseable Content-Length: {:?}", value.trim())))),
                 }
             }
-            // Every other header (`Content-Type`, and anything a server
-            // invents) is ignored rather than rejected.
+            // Other headers (`Content-Type`, inventions) are ignored.
         }
         let Some(length) = length else {
             return Some(Err(self.fail("headers with no Content-Length")));
         };
         let body_start = header_end + 4;
         if self.buf.len() < body_start + length {
-            // The header is complete but the body isn't. Leave
-            // everything in place and re-parse the header next time --
-            // it is a handful of bytes, and keeping no partial state
-            // between calls is what makes this correct regardless of
-            // how the reads happened to land.
+            // Header complete, body not: leave everything and re-parse the
+            // header next time. Keeping no partial state is what makes this
+            // right however the reads land.
             return None;
         }
         let body = self.buf[body_start..body_start + length].to_vec();
@@ -107,8 +85,8 @@ impl Frames {
         format!("{} framing error, stream abandoned: {why}", self.protocol)
     }
 
-    /// Whether a framing error has put this out of action. The owner of
-    /// the subprocess treats this as "the connection is dead."
+    /// Whether a framing error has stopped this; the subprocess's owner
+    /// treats it as a dead connection.
     pub fn is_failed(&self) -> bool {
         self.failed
     }
@@ -160,10 +138,8 @@ mod tests {
         assert_eq!(frames.take_body(), Some(Ok("hi".to_string())));
     }
 
-    // The framing is the only thing that ever said where a message
-    // began, so losing it is not recoverable -- and pretending
-    // otherwise would turn one bad byte into a stream of invented
-    // messages.
+    // Losing the framing isn't recoverable; carrying on would invent
+    // messages from one bad byte.
     #[test]
     fn a_framing_error_stops_everything_after_it() {
         let mut frames = Frames::new("test");
@@ -193,8 +169,7 @@ mod tests {
         assert!(frames.is_failed());
     }
 
-    // The frame was well-formed, so the next one is still findable --
-    // which is exactly what makes this different from the errors above.
+    // The frame was well-formed, so the next one is still findable.
     #[test]
     fn a_body_that_is_not_utf8_is_reported_without_abandoning_the_stream() {
         let mut frames = Frames::new("test");
