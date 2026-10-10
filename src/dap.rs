@@ -1,49 +1,33 @@
-// The Debug Adapter Protocol, as far as it is a *wire format*: the
-// envelope, and typed readings of the payloads a debugger client
-// actually needs. Deliberately nothing else -- no process, no editor,
-// no debugger. This module can be exercised entirely by handing it
-// bytes and reading back messages, which is the same split, and the
-// same reasoning, as `lsp.rs`.
+// The Debug Adapter Protocol as a wire format: the envelope, and typed
+// readings of the payloads a client needs. No process, editor or
+// debugger, so it's tested by feeding bytes and reading messages, as with
+// `lsp.rs`.
 //
-// DAP is LSP's sibling: same people, same `Content-Length` framing
-// (shared, see framing.rs), same job of putting a protocol between an
-// editor and a tool so that M editors and N tools cost M + N instead
-// of M x N. Inside the frame it is *not* JSON-RPC. Every message
-// carries its own `seq`; a response names the `request_seq` it answers
-// and carries `success` as a boolean rather than an error object; and
-// an event is its own third kind rather than a request with no id.
-// Close enough to LSP to be confusing, different enough that sharing
-// the envelope would have been wrong.
+// DAP shares LSP's `Content-Length` framing (framing.rs) but isn't
+// JSON-RPC inside: every message has its own `seq`, a response names the
+// `request_seq` it answers with a boolean `success` instead of an error
+// object, and events are a third kind rather than id-less requests.
 //
-// Messages are built on `json::Value` rather than a typed model, for
-// the reason `lsp.rs` gives at length: a full one is thousands of
-// optional fields that vary by adapter, and `json::query` already
-// reaches into a reply whose exact shape we don't want to commit to.
-// Typed structs earn their place where the *client* has to understand
-// something, which is a much smaller set -- and every one of the ones
-// below was written against what gdb actually sends, not against a
-// reading of the specification.
+// Messages are `json::Value` rather than a typed model, for the reasons
+// `lsp.rs` gives. The typed structs below cover what the client must
+// understand, written against what gdb sends rather than the
+// specification.
 #![allow(dead_code)]
 
 use crate::json::{self, Value};
 
-// ---------------------------------------------------------------------
 // The envelope
-// ---------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// Client to adapter. `seq` is ours and increases; the adapter
     /// echoes it back as `request_seq`.
     Request { seq: i64, command: String, arguments: Value },
-    /// Adapter to client, answering one request.
-    ///
-    /// `Err` carries the adapter's own short message. DAP also allows a
-    /// structured `body.error`, which nothing here needs: the string is
-    /// what an adapter fills in and what a user can act on.
+    /// Adapter to client, answering one request. `Err` carries the adapter's
+    /// short message; DAP's structured `body.error` isn't needed.
     Response { request_seq: i64, command: String, result: Result<Value, String> },
-    /// Adapter to client, unprompted -- which is most of what a debug
-    /// session is. `stopped` is the important one.
+    /// Adapter to client, unprompted, which is most of a debug session.
+    /// `stopped` is the important one.
     Event { event: String, body: Value },
 }
 
@@ -56,9 +40,8 @@ impl Message {
                     ("type".to_string(), Value::Str("request".to_string())),
                     ("command".to_string(), Value::Str(command.clone())),
                 ];
-                // Omitted rather than sent as null: an adapter that
-                // reads `arguments` without checking gets an object or
-                // nothing, never a null to trip over.
+                // Omitted rather than null, so an adapter reading
+                // `arguments` unchecked gets an object or nothing.
                 if *arguments != Value::Null {
                     fields.push(("arguments".to_string(), arguments.clone()));
                 }
@@ -88,10 +71,9 @@ impl Message {
         }
     }
 
-    /// The inverse. `Err` for anything that isn't recognisably one of
-    /// the three shapes -- an adapter that sends such a thing is
-    /// broken, and guessing which was meant would only move the failure
-    /// somewhere less obvious.
+    /// The inverse. `Err` for anything that isn't one of the three shapes:
+    /// guessing which was meant would move the failure somewhere less
+    /// obvious.
     pub fn from_value(v: &Value) -> Result<Message, String> {
         let field = |name: &str| json::query(v, &format!(".{name}")).ok().filter(|v| **v != Value::Null).cloned();
         let string = |name: &str| match field(name) {
@@ -112,9 +94,8 @@ impl Message {
                 let success = matches!(field("success"), Some(Value::Bool(true)));
                 let result = match success {
                     true => Ok(field("body").unwrap_or(Value::Null)),
-                    // An adapter that fails without saying why still
-                    // has to say *something*, or the failure reaches
-                    // the user as a blank.
+                    // A failure without a message still needs one, or the
+                    // user sees a blank.
                     false => Err(string("message").unwrap_or_else(|| "the adapter refused, without saying why".to_string())),
                 };
                 Ok(Message::Response {
@@ -134,8 +115,8 @@ pub fn encode(message: &Message) -> Vec<u8> {
     crate::framing::encode(&json::compact_print(&message.to_value()))
 }
 
-/// The receiving half: bytes in (in whatever sizes a non-blocking read
-/// happens to produce), whole messages out.
+/// The receiving half: bytes in, in whatever sizes reads produce, whole
+/// messages out.
 pub struct Decoder {
     frames: crate::framing::Frames,
 }
@@ -170,26 +151,20 @@ impl Decoder {
     }
 }
 
-// ---------------------------------------------------------------------
 // The payloads a client has to understand
-// ---------------------------------------------------------------------
 
-/// Why the program stopped, and which thread did.
-///
-/// The single most important message in a debug session: everything the
-/// user then sees -- the line the cursor lands on, the variables, the
-/// call stack -- is fetched in response to one of these.
+/// Why the program stopped, and which thread. Everything the user sees
+/// next (the line, variables, the stack) is fetched in response to this.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Stopped {
-    /// `breakpoint`, `step`, `exception`, `pause`, `entry`... An
-    /// adapter may invent its own, so this stays a string.
+    /// `breakpoint`, `step`, `exception`, `pause`, `entry`... Adapters may
+    /// invent their own, so it stays a string.
     pub reason: String,
-    /// Which thread stopped. Absent in principle; in practice every
-    /// adapter says, and a session with no thread id has nothing to
-    /// ask about.
+    /// Which thread stopped. Optional in the protocol, but every adapter
+    /// sends it.
     pub thread_id: Option<i64>,
-    /// Set when the reason deserves more than one word -- an exception
-    /// message, most usefully.
+    /// Set when the reason needs more than a word, such as an exception
+    /// message.
     pub description: Option<String>,
     pub text: Option<String>,
     /// Which breakpoints were hit, when that is the reason.
@@ -215,14 +190,12 @@ pub fn stopped(body: &Value) -> Stopped {
 /// One frame of the call stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackFrame {
-    /// The adapter's own handle for it, which `scopes` is asked in
-    /// terms of. Not an index: gdb numbers from 0 and others do not,
-    /// and inventing our own numbering would break `scopes`.
+    /// The adapter's handle for the frame, which `scopes` takes. Not an
+    /// index: gdb counts from 0 and others don't.
     pub id: i64,
     pub name: String,
-    /// Where it is, when the adapter knows -- a frame inside a library
-    /// with no debug info has a name and nothing else, and that is
-    /// worth showing rather than hiding.
+    /// Where it is, if known. A library frame without debug info has only a
+    /// name, which is still worth showing.
     pub source_path: Option<String>,
     pub line: usize,
     pub column: usize,
@@ -242,16 +215,15 @@ pub fn stack_frames(body: &Value) -> Vec<StackFrame> {
         .collect()
 }
 
-/// A named group of variables in a frame -- gdb calls them "Arguments"
-/// and "Locals"; other adapters add "Registers", "Globals".
+/// A named group of variables in a frame: gdb's "Arguments" and "Locals";
+/// others add "Registers" and "Globals".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     pub name: String,
     /// The handle to ask `variables` for.
     pub variables_reference: i64,
-    /// The adapter warning that fetching this is slow enough to be
-    /// worth not doing until asked. Honoured rather than ignored: a
-    /// pause that stops to read every global is a pause that hangs.
+    /// The adapter saying this is slow to fetch, so wait until asked.
+    /// Honoured, or a pause that reads every global hangs.
     pub expensive: bool,
 }
 
@@ -271,16 +243,12 @@ pub fn scopes(body: &Value) -> Vec<Scope> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Variable {
     pub name: String,
-    /// Already a string, and deliberately not parsed: what a value
-    /// *looks like* is the adapter's own decision -- a Rust `Vec`, a
-    /// C++ `std::string`, a Python object all render through the
-    /// debugger's own pretty-printers, and second-guessing that would
-    /// mean showing something the debugger does not.
+    /// Already a string, and not parsed: how a value looks (a Rust `Vec`, a
+    /// C++ `std::string`) comes from the debugger's pretty-printers.
     pub value: String,
     pub type_name: Option<String>,
-    /// Non-zero when this variable has children to expand -- a struct,
-    /// an array, a pointer worth following. The handle to ask
-    /// `variables` for, exactly as a scope's is.
+    /// Non-zero when the variable has children (a struct, an array, a pointer
+    /// to follow): the handle to ask `variables` for, like a scope's.
     pub variables_reference: i64,
 }
 
@@ -300,17 +268,15 @@ pub fn variables(body: &Value) -> Vec<Variable> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Breakpoint {
     pub id: Option<i64>,
-    /// Whether the adapter could actually place it. A breakpoint on a
-    /// line with no code, or in a file the program does not include,
-    /// comes back unverified -- and showing it as set anyway is a lie
-    /// the user finds out about by the program not stopping.
+    /// Whether the adapter could place it. One on a line with no code, or in
+    /// a file the program doesn't include, comes back unverified, and showing
+    /// it as set would mislead.
     pub verified: bool,
-    /// Where it actually landed, which is not always where it was
-    /// asked for: a breakpoint on a blank line moves to the next
-    /// statement.
+    /// Where it landed, not always where asked: one on a blank line moves to
+    /// the next statement.
     pub line: Option<usize>,
     pub source_path: Option<String>,
-    /// Why it could not be placed, when the adapter says.
+    /// Why it couldn't be placed, if the adapter says.
     pub message: Option<String>,
 }
 
@@ -324,20 +290,16 @@ fn breakpoint(v: &Value) -> Breakpoint {
     }
 }
 
-/// The `setBreakpoints` reply: one entry per breakpoint asked for, in
-/// the same order.
+/// The `setBreakpoints` reply: one entry per breakpoint, in order.
 pub fn breakpoints(body: &Value) -> Vec<Breakpoint> {
     let Ok(Value::Array(items)) = json::query(body, ".breakpoints") else { return Vec::new() };
     items.iter().map(breakpoint).collect()
 }
 
-/// The `breakpoint` *event*: an adapter revising what it said earlier.
-///
-/// Not an optional extra. gdb answers `setBreakpoints` before the
-/// program is running, when it cannot yet know whether a location
-/// exists, so every breakpoint comes back `verified: false` and is
-/// upgraded by one of these once the program loads. A client that read
-/// only the reply would show every breakpoint as broken for ever.
+/// The `breakpoint` event: an adapter revising an earlier answer. gdb
+/// answers `setBreakpoints` before the program runs, when it can't know
+/// whether a location exists, so everything comes back unverified and is
+/// upgraded by one of these once the program loads.
 pub fn breakpoint_event(body: &Value) -> Option<Breakpoint> {
     let bp = json::query(body, ".breakpoint").ok()?;
     Some(breakpoint(bp))
@@ -354,12 +316,9 @@ pub fn threads(body: &Value) -> Vec<Thread> {
     items.iter().map(|t| Thread { id: number(t, ".id").unwrap_or(0), name: string(t, ".name").unwrap_or_default() }).collect()
 }
 
-/// The program's own output, relayed by the adapter.
-///
-/// `category` separates the program's `stdout` and `stderr` from the
-/// adapter's own chatter (`console`, `important`) -- worth keeping,
-/// since showing gdb's copyright banner as if the program had printed
-/// it would be wrong.
+/// The program's output, relayed. `category` separates the program's
+/// `stdout`/`stderr` from the adapter's own (`console`, `important`), such
+/// as gdb's banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub category: String,
@@ -370,7 +329,7 @@ pub fn output(body: &Value) -> Output {
     Output { category: string(body, ".category").unwrap_or_else(|| "console".to_string()), output: string(body, ".output").unwrap_or_default() }
 }
 
-/// What `evaluate` came back with -- a watch expression, or a hover.
+/// What `evaluate` returned: a watch expression or a hover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evaluated {
     pub result: String,
@@ -386,10 +345,9 @@ pub fn evaluated(body: &Value) -> Evaluated {
     }
 }
 
-/// Whether the adapter said it can do something -- the `initialize`
-/// reply is a bag of `supportsXRequest` booleans, and asking for
-/// something an adapter does not have is how a session dies on a
-/// refusal rather than a missing feature.
+/// Whether the `initialize` reply's `supportsXRequest` flags include
+/// `name`: asking an adapter for something it lacks ends the session on a
+/// refusal.
 pub fn supports(capabilities: &Value, name: &str) -> bool {
     matches!(json::query(capabilities, &format!(".{name}")), Ok(Value::Bool(true)))
 }
@@ -444,9 +402,8 @@ mod tests {
         );
     }
 
-    // `success` is a boolean here, not the absence of an error object
-    // -- the one place the envelope most resembles JSON-RPC and is not
-    // it.
+    // `success` is a boolean, not the absence of an error object, the place
+    // the envelope most resembles JSON-RPC and isn't.
     #[test]
     fn a_failed_response_carries_the_adapters_own_words() {
         let m = parse(r#"{"type":"response","request_seq":4,"command":"evaluate","success":false,"message":"No symbol \"nope\""}"#);
@@ -469,9 +426,7 @@ mod tests {
         }
     }
 
-    // Everything below was written against what gdb 17 actually sends,
-    // captured from a real session -- not from a reading of the
-    // specification. The two differ in the details that matter.
+    // These use what gdb 17 sends, captured from a real session.
 
     #[test]
     fn a_stopped_event_says_why_and_which_thread() {
@@ -490,7 +445,7 @@ mod tests {
         ));
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0], StackFrame { id: 0, name: "add".into(), source_path: Some("/tmp/prog.c".into()), line: 2, column: 0 });
-        // A frame with no source is still a frame worth showing.
+        // A frame with no source is still shown.
         assert_eq!(frames[1].source_path, None);
         assert_eq!(frames[1].name, "main");
     }
@@ -513,8 +468,8 @@ mod tests {
         assert_eq!(v[1].type_name.as_deref(), Some("char *"));
     }
 
-    // The reply gdb actually gives before the program is running: it
-    // cannot know yet whether the location exists.
+    // gdb's reply before the program runs: it can't yet know whether the
+    // location exists.
     #[test]
     fn a_breakpoint_starts_unverified_and_an_event_upgrades_it() {
         let first = breakpoints(&body(r#"{"breakpoints":[{"id":1,"verified":false,"reason":"pending"}]}"#));
@@ -532,9 +487,8 @@ mod tests {
     #[test]
     fn output_keeps_the_programs_own_words_apart_from_the_adapters() {
         assert_eq!(output(&body(r#"{"category":"stdout","output":"6\n"}"#)), Output { category: "stdout".into(), output: "6\n".into() });
-        // gdb's banner arrives with no category at all, and defaulting
-        // it to the program's own output would put the copyright notice
-        // in the program's console.
+        // gdb's banner has no category; defaulting to the program's output
+        // would put it in the program's console.
         assert_eq!(output(&body(r#"{"output":"GNU gdb (GDB) 17.2\n"}"#)).category, "console");
     }
 
