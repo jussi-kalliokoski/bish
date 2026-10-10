@@ -1,19 +1,15 @@
-// A diff to read, or to decide on one change at a time.
-//
-// Two versions of some text -- what it was and what it would become --
-// shown as one unified view with every change marked. It has two uses,
-// which differ only in what a key does to a change:
+// A diff to read, or to decide on one change at a time: two versions of
+// some text in one unified view with every change marked.
 //
 // - Deciding (`:review`, `openDiff`): one file, and a verdict on each
-//   change -- taken, refused, or not decided yet. `reverts` turns the
-//   verdicts into the edits that undo the refused ones in a buffer
-//   already holding the new version.
+//   change: taken, refused, or undecided. `reverts` turns the verdicts
+//   into the edits undoing the refused ones in a buffer already holding
+//   the new version.
 // - Reading (`:git show`): a commit's header and every file it touched,
-//   each under a heading of its own, with nothing to decide.
+//   each under its own heading, with nothing to decide.
 //
-// Keys in, a frame out, and nothing about terminals, editors or git in
-// between, so every rule here can be a unit test. Shaped after pager.rs,
-// which is the same arrangement for text that is not a diff.
+// Keys in, a frame out, nothing about terminals, editors or git, so each
+// rule can be unit tested. Arranged like pager.rs.
 
 use crate::bishedit::highlight::{self, ColorOverrides, HighlightContext, StyledSpan};
 use crate::bishedit::unicode_width::char_width;
@@ -23,9 +19,9 @@ use crate::window::Rect;
 use std::collections::HashMap;
 use std::ops::Range;
 
-/// One change: the lines of the old text it replaces, and the lines of
-/// the new text it puts there. Either range may be empty -- a pure
-/// addition replaces nothing, a pure removal puts nothing back.
+/// One change: the old lines it replaces and the new lines it puts there.
+/// Either may be empty: an addition replaces nothing, a removal puts
+/// nothing back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunk {
     pub old: Range<usize>,
@@ -39,10 +35,9 @@ pub enum Verdict {
     Rejected,
 }
 
-/// Every change from `old` to `new`, in order. A removal directly next to
-/// an addition is one change -- a line rewritten, not a line deleted and
-/// an unrelated one added -- because that is what someone deciding on it
-/// is deciding.
+/// Every change from `old` to `new`, in order. A removal next to an
+/// addition is one change, a rewritten line, as that's what someone
+/// deciding on it decides.
 pub fn hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
     use crate::diff::DiffOp;
     let ops = crate::diff::diff(old, new);
@@ -82,9 +77,8 @@ pub fn hunks(old: &[String], new: &[String]) -> Vec<Hunk> {
     out
 }
 
-/// The text the verdicts add up to: the new version of every accepted
-/// change and the old version of every other, with `undecided` saying
-/// which way a change nobody ruled on goes.
+/// The text the verdicts add up to: accepted changes' new version, the
+/// rest's old, with `undecided` saying where unruled changes go.
 pub fn resolve(old: &[String], new: &[String], hunks: &[Hunk], verdicts: &[Verdict], undecided: Verdict) -> Vec<String> {
     let mut out = Vec::new();
     let mut at = 0;
@@ -108,9 +102,9 @@ pub struct FileDiff {
     pub label: String,
     pub old: Vec<String>,
     pub new: Vec<String>,
-    /// Either side is not text. Said so, and not diffed.
+    /// Either side isn't text: said so, not diffed.
     pub binary: bool,
-    /// What it is written in, for its colours -- a name
+    /// Its language, for colours: a name
     /// `highlight::highlighter_for_language` knows, or anything else for
     /// none.
     pub language: String,
@@ -122,21 +116,21 @@ enum Mode {
     Reading,
 }
 
-// Unchanged lines kept either side of a change. `diff -u`'s own number.
+// Unchanged lines kept either side of a change, as `diff -u` keeps.
 const CONTEXT: usize = 3;
 
 // One row of the unified view. `file` is an index into the view's files,
 // `hunk` into its hunks, which run on across files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
-    // A line of the header a reading view opens with -- a commit's hash,
-    // author, date and message.
+    // A line of a reading view's header: a commit's hash, author, date and
+    // message.
     Message(usize),
     Blank,
     // A file's heading.
     File(usize),
-    // A file that is not text, or whose contents did not change (a mode
-    // change, a rename and nothing more).
+    // A file that isn't text, or whose contents didn't change (a mode
+    // change, a bare rename).
     Binary(usize),
     Unchanged(usize),
     // An unchanged line: its index in the old text and in the new.
@@ -174,10 +168,9 @@ pub struct Review {
     // line. Empty until `highlighted`, and for a language with no
     // highlighter.
     paint: Vec<[Vec<Vec<StyledSpan>>; 2]>,
-    // The words that differ within a rewritten line, as character ranges,
-    // keyed by (file, side, line) -- see `changed_words`. Only lines
-    // paired inside a change have an entry, which is most lines having
-    // none.
+    // The differing words within a rewritten line, as character ranges, by
+    // (file, side, line); see `changed_words`. Only lines paired inside a
+    // change have one.
     changed: HashMap<(usize, usize, usize), Words>,
 }
 
@@ -209,8 +202,8 @@ impl Review {
             }
         }
         let rows_all = layout(mode, &header, &files, &hunks_all);
-        // Which removed line of a change was rewritten into which added
-        // one -- see `pair_lines` -- and the words that differ in each.
+        // Which removed line of a change became which added one (see
+        // `pair_lines`), and the words that differ in each.
         let mut changed = HashMap::new();
         for (f, hunk) in &hunks_all {
             let file = &files[*f];
@@ -237,11 +230,9 @@ impl Review {
         }
     }
 
-    /// The view with its lines in their language's colours, `overrides`
-    /// being `::bish hl`'s. Each side of each file is highlighted whole,
-    /// as the editor does a buffer, so a line inside a comment or string
-    /// that started above it is coloured as what it is, not as what it
-    /// would be on its own.
+    /// The view in its languages' colours, `overrides` being `::bish hl`'s.
+    /// Each side of each file is highlighted whole, as the editor does, so a
+    /// line inside a comment or string started above is coloured as such.
     pub fn highlighted(mut self, overrides: Option<&ColorOverrides>) -> Review {
         self.paint = self
             .files
@@ -269,8 +260,7 @@ impl Review {
         (&self.files[0], hunks, verdicts)
     }
 
-    /// The text the verdicts add up to, with `undecided` saying which way
-    /// a change nobody ruled on goes -- see `resolve`.
+    /// The text the verdicts add up to; see `resolve`.
     pub fn resolved(&self, undecided: Verdict) -> Vec<String> {
         let (file, hunks, verdicts) = self.decided();
         resolve(&file.old, &file.new, &hunks, &verdicts, undecided)
@@ -281,10 +271,9 @@ impl Review {
         self.verdicts.contains(&Verdict::Accepted)
     }
 
-    /// What undoes every refused change in a text that already holds the
-    /// new version: which of its lines to replace, and with what. Last
-    /// change first, so applying them in order never moves a line a later
-    /// one still refers to.
+    /// What undoes every refused change in text already holding the new
+    /// version: which lines to replace, and with what. Last change first,
+    /// so applying them in order never moves a line a later one names.
     pub fn reverts(&self) -> Vec<(Range<usize>, Vec<String>)> {
         let (file, hunks, verdicts) = self.decided();
         hunks
@@ -308,8 +297,8 @@ impl Review {
         self.rows.iter().position(|r| *r == Row::Header(hunk))
     }
 
-    // The current change on screen, a third of the way down when it was
-    // not already, so the lines leading into it can be read too.
+    // Puts the current change a third of the way down if it wasn't on
+    // screen, so the lines leading into it show.
     fn reveal_current(&mut self) {
         let Some(header) = self.header_row(self.current) else { return };
         let end = self
@@ -334,8 +323,8 @@ impl Review {
     // current one, so `n` carries on from there.
     fn go_to_file(&mut self, file: usize) {
         // Not held to `max_top`: the last file's heading goes to the top
-        // like any other, with blank rows under it, so which file is on
-        // screen is never in doubt. The next scroll pulls it back.
+        // too, with blank rows under it, so which file is showing is never
+        // in doubt.
         let Some(row) = self.rows.iter().position(|r| *r == Row::File(file)) else { return };
         self.top = row;
         if let Some(hunk) = self.hunks.iter().position(|(f, _)| *f == file) {
@@ -435,10 +424,9 @@ impl Review {
         out
     }
 
-    // One row, styled. What a verdict does shows on the lines it applies
-    // to: an accepted change's removed lines and a refused change's added
-    // ones are the lines that will not be there, so they are dimmed and
-    // struck through.
+    // One row, styled. Lines the verdicts leave out (an accepted change's
+    // removed lines, a refused change's added ones) are dimmed and struck
+    // through.
     fn render_row(&self, row: Row) -> String {
         let verdict = |hunk: usize| self.verdicts[hunk];
         let (sgr, text) = match row {
@@ -470,12 +458,10 @@ impl Review {
         if sgr.is_empty() { fitted } else { format!("\x1b[{sgr}m{fitted}\x1b[0m") }
     }
 
-    // A line of a file, `side` 0 for its old text and 1 for its new, after
-    // `marker`. The marker and whatever the language leaves uncoloured are
-    // in `base` -- red for a removed line, green for an added one -- so
-    // which is which still reads at a glance with the syntax coloured
-    // in. `gone` is a line the verdicts leave out: dimmed and struck
-    // through, whatever colour it is.
+    // A line of a file (`side` 0 old, 1 new) after `marker`. The marker and
+    // uncoloured text are in `base`, red for removed and green for added, so
+    // which is which reads with the syntax coloured in. `gone`: a line the
+    // verdicts leave out, dimmed and struck through.
     fn render_line(&self, file: usize, side: usize, line: usize, marker: &str, base: Color, gone: bool) -> String {
         let text = if side == 0 { &self.files[file].old[line] } else { &self.files[file].new[line] };
         let chars: Vec<char> = marker.chars().chain(text.chars()).collect();
@@ -495,8 +481,8 @@ impl Review {
             })
             .collect();
         let mut cells = highlight::compose(&chars, &[&whole, &syntax]);
-        // The words that changed, in reverse over whatever colour they
-        // are, so a rewritten line says which part of it was rewritten.
+        // The changed words in reverse video over their colour, so a
+        // rewritten line shows which part was rewritten.
         if let Some(words) = self.changed.get(&(file, side, line)) {
             let reverse = CellAttrs { reverse: true, ..CellAttrs::default() };
             let marks: Vec<StyledSpan> =
@@ -530,10 +516,9 @@ impl Review {
 }
 
 // The rows of the unified view. A reading view starts with its header
-// and puts each file under a heading; a deciding view is one file and
-// needs neither. In both, every change gets `CONTEXT` unchanged lines
-// either side of it, and whatever unchanged run is longer than that is
-// folded into one row saying how long.
+// and puts each file under a heading; a deciding view needs neither.
+// Every change gets `CONTEXT` unchanged lines either side, and a longer
+// unchanged run folds into one row saying how long.
 fn layout(mode: Mode, header: &[String], files: &[FileDiff], hunks: &[(usize, Hunk)]) -> Vec<Row> {
     let mut rows: Vec<Row> = (0..header.len()).map(Row::Message).collect();
     let unchanged = |rows: &mut Vec<Row>, file: usize, old_at: usize, new_at: usize, len: usize, first: bool, last: bool| {
@@ -561,8 +546,7 @@ fn layout(mode: Mode, header: &[String], files: &[FileDiff], hunks: &[(usize, Hu
             continue;
         }
         // Where the unchanged run before the next change starts, in both
-        // texts. The two only ever differ by how much the changes so far
-        // added or removed.
+        // texts; they differ by what the changes so far added or removed.
         let (mut old_at, mut new_at) = (0, 0);
         let mut any = false;
         for (i, (_, hunk)) in hunks.iter().enumerate().filter(|(_, (hf, _))| *hf == f) {
@@ -582,10 +566,9 @@ fn layout(mode: Mode, header: &[String], files: &[FileDiff], hunks: &[(usize, Hu
     rows
 }
 
-// One side of a file's syntax colours, a list of spans per line, in
-// character offsets from the start of that line. A span that runs over
-// several lines -- a block comment, a string with a newline in it -- is
-// cut into a piece on each.
+// One side of a file's syntax colours: spans per line, in character
+// offsets. A span over several lines (a block comment, a multi-line
+// string) is cut into a piece per line.
 fn paint(language: &str, lines: &[String], overrides: Option<&ColorOverrides>) -> Vec<Vec<StyledSpan>> {
     let mut out = vec![Vec::new(); lines.len()];
     let Some(highlighter) = highlight::highlighter_for_language(language) else { return out };
@@ -614,33 +597,30 @@ fn paint(language: &str, lines: &[String], overrides: Option<&ColorOverrides>) -
 // The character ranges in one line that `changed_words` picks out.
 type Words = Vec<Range<usize>>;
 
-// One line rewritten into another: the words that differ on each side,
-// and how much of the line's visible text stayed as it was -- what
-// `pair_lines` weighs one pairing against another by.
+// One line rewritten into another: the differing words on each side,
+// and how much visible text stayed, by which `pair_lines` weighs
+// pairings.
 struct Rewrite {
     was: Words,
     is: Words,
     kept: usize,
 }
 
-// Comparisons past which a change's lines are paired first with first,
-// second with second, rather than weighed against each other: fifty
-// removed lines beside fifty added.
+// Comparisons past which a change's lines pair first with first rather
+// than being weighed: fifty removed lines beside fifty added.
 const ALIGN_LIMIT: usize = 2500;
 
-// Which of a change's removed lines was rewritten into which of its added
-// ones, as indices into the two, in order. The pairing chosen is the one
-// that keeps the most text unchanged across all its pairs, so a line
-// added above a rewritten one is left on its own rather than being
-// compared with the line it was added above -- which then goes unmarked
-// too. Only lines `changed_words` would mark can pair at all.
+// Which removed line of a change became which added one, in order. The
+// pairing keeps the most text unchanged overall, so a line added above
+// a rewritten one stays unpaired instead of being compared with it.
+// Only lines `changed_words` would mark can pair.
 fn pair_lines(old: &[String], new: &[String]) -> Vec<(usize, usize, Rewrite)> {
     if old.len() * new.len() > ALIGN_LIMIT {
         return old.iter().zip(new).enumerate().filter_map(|(i, (o, n))| changed_words(o, n).map(|r| (i, i, r))).collect();
     }
     let mut rewrites: Vec<Vec<Option<Rewrite>>> = old.iter().map(|o| new.iter().map(|n| changed_words(o, n)).collect()).collect();
-    // best[i][j]: the most text a pairing of the first i removed lines
-    // with the first j added ones keeps.
+    // `best[i][j]`: the most text kept pairing the first i removed lines
+    // with the first j added.
     let mut best = vec![vec![0usize; new.len() + 1]; old.len() + 1];
     for i in 1..=old.len() {
         for j in 1..=new.len() {
@@ -667,13 +647,13 @@ fn pair_lines(old: &[String], new: &[String]) -> Vec<(usize, usize, Rewrite)> {
     pairs
 }
 
-// Which words of a line differ from the line that replaced it, on each
-// side, as character ranges. A word is a run of letters, digits and `_`;
-// a run of whitespace is one token too, and anything else is a token of
-// its own, so `count;` to `amount;` is one word changed and not two.
+// Which words of a line differ from its replacement, on each side, as
+// character ranges. A word is a run of letters, digits and `_`; a run of
+// whitespace is one token, and anything else a token of its own, so
+// `count;` to `amount;` is one word changed.
 //
-// `None` when most of the line changed: every word marked says nothing a
-// whole red or green line does not already say, and says it louder.
+// `None` when most of the line changed: marking every word says nothing
+// a whole red or green line doesn't.
 fn changed_words(old: &str, new: &str) -> Option<Rewrite> {
     let (old_tokens, new_tokens) = (tokens(old), tokens(new));
     let texts = |tokens: &[(Range<usize>, String)]| tokens.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
@@ -701,8 +681,7 @@ fn changed_words(old: &str, new: &str) -> Option<Rewrite> {
     Some(Rewrite { was, is, kept: total - marked })
 }
 
-// A line cut into the tokens `changed_words` compares, each with where it
-// is in the line's characters.
+// A line cut into `changed_words`' tokens, with their character ranges.
 fn tokens(text: &str) -> Vec<(Range<usize>, String)> {
     let class = |c: char| {
         if c.is_alphanumeric() || c == '_' {
@@ -726,8 +705,8 @@ fn tokens(text: &str) -> Vec<(Range<usize>, String)> {
     out
 }
 
-// `fit`, for cells already styled: a tab is four spaces in the style of
-// the tab, and the row is padded out in the terminal's own colours.
+// `fit` for styled cells: a tab is four spaces in its style, and the row
+// is padded in the terminal's colours.
 fn fit_cells(cells: &[Cell], cols: usize) -> Vec<Cell> {
     let mut out = Vec::new();
     let mut width = 0;
@@ -743,9 +722,9 @@ fn fit_cells(cells: &[Cell], cols: usize) -> Vec<Cell> {
     out
 }
 
-// Exactly `cols` columns of `text`: cut at the last whole character that
-// fits, then padded. Tabs become spaces first -- a tab's width depends on
-// where it lands, and here every line starts after a two-column marker.
+// Exactly `cols` columns of `text`: cut at the last whole character
+// that fits, then padded. Tabs become spaces first, as every line
+// starts after a two-column marker.
 pub(crate) fn fit(text: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
@@ -899,8 +878,7 @@ mod tests {
         assert!(removed.starts_with("\x1b[0;31m- let total = price * \x1b[0;7;31mcount\x1b[0;31m;"), "{removed:?}");
         assert!(added.starts_with("\x1b[0;32m+ let total = price * \x1b[0;7;32mamount\x1b[0;32m;"), "{added:?}");
 
-        // A line rewritten through and through is left as it was: all red,
-        // all green, nothing picked out.
+        // A line rewritten throughout stays all red, all green.
         let review = Review::new("t", lines("alpha beta"), lines("gamma delta"), "text", 10, 80);
         let removed = review.render_row(Row::Removed { file: 0, line: 0, hunk: 0 });
         assert!(!removed.contains(";7;"), "{removed:?}");
