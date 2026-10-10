@@ -1,22 +1,19 @@
-// URLs: parsing one, and finding them in ordinary text.
+// URLs: parsing one, and finding them in text.
 //
-// Two jobs that sound like one and are not. `parse` takes a string that
-// is supposed to be a URL and says what its parts are. `find` takes
-// arbitrary text -- a comment, a commit message, a `.env` value -- and
-// says which stretches of it are URLs, which is a different and
-// fiddlier question, because a URL in prose has no delimiters. The hard
-// part there is entirely about where one *ends*:
+// `parse` takes a string meant to be a URL and names its parts. `find`
+// takes arbitrary text (a comment, a commit message, a `.env` value)
+// and says which stretches are URLs, where the hard part is the end,
+// as prose has no delimiters:
 //
 //     see https://example.com.          <- the full stop is a sentence's
 //     (https://en.wikipedia.org/x_(y))  <- but one of those parens isn't
 //
-// So `find` scans a candidate to the first character that cannot be in
-// a URL, then walks back over trailing punctuation, keeping a closing
-// bracket only when there is an opening one inside the URL to match it.
-// A candidate that doesn't `parse` is then dropped, which is what keeps
-// the two halves of this module honest about each other.
+// So `find` scans to the first character that can't be in a URL, then
+// backs off trailing punctuation, keeping a closing bracket only if an
+// opening one inside the URL matches it. A candidate that doesn't
+// `parse` is dropped, keeping the two halves consistent.
 //
-// Offsets are **char** offsets, matching `highlight::HighlightSpan`.
+// Offsets are char offsets, as in `highlight::HighlightSpan`.
 #![allow(dead_code)]
 
 use std::ops::Range;
@@ -27,17 +24,16 @@ pub struct Url {
     pub userinfo: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
-    /// Always present, possibly empty. `https://example.com` has an
-    /// empty path, which is not the same as `/`.
+    /// Always present, maybe empty: `https://example.com` has an empty path,
+    /// not `/`.
     pub path: String,
     pub query: Option<String>,
     pub fragment: Option<String>,
 }
 
 impl Url {
-    /// `https://example.com:8080` -- what a caller would show as "where
-    /// this points", without the path. `None` for a scheme with no
-    /// authority at all (`mailto:`).
+    /// `https://example.com:8080`: where this points, without the path.
+    /// `None` for a scheme with no authority (`mailto:`).
     pub fn origin(&self) -> Option<String> {
         let host = self.host.as_ref()?;
         Some(match self.port {
@@ -47,17 +43,14 @@ impl Url {
     }
 }
 
-/// RFC 3986's shape, leniently: this reports what the parts *are*, and
-/// does not judge whether each one holds only characters its grammar
-/// allows. A URL that came out of a real file is far more likely to be
-/// slightly out of spec than to be something else entirely, and a
-/// consumer that wants to open it cares about the parts, not the
-/// verdict. `None` is reserved for text that isn't a URL at all: no
-/// scheme, or nothing after it.
+/// RFC 3986's shape, leniently: this names the parts without checking
+/// each one's characters. A URL from a real file is more likely slightly
+/// out of spec than not a URL, and a consumer opening it wants the parts.
+/// `None` only for text that isn't a URL: no scheme, or nothing after it.
 pub fn parse(text: &str) -> Option<Url> {
     let (scheme, rest) = split_scheme(text)?;
-    // `//` introduces an authority; without it everything after the
-    // colon is the path (`mailto:a@b`, `file:relative`).
+    // `//` introduces an authority; without it everything after the colon
+    // is the path (`mailto:a@b`, `file:relative`).
     let (authority, rest) = match rest.strip_prefix("//") {
         Some(rest) => {
             let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -84,10 +77,9 @@ pub fn parse(text: &str) -> Option<Url> {
     Some(Url { scheme, userinfo, host, port, path: path.to_string(), query: query.map(str::to_string), fragment: fragment.map(str::to_string) })
 }
 
-// `scheme:` -- a letter followed by letters, digits, `+`, `-` or `.`.
-// Split out rather than inlined because the `://` in `find` has to agree
-// with it exactly, and two spellings of "what a scheme looks like" is
-// how a detector starts finding things the parser then rejects.
+// `scheme:`: a letter, then letters, digits, `+`, `-` or `.`. Shared
+// with `find`'s `://` check, so the detector can't find what the parser
+// rejects.
 fn split_scheme(text: &str) -> Option<(String, &str)> {
     let colon = text.find(':')?;
     let scheme = &text[..colon];
@@ -101,12 +93,10 @@ fn split_scheme(text: &str) -> Option<(String, &str)> {
     Some((scheme.to_ascii_lowercase(), &text[colon + 1..]))
 }
 
-// The host and port, with an IPv6 literal's own brackets kept: the
-// colons inside `[::1]` are part of the address, not a port separator.
-// Only ever called when an authority was actually present, so an empty
-// one is `Some("")` rather than `None`: `file:///x` has an authority
-// and it is empty, which is a different thing from `mailto:`, which has
-// none at all.
+// The host and port, keeping an IPv6 literal's brackets: the colons in
+// `[::1]` aren't a port separator. Called only with an authority, so an
+// empty one is `Some("")`: `file:///x` has an empty authority, unlike
+// `mailto:`, which has none.
 fn split_host_port(hostport: &str) -> (Option<String>, Option<u16>) {
     if let Some(close) = hostport.strip_prefix('[').and_then(|rest| rest.find(']')) {
         let host = &hostport[..close + 2];
@@ -114,8 +104,8 @@ fn split_host_port(hostport: &str) -> (Option<String>, Option<u16>) {
         return (Some(host.to_string()), port);
     }
     match hostport.rsplit_once(':') {
-        // A trailing `:` with no digits, or something that isn't a port,
-        // stays part of the host rather than being silently dropped.
+        // A trailing `:` with no digits, or a non-port, stays in the host
+        // rather than being dropped.
         Some((host, port)) => match port.parse::<u16>() {
             Ok(port) => (Some(host.to_string()), Some(port)),
             Err(_) => (Some(hostport.to_string()), None),
@@ -131,12 +121,11 @@ fn split_once(text: &str, sep: char) -> (&str, Option<&str>) {
     }
 }
 
-/// Every URL in `text`, as char-offset ranges. Only schemes with an
-/// authority (`https://`, `file://`, `ssh://`, ...) plus the few
-/// authority-less ones worth recognizing in prose -- `mailto:` above
-/// all. A bare `www.example.com` is deliberately not found: guessing at
-/// a missing scheme is how a detector starts underlining ordinary
-/// sentences that happen to contain a dot.
+/// Every URL in `text`, as char ranges: schemes with an authority
+/// (`https://`, `file://`, `ssh://`, ...) plus the few authority-less
+/// ones worth finding in prose, `mailto:` above all. A bare
+/// `www.example.com` isn't found: guessing a scheme underlines ordinary
+/// sentences with a dot in them.
 pub fn find(text: &str) -> Vec<Range<usize>> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Range<usize>> = Vec::new();
@@ -144,7 +133,7 @@ pub fn find(text: &str) -> Vec<Range<usize>> {
         if *c != ':' {
             continue;
         }
-        // Inside a URL already found, so not the start of another.
+        // Inside a URL already found, so not another's start.
         if out.last().is_some_and(|last| last.end > i) {
             continue;
         }
@@ -164,9 +153,8 @@ pub fn find(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-// Walks back from a `:` over the scheme before it, returning where that
-// scheme starts. `None` when what precedes isn't one -- which includes
-// the very common `a:b` inside ordinary text.
+// Walks back from a `:` over the scheme, returning where it starts.
+// `None` when there's none, as in the common `a:b` in prose.
 fn scheme_start(chars: &[char], colon: usize) -> Option<usize> {
     let mut start = colon;
     while start > 0 && is_scheme_char(chars[start - 1]) {
@@ -178,9 +166,8 @@ fn scheme_start(chars: &[char], colon: usize) -> Option<usize> {
     Some(start)
 }
 
-// Whether the colon at `colon` really opens a URL: either `//` follows,
-// or the scheme is one of the few that legitimately has no authority
-// and is still worth finding in prose.
+// Whether the colon opens a URL: `//` follows, or the scheme is one of
+// the few authority-less ones worth finding.
 fn opens_a_url(chars: &[char], colon: usize) -> bool {
     if chars.get(colon + 1) == Some(&'/') && chars.get(colon + 2) == Some(&'/') {
         return true;
@@ -189,9 +176,8 @@ fn opens_a_url(chars: &[char], colon: usize) -> bool {
     matches!(scheme.to_ascii_lowercase().as_str(), "mailto" | "tel")
 }
 
-// The first character that cannot be inside a URL. Whitespace ends one,
-// as do the characters that habitually *surround* one in text: quotes,
-// backticks, angle brackets.
+// The first character that can't be in a URL: whitespace, and what
+// habitually surrounds one in text: quotes, backticks, angle brackets.
 fn url_end(chars: &[char], colon: usize) -> usize {
     let mut end = colon + 1;
     while end < chars.len() {
@@ -204,9 +190,8 @@ fn url_end(chars: &[char], colon: usize) -> usize {
     end
 }
 
-// Walks back over punctuation that belongs to the sentence rather than
-// to the URL. A closing bracket is kept only when there is an opening
-// one inside the URL for it to match -- which is what tells
+// Backs off punctuation belonging to the sentence. A closing bracket
+// stays only if an opening one inside the URL matches it, telling
 // `(https://x/a)` from `https://x/a_(b)`.
 fn trim_trailing(chars: &[char], start: usize, mut end: usize) -> usize {
     while end > start {
@@ -230,25 +215,18 @@ fn trim_trailing(chars: &[char], start: usize, mut end: usize) -> usize {
     end
 }
 
-/// Whether a URL is safe to put inside an OSC 8 escape sequence.
-///
-/// The URL comes from a *file* -- a markdown link's destination, a
-/// string in someone's source -- and is about to be spliced into an
-/// escape sequence, so a control character in it would end the sequence
-/// early and hand the terminal whatever followed as commands. A URL
-/// that needs repairing to be safe is a URL nobody should be one click
-/// away from, so this says no rather than sanitizing.
+/// Whether a URL is safe inside an OSC 8 escape sequence. It comes from a
+/// file (a markdown link, a string in source), and a control character
+/// would end the sequence early and hand the terminal what follows as
+/// commands. One needing repair is refused rather than sanitised.
 pub fn is_safe(url: &str) -> bool {
     !url.is_empty() && !url.chars().any(|c| c.is_control())
 }
 
-/// A link target as something a terminal can actually open. Already a
-/// URL, it is returned as it is; otherwise it is a relative path -- a
-/// markdown link to a sibling document, most often -- resolved against
-/// `base_dir` into a `file://` URL, which is what makes clicking
-/// `[the plan](plan.md)` go somewhere. Without a base directory a
-/// relative target has nothing to be relative *to*, and gets no link
-/// rather than a guessed one.
+/// A link target a terminal can open. A URL is returned as is; a
+/// relative path (a markdown link to a sibling document) is resolved
+/// against `base_dir` into a `file://` URL. Without a base directory a
+/// relative target gets no link rather than a guess.
 pub fn absolute(target: &str, base_dir: Option<&std::path::Path>) -> Option<String> {
     if parse(target).is_some() {
         return Some(target.to_string());
@@ -258,20 +236,13 @@ pub fn absolute(target: &str, base_dir: Option<&std::path::Path>) -> Option<Stri
     Some(format!("file://{}", resolved.display()))
 }
 
-/// A real, percent-encoded `file://` URL for an absolute path.
-///
-/// `absolute` above also produces `file://`-prefixed strings, but for a
-/// different audience: a terminal emulator being handed an OSC 8 target,
-/// which is forgiving about what it gets. A language server is not --
-/// `rootUri` and every `textDocument.uri` are matched against each other
-/// and against the server's own idea of the same file, so a path
-/// containing a space or a `#` has to arrive encoded or it names a
-/// different document (or no document at all).
+/// A percent-encoded `file://` URL for an absolute path, for a language
+/// server, which matches `rootUri` and `textDocument.uri` exactly, so a
+/// space or `#` must be encoded. (`absolute` is for terminals, which are
+/// forgiving.)
 ///
 /// Everything outside RFC 3986's unreserved set is encoded, byte by byte
-/// of the path's UTF-8, with `/` kept as the separator it is. Encoding
-/// more than strictly necessary is safe -- a decoder gets the same path
-/// back either way -- while encoding less is not.
+/// of the UTF-8, keeping `/`. Over-encoding is safe; under-encoding isn't.
 pub fn from_file_path(path: &std::path::Path) -> String {
     let mut out = String::from("file://");
     for byte in path.to_string_lossy().as_bytes() {
@@ -283,22 +254,16 @@ pub fn from_file_path(path: &std::path::Path) -> String {
     out
 }
 
-/// `from_file_path`'s inverse: the path a `file://` URL names, or `None`
-/// for anything that isn't one.
+/// `from_file_path`'s inverse: the path a `file://` URL names, or `None`.
+/// Diagnostics arrive addressed by URI, and the buffer is found by path.
 ///
-/// Needed because a language server's diagnostics arrive addressed by
-/// URI, and the only way to know which buffer they are about is to turn
-/// that back into the path the buffer was opened from.
-///
-/// Percent-decoding is byte-wise and the result is only accepted as
-/// UTF-8 -- a path bish could not have produced a URI for in the first
-/// place is better rejected than guessed at. An authority component
-/// (`file://host/path`) is rejected too: bish has no remote files, so a
-/// URI naming one is not about any buffer here.
+/// Percent-decoding is byte-wise and the result must be UTF-8: a path
+/// bish couldn't have encoded is rejected. So is an authority
+/// (`file://host/path`): bish has no remote files.
 pub fn to_file_path(uri: &str) -> Option<std::path::PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    // `file:///path` (empty authority) is the ordinary form; anything
-    // before the first `/` is a host we can't do anything with.
+    // `file:///path` (empty authority) is the usual form; anything before
+    // the first `/` is a host.
     if !rest.starts_with('/') {
         return None;
     }
@@ -335,8 +300,8 @@ mod tests {
     fn a_file_path_round_trips_through_a_uri_including_the_awkward_characters() {
         for path in [
             "/plain/x.sh",
-            // The ones that actually break a naive encoder: a space and
-            // a `#` both mean something in a URI.
+            // What breaks a naive encoder: a space and a `#` mean something
+            // in a URI.
             "/a dir/my file.rs",
             "/proj/notes#1.md",
             "/proj/100% done/x.py",
@@ -354,13 +319,12 @@ mod tests {
     #[test]
     fn only_a_local_file_url_is_a_path() {
         assert_eq!(to_file_path("https://example.com/x"), None);
-        // An authority names a host, and bish has no remote buffers for
-        // one to be about.
+        // An authority names a host; bish has no remote buffers.
         assert_eq!(to_file_path("file://host/x"), None);
-        // Truncated or non-hex escapes are refused rather than guessed.
+        // Truncated or non-hex escapes are refused.
         assert_eq!(to_file_path("file:///a%"), None);
         assert_eq!(to_file_path("file:///a%zz"), None);
-        // Bytes that aren't UTF-8 are a path bish could not have named.
+        // Non-UTF-8 bytes are a path bish couldn't have named.
         assert_eq!(to_file_path("file:///a%FF"), None);
     }
 
@@ -404,7 +368,7 @@ mod tests {
         assert_eq!(u.path, "/home/jussi/bish/src/url.rs");
     }
 
-    // The colons inside an IPv6 literal are the address, not a port.
+    // The colons in an IPv6 literal are the address.
     #[test]
     fn an_ipv6_host_keeps_its_brackets_and_finds_its_port() {
         let u = parse("http://[::1]:8080/x").unwrap();
@@ -413,8 +377,7 @@ mod tests {
         assert_eq!(parse("http://[::1]/x").unwrap().port, None);
     }
 
-    // Something that isn't a port stays part of the host rather than
-    // being quietly dropped.
+    // A non-port stays part of the host.
     #[test]
     fn a_colon_that_is_not_a_port_is_left_in_the_host() {
         let u = parse("http://example.com:notaport/x").unwrap();
@@ -435,7 +398,7 @@ mod tests {
         assert_eq!(found("see https://example.com/x for more"), vec!["https://example.com/x"]);
     }
 
-    // The sentence's full stop is not the URL's.
+    // The sentence's full stop isn't the URL's.
     #[test]
     fn trailing_sentence_punctuation_is_not_part_of_the_url() {
         assert_eq!(found("see https://example.com/x."), vec!["https://example.com/x"]);
@@ -443,8 +406,7 @@ mod tests {
         assert_eq!(found("a, https://example.com, b"), vec!["https://example.com"]);
     }
 
-    // The classic one: a closing paren is the URL's only when it has an
-    // opening one to match.
+    // A closing paren is the URL's only with an opening one to match.
     #[test]
     fn a_closing_bracket_is_kept_only_when_it_balances() {
         assert_eq!(found("(https://example.com/a)"), vec!["https://example.com/a"]);
@@ -464,7 +426,7 @@ mod tests {
         assert_eq!(found("https://a.example https://b.example"), vec!["https://a.example", "https://b.example"]);
     }
 
-    // A colon inside a URL must not start a second one.
+    // A colon inside a URL doesn't start another.
     #[test]
     fn a_colon_inside_a_url_does_not_start_another() {
         assert_eq!(found("https://example.com:8080/a:b"), vec!["https://example.com:8080/a:b"]);
@@ -476,7 +438,7 @@ mod tests {
         assert_eq!(found("write to a@example.com please"), Vec::<String>::new());
     }
 
-    // The things that look like schemes in ordinary text and are not.
+    // Things in ordinary text that look like schemes and aren't.
     #[test]
     fn ordinary_text_with_colons_finds_nothing() {
         assert_eq!(found("note: this is a note"), Vec::<String>::new());
