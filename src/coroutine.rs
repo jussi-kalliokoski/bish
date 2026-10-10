@@ -1,58 +1,38 @@
-// The scheduler that drives these, and the pipeline stages that will be
-// driven by it, are not written yet -- this is the primitive underneath
-// them, landed on its own because it is the part that can be wrong in
-// ways only its own tests can catch. Everything here is exercised by
-// those tests; the allow goes when the scheduler above it arrives.
 #![allow(dead_code)]
 
 // Two interpreters running at once, in one process, on one thread.
 //
-// A pipeline's stages have to run concurrently -- the producer blocks
-// when the pipe fills and cannot continue until the consumer drains it
-// -- and a separate process per stage is only *one* way to buy that
-// concurrency. It is the expensive way here: a stage that needs a shell
-// costs a whole bish startup, and the new process then knows nothing
-// this one knows except what a generated preamble tells it.
+// A pipeline's stages must run concurrently: a producer blocks when the
+// pipe fills until the consumer drains it. A process per stage buys that,
+// but a stage that needs a shell then costs a bish startup and knows only
+// what a generated preamble tells it. bish's evaluator recurses on the
+// native stack, so where an interpreter is *is* a stack pointer and the
+// callee-saved registers, and switching between two means swapping those,
+// onto a stack of our own.
 //
-// What is actually needed is the ability to stop one interpreter
-// mid-evaluation, run another, and come back. bish's evaluator recurses
-// on the native stack, so "where it is" *is* a stack pointer and a
-// handful of callee-saved registers -- which makes switching between two
-// of them a matter of swapping exactly that, onto a stack of our own.
-//
-// This module is that switch and nothing else: no scheduler, no I/O, no
-// shell. It is the smallest piece that can be tested on its own, and
-// everything above it is ordinary safe Rust.
+// This module is that switch and nothing else; `scheduler` decides when
+// to switch.
 //
 // # Why hand-written assembly
 //
-// There is a libc function for this (`swapcontext`), and it costs about
-// a microsecond because it makes a `sigprocmask` syscall on every switch
-// to save the signal mask -- which this does not need, since a stage
-// never changes it. The switch below touches nothing but registers.
+// libc's `swapcontext` makes a `sigprocmask` syscall on every switch to
+// save the signal mask, which a stage never changes. This switch touches
+// only registers.
 //
-// # What is guaranteed
+// # Guarantees
 //
-// - A coroutine runs until it yields or returns; there is no preemption,
-//   so nothing here needs a lock and no state is shared across a switch
-//   that was not shared before it.
-// - A panic never crosses a switch: the entry point catches it, and the
-//   coroutine reports it to whoever resumed it. Unwinding across a stack
-//   this module built would be undefined behaviour, and the catch is
-//   what makes sure it cannot happen.
-// - Each coroutine's stack is its own mapping with an unreadable guard
-//   page below it, so overrunning it is a fault at the guard rather than
-//   silent corruption of whatever was mapped next.
+// - A coroutine runs until it yields or returns; there's no preemption.
+// - A panic never crosses a switch: the entry point catches it and reports
+//   it to the resumer. Unwinding across a stack built here would be
+//   undefined behaviour.
+// - Each stack is its own mapping with an unreadable guard page below, so
+//   an overrun faults instead of corrupting the next mapping.
 
 #[cfg(not(target_family = "wasm"))]
 use std::cell::Cell;
 
-/// The callee-saved state of a suspended execution: everything the
-/// System V ABI says a function must preserve, plus where its stack is.
-///
-/// Only the stack pointer is named here. Everything else lives *on* that
-/// stack, pushed by the switch itself -- which is what makes this one
-/// word wide and the switch a dozen instructions.
+/// The callee-saved state of a suspended execution. Only the stack pointer
+/// is stored: everything else is pushed onto that stack by the switch.
 #[cfg(not(target_family = "wasm"))]
 #[repr(C)]
 #[derive(Default)]
@@ -60,10 +40,9 @@ struct Context {
     stack_pointer: *mut u8,
 }
 
-// Declares `bish_switch_context` as a global the rest of the binary can
-// call but nothing outside it can see. ELF and Mach-O spell that
-// differently, and Mach-O also puts an underscore in front of every C
-// symbol name, so the extern below only finds it under `_bish...`.
+// Declares `bish_switch_context` as a global the binary can call but
+// nothing outside can see. ELF and Mach-O spell that differently, and
+// Mach-O prefixes C symbols with `_`.
 #[cfg(not(target_family = "wasm"))]
 #[cfg(target_vendor = "apple")]
 macro_rules! switch_context_label {
@@ -80,15 +59,10 @@ macro_rules! switch_context_label {
     };
 }
 
-// x86_64 System V: rbx, rbp and r12-r15 are callee-saved, so a function
-// that switches stacks has to preserve them across the switch the same
-// way any other function would. They are pushed onto the outgoing stack
-// and popped from the incoming one; `ret` then returns into whatever
-// that stack was last suspended at.
-//
-// The `ret` at the end is doing the actual jump. A stack prepared by
-// `Stack::prepare` has the trampoline's address where a return address
-// would be, so the first switch into a coroutine "returns" into it.
+// x86_64 System V: rbx, rbp and r12-r15 are callee-saved, so they're
+// pushed onto the outgoing stack and popped from the incoming one. The
+// final `ret` does the jump: a stack from `Stack::prepare` has the
+// trampoline where a return address would be.
 #[cfg(target_arch = "x86_64")]
 std::arch::global_asm!(
     switch_context_label!(),
@@ -109,9 +83,9 @@ std::arch::global_asm!(
     "ret",
 );
 
-// aarch64 AAPCS: x19-x28 and the frame/link registers are callee-saved,
-// as are the low halves of v8-v15. Same shape as above -- push, swap
-// stack pointers, pop, return through the link register.
+// aarch64 AAPCS: x19-x28, the frame and link registers, and the low
+// halves of v8-v15 are callee-saved. Same shape: push, swap stack
+// pointers, pop, return through the link register.
 #[cfg(target_arch = "aarch64")]
 std::arch::global_asm!(
     switch_context_label!(),
@@ -146,27 +120,19 @@ std::arch::global_asm!(
 
 #[cfg(not(target_family = "wasm"))]
 unsafe extern "C" {
-    /// Saves the current execution into `from` and resumes `to`.
-    ///
-    /// Returns to its caller when something switches *back* into
-    /// `from` -- so from Rust's point of view this is a call that takes
-    /// an arbitrarily long time and may run arbitrary other code, which
-    /// is exactly what it is.
+    /// Saves the current execution into `from` and resumes `to`. Returns when
+    /// something switches back into `from`: a call that can take arbitrarily
+    /// long and run arbitrary code.
     fn bish_switch_context(from: *mut Context, to: *const Context);
 }
 
-/// How much stack each coroutine gets.
-///
-/// bish's evaluator uses several kilobytes per nested construct (see
-/// `stackguard`), so this is sized for a stage that recurses rather than
-/// for the shallow ones. It is virtual address space, not memory: pages
-/// are faulted in as they are touched, so an unused megabyte costs a
-/// page-table entry and nothing else.
+/// Stack per coroutine. The evaluator uses kilobytes per nested construct
+/// (see `stackguard`), so this allows a recursing stage. It's address
+/// space, not memory: pages fault in as touched.
 #[cfg(not(target_family = "wasm"))]
 const STACK_SIZE: usize = 2 * 1024 * 1024;
 
-/// An unreadable page below the stack, so an overrun faults there
-/// instead of running into whatever the allocator put next.
+/// An unreadable page below the stack, so an overrun faults there.
 #[cfg(not(target_family = "wasm"))]
 const GUARD_SIZE: usize = 4096;
 
@@ -180,9 +146,8 @@ struct Stack {
 #[cfg(not(target_family = "wasm"))]
 impl Stack {
     fn new() -> std::io::Result<Stack> {
-        // The guard goes at the *low* end: stacks grow downward, so
-        // that is the end an overrun reaches. Which syscalls that takes
-        // is the platform layer's business, not this module's.
+        // The guard goes at the low end, which a downward-growing stack
+        // overruns into.
         Ok(Stack { base: crate::platform::map_guarded_stack(GUARD_SIZE, STACK_SIZE)?, total: GUARD_SIZE + STACK_SIZE })
     }
 
@@ -205,23 +170,17 @@ impl Drop for Stack {
 pub enum State {
     /// Never resumed yet.
     Fresh,
-    /// Resumed at least once, and currently suspended in a `yield_now`.
+    /// Resumed at least once, now suspended in `yield_now`.
     Suspended,
-    /// Currently running -- the one this thread is inside.
+    /// Running: the one this thread is inside.
     Running,
-    /// Returned, or panicked. Resuming again is a no-op.
+    /// Returned or panicked. Resuming again does nothing.
     Done,
 }
 
-// ---------------------------------------------------------------------
-// The wasm stub. There is no second stack to switch onto in WASI, so a
-// coroutine here cannot suspend: `resume` runs the body straight through
-// (a `yield_now` inside it is a no-op) and `in_coroutine` is always
-// false. Nothing drives the scheduler that would use this yet, so it is
-// never reached -- it exists so `scheduler.rs` still compiles for the
-// web target. The real stack-switching machinery below is compiled for
-// every other target.
-// ---------------------------------------------------------------------
+// The wasm version. WASI has no second stack to switch to, so a
+// coroutine can't suspend: `resume` runs the body through, `yield_now`
+// does nothing, and `in_coroutine` is false.
 
 #[cfg(target_family = "wasm")]
 pub struct Coroutine {
@@ -254,12 +213,11 @@ impl Coroutine {
     }
 }
 
-/// A no-op: a wasm coroutine cannot suspend, so there is nothing to
-/// yield to.
+/// Does nothing: a wasm coroutine can't suspend.
 #[cfg(target_family = "wasm")]
 pub fn yield_now() {}
 
-/// Always false: there is no coroutine to be inside on this platform.
+/// Always false on this platform.
 #[cfg(target_family = "wasm")]
 pub fn in_coroutine() -> bool {
     false
@@ -267,19 +225,12 @@ pub fn in_coroutine() -> bool {
 
 #[cfg(not(target_family = "wasm"))]
 thread_local! {
-    /// Where to switch back to when the running coroutine yields.
-    ///
-    /// Set by `resume` immediately before entering the coroutine, so a
-    /// `yield_now` from arbitrarily deep inside it knows where "back"
-    /// is without having to be handed anything.
+    /// Where to switch back to when the running coroutine yields, set by
+    /// `resume` before entering, so a `yield_now` at any depth knows.
     static RETURN_TO: Cell<*mut Context> = const { Cell::new(std::ptr::null_mut()) };
-    /// The coroutine this thread is currently inside, so `yield_now`
-    /// and the trampoline can find it without being handed anything.
-    /// Null when none is running.
-    ///
-    /// A pointer to the whole `Coroutine` rather than to its `Context`:
-    /// deriving one from the other would be assuming a field offset
-    /// that Rust does not promise.
+    /// The coroutine this thread is inside, for `yield_now` and the
+    /// trampoline; null when none. The whole `Coroutine`, since deriving it
+    /// from its `Context` would assume a field offset Rust doesn't promise.
     static CURRENT: Cell<*mut Coroutine> = const { Cell::new(std::ptr::null_mut()) };
 }
 
@@ -287,39 +238,32 @@ thread_local! {
 #[cfg(not(target_family = "wasm"))]
 pub struct Coroutine {
     context: Context,
-    /// The high end of this coroutine's own stack, and how much of it a
-    /// script may use -- swapped into `stackguard` for the duration of
-    /// every resume, so a runaway recursion inside a stage is measured
-    /// against the stack it is actually running on rather than against
-    /// the thread's, which is a different mapping entirely.
+    /// The top of this coroutine's stack and how much a script may use,
+    /// swapped into `stackguard` during each resume, so recursion in a stage
+    /// is measured against the stack it runs on.
     stack_top: usize,
     stack_budget: usize,
-    // Dropped last, and only once the coroutine can no longer be
-    // resumed -- see `Drop`.
+    // Dropped last, once the coroutine can't be resumed; see `Drop`.
     stack: Option<Stack>,
     state: State,
-    // The closure, boxed, until the coroutine's entry point takes it.
-    // `None` afterwards, whether it ran or not.
+    // The body, until the entry point takes it.
     body: Option<Box<dyn FnOnce()>>,
-    // Set if the body panicked, so `resume` can report it rather than
-    // letting it cross the switch.
+    // Set if the body panicked, so `resume` can report it.
     panicked: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl Coroutine {
-    /// Creates a coroutine that will run `body` when first resumed.
-    ///
-    /// Nothing runs yet: this allocates a stack and arranges for the
-    /// first `resume` to land at the top of `body`.
+    /// A coroutine that runs `body` when first resumed. Allocates the stack
+    /// and arranges for the first `resume` to land at the top of `body`.
     pub fn new(body: impl FnOnce() + 'static) -> std::io::Result<Box<Coroutine>> {
         let stack = Stack::new()?;
         let stack_top = stack.top() as usize;
         let mut co = Box::new(Coroutine {
             context: Context::default(),
             stack_top,
-            // The same two-thirds `stackguard` leaves itself on the
-            // thread's own stack, for unwinding and reporting.
+            // The same two thirds `stackguard` leaves on the thread's
+            // stack, for unwinding and reporting.
             stack_budget: STACK_SIZE / 3 * 2,
             stack: Some(stack),
             state: State::Fresh,
@@ -330,36 +274,28 @@ impl Coroutine {
         Ok(co)
     }
 
-    /// Lays out the initial stack so that switching to it lands in
-    /// `trampoline`, with `self` reachable.
-    ///
-    /// The layout mirrors exactly what `bish_switch_context` pops: the
-    /// six saved registers, then a return address. `ret` takes that
-    /// address, so the first switch "returns" into the trampoline
-    /// having never called it.
+    /// Lays out the initial stack so the first switch lands in
+    /// `trampoline`. It mirrors what `bish_switch_context` pops: six
+    /// registers, then a return address, which `ret` takes, entering the
+    /// trampoline without a call.
     #[cfg(target_arch = "x86_64")]
     fn prepare(&mut self) {
         let top = self.stack.as_ref().expect("a fresh coroutine has its stack").top();
-        // System V wants rsp+8 ≡ 0 (mod 16) at a function's first
-        // instruction -- the state right after a `call` pushed its
-        // return address. `ret` will pop the address below, so the slot
-        // holding it plays that part, and everything is measured from
-        // an aligned `top`.
+        // System V wants rsp+8 to be 16-aligned at a function's first
+        // instruction, as right after a `call`. `ret` pops the address
+        // below, so that slot plays the pushed return address.
         let self_ptr = self as *mut Coroutine as usize;
         unsafe {
             let mut sp = top as *mut usize;
-            // A zero return address under the trampoline: if it ever
-            // returns rather than switching away, it lands on a null
-            // instruction pointer, which faults immediately and
-            // visibly instead of wandering.
+            // A zero return address under the trampoline: returning from it
+            // instead of switching faults at once.
             sp = sp.sub(1);
             sp.write(0);
             sp = sp.sub(1);
             sp.write(trampoline as *const () as usize);
-            // r15, r14, r13, r12, rbx, rbp -- popped in that order by
-            // the switch. r12 carries `self` across, since it is
-            // callee-saved and therefore still there when the
-            // trampoline starts.
+            // r15, r14, r13, r12, rbx, rbp, popped in that order. r12
+            // carries `self`, since it's callee-saved and still there when
+            // the trampoline starts.
             for value in [0usize, 0, 0, self_ptr, 0, 0] {
                 sp = sp.sub(1);
                 sp.write(value);
@@ -373,25 +309,22 @@ impl Coroutine {
         let top = self.stack.as_ref().expect("a fresh coroutine has its stack").top();
         let self_ptr = self as *mut Coroutine as usize;
         unsafe {
-            // 20 saved registers, matching the aarch64 switch above:
-            // x19-x28, x29/x30, and d8-d15.
+            // 20 saved registers, as the aarch64 switch expects: x19-x28,
+            // x29/x30 and d8-d15.
             let sp = (top as *mut usize).sub(20);
             for i in 0..20 {
                 sp.add(i).write(0);
             }
-            // x19 is the first slot and is callee-saved: it carries
-            // `self`. x30 (the link register, slot 11) is where `ret`
-            // jumps, so it holds the trampoline.
+            // x19, the first slot and callee-saved, carries `self`. x30
+            // (slot 11) is where `ret` jumps, so it holds the trampoline.
             sp.add(0).write(self_ptr);
             sp.add(11).write(trampoline as *const () as usize);
             self.context.stack_pointer = sp as *mut u8;
         }
     }
 
-    /// Runs the coroutine until it yields or finishes.
-    ///
-    /// Returns the state it is in afterwards. Resuming one that is
-    /// already `Done` does nothing.
+    /// Runs the coroutine until it yields or finishes, returning its state.
+    /// Resuming a `Done` one does nothing.
     pub fn resume(&mut self) -> State {
         if self.state == State::Done {
             return State::Done;
@@ -401,14 +334,14 @@ impl Coroutine {
         let previous_current = CURRENT.with(|c| c.replace(self as *mut Coroutine));
         self.state = State::Running;
         let outer_stack = crate::stackguard::swap_stack(self.stack_top, self.stack_budget);
-        // Everything between here and the line after is running on the
-        // coroutine's own stack.
+        // From here until it switches back, execution is on the coroutine's
+        // stack.
         unsafe { bish_switch_context(&mut here as *mut Context, &self.context as *const Context) };
         crate::stackguard::swap_stack(outer_stack.0, outer_stack.1);
         RETURN_TO.with(|r| r.set(previous_return));
         CURRENT.with(|c| c.set(previous_current));
         if self.state == State::Running {
-            // It came back without finishing, so it yielded.
+            // Back without finishing, so it yielded.
             self.state = State::Suspended;
         }
         self.state
@@ -427,49 +360,39 @@ impl Coroutine {
 #[cfg(not(target_family = "wasm"))]
 impl Drop for Coroutine {
     fn drop(&mut self) {
-        // A coroutine dropped mid-yield never runs again, so whatever it
-        // had borrowed on its own stack is never touched again either --
-        // but the values living there are also never dropped. Leaking
-        // them is the safe half of the trade; running arbitrary
-        // destructors on a stack nobody is executing on is not something
-        // this can do correctly. Callers run their coroutines to
-        // completion; the scheduler above enforces it.
-        //
-        // The mapping itself always goes back.
+        // A coroutine dropped mid-yield never runs again, and the values on
+        // its stack are never dropped either: leaking them is safe, while
+        // running destructors on a stack nothing executes on isn't
+        // possible. Callers run coroutines to completion; the scheduler
+        // enforces it. The mapping always goes back.
         self.stack.take();
     }
 }
 
-/// The first thing that runs on a coroutine's own stack.
-///
-/// `extern "C"` and never called directly: it is reached by the `ret` at
-/// the end of the first switch into this stack.
+/// The first thing that runs on a coroutine's stack: reached by the `ret`
+/// ending the first switch, never called.
 #[cfg(not(target_family = "wasm"))]
 extern "C" fn trampoline() -> ! {
     let co = CURRENT.with(|c| c.get());
     unsafe {
         let body = (*co).body.take();
         if let Some(body) = body {
-            // A panic must not unwind across a stack switch: the
-            // unwinder would walk off the end of a stack it knows
-            // nothing about. Caught here, reported through the struct.
+            // A panic mustn't unwind across a stack switch, onto a stack
+            // the unwinder doesn't know. Caught here and reported.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
             (*co).panicked = outcome.is_err();
         }
         (*co).state = State::Done;
     }
-    // Back to whoever resumed this, for the last time. `resume` sees
-    // `Done` and does not come back.
+    // Back to the resumer for the last time; `resume` sees `Done`.
     let back = RETURN_TO.with(|r| r.get());
     let mut discard = Context::default();
     unsafe { bish_switch_context(&mut discard as *mut Context, back as *const Context) };
     unreachable!("a finished coroutine was resumed again");
 }
 
-/// Suspends the running coroutine, returning to whoever resumed it.
-///
-/// A no-op when nothing is running as a coroutine, so code that can run
-/// either way does not have to know which it is.
+/// Suspends the running coroutine, returning to its resumer. Does nothing
+/// outside a coroutine, so code needn't know which it's in.
 #[cfg(not(target_family = "wasm"))]
 pub fn yield_now() {
     let current = CURRENT.with(|c| c.get());
@@ -499,7 +422,7 @@ mod tests {
         assert_eq!(co.state(), State::Fresh);
         assert_eq!(co.resume(), State::Done);
         assert!(ran.get(), "the body ran");
-        // Resuming a finished one is a no-op rather than a fault.
+        // Resuming a finished one does nothing.
         assert_eq!(co.resume(), State::Done);
     }
 
@@ -524,8 +447,7 @@ mod tests {
         assert_eq!(*steps.borrow(), ["a", "b", "c"]);
     }
 
-    // The property the whole thing exists for: two of them making
-    // progress in turn, on one thread, neither aware of the other.
+    // Two making progress in turn on one thread, neither aware of the other.
     #[test]
     fn two_coroutines_interleave() {
         let log = Rc::new(std::cell::RefCell::new(String::new()));
@@ -553,9 +475,8 @@ mod tests {
         assert_eq!(*log.borrow(), "A0B0A1B1A2B2");
     }
 
-    // Each one is on its own stack, so a deep recursion in one must not
-    // disturb the other -- and must not disturb the thread's own stack
-    // either, which is what `stackguard` measures against.
+    // Each has its own stack, so deep recursion in one disturbs neither the
+    // other nor the thread's stack, which `stackguard` measures.
     #[test]
     fn a_coroutine_recurses_on_its_own_stack() {
         fn descend(n: usize) -> usize {
@@ -565,8 +486,8 @@ mod tests {
         }
         let depth = Rc::new(Cell::new(0));
         let d = Rc::clone(&depth);
-        // 500 frames of 1KiB each, comfortably inside STACK_SIZE and
-        // comfortably more than a test harness thread would like.
+        // 500 frames of 1 KiB: well inside STACK_SIZE, more than a test
+        // thread would like.
         let mut co = Coroutine::new(move || d.set(descend(500))).unwrap();
         assert_eq!(co.resume(), State::Done);
         assert_eq!(depth.get(), 500);
@@ -588,9 +509,8 @@ mod tests {
         assert!(!in_coroutine(), "and the flag is back off afterwards");
     }
 
-    // A panic must not unwind across the switch -- it would walk off a
-    // stack the unwinder knows nothing about. It ends the coroutine
-    // instead, and is reported.
+    // A panic ends the coroutine and is reported, never unwinding across the
+    // switch.
     #[test]
     fn a_panicking_coroutine_ends_and_says_so() {
         let previous = std::panic::take_hook();
@@ -622,20 +542,16 @@ mod tests {
 mod cost {
     use super::*;
 
-    // Not an assertion about speed -- a check that a switch has not
-    // silently become a syscall, which is what using `swapcontext`
-    // instead would cost (it makes a `sigprocmask` call every time).
-    //
-    // Measured against a real syscall in the same test rather than
-    // against a fixed number of nanoseconds: this runs alongside two
-    // thousand other tests, and an absolute threshold measures the
-    // machine's load as much as the switch. A ratio moves with both.
+    // Checks that a switch hasn't become a syscall, as `swapcontext`'s
+    // `sigprocmask` would make it. Compared with a real syscall in the same
+    // test rather than an absolute time, since this runs alongside thousands
+    // of other tests and a ratio moves with load.
     #[test]
     fn a_switch_costs_far_less_than_a_syscall() {
         const N: usize = 100_000;
 
-        // `close(-1)` fails with EBADF without touching anything --
-        // a syscall and nothing else, and not one the vDSO answers.
+        // `close(-1)` fails with EBADF: a syscall and nothing else, not one
+        // the vDSO answers.
         let started = std::time::Instant::now();
         for _ in 0..N {
             crate::platform::close_fd(-1);
@@ -652,16 +568,15 @@ mod cost {
         for _ in 0..N {
             co.resume();
         }
-        // Two switches per resume: in, and back out.
+        // Two switches per resume: in and out.
         let per_switch = started.elapsed().as_nanos() as f64 / (N * 2) as f64;
 
         assert!(
             per_switch < per_syscall * 3.0,
             "a context switch ({per_switch:.0}ns) should be in the same range as a syscall ({per_syscall:.0}ns), not multiples of it"
         );
-        // Dropped while still suspended inside its loop, which is the
-        // supported thing to do: the mapping goes back, and nothing on
-        // that stack owns anything that needed dropping.
+        // Dropped while suspended in its loop, which is supported: the
+        // mapping goes back, and nothing on that stack needed dropping.
         drop(co);
     }
 }
