@@ -1,19 +1,15 @@
-// How a buffer line longer than the pane is laid out: vim's `wrap`,
-// `linebreak`, `breakindent` and `showbreak`, plus the two that matter
-// when wrapping is *off* (`sidescrolloff`, and the `extends`/`precedes`
-// markers from `listchars`).
+// How a buffer line wider than the pane is laid out: vim's `wrap`,
+// `linebreak`, `breakindent` and `showbreak`, plus `sidescrolloff` and
+// `listchars`' `extends`/`precedes` for when wrapping is off.
 //
-// Pure: given a line's characters, a width and the options, it says
-// which characters go on which screen row. Everything about scrolling,
-// gutters and cursors is the editor's own problem, and keeping this
-// side of it free of those is what makes the awkward cases -- a
-// double-width character straddling the edge, a word longer than the
-// pane, a line of nothing but spaces -- testable without a terminal.
+// Pure: given a line's characters, a width and the options, it says which
+// characters go on which row. Scrolling, gutters and cursors are the
+// editor's, which keeps the awkward cases (a wide character at the edge, a
+// word longer than the pane, a line of spaces) testable without a
+// terminal.
 //
-// Deliberately not here: `textwidth`, which is a *hard* wrap that edits
-// the buffer as you type. That is an editing feature, not a display one,
-// and putting the two behind neighbouring names would invite exactly the
-// confusion vim users already have about them.
+// Not `textwidth`, which edits the buffer as you type: an editing feature,
+// not a display one.
 
 use super::unicode_width::char_width;
 
@@ -30,14 +26,11 @@ pub struct Options {
     // Wrap here rather than at the pane's edge; 0 means the edge. Always
     // capped by the pane, so a narrow pane still wraps at the pane.
     pub column: usize,
-    // With `wrap` off: how many columns to keep visible either side of
-    // the cursor.
-    // Vertical counterpart to `sidescrolloff`, and the one option here
-    // that has nothing to do with wrapping -- it lives on this struct
-    // because this is where a buffer's view options are, and splitting
-    // "how the view scrolls" across two homes would be worse than the
-    // slightly wide name.
+    // Rows to keep visible above and below the cursor: `sidescrolloff`'s
+    // vertical counterpart. Not about wrapping, but this struct is where a
+    // buffer's view options live.
     pub scrolloff: usize,
+    // With `wrap` off: columns to keep visible either side of the cursor.
     pub sidescrolloff: usize,
     // With `wrap` off: what marks a line continuing past the right or
     // left edge. Empty for nothing, which is the default.
@@ -46,10 +39,8 @@ pub struct Options {
 }
 
 impl Default for Options {
-    // The defaults are `wrap` off -- the behaviour this editor has
-    // always had, and vim's `nowrap` -- with the options that shape a
-    // wrapped line already set the way someone turning wrapping on
-    // would want them.
+    // `wrap` off by default, as in vim, with the wrapping options set as
+    // someone turning it on would want them.
     fn default() -> Options {
         Options {
             wrap: false,
@@ -65,13 +56,13 @@ impl Default for Options {
     }
 }
 
-// One screen row's worth of a buffer line.
+// One screen row of a buffer line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub start: usize,
     pub end: usize,
-    // Display columns of prefix this row opens with -- zero on a line's
-    // first row, `showbreak` plus the line's own indent on the rest.
+    // Display columns of prefix on this row: zero on the first,
+    // `showbreak` plus the line's indent on the rest.
     pub indent: usize,
 }
 
@@ -81,26 +72,23 @@ impl Segment {
     }
 }
 
-// vim's own `breakat`: where a line may be broken when `linebreak` is
-// on. Whitespace plus the punctuation that reads as a seam rather than
-// as part of a word.
+// vim's `breakat`: where `linebreak` may break. Whitespace, plus the
+// punctuation that reads as a seam.
 fn is_break_at(c: char) -> bool {
     c.is_whitespace() || matches!(c, '!' | '@' | '*' | '-' | '+' | ';' | ':' | ',' | '.' | '/' | '?')
 }
 
-// The rows `chars` occupies in a pane `width` columns wide. Always at
-// least one segment, even for an empty line, so a caller can index the
-// first without checking.
+// The rows `chars` takes in a pane `width` wide. At least one, even for
+// an empty line, so a caller can index the first.
 pub fn segments(chars: &[char], width: usize, opts: &Options) -> Vec<Segment> {
     let width = width.max(1);
     if !opts.wrap {
         return vec![Segment { start: 0, end: chars.len(), indent: 0 }];
     }
-    // `wrap_column` narrows the text, never widens it past the pane.
+    // `column` narrows the text, never past the pane.
     let first_width = if opts.column == 0 { width } else { opts.column.min(width) };
     let indent = continuation_indent(chars, width, opts);
-    // At least one column has to remain for content, however deep the
-    // indent would like to be.
+    // At least one column stays for content, however deep the indent.
     let rest_width = first_width.saturating_sub(indent).max(1);
 
     let mut out = Vec::new();
@@ -111,15 +99,13 @@ pub fn segments(chars: &[char], width: usize, opts: &Options) -> Vec<Segment> {
         let hard_end = fill(chars, start, avail);
         let end = if opts.linebreak && hard_end < chars.len() { break_before(chars, start, hard_end) } else { hard_end };
         out.push(Segment { start, end, indent: if first { 0 } else { indent } });
-        // Whitespace at a break is consumed by it rather than opening
-        // the next row -- otherwise every wrapped line would start with
-        // the space it broke at.
+        // Whitespace at a break is consumed, or every wrapped row would start
+        // with the space it broke at.
         let mut next = end;
         while next < chars.len() && chars[next] == ' ' {
             next += 1;
         }
-        // `fill` always advances by at least one character, so this
-        // cannot loop.
+        // `fill` advances by at least one character, so this can't loop.
         start = next.max(end.max(start + 1));
     }
     if out.is_empty() {
@@ -128,9 +114,9 @@ pub fn segments(chars: &[char], width: usize, opts: &Options) -> Vec<Segment> {
     out
 }
 
-// The prefix a continued row opens with: `showbreak`, plus the line's
-// own leading whitespace when `breakindent` is on. Capped at half the
-// pane, so a deeply indented line doesn't wrap into a sliver.
+// The prefix of a continued row: `showbreak`, plus the line's leading
+// whitespace with `breakindent`. Capped at half the pane, so a deep indent
+// doesn't leave a sliver.
 fn continuation_indent(chars: &[char], width: usize, opts: &Options) -> usize {
     let mut indent = opts.showbreak.chars().map(char_width).sum::<usize>();
     if opts.breakindent {
@@ -139,9 +125,8 @@ fn continuation_indent(chars: &[char], width: usize, opts: &Options) -> usize {
     indent.min(width / 2)
 }
 
-// How far from `start` fits in `avail` columns -- at least one
-// character, however wide it is, so a pane narrower than a glyph still
-// makes progress.
+// How far from `start` fits in `avail` columns: at least one character,
+// so a pane narrower than a glyph still progresses.
 fn fill(chars: &[char], start: usize, avail: usize) -> usize {
     let mut used = 0;
     let mut i = start;
@@ -156,15 +141,10 @@ fn fill(chars: &[char], start: usize, avail: usize) -> usize {
     i.max(start + 1).min(chars.len())
 }
 
-// The last break opportunity at or before `hard_end`, or `hard_end`
-// itself when the row holds no seam at all -- a single word longer than
-// the pane still has to be broken somewhere.
-//
-// Where the seam itself goes differs by kind, and matching vim here
-// matters because both look wrong the other way round: a space is
-// *consumed* by the break (a row ending in a trailing space reads as a
-// stray one), while punctuation stays on the row it ended, so
-// `--long-option` breaks after a dash rather than before it.
+// The last break opportunity at or before `hard_end`, or `hard_end` when
+// there's none: a word longer than the pane still breaks somewhere. As in
+// vim, a space is consumed by the break, while punctuation stays on its
+// row, so `--long-option` breaks after a dash.
 fn break_before(chars: &[char], start: usize, hard_end: usize) -> usize {
     for i in (start..hard_end).rev() {
         if !is_break_at(chars[i]) {
@@ -178,7 +158,7 @@ fn break_before(chars: &[char], start: usize, hard_end: usize) -> usize {
     hard_end
 }
 
-// Which segment `col` (a char index) falls on, and the row's own index.
+// The segment `col` (a char index) falls on.
 pub fn segment_of(segments: &[Segment], col: usize) -> usize {
     segments.iter().rposition(|s| col >= s.start).unwrap_or(0)
 }
@@ -216,18 +196,16 @@ mod tests {
         assert_eq!(split("abcdefghij", 4, &opts(true)), vec!["abcd", "efgh", "ij"]);
     }
 
-    // linebreak: break between words, and the space that was broken at
-    // belongs to neither row.
+    // `linebreak` breaks between words, and the space belongs to neither row.
     #[test]
     fn linebreak_breaks_between_words() {
         let o = Options { linebreak: true, ..opts(true) };
         assert_eq!(split("the quick brown fox", 10, &o), vec!["the quick", "brown fox"]);
-        // Punctuation stays on the row it ended, so an option name
-        // breaks after a dash rather than before it.
+        // Punctuation stays on its row: an option name breaks after a dash.
         assert_eq!(split("--some-long-option here", 12, &o), vec!["--some-long-", "option here"]);
     }
 
-    // ...but a single word longer than the pane still has to break.
+    // ...but a word longer than the pane still breaks.
     #[test]
     fn a_word_longer_than_the_pane_breaks_anyway() {
         let o = Options { linebreak: true, ..opts(true) };
@@ -240,15 +218,14 @@ mod tests {
         let chars: Vec<char> = "    abcdefghij".chars().collect();
         let segs = segments(&chars, 12, &o);
         assert_eq!(segs[0].indent, 0, "the first row has no prefix");
-        // "> " is 2 columns, the line's own indent is 4.
+        // `> ` is 2 columns and the line's indent is 4.
         assert_eq!(segs[1].indent, 6);
         assert_eq!(text(&chars, &segs[0]), "    abcdefgh");
         // 12 columns minus a 6-column prefix leaves 6.
         assert_eq!(text(&chars, &segs[1]), "ij");
     }
 
-    // A pathologically indented line must not wrap into a one-column
-    // sliver.
+    // A deeply indented line doesn't wrap into a one-column sliver.
     #[test]
     fn the_continuation_indent_is_capped_at_half_the_pane() {
         let o = Options { showbreak: String::new(), breakindent: true, ..opts(true) };
@@ -257,17 +234,14 @@ mod tests {
         assert!(segs.iter().skip(1).all(|s| s.indent <= 10), "{segs:?}");
     }
 
-    // Display width, not character count: a double-width glyph must not
-    // straddle the edge.
-    // Four columns hold two double-width glyphs, or one plus two
-    // single-width ones. Counting *characters* instead would put three
-    // glyphs on the first row and overflow the pane.
+    // Display width, not characters: four columns hold two double-width
+    // glyphs, or one and two narrow ones, and a glyph never straddles the
+    // edge.
     #[test]
     fn wrapping_measures_display_width() {
         let o = opts(true);
         assert_eq!(split("\u{65e5}\u{672c}\u{8a9e}ab", 4, &o), vec!["\u{65e5}\u{672c}", "\u{8a9e}ab"]);
-        // At three columns no two double-width glyphs fit together --
-        // character counting would give ["\u{65e5}\u{672c}\u{8a9e}", "ab"].
+        // At three columns no two double-width glyphs fit together.
         assert_eq!(split("\u{65e5}\u{672c}\u{8a9e}ab", 3, &o), vec!["\u{65e5}", "\u{672c}", "\u{8a9e}a", "b"]);
     }
 
@@ -281,7 +255,7 @@ mod tests {
     fn wrap_column_narrows_the_text_but_never_past_the_pane() {
         let o = Options { column: 4, ..opts(true) };
         assert_eq!(split("abcdefgh", 20, &o), vec!["abcd", "efgh"]);
-        // A pane narrower than the column still wraps at the pane.
+        // A pane narrower than `column` still wraps at the pane.
         let o = Options { column: 40, ..opts(true) };
         assert_eq!(split("abcdefgh", 4, &o), vec!["abcd", "efgh"]);
     }
@@ -293,7 +267,7 @@ mod tests {
         let chars: Vec<char> = line.chars().collect();
         for width in 4..40 {
             let segs = segments(&chars, width, &o);
-            // Segments are in order and cover the line, apart from the
+            // Segments are in order and cover the line, apart from
             // whitespace a break consumed.
             let mut at = 0;
             let mut seen = String::new();
@@ -318,8 +292,8 @@ mod tests {
         assert_eq!(segment_of(&segs, 3), 0);
         assert_eq!(segment_of(&segs, 4), 1);
         assert_eq!(segment_of(&segs, 9), 2);
-        // Past the end clamps to the last row, which is where the cursor
-        // sits at end-of-line.
+        // Past the end clamps to the last row, where the cursor sits at end
+        // of line.
         assert_eq!(segment_of(&segs, 99), 2);
     }
 }
