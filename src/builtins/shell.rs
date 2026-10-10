@@ -1,7 +1,5 @@
-// The builtins that are about the shell itself: what it has turned on,
-// what a name means to it, and how a function reads its own arguments.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
+// The builtins about the shell itself: its options, what a name means to
+// it, and how a function reads its arguments.
 
 use crate::exec::{
     BUILTIN_HELP, ExecResult, KNOWN_BUILTINS, KNOWN_SHOPT_OPTIONS, Shell, command_own_redirects, resolve_in_path, sh_eprintln, sh_println,
@@ -10,10 +8,9 @@ use crate::exec::{
 use crate::parser;
 use crate::parser::Redirect;
 
-// getopts optstring name [args...]. Options requiring an argument are
-// marked with a trailing ':' in optstring (e.g. "ab:c"); a leading ':'
-// switches to "silent" error mode (custom handling via OPTARG/'?'/':'
-// instead of a printed message), matching bash.
+// `getopts optstring name [args...]`. A trailing `:` in optstring marks an
+// option with an argument (`ab:c`); a leading `:` selects silent error
+// mode, reported through OPTARG and `?`/`:`, as in bash.
 pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
     let optstring = args.first().cloned().unwrap_or_default();
     let varname = match args.get(1) {
@@ -40,33 +37,28 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
         return ExecResult::Status(1);
     }
 
-    // Every branch below that does not set `OPTARG` leaves it *unset*,
-    // so clear it once here rather than in each of them. An option that
-    // takes no argument is the common case, and leaving the previous
-    // option's argument in place made `-b val -c` report `c` with
-    // `OPTARG` still `val`.
+    // Every branch that doesn't set OPTARG leaves it unset, so it's cleared
+    // once here.
     sh.remove_var("OPTARG");
-    // `-ab` is two options in one word. OPTIND names the word, so how
-    // far into it this scan has got lives on the shell -- 0 meaning
-    // "not started" and therefore the first character after the `-`.
-    // bash keeps the same thing out of sight, and resets it when a
-    // script assigns OPTIND (see Shell::getopts_offset).
+    // `-ab` is two options in one word. OPTIND names the word, so the
+    // position within it lives on the shell, 0 meaning not started. bash
+    // also keeps it hidden, and resets it when a script assigns OPTIND (see
+    // `Shell::getopts_offset`).
     let at = match sh.getopts_offset {
         0 => 1,
         n => n,
     };
     let word: Vec<char> = cur.chars().collect();
     let opt_char = word.get(at).copied().unwrap_or('?');
-    // Whether this word still has letters after the one being read.
-    // While it does, OPTIND stays put and only the offset moves.
+    // Whether the word has letters after this one. While it does, OPTIND
+    // stays and only the offset moves.
     let more_in_word = at + 1 < word.len();
     let silent = optstring.starts_with(':');
     let spec = optstring.trim_start_matches(':');
 
-    // Every exit that is finished with this word advances OPTIND; the
-    // one that is not re-assigns the same value and then records where
-    // it got to. The order matters both ways round: assigning OPTIND is
-    // what clears the offset.
+    // Every exit done with this word advances OPTIND; the one that isn't
+    // reassigns the same value and then records the offset. In that order,
+    // since assigning OPTIND clears the offset.
     let step = |sh: &mut Shell, words: usize| {
         sh.assign_var("OPTIND", (optind + words).to_string());
     };
@@ -80,8 +72,8 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
             sh.assign_var(&varname, "?".to_string());
             sh.assign_var("OPTARG", opt_char.to_string());
         } else {
-            // bash's own wording, which names neither the builtin nor
-            // quotes the letter.
+            // bash's wording, which names neither the builtin nor quotes
+            // the letter.
             sh_eprintln!(sh, "bish: illegal option -- {}", opt_char);
             sh.assign_var(&varname, "?".to_string());
         }
@@ -95,9 +87,8 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
 
     let needs_arg = spec.as_bytes().get(pos + 1) == Some(&b':');
     if needs_arg {
-        // An argument glued to the option takes the rest of the word,
-        // however deep into a cluster it is: `-ab v` gives `b` the
-        // separate `v`, and `-abv` gives it `v` from inside the word.
+        // An argument glued to the option takes the rest of the word, however
+        // deep in a cluster: `-ab v` gives `b` the `v`, and so does `-abv`.
         let rest: String = word[at + 1..].iter().collect();
         if !rest.is_empty() {
             sh.assign_var("OPTARG", rest);
@@ -125,15 +116,11 @@ pub(crate) fn run_getopts(sh: &mut Shell, args: &[String]) -> ExecResult {
     ExecResult::Status(0)
 }
 
-// shopt [-su] [-q] [-p] [NAME ...]. Bare `shopt` lists every known
-// option's on/off state; `shopt -s`/`shopt -u` alone list only the
-// ones currently on/off (respectively); either with NAMEs given
-// toggles just those. `-p` prints in the same `shopt -s/-u NAME` form
-// that can be fed back in, instead of the plain "NAME\ton/off" table.
-// A NAME not in KNOWN_SHOPT_OPTIONS is rejected up front, matching
-// real bash's own "invalid shell option name" error -- see that
-// list's own doc comment for what most of these names actually do (or
-// don't do) in bish.
+// `shopt [-su] [-q] [-p] [NAME ...]`. Bare, it lists every option; `-s`
+// or `-u` alone list those on or off; with NAMEs they set those. `-p`
+// prints `shopt -s/-u NAME` lines that can be fed back in. A NAME not in
+// KNOWN_SHOPT_OPTIONS is "invalid shell option name", as in bash; see that
+// list for what each does in bish.
 pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
     let mut mode: Option<bool> = None; // Some(true)=-s, Some(false)=-u
     let mut quiet = false;
@@ -168,9 +155,8 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
         }
         Some(on) => {
             for n in &names {
-                // A fact about how the shell was started, not a
-                // setting. bash takes the `-s`/`-u` with a status of 0
-                // and changes nothing, and so does this.
+                // A fact about how the shell started, not a setting: bash
+                // accepts `-s` and `-u` with status 0 and changes nothing.
                 if *n == "login_shell" {
                     continue;
                 }
@@ -188,11 +174,9 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
         None => {
             let listing_everything = names.is_empty();
             let targets: Vec<&str> = if listing_everything { KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| *n).collect() } else { names };
-            // With names, the status answers the question as well as
-            // the output does -- 0 only when every one of them is on,
-            // which is what makes `shopt -q NAME` and plain
-            // `shopt NAME` interchangeable in a condition. The bare
-            // listing is not a question, so it is always 0.
+            // With names, the status answers too: 0 only when all are on,
+            // so `shopt -q NAME` and `shopt NAME` work alike in a
+            // condition. The bare listing always returns 0.
             let all_on = targets.iter().all(|n| sh.shopt_is_on(n));
             for n in targets {
                 sh.print_shopt_line(n, reusable);
@@ -202,21 +186,14 @@ pub(crate) fn run_shopt(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
-// `caller [N]` -- where the function you are in was called from.
+// `caller [N]`: where the current function was called from. `caller 0`
+// is the innermost call: its line, the function containing it, and the
+// file. `caller 1` is the call to that function, and so on. Past the top
+// it prints nothing and fails, which ends `while caller $i; do ...`. Bare
+// `caller` is line and file only, bash's short form.
 //
-// `caller 0` is the innermost call: the line it sits on, the
-// function containing that line, and the file. `caller 1` is the
-// call to *that* function, and so on outwards. A depth past the top
-// of the stack prints nothing and fails, which is what makes
-// `while caller $i; do ...` terminate.
-//
-// Bare `caller` is the short form: line and file only, no function
-// name -- bash's own shape, and the reason this is not just `caller
-// 0` with a default.
-//
-// Who made a call is the `called` of the frame below rather than
-// anything stored: at the bottom of the stack nothing called it, and
-// bash names that `main`.
+// Who made a call comes from the frame below; at the bottom, bash names
+// it `main`.
 pub(crate) fn run_caller(sh: &mut Shell, args: &[String]) -> i32 {
     if sh.call_stack.is_empty() {
         return 1;
@@ -237,10 +214,9 @@ pub(crate) fn run_caller(sh: &mut Shell, args: &[String]) -> i32 {
         Some(a) => match a.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                // bash's own shape here: the complaint, then the
-                // usage, then 2 -- a malformed argument is a usage
-                // error, not "no such frame", which is what 1 means
-                // and is what `while caller $i` stops on.
+                // bash's shape: the complaint, the usage, then 2. A
+                // malformed argument is a usage error, not 1, which means
+                // "no such frame".
                 sh_eprintln!(sh, "bish: caller: {a}: invalid number");
                 sh_eprintln!(sh, "caller: usage: caller [expr]");
                 return 2;
@@ -251,33 +227,25 @@ pub(crate) fn run_caller(sh: &mut Shell, args: &[String]) -> i32 {
         return 1;
     };
     let frame = &sh.call_stack[idx];
-    // The enclosing function, and the file its body lives in -- both
-    // come from the frame *below*, because that is whose code made
-    // this call. They are only the same file as `frame.source` until
-    // something is sourced: a function defined in a library and
-    // called from there reports the library, not the script that
-    // sourced it. Same index for both, since they are two halves of
-    // one answer.
+    // The enclosing function and its file both come from the frame below,
+    // whose code made the call. That file differs from `frame.source` once
+    // something is sourced: a function in a library reports the library.
     let (enclosing, source) = match idx.checked_sub(1) {
         Some(below) => {
             let name = sh.call_stack[below].called.clone();
             let file = sh.function_sources.get(&name).cloned().unwrap_or_else(|| frame.source.clone());
             (name, file)
         }
-        // Nothing below: the call was made by the script itself,
-        // which bash names `main`, and the frame already recorded
-        // which file that was.
+        // Nothing below: the script itself made the call, which bash names
+        // `main`.
         None => ("main".to_string(), frame.source.clone()),
     };
     sh_println!(sh, "{} {} {}", frame.call_line, enclosing, source);
     0
 }
 
-// `help [NAME...]` -- an index of the builtins.
-//
-// A name may be a glob, as bash's is, so `help comp*` works. A name
-// that matches nothing is an error naming it, since silence would
-// look like a builtin with nothing to say about it.
+// `help [NAME...]`: an index of the builtins. A name may be a glob, as
+// in bash (`help comp*`); one that matches nothing is an error.
 pub(crate) fn run_help(sh: &mut Shell, args: &[String]) -> i32 {
     let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
     if names.is_empty() {
@@ -304,16 +272,11 @@ pub(crate) fn run_help(sh: &mut Shell, args: &[String]) -> i32 {
     status
 }
 
-// `enable [-n] [-a] [NAME...]` -- which builtins are in service.
-//
-// `-n NAME` takes one out, so `enable -n echo; echo hi` runs
-// /bin/echo. Bare `NAME` puts it back. With no names it lists: the
-// enabled ones by default, all of them with `-a`.
-//
-// bash also has `-f`/`-d` for loading builtins from a shared object.
-// bish has no dynamic loading and no plans for any, so those are
-// refused by name rather than silently ignored -- this shell's own
-// convention for something it does not do.
+// `enable [-n] [-a] [NAME...]`: which builtins are in service. `-n NAME`
+// takes one out (`enable -n echo; echo hi` runs /bin/echo); bare `NAME`
+// puts it back. With no names it lists the enabled ones, or all with
+// `-a`. bash's `-f`/`-d` load builtins from a shared object, which bish
+// doesn't do, so they're refused by name.
 pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
     let (mut disable, mut list_all, mut names) = (false, false, Vec::new());
     for arg in args {
@@ -357,22 +320,15 @@ pub(crate) fn run_enable(sh: &mut Shell, args: &[String]) -> i32 {
     status
 }
 
-// set [-euxo pipefail] [--] [args...]. Combined single-char flags
-// (-eu, -ex, -eux) work, and so does a cluster *ending* in `o`:
-// `set -euo pipefail` is what nearly every strict-mode script actually
-// writes, and it applies e, u, and then `-o pipefail`. (An earlier
-// comment here claimed bash rejects that form. It does not -- checked
-// again: `set -euo pipefail; set -o` shows all three on.)
-// Every short flag real bash's `set` accepts. Most of them do nothing
-// here (see apply_shell_flag for the ones that do) -- but accepting
-// exactly bash's set, no more, is what makes `set -Z` a reported typo
-// instead of a silent no-op.
+// Every short flag bash's `set` accepts. Most do nothing here (see
+// `apply_shell_flag`), but accepting exactly bash's set makes `set -Z` a
+// reported typo.
 const SET_FLAGS: &str = "abefhkmnptuvxBCEHPTro";
 const SET_USAGE: &str = "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]";
 
 // `set -o` (a padded name/on-off table) and `set +o` (the same as
-// `set -o NAME`/`set +o NAME` commands). Only the options this shell
-// actually gates behaviour on are listed -- see SET_O_OPTIONS.
+// `set -o`/`+o NAME` commands). Only options this shell acts on are listed
+// (see SET_O_OPTIONS).
 fn list_shell_options(sh: &mut Shell, as_commands: bool) {
     for name in crate::exec::SET_O_OPTIONS {
         let on = sh.shell_option_enabled(name).unwrap_or(false);
@@ -384,6 +340,9 @@ fn list_shell_options(sh: &mut Shell, as_commands: bool) {
     }
 }
 
+// `set [-euxo pipefail] [--] [args...]`. Flags cluster, including a
+// cluster ending in `o`: `set -euo pipefail` sets e, u, then
+// `-o pipefail`.
 pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
     let mut idx = 0;
     let mut saw_dashdash = false;
@@ -411,7 +370,7 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
                     idx += 2;
                     continue;
                 }
-                // Bare `set -o`: the on/off table.
+                // Bare `set -o`: the table.
                 list_shell_options(sh, false);
                 return 0;
             }
@@ -438,8 +397,8 @@ pub(crate) fn run_set(sh: &mut Shell, args: &[String]) -> i32 {
                     idx += 2;
                     continue;
                 }
-                // Bare `set +o`: the same state, but as commands that
-                // reproduce it -- the form `eval "$(set +o)"` restores.
+                // Bare `set +o`: the state as commands that restore it, for
+                // `eval "$(set +o)"`.
                 list_shell_options(sh, true);
                 return 0;
             }
@@ -465,19 +424,12 @@ pub(crate) fn run_command(sh: &mut Shell, cmd: &parser::Command, background: boo
     if !redirects.is_empty() {
         return sh.run_compound_redirected(cmd, redirects, background);
     }
-    // `&` on a compound is a job, which means a *child*. Only a simple
-    // command and a subshell took any notice of it; every other kind
-    // ran in this shell, synchronously, and registered no job -- so
-    // `{ ...; } &` finished before the next command started, `$!` was
-    // unset and `wait` had nothing to wait for. Worse, it ran in this
-    // shell's own state: `v=0; { v=1; } &` left `v` at 1 where bash
-    // leaves it at 0, and an `exit` inside one took the whole shell
-    // down with it.
-    //
-    // A compound carrying redirects already went this way; this is the
-    // same route for one that carries none. Simple commands are their
-    // own case (see dispatch_builtin_or_external), and a subshell and a
-    // coproc both already background themselves.
+    // `&` on a compound makes a job, so a child: `{ ...; } &` doesn't finish
+    // before the next command, sets `$!`, can be waited for, and doesn't
+    // change this shell (`v=0; { v=1; } &` leaves `v` 0, and an `exit` in it
+    // can't end the shell). Simple commands are handled in
+    // `dispatch_builtin_or_external`, and a subshell and a coproc background
+    // themselves.
     let backgrounds_itself = matches!(cmd, parser::Command::Simple(_) | parser::Command::Subshell(..) | parser::Command::Coproc { .. });
     if background && !backgrounds_itself {
         return sh.run_compound_redirected(cmd, &[], true);
@@ -485,28 +437,18 @@ pub(crate) fn run_command(sh: &mut Shell, cmd: &parser::Command, background: boo
     sh.run_command_body(cmd, background)
 }
 
-// type [-p] [-t] name... A scoped subset of real bash's `type`:
-// reports function/builtin/PATH-resolved-executable, or "not found"
-// (status 1). `-a` is accepted but not distinguished from the
-// default.
-//
-// `-t` prints just the kind -- `function`, `builtin`, `file` -- and
-// nothing at all for a name that is none of them. That last part is
-// the point of it: `[ "$(type -t x)" = function ]` is how a script
-// asks, and a sentence like "x is a shell builtin" fails that test
-// however true it reads.
+// `type [-a] [-p] [-P] [-t] name...`: reports alias, keyword, function,
+// builtin or file, or "not found" (status 1). `-t` prints just the kind,
+// and nothing for an unknown name: `[ "$(type -t x)" = function ]` is how a
+// script asks.
 pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
     let mut path_only = false;
-    // `-P` is not `-p`: it forces the PATH search and ignores every
-    // other way the name resolves, which is how a script gets at
-    // `/usr/bin/echo` when `echo` is a builtin. `-p` prints a path only
-    // where `type` would have said "file" at all. Both were read as
-    // `-p`, so `type -P echo` printed nothing.
+    // `-P` forces the PATH search, ignoring other resolutions, so a script
+    // can reach `/usr/bin/echo` past the builtin. `-p` prints a path only
+    // where `type` would say "file".
     let mut force_path = false;
     let mut kind_only = false;
-    // `-a` reports *every* way the name resolves, not just the first:
-    // `type -a echo` is how you find out there is a /usr/bin/echo
-    // behind the builtin.
+    // `-a` reports every way the name resolves, not just the first.
     let mut all = false;
     let mut names: Vec<&String> = Vec::new();
     for a in args {
@@ -531,13 +473,10 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
             }
             continue;
         }
-        // bash's own order, and `-a` reports every one of them: alias,
-        // keyword, function, builtin, file.
-        // Only when alias expansion is actually in effect: `type` says
-        // what the shell would *do* with the name, and a recorded alias
-        // that will never be expanded is not what it would do. bash
-        // reports it interactively and not under `-c`, and `alias -p`
-        // lists it either way.
+        // bash's order: alias, keyword, function, builtin, file. An alias
+        // counts only when alias expansion is on, since `type` says what
+        // the shell would do; bash reports one interactively but not under
+        // `-c`.
         let alias = sh.shopt_is_on("expand_aliases").then(|| sh.aliases.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())).flatten();
         if let Some(target) = alias {
             if kind_only {
@@ -593,9 +532,8 @@ pub(crate) fn run_type(sh: &mut Shell, args: &[String]) -> i32 {
             }
             None if found => {}
             None => {
-                // `-t` says nothing about a name it does not know:
-                // the empty answer is the answer, and bash keeps the
-                // failing status without the message.
+                // `-t` prints nothing for an unknown name, but keeps the
+                // failing status, as bash does.
                 if !kind_only {
                     sh_eprintln!(sh, "bish: type: {}: not found", name);
                 }
