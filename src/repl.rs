@@ -1345,8 +1345,8 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         }
     }
     if attach_debug {
-        // Only ever one target here (see run_edit_debug), always a text
-        // one -- `bish tool debug` has no `--hex` of its own to parse.
+        // One target here (see `run_edit_debug`), always text: `bish tool
+        // debug` has no `--hex`.
         let edit_frame_id: EditFrameId = 1;
         let path = targets[0].path.as_deref().unwrap_or_default();
         match debugger::DebugSession::attach(std::path::Path::new(path)) {
@@ -1365,19 +1365,14 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
             }
         }
     }
-    // Back-to-front, so the first file named is the one on top -- see
-    // the `e` builtin's own identical push in run().
+    // Back to front, so the first file named is on top, as `e` pushes them.
     for frame in opened.iter().rev() {
         app.windows[app.current_window].stack_mut().push(*frame);
     }
 
-    // Loops rather than driving `edit_frame_id` once: with several files
-    // open, closing the top one has to hand control to the next frame
-    // down, which is exactly what `run()`'s own main loop does for the
-    // builtin. Terminates because run_edit_frame only ever returns once
-    // its own frame is no longer this pane's top one (it pops on `:q`,
-    // and keeps driving through a no-op detach itself -- see its own
-    // `Detached` arm).
+    // Loops: with several files open, closing the top one hands control to
+    // the next frame down, as `run()`'s main loop does for `e`.
+    // `run_edit_frame` returns only once its frame is no longer on top.
     loop {
         match *app.windows[app.current_window].stack().last().unwrap() {
             Frame::Edit(id) => run_edit_frame(app, id, 0),
@@ -1386,34 +1381,26 @@ fn run_edit_impl(targets: &[fileeditor::EditTarget], attach_debug: bool) -> i32 
         }
     }
 
-    // Same restoration run()'s own final-exit path does -- see its own
-    // doc comment on why this is a direct terminal write, not anything
-    // routed through a session's own sink.
+    // The same restoration as `run()`'s exit, written to the terminal
+    // directly.
     print!("\x1b[?1049l");
     let _ = io::stdout().flush();
     0
 }
 
-// Shared by both places command mode can be entered: normal mode's own
-// ':' (run_normal_mode_navigation -- the *only* typed-text path now, see
-// editor::ReadOutcome::NormalMode's doc comment), and (M10c) the detach
-// key firing while a Job frame owns the window instead. Returns the
-// underlying CommandModeOutcome so a caller that cares (only normal
-// mode's ':' handler does) can tell Quit apart from a command that just
-// ran normally -- the job-detach path ignores it, same as it always
-// ignored what command mode did before this returned anything.
+// Command mode, entered from Normal mode's `:` or by the detach key
+// over a job frame. Returns the outcome so Normal mode can tell `Quit`
+// from a command that ran; the job-detach path ignores it.
 fn handle_command_mode(
     app: &mut App,
     session_id: SessionId,
     editing: Option<&mut TextBuffer>,
     seed: Option<String>,
-    // Keys a mapping produced that this colon line has to finish
-    // delivering -- see editor::read_line's own `queued` parameter.
+    // Keys a mapping produced that this line has to finish delivering; see
+    // `editor::read_line`'s `queued`.
     queued: Vec<Key>,
-    // The `/` pattern most recently searched for, which lives on the
-    // caller's own `VimKeys` -- `:s//repl/` and the `r` flag are the
-    // only things in here that want it, and a caller with no search
-    // history of its own passes "".
+    // The last `/` pattern, from the caller's `VimKeys`, for `:s//repl/`
+    // and the `r` flag; "" for a caller with no search.
     last_search: &str,
 ) -> CommandModeOutcome {
     let outcome = run_command_mode(app, session_id, editing, seed, queued, last_search);
@@ -1429,17 +1416,10 @@ fn handle_command_mode(
         | CommandModeOutcome::ConfirmSubstitute(_)
         | CommandModeOutcome::NoHighlight => {
             if app.sinks_are_grid {
-                // No window action, but command mode may still have
-                // written a rejected-attempt message straight to this
-                // session's grid (a command_mode_violation/syntax error
-                // -- see run_command_mode's own doc comment; an ordinary
-                // Ran result's own output never touches the grid, it's
-                // captured -- see OutputSink::Capture) -- without this,
-                // that message would sit written but never actually
-                // drawn. Also restores the plain compositor frame under
-                // a Ran result before the caller (only normal mode's ':'
-                // handler cares) paints its own overlay on top of it --
-                // see PendingView's own doc comment.
+                // Command mode may have written a rejection straight to the
+                // grid (a violation or syntax error); this draws it. It
+                // also restores the frame under a `Ran` result before
+                // Normal mode paints its overlay.
                 compositor_redraw(app);
             }
         }
@@ -3762,19 +3742,13 @@ fn service_background_jobs(app: &mut App) -> bool {
     for i in 0..app.windows.len() {
         let pane_ids: Vec<PaneId> = app.windows[i].panes.iter().map(|p| p.id).collect();
         for pane_id in pane_ids {
-            // No focused-pane exemption: `run_fg_job_frame` *removes* the
-            // job it's driving from `app.job_frames` for the whole time it
-            // holds it (re-inserting on the way out), so the lookup below
-            // already misses for a job someone else is reading -- the
-            // skip that used to be here was belt-and-braces, and it cost
-            // the one case it actually covered. Ctrl+G out of a
-            // running job and normal mode owns that pane while nothing
-            // reads its pty: the job stalled the moment its buffer
-            // filled, and everything it had said appeared in one lump
-            // only once normal mode was left. It keeps running now, into
-            // its own session's grid, with the reader's viewport left
-            // where they put it and the mode line reporting what arrived
-            // (see ScreenBuffer::new_lines).
+            // No exemption for the focused pane: `run_fg_job_frame` takes
+            // the job it drives out of `app.job_frames` meanwhile, so the
+            // lookup below already skips it. A job left by Ctrl+G into
+            // normal mode has no reader otherwise, and would stall once its
+            // pty buffer filled; it keeps running into its grid, with the
+            // mode line counting what arrived (see
+            // `ScreenBuffer::new_lines`).
             let job_frame_id = match app.windows[i].pane(pane_id).stack.last() {
                 Some(Frame::Job(id)) => *id,
                 _ => continue,
@@ -3810,48 +3784,34 @@ fn service_background_jobs(app: &mut App) -> bool {
             }
         }
     }
-    // Any of these is the caller's cue to follow up with its own view
-    // redraw if it has one the grid can't express (see the just_attached
-    // comment above). A resize additionally means the caller's own cached
-    // pane rect is stale, so it has to re-measure before redrawing.
+    // Any of these means the caller should redraw a view the grid can't
+    // hold; after a resize it re-measures its rect first.
     just_attached || bg_output || resized
 }
 
-// Raw stdin read for drive_fg_job. Renamed via link_name so the local
-// name doesn't collide with anything already in scope (drive_fg_job also
-// imports the `Read` trait, a different namespace, but this keeps the
-// pattern consistent with pty.rs's own `c_open` reasoning). Deliberately
-// not going through std::io::Stdin here (its internal buffering could
-// swallow bytes term::stdin_ready's poll() wouldn't know about) -- same
-// reasoning as editor.rs's own read_byte.
-// One leaf pane's rendering info, resolved from a window's layout tree
-// against the real terminal size: which rectangle it occupies, a live
-// (Rc-shared, not a content copy -- see run_fg_job_frame's own comment
-// on why that matters for a job's redraw callback) reference to its
-// owning session's grid, and whether it's the focused pane (only one
-// ever is), which decides where the real cursor ends up.
+// One leaf pane's rendering info: its rectangle, its session's grid
+// (shared, not copied, so a job's redraw callback sees it live; see
+// `run_fg_job_frame`), and whether it's focused, which decides where the
+// cursor goes.
 struct PaneSnapshot {
     rect: Rect,
     screen: Rc<RefCell<vt100::Screen>>,
     focused: bool,
 }
 
-// Everything render_compositor_frame needs for one window: its panes'
-// resolved rectangles/screens plus the divider line segments between
-// them (see compute_regions).
+// What `render_compositor_frame` needs for one window: the panes'
+// rectangles and screens, and the dividers between them (see
+// `compute_regions`).
 struct CompositorLayout {
-    // This window's session's `ui_col_divider` (see theme.rs), resolved
-    // once per frame -- `draw_divider` writes straight into the frame
-    // string and has no Shell to ask.
+    // The window session's `ui_col_divider` (see theme.rs), resolved per
+    // frame, as `draw_divider` has no shell to ask.
     divider_sgr: String,
     panes: Vec<PaneSnapshot>,
     dividers: Vec<Divider>,
 }
 
-// `window =`/`balance`: resets every pane's weight throughout the
-// whole layout tree back to the default 1.0, undoing any accumulated
-// `+`/`-`/`size` adjustments at every level, not just the focused
-// pane's own immediate split.
+// `window =`/`balance`: resets every pane's weight in the whole tree to
+// 1.0, at every level, not only the focused pane's split.
 fn balance_panes(layout: &mut PaneLayout) {
     if let PaneLayout::Split { children, .. } = layout {
         for child in children.iter_mut() {
@@ -4172,8 +4132,8 @@ fn minimize_focused_pane(window: &mut WindowEntry) {
     window.focused_pane = landing;
 }
 
-// The first pane inside a subtree -- where focus lands when it has to
-// leave a pane and the sibling may itself be a split.
+// The first pane in a subtree: where focus lands when leaving a pane
+// whose sibling may be a split.
 fn first_leaf_of(layout: &PaneLayout) -> Option<PaneId> {
     match layout {
         PaneLayout::Leaf(id) => Some(*id),
@@ -4904,17 +4864,10 @@ fn mode_label(vk: &VimKeys) -> &'static str {
     }
 }
 
-// The status bar's left side: the search/command line while one is being
-// typed (`command_line`, e.g. ":q" or "/foo" as typed so far -- this is
-// how `:`/`/`/`?` input actually becomes visible; previously nothing was
-// drawn while typing them at all, easily read as "doesn't work"), else
-// whatever `vk` has to say about the current key sequence -- a pending
-// count/prefix in progress (e.g. "20g" mid-`20gg`), or failing that a
-// brief flash of the motion that was just applied (e.g. "[20k]"), else
-// just the bare mode indicator (`mode_label`, above). A pending search
-// ('/'/'?') is shown alone, without the mode-indicator prefix, matching
-// vim's own command-line convention of replacing the mode indicator
-// outright while typing one.
+// The status bar's left side: the `:`/`/`/`?` line being typed, else a
+// pending count or prefix (`20g` in `20gg`), else a brief flash of the
+// motion just applied (`[20k]`), else the mode label. A search line
+// replaces the mode label, as in vim.
 fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     if let Some(cmd) = command_line {
         return cmd.to_string();
@@ -4923,8 +4876,7 @@ fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     if pending.starts_with('/') || pending.starts_with('?') {
         return pending.to_string();
     }
-    // "recording @a" while `q{reg}` is active, ahead of the mode label --
-    // vim's own recording indicator.
+    // `recording @a` while `q{reg}` is recording, as vim shows it.
     let recording = vk.is_recording().map(|r| format!("recording @{r}  ")).unwrap_or_default();
     let label = mode_label(vk);
     if !pending.is_empty() {
@@ -5248,14 +5200,9 @@ fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crat
     LocationList { title: title.to_string(), items }
 }
 
-// `gO`'s outline, as a location list. Same pane, different producer --
-// which is the whole reason that pane holds `LocationItem`s rather than
-// anything reference-shaped.
-//
-// Indented by nesting depth, so a method reads as belonging to its
-// struct, and labelled with the symbol's own kind: the line number is
-// far less useful here than in a reference list, where the point *is*
-// which line.
+// `gO`'s outline, as a location list: the same pane as references,
+// which is why it holds `LocationItem`s. Indented by nesting depth and
+// labelled with the symbol's kind; the line number matters less here.
 fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp::PositionEncoding) -> LocationList {
     let items = symbols
         .iter()
@@ -5572,11 +5519,8 @@ fn run_normal_mode_navigation(
             sb.set_cursor(last_line, editor::visible_len(&prompt_str) + cursor);
             (NavBuffer::ReadOnly(sb), VimKeys::new())
         }
-        // No repositioning at all: ScreenBuffer::new's own default
-        // cursor is already the live grid's real cursor -- exactly where
-        // the job's own on-screen cursor was left, which is the only
-        // sensible place for navigation to start when there's no
-        // synthetic prompt line to land after.
+        // No repositioning: `ScreenBuffer::new` puts the cursor where the job
+        // left the grid's cursor.
         NavStart::JobDetach => {
             let screen = app.sessions[&session_id].screen.clone();
             let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
@@ -5586,24 +5530,18 @@ fn run_normal_mode_navigation(
         NavStart::Edit(tb, vk0) => (NavBuffer::Editable(*tb), *vk0),
     };
 
-    // `::bish map`, snapshotted the same way and for the same reason as
-    // `color_overrides` above -- the colon line can redefine a mapping
-    // mid-session, so this is refreshed after every command-mode command
-    // rather than captured once.
+    // `::bish map`, refreshed after every command like `color_overrides`,
+    // as the colon line can redefine a mapping.
     vk.set_mappings(app.sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default());
 
     // The `mouse` bishopt: off means reporting is never enabled, so the
     // terminal keeps its own click-and-drag selection.
     let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
     let _guard = term::RawGuard::enable_maybe_mouse(0, mouse)?;
-    // `mouse_hover`: motion reports with no button held, which is the
-    // only way a terminal can say where the pointer is *resting*.
-    //
-    // Not asked for in `RawGuard` with the rest of the mouse, and not
-    // just switched on for the length of this call: this same loop also
-    // drives a plain prompt, where nothing reads these and they are a
-    // report per cell of pure traffic. So it follows the buffer --
-    // see the `set` at the top of the loop below.
+    // `mouse_hover`: motion reports with no button held, the only way to
+    // know where the pointer rests. This loop also drives a plain prompt,
+    // where nothing reads them, so they follow the buffer (see the `set`
+    // at the top of the loop).
     let hover_wanted = mouse && app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse_hover"));
     // Repaints the whole screen first (needed the first time normal mode
     // promotes, as the alternate screen starts blank), then the pane.
@@ -5874,10 +5812,8 @@ fn run_normal_mode_navigation(
                     _ => {}
                 }
             } else if ev.is_left_drag() {
-                // Dragging just moves the cursor -- the Visual selection
-                // armed by the press is anchored where it started, so it
-                // grows and shrinks on its own with no separate
-                // selection bookkeeping here at all.
+                // Dragging moves the cursor; the Visual selection the press
+                // armed is anchored, so it follows with no bookkeeping.
                 let row0 = (ev.row as usize).saturating_sub(1);
                 let col0 = (ev.col as usize).saturating_sub(1);
                 if vk.is_visual() {
@@ -5886,11 +5822,9 @@ fn run_normal_mode_navigation(
                     nav_scroll_to_show_cursor(&mut buf, content_cols);
                 }
             } else if ev.is_release() {
-                // A press with no drag after it: the anchor is still
-                // exactly where the cursor is, so there's nothing
-                // selected and the armed Visual mode should just go
-                // away. A real drag leaves its selection standing, ready
-                // for `y`/`d`/`c` like any other.
+                // A press with no drag: nothing is selected, so the armed
+                // Visual mode goes. A real drag leaves its selection for
+                // `y`, `d` or `c`.
                 if !ranged_selection
                     && let Some((_, anchor)) = vk.visual_anchor()
                     && anchor == buf.cursor()
@@ -5898,9 +5832,9 @@ fn run_normal_mode_navigation(
                     vk.end_visual(buf.cursor());
                 }
             } else if ev.is_scroll_down() || ev.is_scroll_up() {
-                // A cursor motion, with the view following -- see
-                // fileeditor::MOUSE_WHEEL_LINES for the measurement that
-                // says why this is not a viewport scroll.
+                // A cursor motion with the view following; see
+                // `fileeditor::MOUSE_WHEEL_LINES` for why not a viewport
+                // scroll.
                 let motion = if ev.is_scroll_down() { motion::Motion::Down } else { motion::Motion::Up };
                 editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
                 let content_cols = nav_content_cols(&buf, rect);
@@ -5908,31 +5842,24 @@ fn run_normal_mode_navigation(
             } else if ev.is_scroll_left() || ev.is_scroll_right() {
                 let columns = fileeditor::MOUSE_WHEEL_COLUMNS as isize;
                 let content_cols = nav_content_cols(&buf, rect);
-                // Deliberately *not* followed by scroll_to_show_cursor,
-                // which pulls the view back to the cursor -- the exact
-                // opposite of what a scroll is asking for. The cursor
-                // comes along instead; see fileeditor::scroll_horizontally.
+                // Not followed by `scroll_to_show_cursor`, which would pull
+                // the view back; the cursor comes along instead (see
+                // `fileeditor::scroll_horizontally`).
                 nav_scroll_horizontally(&mut buf, if ev.is_scroll_right() { columns } else { -columns }, content_cols);
             }
             render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             continue 'nav;
         }
 
-        // Every mouse event has been dealt with above, so this is a
-        // keystroke -- and typing puts a hover popup away. Redrawn
-        // here rather than left to the arms below, since not all of
-        // them repaint and a popup nobody removes stays on screen over
-        // whatever comes next.
+        // Every mouse event was handled above, so this is a key, and typing
+        // hides a hover popup. Redrawn here, as not every arm below repaints.
         if std::mem::take(&mut hover_shown) {
             hover_at = None;
             render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
         }
 
-        // `n`/`N` step through the definitions `gd` just found, and
-        // any other key ends that. Scoped rather than bound outright
-        // because both keys already mean something (repeat-search
-        // forward and backward), and a `gd` that permanently took them
-        // over would be a worse trade than the cycling is worth.
+        // `n`/`N` step through what `gd` found, and any other key ends that.
+        // Scoped, because both keys already repeat the search.
         if definitions.is_some() {
             let cycling = vk.is_idle() && matches!(key, Key::Char('n') | Key::Char('N'));
             if !cycling {
@@ -7550,8 +7477,8 @@ fn sync_debug_adapter(app: &mut App, edit_frame_id: EditFrameId, buf: &mut TextB
     if !app.dap_frames.contains_key(&edit_frame_id) {
         return false;
     }
-    // The pane the program's own output belongs in, resolved before the
-    // frame is borrowed -- both live on `app`.
+    // The pane for the program's output, resolved before `app` is borrowed
+    // for the frame.
     let screen = debug_run_sibling(&app.windows[app.current_window], edit_frame_id)
         .map(|pane_id| app.windows[app.current_window].pane(pane_id).owning_session())
         .and_then(|sid| app.sessions.get(&sid))
@@ -7560,10 +7487,8 @@ fn sync_debug_adapter(app: &mut App, edit_frame_id: EditFrameId, buf: &mut TextB
     advance_debug_adapter(frame, buf, screen.as_ref())
 }
 
-/// The half of `sync_debug_adapter` that is only about the session --
-/// separated from the pane arithmetic so it can be driven by a test
-/// against a real adapter, which is the only way any of this was ever
-/// going to be right.
+/// The session half of `sync_debug_adapter`, apart from the pane
+/// arithmetic so a test can drive it against a real adapter.
 fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Option<&Rc<RefCell<vt100::Screen>>>) -> bool {
     let events = frame.session.service();
     let mut changed = false;
@@ -7909,8 +7834,7 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
 //
 // Returns true when the hints changed, the cue to redraw.
 fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
-    // Off is off: no request, and nothing left drawn from when it was
-    // on.
+    // Off is off: no request, and nothing left drawn.
     if !buf.inlayhints {
         if buf.inlay_hints.is_empty() {
             return false;
@@ -7946,8 +7870,8 @@ fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id:
             .into_iter()
             .filter(|hint| hint.line < buf.line_count())
             .map(|hint| {
-                // The server's own column, in whatever encoding was
-                // negotiated, converted to one of this buffer's chars.
+                // The server's column, in the negotiated encoding, as a
+                // char index.
                 let chars = buf.line_chars(hint.line);
                 (hint.line, crate::lsp::from_server_column(&chars, hint.character, encoding), hint.label)
             })
@@ -7991,17 +7915,11 @@ fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id:
     false
 }
 
-// A server's tokens as drawable spans, in this buffer's own char
-// offsets, keeping only the ones that resolve to a colour.
-//
-// The colour comes from `::bish hl` by the server's own name for the
-// token type -- `::bish hl --set parameter '#d19a66'` -- which is what
-// that command's open namespace was for. Failing that, from the
-// `HighlightKind` the name means the same thing as, if there is one
-// (`highlight::kind_for_semantic_type`). A type with neither is dropped
-// here rather than drawn in some default colour: the local highlighter
-// already had an opinion about that text, and overwriting it with
-// "no opinion" would be a downgrade.
+// A server's tokens as spans in this buffer's char offsets, keeping
+// those that resolve to a colour: from `::bish hl` by the server's
+// token type name (`::bish hl --set parameter '#d19a66'`), else from
+// the matching `HighlightKind` (`highlight::kind_for_semantic_type`).
+// Others are dropped, leaving the local highlighter's colour.
 fn semantic_spans(
     shell: &exec::Shell,
     buf: &TextBuffer,
@@ -8010,9 +7928,8 @@ fn semantic_spans(
 ) -> Vec<highlight::StyledSpan> {
     let starts = fileeditor::line_starts_of(buf);
     let mut out = Vec::with_capacity(tokens.len());
-    // One lookup per distinct type name, not per token: a large file is
-    // tens of thousands of tokens over a couple of dozen names, and
-    // every miss walks the theme table.
+    // One lookup per type name, not per token: a large file has tens of
+    // thousands of tokens over a few dozen names.
     let mut resolved: HashMap<&str, Option<(vt100::Color, vt100::CellAttrs)>> = HashMap::new();
     for token in tokens {
         let style = *resolved.entry(token.kind.as_str()).or_insert_with(|| {
@@ -8032,14 +7949,9 @@ fn semantic_spans(
     out
 }
 
-// Insert mode's own view of everything repl.rs owns -- see
-// `fileeditor::InsertServices` for why this is one object rather than
-// two closures.
-// What the file editor's Insert mode is allowed to reach back into the
-// shell for: an idle tick, a completion list, a signature popup. Six of
-// its eight fields used to be the same six values every other function
-// here threaded, bundled by hand for exactly this one trait; `App`
-// bundles them for everyone.
+// What the editor's Insert mode can reach back into the shell for: an
+// idle tick, completions, a signature popup. See
+// `fileeditor::InsertServices`.
 struct EditorServices<'a> {
     app: &'a mut App,
     session_id: SessionId,
@@ -8059,34 +7971,25 @@ impl fileeditor::InsertServices for EditorServices<'_> {
     }
 }
 
-// The signature of the call being typed, if the server has one and this
-// is a moment worth asking about.
+// The signature of the call being typed, if the server has one and
+// it's worth asking: the character just typed is a trigger the server
+// named (`(`, `,`), or a signature is already up, so it keeps up with
+// the active parameter and closes when the call ends. Otherwise one
+// string search and no request.
 //
-// Two things decide "worth asking": the character just typed is one the
-// server named as a trigger (`(` and `,` for most languages), or a
-// signature is already showing -- in which case every keystroke
-// refreshes it, so the active overload keeps up with what has been
-// typed and the popup closes on its own once the call is finished.
-// Anything else costs one string search and no request.
-//
-// Same bounded, servicing wait `K` uses: something *is* blocked on this
-// answer, because the popup is drawn in the same frame as the character
-// that opened it.
+// Uses `K`'s bounded wait: the popup is drawn in the same frame as the
+// character that opened it.
 fn signature_from_server(app: &mut App, session_id: SessionId, buf: &TextBuffer, row: usize, col: usize, typed: Option<char>) -> Option<Vec<String>> {
     let triggers = signature_triggers(&app.sessions, session_id, buf)?;
-    // `None` means something other than typing moved the cursor, and a
-    // refresh is only wanted for a popup already up.
+    // `None`: something other than typing moved the cursor; only refresh a
+    // popup already up.
     if let Some(ch) = typed
         && !triggers.contains(ch)
     {
         return None;
     }
-    // The one place the debounce is wrong. `sync_language_server_
-    // document` deliberately waits for typing to settle, but the
-    // character that opens this popup is by definition the one just
-    // typed -- asking about a document the server was last told about
-    // 150ms ago means asking about a file with no call in it, and
-    // getting the correct answer: nothing.
+    // Skip the debounce: the character that opens the popup was just
+    // typed, and a server told about the document 150ms ago sees no call.
     flush_language_server_document(&mut app.sessions, session_id, buf);
     let result = ask_server_at_cursor(
         app,
@@ -8100,15 +8003,10 @@ fn signature_from_server(app: &mut App, session_id: SessionId, buf: &TextBuffer,
     (!lines.is_empty()).then_some(lines)
 }
 
-// The characters this buffer's server said should open a signature
-// popup, plus the ones that should keep it up to date, as one string to
-// search. `None` when there is no server or it does not do signatures
-// at all -- which is also the "don't ask" answer.
-//
-// A server that declares the capability without naming any trigger
-// characters gets the conventional pair, rather than never being asked:
-// the capability is the claim that matters, and `(`/`,` is what every
-// server that bothers to name them names.
+// The characters that open or refresh a signature popup for this
+// buffer's server, as one string to search. `None` without a server or
+// signature support, meaning don't ask. A server declaring support
+// without naming triggers gets `(` and `,`.
 fn signature_triggers(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<String> {
     let session = sessions.get(&session_id)?;
     let target = server_target(session, buf)?;
@@ -8131,22 +8029,14 @@ fn signature_triggers(sessions: &HashMap<SessionId, SessionState>, session_id: S
 }
 
 // `ga`: what the server offers to do here, picked from a popup and
-// applied.
+// applied. The popup is the completion widget over plain rows.
 //
-// The popup is the completion widget over plain rows -- a labelled list
-// anchored at the cursor is the same thing whether the labels are
-// identifiers or refactors, and building a second one would have been
-// building the same thing twice.
-//
-// Returns a message to show, or `None` when the picker was cancelled
-// and there is nothing to say.
+// Returns a message to show, or `None` if the pick was cancelled.
 fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, rect: Rect) -> Option<String> {
     let encoding = server_encoding_for(&app.sessions, session_id, buf)?;
     let (row, col) = buf.cursor();
-    // The diagnostics on this line are the `context` that makes a
-    // server offer quick *fixes* rather than only refactors -- without
-    // them rust-analyzer has nothing to fix, since it is being asked
-    // "what can you do here" with no mention of what is wrong.
+    // The diagnostics on this line are the `context` that lets a server
+    // offer quick fixes, not only refactors.
     let starts = fileeditor::line_starts_of(buf);
     let line_start = starts[row.min(starts.len().saturating_sub(1))];
     let line_end = line_start + buf.line_len(row);
@@ -8185,7 +8075,7 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
         "textDocument/codeAction",
         "codeActionProvider",
         vec![
-            // An empty range at the cursor: "what applies here".
+            // An empty range at the cursor: what applies here.
             ("range".to_string(), crate::json::Value::Object(vec![("start".to_string(), position.clone()), ("end".to_string(), position)])),
             ("context".to_string(), crate::json::Value::Object(vec![("diagnostics".to_string(), crate::json::Value::Array(here))])),
         ],
@@ -8212,12 +8102,9 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
         return Some(format!("that action does not apply here: {why}"));
     }
 
-    // A server may send an action without its edit and compute one only
-    // for the action actually chosen. rust-analyzer does exactly this,
-    // so an action with no edit is not an action with nothing to do.
-    //
-    // Only asked for when there is nothing to go on yet: an action that
-    // already carries an edit, or names a command to run, is complete.
+    // A server may leave out an action's edit and compute it only for the
+    // chosen one (`codeAction/resolve`). Asked only when the action carries
+    // neither an edit nor a command.
     let action = if action.edit.is_none() && action.invocation.is_none() {
         let resolved = ask_server(
             app,
@@ -8238,10 +8125,8 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
         action.clone()
     };
 
-    // Both halves, in the order the spec gives them: the edit first,
-    // then the command. An action is allowed to have either, or both --
-    // "apply this rewrite, then re-run the thing it was in the middle
-    // of" is one action, not two.
+    // The edit first, then the command, as the spec orders them; an action
+    // can have either or both.
     let mut written = 0;
     let mut unsaved = 0;
     let mut did_something = false;
@@ -8269,8 +8154,7 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
                 unsaved += u;
                 did_something = true;
             }
-            // Reported with the action's own title, since "that command
-            // timed out" on its own does not say which one.
+            // With the action's title, so a timeout says which.
             Err(why) => return Some(format!("\"{}\": {why}", action.title)),
         }
     }
@@ -8279,8 +8163,7 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
     }
     let total = written + unsaved;
     if total == 0 {
-        // A command that ran and asked for nothing. Not an error --
-        // plenty of server commands only move the server's own state.
+        // A command that asked for nothing; many only change server state.
         return Some(format!("{} -- nothing to change here", action.title));
     }
     let mut message = format!("{} -- {total} file{}", action.title, if total == 1 { "" } else { "s" });
@@ -8290,12 +8173,9 @@ fn code_actions_at_cursor(app: &mut App, session_id: SessionId, buf: &mut TextBu
     Some(message)
 }
 
-// Draws a labelled list at the cursor and lets one be chosen. `None` if
-// cancelled.
-//
-// Its own small key loop rather than a pane: this is a menu that
-// answers a question and goes away, not a view to navigate between --
-// which is exactly the distinction between this and the location list.
+// Draws a labelled list at the cursor and lets one be chosen; `None` if
+// cancelled. Its own key loop rather than a pane: a menu answers and
+// goes away, unlike the location list.
 fn pick_from_popup(rows: &[(String, String)], buf: &TextBuffer, rect: Rect, term_rows: usize, term_cols: usize) -> Option<usize> {
     let (row, col) = buf.cursor();
     let chars = buf.line_chars(row);
@@ -8321,11 +8201,8 @@ fn pick_from_popup(rows: &[(String, String)], buf: &TextBuffer, rect: Rect, term
     }
 }
 
-// `:rename NEW` through the language server.
-//
-// Every refusal happens before anything is written; `apply_workspace_
-// edit` below is what actually carries the change out, and its own doc
-// comment explains where the edits land.
+// `:rename NEW` through the language server. Every refusal happens
+// before anything is written; `apply_workspace_edit` carries it out.
 fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, new_name: &str) -> Result<String, String> {
     let encoding = server_encoding_for(&app.sessions, session_id, buf).ok_or("no language server for this file")?;
     let (row, col) = buf.cursor();
@@ -8344,8 +8221,8 @@ fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer,
     .ok_or("the language server did not answer")?;
     let edit = crate::lsp::workspace_edit(&result);
     if !edit.unsupported.is_empty() {
-        // Not something to do partially: see this function's own doc
-        // comment, and `lsp::WorkspaceEdit::unsupported`.
+        // Refused whole rather than done in part; see
+        // `lsp::WorkspaceEdit::unsupported`.
         return Err(format!("this rename also needs to {} files, which bish cannot do yet -- nothing changed", edit.unsupported.join("/")));
     }
     if edit.changes.is_empty() && edit.operations.is_empty() {
@@ -8363,29 +8240,23 @@ fn rename_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer,
 }
 
 // Carries out a `WorkspaceEdit`, returning how many files were written
-// and how many open buffers were left modified-but-unsaved.
+// and how many open buffers were left modified.
 //
-// **All or nothing.** A change that lands in some files and not others
-// leaves the project broken, which is worse than not changing anything
-// -- so files that are not open are read and edited *in memory* first,
-// and written only once every one of them has succeeded. A file that
-// cannot be opened stops the whole thing with nothing changed.
+// All or nothing: a change in some files and not others leaves the
+// project broken. Files that aren't open are edited in memory first
+// and written only once all have succeeded; one that can't be opened
+// stops everything with nothing changed.
 //
-// Where the changes land follows what every mainstream editor does:
-// buffers that are **open** get the edits in memory and stay dirty, so
-// the user keeps control of their own unsaved work; files that are
-// **not** open are written, because there is nowhere else for them to
-// go.
+// Open buffers get the edits in memory and stay dirty, leaving the user
+// in control of unsaved work; files not open are written.
 //
-// Files an edit creates, renames or deletes are dealt with first, and
-// only once `fileops::plan` has found nothing to refuse. A text change
-// before a rename follows its file to where the rename puts it, and an
-// open buffer whose file moves moves with it -- `renamed` is told, so the
-// language server can be too. Anything that fails before a file holds
-// new text takes the file operations back.
+// Created, renamed and deleted files are handled first, once
+// `fileops::plan` has found nothing to refuse. A text change before a
+// rename follows its file, and an open buffer whose file moves moves
+// with it (`renamed` is told, for the language server). A failure
+// before any file holds new text undoes the file operations.
 //
-// Shared by `:rename` and by code actions, which are the same operation
-// wearing different names.
+// Shared by `:rename` and code actions.
 fn apply_workspace_edit(
     edit_frames: &mut HashMap<EditFrameId, fileeditor::EditSession>,
     buf: &mut TextBuffer,
@@ -8420,19 +8291,16 @@ fn apply_workspace_edit(
         .filter_map(|b| b.path().map(Path::to_path_buf))
         .collect();
     let plan = crate::fileops::plan(&operations, &unsaved).map_err(|why| format!("{why} -- nothing changed"))?;
-    // Every buffer is matched by where its file will be once the plan
-    // has run, and every text change by where the file it names will be.
-    //
-    // A file can be named by more than one entry -- `documentChanges`
-    // allows it -- and each entry applies to the text the one before it
-    // left, so every entry is kept, in order, rather than the last.
+    // Buffers and text changes are matched by where their files will be
+    // after the plan. A file can appear in several `documentChanges`
+    // entries, each applying to the text the previous left, so all are
+    // kept, in order.
     let here = buf.path().map(|p| plan.follow(p));
     let mut in_this_buffer: Vec<Vec<crate::lsp::TextEdit>> = Vec::new();
     let mut in_open_buffers: Vec<(EditFrameId, Vec<crate::lsp::TextEdit>)> = Vec::new();
     let mut to_load: Vec<(std::path::PathBuf, Vec<Vec<crate::lsp::TextEdit>>)> = Vec::new();
     for (position, (uri, edits)) in edit.changes.iter().enumerate() {
-        // A file a later step deletes: whatever this change did to it
-        // would be deleted with it.
+        // A file a later step deletes: the change would be deleted with it.
         let Some(path) = plan.destination(position, &path_of(uri)?) else { continue };
         if here.as_deref() == Some(path.as_path()) {
             in_this_buffer.push(edits.clone());
@@ -8448,9 +8316,8 @@ fn apply_workspace_edit(
         }
     }
 
-    // Phase two: the files themselves -- created, renamed and deleted,
-    // then read and edited in memory. A failure in any of that takes
-    // back every file operation, and nothing has changed.
+    // Phase two: create, rename and delete files, then edit in memory. Any
+    // failure undoes the file operations, and nothing has changed.
     let mut done = crate::fileops::commit(&plan).map_err(|why| format!("{why} -- nothing changed"))?;
     let mut on_disk: Vec<(std::path::PathBuf, TextBuffer)> = Vec::new();
     for (path, entries) in to_load {
@@ -8475,8 +8342,8 @@ fn apply_workspace_edit(
                 done.undo();
                 return Err(format!("{}: {e} -- nothing changed", path.display()));
             }
-            // Files already hold their new text, under the names the
-            // operations gave them, so the operations stay.
+            // Files hold their new text under their new names, so the
+            // operations stay.
             done.finish();
             return Err(format!("{}: {e} -- some files were already written", path.display()));
         }
@@ -8505,36 +8372,29 @@ fn apply_workspace_edit(
     for edits in &in_this_buffer {
         fileeditor::apply_text_edits(buf, edits, encoding);
     }
-    // Buffers, not entries: one buffer given two entries is one buffer
-    // left to save.
+    // Buffers, not entries: one buffer given two entries is one to save.
     let open_buffers = in_open_buffers.iter().map(|(id, _)| id).collect::<std::collections::HashSet<_>>().len();
     Ok((written, open_buffers + usize::from(!in_this_buffer.is_empty())))
 }
 
-// An open buffer whose file an edit has just renamed. The language server
-// hears the document close under its old name and open under its new
-// one, which is what it would have heard had the file been closed and
-// opened again.
+// An open buffer whose file an edit renamed. The language server hears
+// it close under the old name and open under the new.
 fn follow_rename(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer, to: &Path) {
     close_language_server_document(sessions, session_id, buf);
     buf.set_path(to);
     open_language_server_document(sessions, session_id, buf);
 }
 
-// `:fmt` through the language server. `None` when there is nothing to
-// ask -- no server, no `documentFormattingProvider`, no answer -- which
-// is the caller's cue to fall back to bish's own formatter, so a bash
-// file with no server behaves exactly as it always has.
+// `:fmt` through the language server. `None` when there's nothing to
+// ask (no server, no `documentFormattingProvider`, no answer), so the
+// caller falls back to bish's formatter.
 //
-// `Some(n)` is how many edits actually changed something, so a server
-// that reports "already formatted" (an empty list, or edits that are
-// all no-ops) is distinguishable from one that reformatted.
+// `Some(n)` counts the edits that changed something, telling "already
+// formatted" from reformatted.
 fn format_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<usize> {
     let encoding = server_encoding_for(&app.sessions, session_id, buf)?;
-    // The buffer's own indent settings, which is what the file already
-    // agrees with -- editorconfig and `bishopt` both feed these, so a
-    // server is told the same thing `>>` and Tab already obey rather
-    // than whatever its own default happens to be.
+    // The buffer's indent settings (from editorconfig and `bishopt`), so
+    // the server formats as `>>` and Tab indent.
     let options = crate::json::Value::Object(vec![
         ("tabSize".to_string(), crate::json::Value::Number(buf.shiftwidth as f64)),
         ("insertSpaces".to_string(), crate::json::Value::Bool(buf.expandtab)),
@@ -8545,14 +8405,13 @@ fn format_via_server(app: &mut App, session_id: SessionId, buf: &mut TextBuffer)
     Some(fileeditor::apply_text_edits(buf, &crate::lsp::text_edits(&result), encoding))
 }
 
-// What could go where the cursor is, for the editor's completion
-// popup. Empty for every ordinary reason there is nothing to offer --
-// no server, not ready, no `completionProvider`, no answer in time --
-// which is what makes Ctrl-N a no-op rather than an error.
+// What could go at the cursor, for the completion popup. Empty for any
+// ordinary reason (no server, not ready, no `completionProvider`, no
+// answer in time), so Ctrl-N is a no-op, not an error.
 //
-// The server's own replace ranges are resolved to buffer coordinates
-// here, where the position encoding is known, so the editor never sees
-// anything protocol-shaped (see `EditorCompletion`).
+// Replace ranges are resolved to buffer coordinates here, where the
+// encoding is known, so the editor sees nothing protocol-shaped (see
+// `EditorCompletion`).
 fn completions_from_server(
     app: &mut App,
     session_id: SessionId,
@@ -8572,17 +8431,15 @@ fn completions_from_server(
         return Vec::new();
     };
     let mut found = crate::lsp::completions(&result);
-    // `sortText` is how a server puts the likely answers first, and
-    // ignoring it is how a completion list ends up alphabetical and
-    // useless.
+    // `sortText` puts the likely answers first.
     crate::sort::sort_by(&mut found, |a, b| a.sort.cmp(&b.sort));
     let starts = fileeditor::line_starts_of(buf);
     found
         .into_iter()
         .map(|item| {
-            // Only a range on the cursor's own line can be expressed as
-            // a single-line replacement, which is all the editor does
-            // here; anything else falls back to the word being typed.
+            // Only a range on the cursor's line can be a single-line
+            // replacement, which is all the editor does; otherwise the word
+            // being typed is replaced.
             let replace = item.edit.and_then(|(start, end)| {
                 (start.0 == end.0 && start.0 == row).then(|| {
                     let to_col = |position: (usize, usize)| {
@@ -8598,53 +8455,21 @@ fn completions_from_server(
         .collect()
 }
 
-// Asks the language server one position-shaped question about whatever
-// is under the cursor -- `textDocument/hover` for `K`,
-// `textDocument/definition` for `gd` -- and returns its raw result.
-// `None`, meaning "fall back to whatever bish knows itself", for every
-// ordinary reason there might not be an answer: no server, not ready
-// yet, doesn't advertise `capability`, answered with an error, or
-// didn't answer in time.
-//
-// **This one blocks**, unlike everything else in this file's LSP path,
-// and that is the deliberate trade. Hover is a question the user just
-// asked and is waiting for; making the whole editor loop asynchronous
-// to serve it would be a rewrite of every mode. So it waits in place --
-// the same call `debugger.rs`'s pause loop already makes for the same
-// reason -- but it waits *servicing*: `service_background_jobs` runs on
-// every tick of the wait, so other panes' jobs keep draining, a resize
-// still lands, and the server's own stream keeps being read (which is
-// what delivers the reply at all).
-//
-// A keystroke abandons the wait. Someone who has started typing again
-// is no longer waiting for this answer, and holding their input for the
-// rest of a timeout to show them a popup they've moved past is the
-// wrong side of the trade.
 // What a cursor-position request is, apart from where the cursor is.
-// Three fields that always travel together and mean nothing apart --
-// which is also what got `ask_server_at_cursor` over clippy's argument
-// limit once `App` had taken the other five.
 struct CursorRequest<'a> {
     method: &'a str,
     capability: &'a str,
-    // Anything the method needs beyond `textDocument`/`position`.
-    // `textDocument/references` is the reason this exists: its
-    // `context` is *required*, not optional, so omitting it is a
-    // malformed request rather than a sparse one.
+    // Params beyond `textDocument`/`position`. `textDocument/references`
+    // requires its `context`; leaving it out is a malformed request.
     extra: &'a [(&'a str, crate::json::Value)],
 }
 
-/// The hover popup to print, if the pointer has been resting long
-/// enough on something worth describing.
+/// The hover popup to print, if the pointer has rested long enough on
+/// something worth describing. Runs on every idle poll, so the cheap
+/// checks (the option, the dwell, a popup already up) come first.
 ///
-/// `None` almost every time it is called -- this runs on every idle
-/// poll -- so everything that would cost anything is behind the cheap
-/// checks: the option, the dwell, and whether a popup is already up.
-///
-/// Takes `hover_shown` by reference and sets it, so the caller cannot
-/// print a popup without recording that one is on screen; the two going
-/// out of step is how a popup gets left behind with nothing to remove
-/// it.
+/// Sets `hover_shown` itself, so a popup can't be printed without being
+/// recorded; out of step, a popup is left behind.
 #[allow(clippy::too_many_arguments)]
 fn hover_popup_due(
     app: &mut App,
@@ -8662,21 +8487,17 @@ fn hover_popup_due(
     if since.elapsed() < HOVER_DWELL {
         return None;
     }
-    // Only where `K` itself means something: a real file buffer. A
-    // pane's scrollback has no symbols to look up.
+    // Only in a file, where `K` means something.
     let NavBuffer::Editable(tb) = buf else { return None };
-    // `is_none_or`, matching the guard that asked the terminal for
-    // these reports in the first place: no session is the `bish tool
-    // edit` case, and the two disagreeing meant the mode was enabled
-    // and then nothing ever read it.
+    // `is_none_or`, as in the guard that enabled these reports: no session
+    // is `bish tool edit`, and disagreeing would enable the mode and then
+    // never read it.
     if !app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse_hover")) {
         return None;
     }
     let (row0, col0) = ((row1 as usize).saturating_sub(1), (col1 as usize).saturating_sub(1));
-    // The gutter first: it is not text, and asking `position_at_screen`
-    // about it gets the line's first character, which is how hovering a
-    // line number used to describe whatever word happened to start that
-    // line.
+    // The gutter first: `position_at_screen` would describe the line's
+    // first word.
     if let Some((line, column)) = fileeditor::gutter_at_screen(tb, rect, row0, col0) {
         *hover_at = None;
         let lines = gutter_hover_lines(tb, line, column);
@@ -8691,48 +8512,35 @@ fn hover_popup_due(
         return None;
     };
     let lines = hover_lines_at(app, session_id, edit_frame_id, tb, line, col);
-    // A man page still being fetched in the background. Left pending on
-    // purpose -- `hover_at` is not cleared, so the next idle poll asks
-    // again and the popup appears when the page lands. `K`'s own answer
-    // for this is "press K again in a moment", which is advice about a
-    // key nobody pressed.
+    // A man page still being fetched. `hover_at` stays set so the next poll
+    // asks again and the popup appears when it lands; `K`'s "press K again"
+    // would be advice about a key nobody pressed.
     if docs::is_still_looking(&lines) {
         return None;
     }
-    // Asked and answered, whatever the answer was: without clearing
-    // this, a cell with nothing to say is looked up again on every idle
-    // poll for as long as the pointer rests on it.
+    // Answered, whatever the answer: otherwise a cell with nothing to say is
+    // looked up on every poll.
     *hover_at = None;
-    // Nothing worth interrupting for. `K` says "no info available"
-    // because it was asked; a popup that appears on its own has no
-    // business appearing to say that.
+    // Nothing worth interrupting for: `K` says "no info" because it was
+    // asked, a popup nobody asked for doesn't.
     if docs::says_nothing(&lines) {
         return None;
     }
     *hover_shown = true;
-    // Anchored to the cell the pointer is on, not to the text cursor --
-    // the popup belongs to what is being pointed at.
+    // Anchored at the pointer, not the text cursor.
     Some(fileeditor::render_hover_popup(&lines, row0, col0, rect))
 }
 
-/// What resting the pointer on a gutter column says.
-///
-/// The other half of the division in `gutter_click`: these three
-/// columns draw a mark meaning "something is true of this line", and
-/// this is where the mark says what. The marker itself has room for one
-/// coloured bullet; the answer does not fit in it.
-///
-/// Empty for a column with nothing to add, and for a cell with no mark
-/// in it -- hovering the blank part of a gutter should be as quiet as
-/// hovering blank text.
+/// What resting the pointer on a gutter column says: the other half of
+/// `gutter_click`. These columns draw a one-character mark; this says
+/// what it means. Empty for a column with nothing to add, or a cell with
+/// no mark.
 fn gutter_hover_lines(tb: &TextBuffer, line: usize, column: fileeditor::GutterKind) -> Vec<String> {
     match column {
         fileeditor::GutterKind::Diagnostic => {
             fileeditor::diagnostics_on_line(tb, line).into_iter().map(|d| format!("{}: {}", d.label(), d.message)).collect()
         }
-        // `git blame`'s three fields, which is the whole of what the
-        // column is drawn from -- it shows them abbreviated to fit, and
-        // this is the unabbreviated form.
+        // `git blame`'s three fields, unabbreviated.
         fileeditor::GutterKind::Blame => tb
             .blame
             .as_ref()
@@ -8752,50 +8560,35 @@ fn gutter_hover_lines(tb: &TextBuffer, line: usize, column: fileeditor::GutterKi
                 }]
             })
             .unwrap_or_default(),
-        // A breakpoint's marker already says everything a breakpoint
-        // has to say, and a line number says its own number.
+        // A breakpoint's marker says it all, and a line number says its
+        // number.
         fileeditor::GutterKind::Breakpoint | fileeditor::GutterKind::LineNumber => Vec::new(),
     }
 }
 
-/// What a click on a gutter column *means*, decided without doing it.
-///
-/// Separated from `gutter_click` so the policy -- which column does
-/// what -- can be stated and tested on its own. That matters most for
-/// the columns that deliberately do nothing: "nothing" is a decision
-/// here rather than the absence of code somewhere, and a test can hold
-/// it to that.
+/// What a click on a gutter column means, decided without doing it, so
+/// the policy can be tested, including the columns that deliberately do
+/// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GutterAction {
-    /// 1-based, the way breakpoints are numbered everywhere else.
+    /// 1-based, as breakpoints are numbered.
     ToggleBreakpoint(usize),
-    /// 0-based, the way the buffer numbers its lines.
+    /// 0-based, as the buffer numbers lines.
     GoToLine(usize),
-    /// Deliberately nothing -- see `gutter_action`.
+    /// Deliberately nothing; see `gutter_action`.
     Nothing,
 }
 
-/// The division is that **clicking acts and hovering informs**: a
-/// column whose click would only be "tell me about this line" does not
-/// need one, because resting the pointer there already says it.
+/// Clicking acts, hovering informs: a column whose click would only say
+/// something about the line doesn't need one.
 ///
-/// Two columns act, one goes where it points, and two do nothing on
-/// purpose:
-///
-///   - **Breakpoint** -- the marker is the control, so clicking it is
-///     how you set one and how you take it away again.
-///   - **Line number** -- goes to the line, which is what clicking one
-///     means everywhere it means anything.
-///   - **Diagnostic**, **blame** and **diff** -- nothing at all, and
-///     that is the decision rather than an omission. Each has an
-///     obvious action waiting for it: clicking a problem marker should
-///     offer the fix, clicking a blame line should open that commit,
-///     clicking a diff marker should go to the hunk. None is settled,
-///     and an incidental "puts the cursor on the line" is exactly the
-///     sort of behaviour that becomes load-bearing while nobody is
-///     looking -- at which point giving the click its real meaning is
-///     a change that takes something away. Reserving them costs
-///     nothing now and keeps that a free choice.
+/// - Breakpoint: the marker is the control; a click sets or clears it.
+/// - Line number: goes to the line.
+/// - Diagnostic, blame and diff: nothing, on purpose. Each has an obvious
+///   action (offer the fix, open the commit, go to the hunk), none
+///   settled yet, and an incidental "cursor goes to the line" would
+///   become something people rely on and make the real meaning a
+///   breaking change.
 fn gutter_action(column: fileeditor::GutterKind, line: usize) -> GutterAction {
     match column {
         fileeditor::GutterKind::Breakpoint => GutterAction::ToggleBreakpoint(line + 1),
@@ -8804,11 +8597,9 @@ fn gutter_action(column: fileeditor::GutterKind, line: usize) -> GutterAction {
     }
 }
 
-/// Carries out `gutter_action`. `Some` is a line for the status row.
-///
-/// A reserved column still *consumes* the click: letting it fall
-/// through would place the cursor by the text path, which is the
-/// behaviour being withheld.
+/// Carries out `gutter_action`; `Some` is a line for the status row. A
+/// reserved column still consumes the click, or the text path would
+/// place the cursor.
 fn gutter_click(
     app: &mut App,
     edit_frame_id: Option<EditFrameId>,
@@ -8820,8 +8611,8 @@ fn gutter_click(
         GutterAction::ToggleBreakpoint(at) => {
             let added = match edit_frame_id {
                 Some(id) => toggle_breakpoint(app, id, tb, at),
-                // No frame means no adapter to tell, but the marker is
-                // still the user's to set.
+                // No frame means no adapter to tell; the marker is still
+                // the user's.
                 None => {
                     let added = tb.breakpoints.insert(at);
                     if !added {
@@ -8840,13 +8631,9 @@ fn gutter_click(
     }
 }
 
-/// Adds or removes a breakpoint on `line` (1-based), and tells a live
-/// debug adapter about it.
-///
-/// Shared by `:dbg break` and by clicking the gutter, so the two cannot
-/// drift: a breakpoint set one way has to reach the adapter the same as
-/// one set the other, or a click would put a marker on screen that
-/// nothing is watching.
+/// Adds or removes a breakpoint on `line` (1-based) and tells a live
+/// debug adapter. Shared by `:dbg break` and gutter clicks so a marker
+/// is never on screen without the adapter knowing.
 fn toggle_breakpoint(app: &mut App, edit_frame_id: EditFrameId, tb: &mut TextBuffer, line: usize) -> bool {
     let added = tb.breakpoints.insert(line);
     if !added {
@@ -8856,12 +8643,9 @@ fn toggle_breakpoint(app: &mut App, edit_frame_id: EditFrameId, tb: &mut TextBuf
     added
 }
 
-/// Tells a live debug adapter what this buffer's breakpoints now are.
-///
-/// The whole set rather than the change, because that is what
-/// `setBreakpoints` takes -- it replaces a file's list outright. Called
-/// after every way of changing them, so a marker on screen and a
-/// breakpoint in the debugger cannot disagree.
+/// Tells a live debug adapter this buffer's breakpoints: the whole set,
+/// as `setBreakpoints` replaces a file's list. Called after every
+/// change, so the screen and the debugger agree.
 fn sync_breakpoints_to_adapter(app: &mut App, edit_frame_id: EditFrameId, tb: &TextBuffer) {
     if let (Some(frame), Some(path)) = (app.dap_frames.get_mut(&edit_frame_id), tb.path()) {
         let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
@@ -8869,20 +8653,12 @@ fn sync_breakpoints_to_adapter(app: &mut App, edit_frame_id: EditFrameId, tb: &T
     }
 }
 
-/// Everything this editor knows about whatever is at `(row, col)` --
-/// what `K` prints, and what resting the pointer there shows.
-///
-/// One function because they are one question. They were the same code
-/// written once, and a hover that disagreed with `K` about the same
-/// word would be the sort of difference nobody thinks to test for.
-///
-/// Empty when there is nothing to say. The two callers differ only in
-/// what they do about that: `K` was asked and answers anyway, hover was
-/// not and stays quiet.
+/// Everything known about what's at `(row, col)`: what `K` prints and
+/// what hovering shows, one function so the two can't disagree. Empty
+/// when there's nothing to say; `K` answers anyway, hover stays quiet.
 fn hover_lines_at(app: &mut App, session_id: SessionId, edit_frame_id: Option<EditFrameId>, tb: &TextBuffer, row: usize, col: usize) -> Vec<String> {
-    // A language server's answer wins when there is one: it knows the
-    // actual language, where `docs.rs` knows bash and this buffer's own
-    // comments.
+    // A language server's answer wins: it knows the language, where
+    // docs.rs knows bash and this buffer's comments.
     if let Some(lines) =
         ask_server_at_cursor(app, session_id, tb, row, col, CursorRequest { method: "textDocument/hover", capability: "hoverProvider", extra: &[] })
             .and_then(|result| crate::lsp::hover_lines(&result))
@@ -8892,13 +8668,23 @@ fn hover_lines_at(app: &mut App, session_id: SessionId, edit_frame_id: Option<Ed
     let chars = tb.line_chars(row);
     let line_text: String = chars.iter().collect();
     let base_path = tb.path().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("untitled"));
-    // Rebuilt from this buffer's own *live* text every time, not
-    // re-read off disk, so an unsaved edit is reflected immediately.
+    // Built from the live text, so unsaved edits count.
     let index = docs::DocIndex::build_from_source(&tb.text(), &base_path);
     let debug_session = edit_frame_id.and_then(|id| app.debug_frames.get(&id));
     docs::hover_lines_at(&chars, col, &line_text, &index, |name| debug_session.and_then(|s| s.peek_var(name)))
 }
 
+// Asks the language server one question about what's under the cursor
+// (`textDocument/hover` for `K`, `textDocument/definition` for `gd`) and
+// returns the raw result. `None`, meaning fall back to what bish knows,
+// for any ordinary reason: no server, not ready, no `capability`, an
+// error, no answer in time.
+//
+// This one blocks: the user asked and is waiting, and making every mode
+// asynchronous for it would be a rewrite. The wait services
+// (`service_background_jobs` each tick), so jobs drain, resizes land and
+// the server's stream is read. A key press abandons it: someone typing
+// again has moved past the answer.
 fn ask_server_at_cursor(
     app: &mut App,
     session_id: SessionId,
@@ -8922,12 +8708,9 @@ fn ask_server_at_cursor(
     ask_server(app, session_id, buf, method, capability, params)
 }
 
-// The general form: one request about this buffer, with whatever params
-// the method takes, waited for the same bounded, servicing way.
-//
-// `textDocument` is added here rather than by every caller, since every
-// method that is about a document needs it and none of them want to
-// build the uri themselves.
+// The general form: one request about this buffer with whatever params
+// the method takes, waited for the same way. Adds `textDocument`, which
+// every document method needs.
 fn ask_server(
     app: &mut App,
     session_id: SessionId,
@@ -8944,16 +8727,13 @@ fn ask_server(
     let id = {
         let mut table = lsp.borrow_mut();
         let server = table.running(&target.display, &target.root)?;
-        // Asking a server that hasn't said it answers this would spend
-        // the whole timeout to be told so.
+        // A server that hasn't said it answers this would spend the whole
+        // timeout saying so.
         if !server.is_ready() || !server.provides(capability) {
             return None;
         }
-        // Only for the methods that are actually *about* a document.
-        // `codeAction/resolve` takes the action back verbatim and
-        // `workspace/symbol` takes a query, and adding a field of our
-        // own to either is at best ignored and at worst confusing to
-        // read in a server's log.
+        // Only for methods about a document: `codeAction/resolve` takes the
+        // action back verbatim, `workspace/symbol` takes a query.
         if method.starts_with("textDocument/") {
             params.insert(
                 0,
@@ -8967,13 +8747,11 @@ fn ask_server(
     while std::time::Instant::now() < deadline {
         service_background_jobs(app);
         if let Some(result) = lsp.borrow_mut().running(&target.display, &target.root)?.take_response(id) {
-            // A server answering with an error has answered: there is
-            // nothing better to wait for, and the caller's own fallback
-            // is still a sensible thing to do instead.
+            // An error is an answer: nothing better is coming, and the
+            // caller's fallback still makes sense.
             return result.ok();
         }
-        // Doubles as the tick: a byte arriving means the user has moved
-        // on, so the wait is abandoned rather than held out.
+        // Also the tick: a key arriving means the user moved on.
         if term::stdin_ready(editor::IDLE_POLL_MS) {
             return None;
         }
@@ -8981,26 +8759,20 @@ fn ask_server(
     None
 }
 
-// Runs a server-side command and applies whatever it asks for on the
-// way.
+// Runs a server-side command, applying what it asks for on the way: the
+// other half of a command-style code action. Not through `ask_server`:
+// the result is usually `null`, and the work arrives as a
+// `workspace/applyEdit` request mid-command, which the server waits on
+// until answered.
 //
-// This is the other half of a command-style code action, and the reason
-// it cannot go through `ask_server`: the command's *result* is almost
-// always `null`. The work arrives as a separate `workspace/applyEdit`
-// request from the server, mid-command, and answering it is what makes
-// the command finish at all -- a server waiting on that reply will sit
-// there until the timeout otherwise.
+// So each tick of this wait applies and answers the edits the server
+// parked (see `Server::take_apply_edit`; only those `--apply-edits`
+// accepts are parked). That window, from request to response, is the
+// scope of `--apply-edits=scoped`; `refuse_pending_applies` closes it
+// on every exit, timeout included.
 //
-// So the wait loop here is `ask_server`'s with one thing added: each
-// tick, whatever edits the server parked (see `Server::take_apply_edit`
-// -- only edits the `--apply-edits` policy already accepted get parked)
-// are applied and answered. That is also what defines the scope in
-// `--apply-edits=scoped`: the window is open from the request going out
-// to its response coming back, and `refuse_pending_applies` closes it
-// on every exit from this function, including the timeout.
-//
-// Returns how many files were changed and how many of those are open
-// and unsaved, or an error to show.
+// Returns how many files changed and how many of those are open and
+// unsaved, or an error to show.
 fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer, invocation: &crate::json::Value) -> Result<(usize, usize), String> {
     let Some(session) = app.sessions.get(&session_id) else { return Err("no session".to_string()) };
     let Some(target) = server_target(session, buf) else { return Err("no language server for this file".to_string()) };
@@ -9024,7 +8796,7 @@ fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer
             crate::json::Value::Object(fields) => fields.clone(),
             _ => Vec::new(),
         };
-        // A `Command`'s own `title` is menu text, not a parameter.
+        // A `Command`'s `title` is menu text, not a parameter.
         params.retain(|(name, _)| name == "command" || name == "arguments");
         server.execute_command(crate::json::Value::Object(params))
     };
@@ -9045,10 +8817,9 @@ fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer
                 }
             };
             let Some((request_id, params)) = taken else { break };
-            // The edit is applied with the table *not* borrowed:
-            // writing a file can reach back into the same table (an
-            // open buffer's own `didChange`), and holding the borrow
-            // across that is how a RefCell panic gets written.
+            // Applied with the table not borrowed: writing a file can reach
+            // back into it (an open buffer's `didChange`), and a held
+            // borrow panics.
             let edit = crate::lsp::workspace_edit(&crate::json::query(&params, ".edit").cloned().unwrap_or(crate::json::Value::Null));
             let applied = if !edit.unsupported.is_empty() {
                 failure = Some(format!("that command wanted to {} files, which bish cannot do -- nothing changed", edit.unsupported.join("/")));
@@ -9091,9 +8862,8 @@ fn run_server_command(app: &mut App, session_id: SessionId, buf: &mut TextBuffer
     }
 }
 
-// The position encoding the server for this buffer negotiated, if there
-// is one running. `None` when there isn't, in which case any position
-// arithmetic is moot anyway.
+// The position encoding this buffer's server negotiated, or `None` with
+// no server, where positions don't matter.
 fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) -> Option<crate::lsp::PositionEncoding> {
     let session = sessions.get(&session_id)?;
     let target = server_target(session, buf)?;
@@ -9102,10 +8872,9 @@ fn server_encoding_for(sessions: &HashMap<SessionId, SessionState>, session_id: 
     Some(table.running(&target.display, &target.root)?.encoding())
 }
 
-// Where the cursor is, as a jump-list entry -- `None` for anything with
-// no file behind it (the prompt's own Normal mode, a job's scrollback),
-// which is also every case where a cross-file jump could not mean
-// anything.
+// Where the cursor is, as a jump-list entry; `None` with no file behind
+// it (a prompt, a job's scrollback), where a cross-file jump means
+// nothing.
 fn jump_here(buf: &NavBuffer) -> Option<JumpEntry> {
     let tb = buf.as_editable()?;
     let (row, col) = tb.cursor();
@@ -9123,28 +8892,24 @@ fn record_jump(windows: &mut [WindowEntry], current_window: usize, buf: &NavBuff
 enum Goto {
     /// The cursor moved within this buffer.
     Moved,
-    /// The target is a different file, which this loop cannot open --
-    /// see `NavExit::OpenAt`.
+    /// The target is in another file, which this loop can't open; see
+    /// `NavExit::OpenAt`.
     Elsewhere { path: PathBuf, line: usize, character: usize, encoding: crate::lsp::PositionEncoding },
     /// Nothing to go to, with what to say about it.
     Nowhere(String),
 }
 
-// Moves the cursor to `location` if it is in this buffer, or reports
-// what else it is. Shared by `gd`/`gy`/`gD` and by the `n`/`N` cycling
-// that follows one, so they cannot disagree about what "go there"
-// means.
-//
-// Recording the jump is the caller's job (`record_jump`), so that a
-// `gd` leaves exactly one entry behind -- at the place the question was
-// asked -- while cycling through its results with `n`/`N` leaves none.
+// Moves the cursor to `location` if it's in this buffer, or says what
+// else it is. Shared by `gd`/`gy`/`gD` and the `n`/`N` cycling, so they
+// agree. Recording the jump is the caller's (`record_jump`): a `gd`
+// leaves one entry, where it was asked, and cycling leaves none.
 fn goto_location(
     sessions: &HashMap<SessionId, SessionState>,
     session_id: SessionId,
     buf: &mut NavBuffer,
     location: &crate::lsp::Location,
-    // What the caller asked for, for the two messages this can produce
-    // -- "definition", "type definition", "declaration".
+    // What was asked for ("definition", "type definition",
+    // "declaration"), for the messages.
     noun: &str,
 ) -> Goto {
     let Some(tb) = buf.as_editable_mut() else {
@@ -9161,14 +8926,14 @@ fn goto_location(
     }
     match crate::url::to_file_path(&location.uri) {
         Some(path) => Goto::Elsewhere { path, line: location.start.0, character: location.start.1, encoding },
-        // A uri naming no local file at all (`jar:`, `zipfile:`, a
-        // server's own synthetic scheme) is nothing bish can open.
+        // A uri naming no local file (`jar:`, `zipfile:`, a server's own
+        // scheme) is nothing bish can open.
         None => Goto::Nowhere(format!("{noun} is at {}:{}", location.uri, location.start.0 + 1)),
     }
 }
 
-// Asks this buffer's server to hand over its last publication again on
-// the next idle tick. See `Server::redeliver_diagnostics`.
+// Asks this buffer's server to resend its last publication on the next
+// tick. See `Server::redeliver_diagnostics`.
 fn redeliver_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
@@ -9179,35 +8944,22 @@ fn redeliver_language_server_diagnostics(sessions: &mut HashMap<SessionId, Sessi
     }
 }
 
-// Applies whatever the language server has most recently said about
-// this buffer. `true` when the buffer's diagnostics actually changed,
-// which is the caller's cue to repaint.
+// Applies what the language server last published about this buffer;
+// `true` when the diagnostics changed, the cue to repaint. On the idle
+// path, as publications arrive whenever the server sends them.
 //
-// Runs from the same idle path as `sync_language_server_document`, and
-// for the same reason: a publication arrives whenever the server feels
-// like sending one, and the editor loop is the only thing holding the
-// buffer it describes.
-//
-// **Version-gated.** A publication naming a revision the buffer has
-// already left is dropped rather than drawn: its offsets address text
-// that no longer exists, and putting a squiggle under the wrong word is
-// worse than showing none. A server that says nothing about the version
-// is taken at its word, since there is nothing else to go on. This is
-// what `TextBuffer::version` was added for.
+// Version-gated: a publication for a revision the buffer has left is
+// dropped, as its offsets address text that's gone. One with no version
+// is taken at its word.
 fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     let Some(session) = sessions.get(&session_id) else { return false };
     let Some(target) = server_target(session, buf) else { return false };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
-    // The server this buffer's findings came from may be gone -- it
-    // crashed, or `::bish lsp restart` took it away. Its underlines and
-    // gutter marks are then claims nobody stands behind, and nothing
-    // will ever come along to correct them, since diagnostics are
-    // pushed rather than asked for.
-    //
-    // `source` is what tells the two apart: a server's findings carry
-    // one, and bish's own linter (`:diag`) sets none. So this clears
-    // exactly the dead server's half and leaves `:diag`'s alone.
+    // The server may be gone (crashed, or `::bish lsp restart`), leaving
+    // findings nobody will correct, as diagnostics are pushed. A server's
+    // findings carry a `source` and `:diag`'s don't, so only the dead
+    // server's are cleared.
     if table.running(&target.display, &target.root).is_none_or(|server| server.is_dead()) {
         drop(table);
         let kept: Vec<lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.source.is_none()).cloned().collect();
@@ -9225,15 +8977,12 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
     }
     let relayed = fileeditor::diagnostics_from_server(buf, &publication.findings, encoding);
     drop(table);
-    // A publication replaces this server's findings outright, and
-    // leaves bish's own linter output (`:diag`, which sets no `source`)
-    // exactly where it was. The two coexist in one list precisely so
-    // that the gutter, the underlines and the diagnostics pane need to
-    // know nothing about where a finding came from.
+    // A publication replaces this server's findings and leaves `:diag`'s
+    // (no `source`). One list, so the gutter, underlines and pane don't
+    // care where a finding came from.
     let mut merged: Vec<lint::Diagnostic> = buf.diagnostics.iter().filter(|d| d.source.is_none()).cloned().collect();
     merged.extend(relayed);
-    // Document order, so the diagnostics pane reads top to bottom
-    // however the two sources interleave.
+    // Document order, however the two sources interleave.
     crate::sort::sort_by_key(&mut merged, |d| (d.start, d.end));
     if merged == buf.diagnostics {
         return false;
@@ -9242,25 +8991,24 @@ fn apply_language_server_diagnostics(sessions: &mut HashMap<SessionId, SessionSt
     true
 }
 
-// `:w` happened. Sent after the write rather than before it, so a
-// server that reruns a build on save is looking at what is actually on
-// disk.
+// `:w` happened. Sent after the write, so a server that builds on save
+// sees what's on disk.
 fn save_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
     let Some(server) = table.running(&target.display, &target.root) else { return };
-    // A save with unsent edits behind it would otherwise tell the server
-    // "this is saved" about a version it has never seen.
+    // With unsent edits behind it, a save would tell the server about a
+    // version it never saw.
     if server.has_document(&target.uri) {
         server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
         server.save_document(&target.uri, &fileeditor::buffer_text(buf));
     }
 }
 
-// The buffer is going away. Fired while it still exists, which is what
-// makes the URI resolvable at all.
+// The buffer is going away; sent while it still exists, so the URI
+// resolves.
 fn close_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
@@ -9281,10 +9029,9 @@ fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: Sessio
     run_hooks_for(sessions, session_id, event, &fileeditor::language_of(buf), &path);
 }
 
-// The same for an event with no buffer behind it. A `shell:` event's
-// language is bash -- the prompt *is* bash, which is also what
-// `abbr --lang` defaults to, so one `--lang=bash` hook means the same
-// thing in both places.
+// The same for an event with no buffer. A `shell:` event's language is
+// bash, the prompt's language and `abbr --lang`'s default, so one
+// `--lang=bash` hook means the same in both places.
 fn run_shell_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, argument: &str) {
     run_hooks_for(sessions, session_id, event, crate::bishedit::snippet::DEFAULT_LANG, argument);
 }
@@ -9297,29 +9044,22 @@ fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: Se
     }
     let path = argument.to_string();
     let Some(session) = sessions.get_mut(&session_id) else { return };
-    // Anything these do can't fire more hooks -- a `shell:cwd:change`
-    // hook that `cd`s would otherwise keep triggering itself.
+    // What these run can't fire more hooks, or a `shell:cwd:change` hook
+    // that `cd`s would trigger itself.
     session.shell.set_firing_hooks(true);
-    // A hook is not a command the user ran, so it must not become the
-    // answer to their next `$?`. Kept across the whole run rather than
-    // per hook, so `$?` means the same thing to each of several hooks
-    // on one event.
+    // A hook isn't something the user ran, so `$?` is restored after. Kept
+    // across the whole run, so each of several hooks sees the same `$?`.
     let status = session.shell.last_status();
     let captured = Rc::new(RefCell::new(String::new()));
-    // Borrowed and given back, rather than set and assumed: an
-    // unpromoted session writes to the real terminal, and "restoring" it
-    // to a grid nobody paints makes every later line disappear. Found
-    // exactly that way -- `::bish hook help` printed nothing once any
-    // hook had fired.
+    // Borrowed and given back, not set and assumed: an unpromoted session
+    // writes to the terminal, and "restoring" it to an unpainted grid hides
+    // every later line.
     let saved = session.shell.borrow_sink(captured);
     for command in commands {
-        // The path as one quoted word, so a name with a space in it
-        // arrives as one argument rather than several.
+        // The path as one quoted word, so spaces don't split it.
         let line = format!("{command} {}", crate::exec::shell_quote(&path));
-        // A hook that doesn't parse is a config error, and the middle of
-        // a redraw is the worst possible place to report one -- it is
-        // simply not run, the same tolerance the abbreviation table
-        // already has for a bad expansion.
+        // A hook that doesn't parse is a config error, and mid-redraw is no
+        // place to report one: it's skipped, as a bad abbreviation is.
         if let Ok(toks) = Lexer::new(&line).tokenize()
             && let Ok(prog) = Parser::new(toks).parse_program()
         {
@@ -9331,11 +9071,9 @@ fn run_hooks_for(sessions: &mut HashMap<SessionId, SessionState>, session_id: Se
     session.shell.return_sink(saved);
 }
 
-// The window list as the `window` builtin sees it -- pushed into every
-// session's Shell before a command runs, so `window ls` and `window
-// select` are ordinary builtins reading a snapshot rather than actions
-// the repl applies afterwards. That is the difference between
-// `$(window ls)` capturing the listing and capturing nothing.
+// The window list as the `window` builtin sees it, pushed into every
+// shell before a command runs, so `window ls` and `window select` read a
+// snapshot and `$(window ls)` captures the listing.
 fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
     let home = std::env::var("HOME").unwrap_or_default();
     app.windows
@@ -9351,20 +9089,16 @@ fn window_snapshot(app: &App) -> Vec<exec::WindowInfo> {
         .collect()
 }
 
-// The visible text of one tab's own segment -- shared by render_tab_bar
-// and tab_bar_regions so the rendered tab bar and its hit-test column
-// ranges (see hit_test_click) can never drift apart from each other.
-/// What one tab's label may take: its share of the bar, less what the
-/// segment spends on the window id and the spaces around it, and less
-/// one more so the bar ends before the line does rather than on it.
-///
-/// Its own function so the arithmetic can be read and tested without an
-/// `App` to hand.
+/// What one tab's label may take: its share of the bar, less the
+/// segment's id and spaces, less one so the bar ends before the line
+/// does.
 fn tab_label_budget(term_cols: usize, windows: usize) -> usize {
     let share = term_cols / windows.max(1);
     share.saturating_sub(tab_segment_text(0, "").chars().count() + 1)
 }
 
+// The text of one tab's segment, shared by `render_tab_bar` and
+// `tab_bar_regions` so what's drawn and what's hit-tested agree.
 fn tab_segment_text(id: u32, cwd: &str) -> String {
     format!(" [{}] {} ", id, cwd)
 }
@@ -9384,10 +9118,9 @@ fn render_tab_bar(snapshot: &[(u32, bool, String)]) -> String {
     line
 }
 
-// (window_id, start_col, end_col), 0-indexed and half-open, in
-// tab_bar_snapshot's own order -- for hit-testing a tab-bar click (see
-// hit_test_click) against exactly the same segment widths render_tab_bar
-// just drew, via the shared tab_segment_text helper.
+// (window_id, start_col, end_col), 0-based and half-open, in
+// `tab_bar_snapshot`'s order, for hit-testing a tab bar click against
+// the widths `render_tab_bar` drew.
 fn tab_bar_regions(snapshot: &[(u32, bool, String)]) -> Vec<(u32, usize, usize)> {
     let mut col = 0;
     snapshot
@@ -9400,44 +9133,30 @@ fn tab_bar_regions(snapshot: &[(u32, bool, String)]) -> Vec<(u32, usize, usize)>
         .collect()
 }
 
-// Where a qualifying left click (see MouseEvent::is_left_click) landed:
-// the tab bar (an absolute index into `windows`, mirroring
-// dispatch_window_cmd's own GotoFirstWindow/GotoLastWindow -- there's no
-// WindowAction variant for an arbitrary-index jump either) or a pane
-// within the current window. `None` (not a variant here) covers a miss
-// -- landing on a divider strip, or off both areas entirely.
+// Where a left click (see `MouseEvent::is_left_click`) landed: a tab
+// (an index into `windows`; no `WindowAction` jumps to an arbitrary
+// index), a pane, or a divider. A miss is `None`.
 enum ClickTarget {
     Window(usize),
     Pane(PaneId),
-    // A press landed on the strip between two panes -- the start of a
-    // resize drag, not a focus change. Carries what
-    // `resize_split_child_to` needs to act on every motion event that
-    // follows without re-deriving the layout each time.
+    // A press on the strip between panes: the start of a resize drag.
+    // Carries what `resize_split_child_to` needs for each motion event.
     Divider(Divider),
 }
 
-// How close together two presses on the same cell have to be to count as
-// a double-click. Terminals report neither the double-click nor the
-// timing, so this is bish's own judgement -- the same order most toolkits
-// use, and deliberately paired with an exact same-cell test so a slow
-// drag across two characters can never read as one.
+// How close together two presses on the same cell count as a
+// double-click; the terminal reports neither. Paired with an exact
+// same-cell test, so a slow drag never reads as one.
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
-// How long the pointer has to sit still before a hover popup appears.
-//
-// Also bish's own judgement, and the number that decides whether this
-// feature is helpful or infuriating. Too short and a popup chases the
-// pointer across the screen; too long and it feels broken. This is
-// about what an editor with a mouse conventionally waits, and it is
-// long enough that a sweep across a line asks a language server
-// nothing at all -- the lookup only happens where the pointer stops.
+// How long the pointer sits still before a hover popup. Too short and
+// popups chase the pointer; too long and it feels broken. A sweep across
+// a line asks the server nothing.
 const HOVER_DWELL: std::time::Duration = std::time::Duration::from_millis(350);
 
-// `fileeditor::position_at_screen`'s counterpart for a `ScreenBuffer` --
-// simpler because a read-only pane has neither a gutter nor horizontal
-// scrolling (see Buffer::viewport_left's own doc comment), so a column
-// maps straight through. Mirrors render_normal_mode_frame's own
-// placement exactly, the same way that one mirrors build_editor_frame's.
+// `fileeditor::position_at_screen` for a `ScreenBuffer`: no gutter, no
+// horizontal scrolling, so a column maps straight through, as
+// `render_normal_mode_frame` places it.
 fn screen_position_at(buf: &ScreenBuffer, rect: Rect, row0: usize, col0: usize) -> Option<(usize, usize)> {
     if row0 < rect.row || col0 < rect.col || col0 >= rect.col + rect.cols {
         return None;
@@ -9453,8 +9172,8 @@ fn screen_position_at(buf: &ScreenBuffer, rect: Rect, row0: usize, col0: usize) 
     Some((line, (col0 - rect.col).min(buf.line_len(line).saturating_sub(1))))
 }
 
-// Where a click inside the focused pane puts the cursor, for whichever
-// kind of buffer normal mode is driving. `true` when it actually moved.
+// Where a click in the focused pane puts the cursor, for either buffer
+// kind. `true` when it moved.
 fn place_nav_cursor_at(buf: &mut NavBuffer, rect: Rect, row0: usize, col0: usize) -> bool {
     let pos = match buf {
         NavBuffer::ReadOnly(sb) => screen_position_at(sb, rect, row0, col0),
@@ -9469,13 +9188,9 @@ fn place_nav_cursor_at(buf: &mut NavBuffer, rect: Rect, row0: usize, col0: usize
     }
 }
 
-// Hit-tests a click's screen coordinates against the tab bar (if any),
-// then the current window's own pane layout -- shared by both places a
-// click can be acted on (repl::run's plain-prompt loop, and
-// run_normal_mode_navigation's own loop), so the two can't disagree on
-// what a given click means. `ev.row`/`ev.col` are 1-indexed (the
-// terminal's own convention -- see MouseEvent's own doc comment); `Rect`/
-// the tab bar's own row are 0-indexed, hence the -1 conversions below.
+// Hit-tests a click against the tab bar, then the current window's
+// panes. Shared by the prompt loop and Normal mode so they agree.
+// `ev.row`/`ev.col` are 1-based (see `MouseEvent`), rects 0-based.
 fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     let row0 = (ev.row as usize).saturating_sub(1);
     let col0 = (ev.col as usize).saturating_sub(1);
@@ -9488,16 +9203,13 @@ fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     let mut regions = Vec::new();
     let mut dividers = Vec::new();
     app.windows[app.current_window].regions(area, &mut regions, &mut dividers);
-    // Dividers first: they sit *between* pane rectangles, so nothing here
-    // overlaps, but checking them first keeps the intent obvious -- a
-    // press on the strip is a resize, never a focus change.
+    // Dividers first: nothing overlaps, but it states the intent, a press
+    // on the strip is a resize.
     if let Some(divider) =
         dividers.into_iter().find(|d| row0 >= d.rect.row && row0 < d.rect.row + d.rect.rows && col0 >= d.rect.col && col0 < d.rect.col + d.rect.cols)
     {
-        // A folded divider stands for several boundaries at once, so
-        // there is no single one for a drag to move. Clicking it focuses
-        // the first pane it is hiding instead, which unfolds the run
-        // around it -- the "flip" in flipper divider.
+        // A folded divider stands for several boundaries, none for a drag to
+        // move; a click focuses the first hidden pane, unfolding the run.
         if divider.folded.is_some() {
             return folded_divider_pane(&app.windows[app.current_window], &divider).map(ClickTarget::Pane);
         }
@@ -9507,35 +9219,20 @@ fn hit_test_click(app: &App, ev: editor::MouseEvent) -> Option<ClickTarget> {
     Some(ClickTarget::Pane(pane_id))
 }
 
-// Drives a divider drag to completion: reads mouse events directly until
-// the button comes up, resizing on every motion that actually moves the
-// boundary and repainting as it goes, so the split follows the pointer
-// live rather than jumping once at the end.
-//
-// Runs its own read loop rather than threading drag state back through
-// whichever caller started it: a drag is a self-contained gesture with a
-// definite end (the release), and both entry points -- the plain prompt
-// and normal mode -- would otherwise each need the same three-state
-// machine carried across their own unrelated loops. Everything else
-// arriving mid-drag is ignored, including keystrokes: the terminal is
-// mid-gesture, and a stray key is far more likely to be the user
-// fumbling than a command.
+// Drives a divider drag until the button comes up, resizing on every
+// motion that moves the boundary and repainting as it goes. Its own
+// read loop, so the prompt and Normal mode needn't each carry drag
+// state. Keys mid-drag are ignored: more likely fumbling than a
+// command.
 fn drag_divider(app: &mut App, divider: &Divider) {
-    // Re-derived from the live layout on every motion: the first resize
-    // moves the divider itself, so a `Divider` captured at press time is
-    // stale from then on -- but its *identity* (path, child, axis) is
-    // what's being dragged and doesn't move, so only the position needs
-    // refreshing.
+    // Re-derived from the live layout on each motion: the first resize
+    // moves the divider, so only its identity (path, child, axis) holds.
     let mut current = divider.clone();
     {
-        // Raw mode *and* mouse reporting for the duration. The prompt
-        // path arrives here after read_line has already dropped its own
-        // guard (it returns the click and exits), so without this the
-        // motion events would land in a cooked terminal and be echoed
-        // into the next prompt as literal escape text -- which is exactly
-        // what happened before this was here. Normal mode's own guard is
-        // still live; a nested one just saves and restores the same raw
-        // state.
+        // Raw mode and mouse reporting for the duration: from the prompt,
+        // `read_line` has dropped its guard, and motion events would be
+        // echoed into the next prompt as text. In Normal mode a nested
+        // guard saves and restores the same state.
         let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
         while let Ok(Some(key)) = editor::read_key_idle(&mut || {
             service_background_jobs(app);
@@ -9551,8 +9248,7 @@ fn drag_divider(app: &mut App, divider: &Divider) {
             if !resize_split_child_to(&mut app.windows[app.current_window], &current, to) {
                 continue;
             }
-            // Refresh this divider's own geometry from the layout it just
-            // changed, matched by identity rather than position.
+            // Refresh the divider's geometry, matched by identity.
             let area = Rect { row: 0, col: 0, rows: content_rows(app.term_rows), cols: app.term_cols };
             let mut regions = Vec::new();
             let mut dividers = Vec::new();
@@ -9565,32 +9261,24 @@ fn drag_divider(app: &mut App, divider: &Divider) {
             }
         }
     }
-    // The guard above turned mouse reporting off on its way out, and
-    // whoever called us was mid-gesture precisely because it was on --
-    // put it back rather than leaving them blind to the next click.
+    // The guard turned mouse reporting off on its way out; the caller was
+    // mid-gesture with it on, so put it back.
     print!("{}", term::MOUSE_REPORTING_ENABLE);
     let _ = io::stdout().flush();
 }
 
-// Records a new "current" directory in this session's back/forward
-// history (Alt+Left/Right -- see SessionState::dir_history's own doc
-// comment), browser-style: anything reachable by "forward" from here is
-// discarded first, since navigating to `dir` fresh (not by walking that
-// existing forward stack) makes it stale, the same way a browser drops
-// its forward history the instant you follow a new link after going
-// back.
+// Records a fresh directory in the session's back/forward history
+// (Alt+Left/Right, see `SessionState::dir_history`), dropping anything
+// forward of here, as a browser does on following a new link.
 fn push_dir_history(session: &mut SessionState, dir: std::path::PathBuf) {
     session.dir_history.truncate(session.dir_history_index + 1);
     session.dir_history.push(dir);
     session.dir_history_index = session.dir_history.len() - 1;
 }
 
-// Alt+Left/Right/Up (editor::DirNav -- see its own doc comment). Back/
-// Forward walk dir_history without touching it (push_dir_history is
-// only for a *fresh* cd); Up computes the real parent of the current
-// cwd and treats arriving there as an ordinary fresh navigation (does
-// push, and drops any forward history), matching what typing `cd ..`
-// itself would do.
+// Alt+Left/Right/Up (`editor::DirNav`). Back and forward walk
+// `dir_history` without changing it; Up goes to the parent as a fresh
+// navigation, as `cd ..` would.
 fn navigate_dir(session: &mut SessionState, kind: editor::DirNav) {
     match kind {
         editor::DirNav::Back => {
@@ -9619,46 +9307,26 @@ fn navigate_dir(session: &mut SessionState, kind: editor::DirNav) {
     }
 }
 
-// Distinguishes "needs more lines" (unterminated quote/paren, or the parser
-// ran out of tokens expecting a closing keyword like `fi`/`done`) from a
-// genuine syntax error, by checking for the exact phrasing this crate's own
-// lexer/parser error messages use for those cases. Every parser error that
-// stems from running out of tokens ends in "None" (`format!("{:?}", other)`
-// on an `Option<Tok>` that was `None`), whether it came through the
-// `expect()` helper ("expected KwDo, got None") or parse_list_until's own
-// message ("...expected one of [...]" -- ends with the debug-printed stop
-// list, not "None", hence the separate check).
+// Tells "needs more lines" from a real syntax error by the lexer's and
+// parser's wording: an unterminated quote, "unexpected end of input",
+// or an `expect()` that ran out of tokens ("expected KwDo, got None").
 fn is_incomplete(err: &str) -> bool {
     err.starts_with("unterminated") || err.contains("unexpected end of input") || err.ends_with("None")
 }
 
-// A single command mode has actually run (successfully parsed and
-// executed -- a command_mode_violation or syntax error never produces
-// one of these, matching how `history.record` itself only ever records
-// something that parsed). `command` is the buffer text as it was
-// actually submitted (post history-expansion, same text that went to
-// `history.record`); `output` is the combined stdout+stderr captured
-// via OutputSink::Capture (embedded newlines and all -- see render_
-// command_output_overlay/render_command_transcript for how multi-line
-// entries are laid out); `status` is Shell::last_status right after the
-// attempt. Stored in SessionState::command_transcript -- see its own
-// doc comment for why this outlives any one ':' invocation.
+// One command that command mode ran (parsed and executed; a violation
+// or syntax error makes none, as `history.record` records only what
+// parsed). `command` is the submitted text after history expansion,
+// `output` the captured stdout and stderr, `status` the exit status.
+// Kept in `SessionState::command_transcript`.
 struct TranscriptEntry {
     command: String,
     output: String,
     status: i32,
 }
 
-// `:help`/`:h`/`:?`'s own content -- written in markdown and rendered
-// through crate::markdown (see `render_help`), which is the whole point
-// of having that parser: the help is now a *document*, with headings,
-// tables and emphasis, rather than hand-aligned columns of plain text
-// that had to be re-aligned by hand whenever a line changed.
-//
-// Kept short enough to fit one ordinary terminal's worth of command-
-// output overlay without truncating (see command_mode_content_rows) --
-// a genuinely exhaustive reference would need real pagination/topics
-// this feature doesn't attempt.
+// `:help`'s content, in markdown rendered by `crate::markdown` (see
+// `render_help`).
 const EDITOR_HELP_MARKDOWN: &str = r#"# bish editor
 
 ## Moving around
@@ -9713,21 +9381,15 @@ its decompressed text.
 | `:help` | this screen (`:help keys`, `:help options`, `:help hooks`) |
 "#;
 
-// `:help options`, as markdown: every bishopt with what it accepts, its
-// default and its current value.
-//
-// Generated from the registry rather than written out, so an option
-// added tomorrow is documented today -- the same reason `bishopt`'s own
-// completion reads the registry instead of a copy. `Shell::describe_
-// bishopts` does the formatting, so this page and `bishopt --describe`
-// can never disagree about what an option is for.
+// `:help options`: every bishopt with what it accepts, its default and
+// its value. Generated from the registry so it can't go stale;
+// `Shell::describe_bishopts` formats it, as for `bishopt --describe`.
 fn options_help(shell: &exec::Shell) -> String {
     let mut out = String::from(
         "# bish options\n\nSet with `bishopt --set NAME VALUE`, read with `bishopt NAME`, cleared with `bishopt --unset NAME`.\nEverything here also works from the editor's own `:` line.\n\n",
     );
     let described = shell.describe_options(None);
-    // describe_bishopts emits three lines per option: the name, the
-    // description, then what it accepts.
+    // Three lines per option: name, description, what it accepts.
     for block in described.chunks(3) {
         let [name, description, accepts] = block else { continue };
         out.push_str(&format!("## `{}`\n\n{}\n\n`{}`\n\n", name.trim(), description.trim(), accepts.trim()));
@@ -9735,23 +9397,18 @@ fn options_help(shell: &exec::Shell) -> String {
     out
 }
 
-// `:help keys`, as markdown -- generated from `keymap::key_index`,
-// which asks the editor itself what every key does. The same treatment
-// `:help options` already gets from the option registry, and for the
-// same reason: a page written out by hand goes stale silently. This one
-// did -- the prose above has never mentioned `D`, and finding out that
-// `D` deletes to end of line meant mapping a throwaway key to it and
-// listing the mappings.
+// `:help keys`, generated from `keymap::key_index`, which asks the
+// editor what every key does, so the page can't go stale.
 //
-// `{motion}`, `{object}`, `{char}` and `{pattern}` in the key column
-// are patterns rather than literal keys; see `key_index`.
+// `{motion}`, `{object}`, `{char}` and `{pattern}` in the key column are
+// patterns, not keys; see `key_index`.
 fn keys_help() -> String {
     let mut out = String::from(
         "# bish editor keys\n\nNormal mode, as the editor itself reports it -- this page is generated from the\nkey table, not written beside it, so it cannot describe a key that isn't there or\nmiss one that is.\n\nA leading count repeats most of these (`3j`, `2dd`). `{motion}` stands for any\nmotion, `{object}` for any text object, `{char}` for one typed character, and\n`{pattern}` for text ending in Enter.\n\n| Keys | What |\n|:--|:--|\n",
     );
     for (keys, action) in crate::keymap::key_index() {
-        // A `|` inside a table cell would end it, and `` ` `` inside
-        // code spans needs a wider fence.
+        // A `|` would end the table cell, and a `` ` `` needs a wider code
+        // fence.
         let keys = keys.replace('|', "\\|");
         out.push_str(&format!("| ``{keys}`` | {action} |\n"));
     }
@@ -9760,10 +9417,8 @@ fn keys_help() -> String {
 
 #[cfg(test)]
 mod keys_help_tests {
-    // The written help has never mentioned `D`, and nothing could have
-    // noticed -- which is the whole argument for generating this page
-    // instead. So the test is that the generated page really does carry
-    // every row, rather than quietly truncating or mangling some.
+    // Every row makes it onto the generated page, none truncated or
+    // mangled.
     #[test]
     fn the_generated_page_carries_every_row_of_the_index() {
         let page = super::keys_help();
@@ -9774,17 +9429,15 @@ mod keys_help_tests {
         assert!(page.contains("delete line-end"), "the miss that started this");
     }
 
-    // The prose page is what points at the generated one, so it has to
-    // say the name.
+    // The prose page points at the generated one, so it names it.
     #[test]
     fn the_written_help_points_at_the_generated_one() {
         assert!(super::EDITOR_HELP_MARKDOWN.contains(":help keys"));
     }
 }
 
-// `:help hooks`, as markdown -- the same event descriptions
-// `::bish hook help` prints, so a page and a command can't disagree
-// about when something fires.
+// `:help hooks`: the event descriptions `::bish hook help` prints, so
+// the two agree.
 fn hooks_help() -> String {
     let mut out = String::from(
         "# bish hooks\n\nAttach a command to something bish does. Registered with `::bish hook add`, listed with\n`::bish hook ls`, removed by the id `add` printed.\n\n```\n::bish hook add --lang=bash editor:file:open __my_bash_stuff\n```\n\nA hook runs its command with the event's own argument appended, and its output goes\nnowhere -- a hook fires while the editor owns the terminal. `--lang` is a glob over the\nfile's language, the same shape `abbr --lang` uses.\n\n## Events\n\n",
@@ -9795,11 +9448,8 @@ fn hooks_help() -> String {
     out
 }
 
-// Shared by `:help` and `:preview` -- the same pipeline either way,
-// which is what makes the help page a real markdown document rather
-// than a special case. Rendered on demand rather than once: the width is
-// the terminal's, and a table has to be laid out for the width it will
-// actually occupy.
+// Shared by `:help` and `:preview`. Rendered on demand at the
+// terminal's width, which tables are laid out for.
 fn render_markdown_document(source: &str, term_cols: usize, render: &RenderOptions) -> Vec<String> {
     let doc = crate::markdown::parse(source);
     let opts = crate::markdown::render::Options {
@@ -9813,9 +9463,8 @@ fn render_markdown_document(source: &str, term_cols: usize, render: &RenderOptio
     crate::markdown::render::to_lines(&doc, &opts)
 }
 
-// `:preview`'s own dispatch: which languages have something to render,
-// and how. `None` for a language that has no rendered form -- which is
-// what the command reports rather than guessing at one.
+// `:preview`'s dispatch: which languages render, and how. `None` for a
+// language with no rendered form.
 fn preview_document(language: &str, source: &str, term_cols: usize, render: &RenderOptions) -> Option<Vec<String>> {
     let width = term_cols.saturating_sub(1).max(20);
     match language {
@@ -9828,34 +9477,16 @@ fn preview_document(language: &str, source: &str, term_cols: usize, render: &Ren
     }
 }
 
-// `:help`/`:preview`'s own driving loop: a pager over already-rendered
-// lines, taking over the terminal for its own duration and handing
-// control straight back -- the same "blocks until it exits" shape
-// `:dbg`'s own run already has, and for the same reason (a document
-// someone is reading wants the whole screen, and wants it gone
-// completely afterwards).
-//
-// The view lives in crate::pager; this is only the loop: read a key,
-// hand it over, redraw. `service_background_jobs` runs as the idle
-// callback exactly as it does in every other blocking loop here, so a
-// background job's output still lands in its own pane's grid while a
-// help page is open.
-// What the pager is showing, so a resize can re-render it at the new
-// width -- which is not optional, since a table's layout and every
-// wrapped line depend on it.
-// Everything a rendered document needs that it cannot go and read for
-// itself: whether links are emitted as real terminal hyperlinks and
-// what a relative one is relative to, this session's `ui_col_*`
-// colours, and whether a wide table is fitted to the pane. Carried
-// rather than read where it's needed, because neither the pager nor the
-// markdown renderer has a Shell to ask or a buffer to look at.
+// What a rendered document needs and can't read itself: whether links
+// are terminal hyperlinks and what relative ones are relative to, the
+// session's `ui_col_*` colours, and whether wide tables are fitted.
+// Passed in, as neither the pager nor the renderer has a shell to ask.
 #[derive(Debug, Clone)]
 struct RenderOptions {
     hyperlinks: bool,
     base_dir: Option<std::path::PathBuf>,
     colors: Option<crate::theme::UiColors>,
-    // The `table_wrap` bishopt. `true` in `Default`, matching both the
-    // option's own default and the renderer's.
+    // The `table_wrap` bishopt; `true` by default, as the option is.
     wrap_tables: bool,
 }
 
@@ -9865,6 +9496,8 @@ impl Default for RenderOptions {
     }
 }
 
+// What the pager shows, kept so a resize can re-render it at the new
+// width; tables and wrapping depend on it.
 struct PagerSource {
     language: String,
     source: String,
@@ -9877,16 +9510,10 @@ impl PagerSource {
     }
 }
 
-// The man page for the command word under the cursor, if this is a
-// shell buffer and there is one.
-//
-// Scoped to bash on purpose: "the word under the cursor names a program
-// on this machine" is only a safe reading where a word in command
-// position *is* a program. In a Rust file it would be a coincidence.
-//
-// `manpages::source_for` reads the page synchronously rather than going
-// through `query`'s background fetch -- this is answering a key someone
-// just pressed, and there is nothing useful to show them a moment later.
+// The man page for the command word under the cursor, in a shell
+// buffer. Only bash: there a word in command position is a program; in
+// a Rust file a match would be coincidence. `manpages::source_for` reads
+// synchronously, answering a key just pressed.
 fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
     if fileeditor::language_of(buf) != crate::bishedit::snippet::DEFAULT_LANG {
         return None;
@@ -9902,10 +9529,9 @@ fn man_page_under_cursor(buf: &TextBuffer) -> Option<(String, String)> {
     crate::bishedit::manpages::source_for(&word).map(|source| (word, source))
 }
 
-// Opens every review waiting in `pending_reviews`, one after another,
-// and answers each client as soon as its review is decided. Says whether
-// anything was opened: the caller's cue to repaint what a review covered,
-// the same contract `service_background_jobs`'s own return has.
+// Opens each review in `pending_reviews` in turn and answers each
+// client once decided. Returns whether anything opened, the cue to
+// repaint, like `service_background_jobs`.
 fn open_pending_reviews(app: &mut App) -> bool {
     if app.pending_reviews.is_empty() {
         return false;
@@ -9918,14 +9544,10 @@ fn open_pending_reviews(app: &mut App) -> bool {
     true
 }
 
-// One proposed version of a file, gone through against the file as it is
-// now. What was taken is written, and the answer carries what the file
-// then holds; nothing taken, or the review walked away from, leaves the
-// file alone and says so.
-//
-// A change nobody ruled on is not taken. The proposal is not in the file
-// yet, so leaving a change undecided leaves it out -- `:review`'s own
-// "nothing happens unless you say so", from the other side.
+// One proposed version of a file, reviewed against the file as it is.
+// What was taken is written, and the answer carries the file's new
+// content; nothing taken, or walking away, leaves the file alone. An
+// undecided change isn't taken.
 fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOutcome {
     let current = match std::fs::read(&request.path) {
         Ok(bytes) => crate::encoding::decode(&bytes).text,
@@ -9958,9 +9580,8 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
     if std::fs::write(&request.path, &text).is_err() {
         return mcp::ReviewOutcome::Rejected;
     }
-    // An open buffer on the file with nothing unsaved of its own follows
-    // it. One that has unsaved changes is left to say so itself -- see
-    // `sync_watched_file` -- rather than having them thrown away here.
+    // An open buffer on the file with nothing unsaved follows it; one with
+    // unsaved changes says so itself (see `sync_watched_file`).
     for session in app.edit_frames.values_mut() {
         if session.buffer.path() == Some(request.path.as_path()) && !session.buffer.is_dirty() {
             let _ = session.buffer.reload();
@@ -9969,10 +9590,9 @@ fn review_proposal(app: &mut App, request: &mcp::ReviewRequest) -> mcp::ReviewOu
     mcp::ReviewOutcome::Saved(text)
 }
 
-// `:git show REV` as a view to read: the commit's header, then every file
-// it changed, each as it was in the parent beside what the commit made it.
-// Opens at `path`'s own section when the commit touched that file. From
-// the directory `path` is in, or the working directory without one.
+// `:git show REV` as a view: the commit's header, then each changed file,
+// parent beside commit. Opens at `path`'s section when the commit
+// touched it. Runs in `path`'s directory, or the working directory.
 fn git_show_view(
     path: Option<&Path>,
     rev: &str,
@@ -9994,8 +9614,8 @@ fn git_show_view(
     let mut start = None;
     let mut files = Vec::new();
     for changed in &commit.files {
-        // A side the file is not on -- before it was added, after it was
-        // deleted -- is empty.
+        // A side the file isn't on (before it was added, after it was
+        // deleted) is empty.
         let side = |rev: Option<&str>, path: &Option<String>| match (rev, path) {
             (Some(rev), Some(path)) => crate::git::blob(&commit.root, rev, path),
             _ => Ok(Vec::new()),
@@ -10035,20 +9655,18 @@ fn git_show_view(
     Ok(crate::review::Review::reading(&format!("git show {short}"), header, files, start, rows, cols).highlighted(colors))
 }
 
-// What git itself goes by: a NUL in the first 8000 bytes. A UTF-16 file
-// is full of them and is still text, so its byte-order mark says so first.
+// Git's test: a NUL in the first 8000 bytes. A UTF-16 file is full of
+// them and still text, so its byte-order mark is checked first.
 fn looks_binary(bytes: &[u8]) -> bool {
     !bytes.starts_with(&[0xff, 0xfe]) && !bytes.starts_with(&[0xfe, 0xff]) && bytes[..bytes.len().min(8000)].contains(&0)
 }
 
-// `:review`'s loop -- `run_pager`'s arrangement, for a view that decides
-// rather than reads. The review comes back when it was finished, so its
-// verdicts can be acted on, and not when it was walked away from.
-// `view` is made by the caller, sized to `focused_pane_rect`, so the same
-// loop serves one that reads, too.
+// `:review`'s loop, arranged like `run_pager`. Returns the review when
+// finished, so its verdicts can be acted on, and `None` when walked
+// away from. The caller makes `view`, sized to `focused_pane_rect`.
 fn run_review(app: &mut App, mut view: crate::review::Review) -> Option<crate::review::Review> {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
-    // What capture reports while this is open -- see `OVERLAYS`.
+    // What capture reports while this is open; see `OVERLAYS`.
     let _overlay = OverlayOpen::new();
     let mut rect = app.focused_pane_rect();
     compositor_redraw(app);
@@ -10063,7 +9681,7 @@ fn run_review(app: &mut App, mut view: crate::review::Review) -> Option<crate::r
             service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
-            // EOF: there is nobody left to decide anything.
+            // EOF: nobody is left to decide.
             Ok(None) | Err(_) => break crate::review::Outcome::Cancel,
         };
         if (app.term_rows, app.term_cols) != last_size {
@@ -10082,11 +9700,10 @@ fn run_review(app: &mut App, mut view: crate::review::Review) -> Option<crate::r
     (outcome == crate::review::Outcome::Done).then_some(view)
 }
 
-// `:git log`'s loop: the list, and the diff view a commit opens in.
-// The list lets go of the terminal while a commit is open -- the diff
-// view takes it for itself -- and takes it back afterwards, with the
-// same commit still picked out. What comes back is why a commit could
-// not be opened, if one could not.
+// `:git log`'s loop: the list, and the diff view a commit opens in. The
+// list lets go of the terminal while a commit is open and takes it back
+// after, with the same commit picked. Returns why a commit couldn't be
+// opened, if one couldn't.
 fn run_commit_list(
     app: &mut App,
     mut list: crate::commitlist::CommitList,
@@ -10096,7 +9713,7 @@ fn run_commit_list(
     loop {
         let choice = {
             let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
-            // What capture reports while this is open -- see `OVERLAYS`.
+            // What capture reports while this is open; see `OVERLAYS`.
             let _overlay = OverlayOpen::new();
             let mut rect = app.focused_pane_rect();
             compositor_redraw(app);
@@ -10138,14 +9755,16 @@ fn run_commit_list(
     }
 }
 
+// `:help`/`:preview`'s loop: a pager over rendered lines that takes the
+// terminal until it exits, as a document being read wants the whole
+// screen. The view is `crate::pager`; this reads keys and redraws, with
+// `service_background_jobs` as the idle callback.
 fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
     let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return };
-    // What capture reports while this is open -- see `OVERLAYS`.
+    // What capture reports while this is open; see `OVERLAYS`.
     let _overlay = OverlayOpen::new();
-    // One pane's rectangle, not the whole screen. The neighbours are
-    // painted once here and then left alone -- the pager only ever
-    // writes inside its own rect, the same arrangement browser.rs and
-    // the hex view already use.
+    // One pane's rectangle: the neighbours are painted once and left
+    // alone, as for browser.rs and the hex view.
     let mut rect = app.focused_pane_rect();
     compositor_redraw(app);
     let mut view = crate::pager::Pager::new(title, doc.lines(rect.cols), rect.rows, rect.cols);
@@ -10159,12 +9778,11 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
             service_background_jobs(app);
         }) {
             Ok(Some(k)) => k,
-            // EOF/error: nothing to resume, same as every other loop's
-            // own EOF arm.
+            // EOF or error: nothing to resume.
             Ok(None) | Err(_) => break,
         };
-        // A resize while reading re-renders the *document*, not just the
-        // view: the wrap width changed, and so did every table's layout.
+        // A resize re-renders the document, not just the view: the wrap width
+        // and every table's layout changed.
         if (app.term_rows, app.term_cols) != last_size {
             last_size = (app.term_rows, app.term_cols);
             rect = app.focused_pane_rect();
@@ -10176,10 +9794,9 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
         }
         match view.handle_key(key) {
             crate::pager::Outcome::Quit => break,
-            // A click the pager has no use for. Landing on another tab
-            // or pane, going there closes it -- the same rule a `<C-w>`
-            // focus change already follows. Anything else (this pane, a
-            // divider, a miss) keeps reading.
+            // A click on another tab or pane goes there and closes the
+            // pager, as a `<C-w>` focus change does. Anything else keeps
+            // reading.
             crate::pager::Outcome::Click(ev) => match hit_test_click(app, ev) {
                 Some(ClickTarget::Window(idx)) if idx != app.current_window => {
                     app.current_window = idx;
@@ -10195,18 +9812,12 @@ fn run_pager(app: &mut App, title: &str, doc: PagerSource) {
             crate::pager::Outcome::Continue => {}
         }
     }
-    // The guard's own Drop turns mouse reporting off; whoever called
-    // this still wants it (see every other nested-guard site here).
+    // The guard's drop turns mouse reporting off; the caller still wants it.
     print!("{}", term::MOUSE_REPORTING_ENABLE);
     let _ = io::stdout().flush();
 }
 
-// `:dbg help`/`:dbg h`/`:dbg ?`'s own reference text -- shown via the
-// same command-output overlay every other command's own output already
-// uses (CommandModeOutcome::Ran), not a hover popup (that was the
-// original standalone debugger's own convention, replaced along with
-// the rest of that view -- see debugger.rs's own top-of-file doc
-// comment).
+// `:dbg help`'s text, shown in the command output overlay.
 const DBG_HELP_TEXT: &str = "\
 bish dbg -- quick reference (:dbg help, :dbg h, :dbg ?)
 
@@ -10219,87 +9830,52 @@ bish dbg -- quick reference (:dbg help, :dbg h, :dbg ?)
 While paused at a breakpoint (in the debug-run pane): c)ontinue n)ext
 s)tep p)rint q)uit h)elp -- bare key, or `:` then the long/short name";
 
-// Command mode's own row, immediately above the tab bar (see render_
-// compositor_frame's own "pinned to the terminal's real last row"
-// comment) -- 0-indexed. Global, not tied to any particular pane's rect
-// -- the same row render_global_status_row draws the ordinary mode-line
-// into the rest of the time (see its own doc comment for why the two
-// never conflict).
+// Command mode's row, 0-based, just above the tab bar. Global, not a
+// pane's; `render_global_status_row` draws the mode line there the rest
+// of the time.
 pub(crate) fn command_mode_row(term_rows: usize) -> usize {
     term_rows.saturating_sub(2)
 }
 
-// How many rows are free above command mode's own prompt row for the
-// output overlay/transcript view to grow into.
+// Rows free above command mode's row for the output overlay and
+// transcript.
 fn command_mode_content_rows(term_rows: usize) -> usize {
     command_mode_row(term_rows)
 }
 
-// The terminal's one global mode-line/status row -- `command_mode_row`,
-// styled in reverse video, exactly like real vim's own single command/
-// status line: `run_command_mode`'s own `:` prompt draws directly to
-// this same row while it's active, and this function is simply never
-// called while that's happening (both live-render loops -- build_
-// editor_frame's caller and render_normal_mode_frame -- only ever run
-// between command-mode excursions, never during one). `text` is already
-// padded/truncated to `term_cols` by the caller's own status-text
-// function (fileeditor::status_text / normal_mode_status_text) -- this
-// only adds positioning and styling.
+// The global mode line: `command_mode_row` in reverse video, like vim's
+// one status line. The `:` prompt draws on the same row, and this is
+// never called meanwhile. `text` is already fitted to the width by the
+// caller (`fileeditor::status_text`, `normal_mode_status_text`).
 pub(crate) fn render_global_status_row(text: &str, term_rows: usize) -> String {
     format!("\x1b[{};1H\x1b[7m{}\x1b[0m", command_mode_row(term_rows) + 1, text)
 }
 
-// A true erase of the same row `render_global_status_row` draws into --
-// plain `\x1b[K`, not a reverse-video row of spaces (which would just be
-// a highlighted *empty* bar sitting there, not actually gone). For a
-// bar that's shown only sometimes within a single excursion (Ctrl-E's
-// own line-local search input, editor.rs's `run_line_normal_mode` --
-// unlike this row's other consumers, which are either always-on for the
-// whole excursion or cleaned up by a coarser `compositor_redraw` at a
-// handful of fixed transition points), calling this directly on every
-// redraw where there's nothing to show is simpler and more precise than
-// waiting for one of those coarser resets to happen to fire.
+// Erases the global status row (`\x1b[K`, not a reversed row of
+// spaces). For a bar shown only sometimes within an excursion, such as
+// Ctrl-E's search input (`editor::run_line_normal_mode`), erasing on
+// each redraw with nothing to show is simpler than waiting for a
+// `compositor_redraw`.
 pub(crate) fn erase_global_status_row(term_rows: usize) -> String {
     format!("\x1b[{};1H\x1b[K", command_mode_row(term_rows) + 1)
 }
 
-// Dark background/light foreground for a successful (exit 0) command's
-// output; error background/dark foreground for a failed one -- see
-// run_command_mode's own doc comment for the request this implements.
-// Deliberately distinct from every other color this crate uses
-// (prompt.rs's OK_COLOR/ERR_COLOR only ever recolor a short glyph, never
-// a whole line's background) so the overlay reads as its own distinct
-// UI surface, not just a tinted prompt.
+// The overlay's colours: dark background for a command that succeeded,
+// red for one that failed, unlike anything else bish draws, so it reads
+// as its own surface.
 const OUTPUT_BG: &str = "\x1b[48;5;236m";
 const OUTPUT_FG: &str = "\x1b[38;5;253m";
 const ERROR_BG: &str = "\x1b[41m";
 const ERROR_FG: &str = "\x1b[30m";
-// The transcript view's own command-echo lines (render_command_
-// transcript): the terminal's ordinary background, bold foreground --
-// distinguishes a ":"-command line from the output rows following it
-// without needing a third background color.
+// Command echo lines in the transcript: the terminal's background,
+// bold, setting them apart from the output without a third colour.
 const CMD_ECHO_BG: &str = "\x1b[49m";
 const CMD_ECHO_FG: &str = "\x1b[1m";
 
-// Pads or truncates `text` to exactly `cols` visible columns (plain
-// chars only -- callers never feed this pre-colored text) and wraps it
-// in the given SGR bg/fg pair, reset at the end -- shared by the output
-// overlay and the transcript view so both always paint a full-width,
-// unambiguously-edged line rather than leaving stray real-terminal
-// content peeking out past a short one.
-// Tabs, as the terminal will actually draw them: out to the next
-// multiple of eight, counting only what is visible (an SGR sequence
-// occupies no columns).
-//
-// A fixed-width bar cannot leave these alone. `visible_len` counts a
-// tab as one column because a per-character width is all it can
-// return, but a terminal draws it as up to eight -- so a line holding
-// one is padded as though it were short, overflows `cols`, and wraps
-// onto the row below. That row is the mode line, which is what made
-// `::bish lsp status` (tab-separated, like every `ls` this shell has)
-// look spliced into the file and spilling over the status bar.
-// Expanding here rather than at each call site keeps the "this draws
-// exactly `cols` columns" promise in the one place that makes it.
+// Tabs as the terminal draws them, out to the next multiple of eight,
+// counting only visible columns. `visible_len` counts a tab as one, so
+// a line with one was padded as if short, overflowed `cols` and wrapped
+// onto the mode line (`::bish lsp status` is tab-separated).
 const TAB_STOP: usize = 8;
 
 fn expand_tabs(text: &str) -> String {
@@ -10385,8 +9961,8 @@ mod workspace_edit_tests {
         TextEdit { start: (line, from), end: (line, to), text: text.to_string() }
     }
 
-    // rust-analyzer's own shape for renaming a module that has a file of
-    // its own: the file moves, then it and whatever names it are edited.
+    // Renaming a module that has a file of its own: the file moves, then it
+    // and whatever names it are edited.
     #[test]
     fn a_file_is_renamed_then_edited_by_its_new_name_and_its_open_buffer_follows() {
         let dir = scratch("rename");
@@ -10428,8 +10004,8 @@ mod workspace_edit_tests {
         std::fs::write(dir.join("closed.rs"), "one\n").unwrap();
         std::fs::write(dir.join("open.rs"), "one\n").unwrap();
         let mut buf = TextBuffer::open(&dir.join("open.rs"), 10).unwrap();
-        // The second entry's position is in the text the first one left:
-        // ` three` goes after the ` two` the first entry put there.
+        // The second entry's position is in the text the first left: ` three`
+        // goes after the ` two` the first put there.
         let entries = |path: &Path| vec![(uri(path), vec![replace(0, 3, 3, " two")]), (uri(path), vec![replace(0, 7, 7, " three")])];
         let edit = WorkspaceEdit {
             changes: [entries(&dir.join("closed.rs")), entries(&dir.join("open.rs"))].concat(),
@@ -10510,10 +10086,8 @@ mod workspace_edit_tests {
 mod overlay_tab_tests {
     use super::*;
 
-    // The bug this exists for: a tab-separated line (every `ls` in this
-    // shell prints one) was padded as though each tab were one column,
-    // overflowed the row, and wrapped onto the mode line -- which is
-    // what made `::bish lsp status` look spliced into the file.
+    // A tab-separated line was padded as if each tab were one column,
+    // overflowed the row and wrapped onto the mode line.
     #[test]
     fn a_tabbed_line_still_draws_exactly_one_row_wide() {
         let row = "1\tready\tutf-32\t1\t/home/jussi/bish\trust-analyzer";
@@ -10528,13 +10102,13 @@ mod overlay_tab_tests {
         assert_eq!(expand_tabs("abcdefg\tb"), "abcdefg b");
         // Exactly on a stop still advances a whole one, as a terminal does.
         assert_eq!(expand_tabs("abcdefgh\tb"), "abcdefgh        b");
-        // A line with none is handed back untouched.
+        // A line with none is returned untouched.
         assert_eq!(expand_tabs("plain"), "plain");
-        // SGR occupies no columns, so it must not shift the stops.
+        // SGR takes no columns, so it doesn't shift the stops.
         assert_eq!(expand_tabs("\x1b[1ma\x1b[0m\tb"), "\x1b[1ma\x1b[0m       b");
     }
 
-    // Long output is truncated rather than wrapped, for the same reason.
+    // Long output is truncated, not wrapped, for the same reason.
     #[test]
     fn a_line_wider_than_the_row_is_cut_to_it() {
         let wide = "x".repeat(50) + "\t" + &"y".repeat(50);
@@ -10542,16 +10116,17 @@ mod overlay_tab_tests {
     }
 }
 
+// Pads or truncates `text` to exactly `cols` columns in the given colours,
+// so the overlay and transcript paint full-width lines with nothing from
+// before showing past a short one.
 fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String {
     let text = &expand_tabs(text);
     let mut out = String::new();
     out.push_str(bg);
     out.push_str(fg);
-    // Measured by what the line *draws*, not by how many chars it holds:
-    // command output may contain its own SGR sequences (a rendered
-    // markdown document does -- see render_markdown_document), and
-    // counting those as text would truncate a styled line at a fraction
-    // of its real width and mis-pad the rest.
+    // Measured by what the line draws: output can carry SGR sequences (a
+    // rendered markdown document does), and counting them would cut a
+    // styled line short.
     let len = editor::visible_len(text);
     if len >= cols {
         out.push_str(&truncate_to_width(text, cols));
@@ -10563,9 +10138,8 @@ fn styled_full_width_line(text: &str, bg: &str, fg: &str, cols: usize) -> String
     out
 }
 
-// The first `cols` *columns* of `text`, keeping every SGR sequence it
-// passes (dropping one would leave the rest of the line in whatever
-// style happened to be active).
+// The first `cols` columns of `text`, keeping every SGR sequence passed,
+// or the rest of the line would be in the wrong style.
 fn truncate_to_width(text: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
@@ -10592,33 +10166,21 @@ fn truncate_to_width(text: &str, cols: usize) -> String {
     out
 }
 
-// Shows one command's captured output anchored directly above command
-// mode's own prompt row, growing upward -- see run_command_mode's own
-// doc comment for the overall UI this is part of. Capped to however
-// many rows are actually free above the prompt (command_mode_content_
-// rows); a longer output is truncated from the top, with a one-line "N
-// more lines above" marker taking the truncated content's place, rather
-// than spilling into (and overwriting) the tab bar or wrapping
-// unpredictably. Blanks every row above the shown content first --
-// self-healing against a previous, taller overlay having left rows
-// higher up the screen painted, matching this crate's existing "always
-// a full repaint, never a diff" convention (see compositor_redraw's own
-// doc comment).
+// Shows one command's output just above command mode's row, growing
+// upward, capped at `command_mode_content_rows`. Longer output is cut
+// from the top, with an "N more lines above" marker, rather than
+// overwriting the tab bar.
 fn render_command_output_overlay(output: &str, status: i32, term_rows: usize, term_cols: usize) {
     print!("{}", build_command_output_overlay(output, status, term_rows, term_cols));
     let _ = io::stdout().flush();
 }
 
-// render_command_output_overlay's own string-building half, split out
-// purely for testability -- same "pure builder plus a thin print
-// wrapper" shape build_compositor_frame_output/diff_frames already
-// established.
+// The string-building half of `render_command_output_overlay`, for
+// tests.
 fn build_command_output_overlay(output: &str, status: i32, term_rows: usize, term_cols: usize) -> String {
     let (bg, fg) = if status == 0 { (OUTPUT_BG, OUTPUT_FG) } else { (ERROR_BG, ERROR_FG) };
-    // A caller-checked non-zero exit with genuinely empty output (see
-    // run_normal_mode_navigation's own doc comment on this) still gets
-    // one bare colored row -- `output.lines()` on an empty string yields
-    // nothing at all, which would otherwise mean no bar shown.
+    // A failure with no output still gets one coloured row: `lines()` on an
+    // empty string yields nothing.
     let all_lines: Vec<&str> = if output.is_empty() { vec![""] } else { output.lines().collect() };
     let available = command_mode_content_rows(term_rows).max(1);
     let prompt_row = command_mode_row(term_rows);
@@ -10634,19 +10196,9 @@ fn build_command_output_overlay(output: &str, status: i32, term_rows: usize, ter
 
     let start_row = prompt_row.saturating_sub(shown.len());
     let mut out = String::new();
-    // Deliberately does NOT blank rows 0..start_row: this overlay is
-    // reused for both the plain scrollback view (nothing meaningful
-    // above it) AND Frame::Edit's own real file content (very much
-    // meaningful) -- the caller in the latter case (run_normal_mode_
-    // navigation's own CommandModeOutcome::Ran arm) never repaints the
-    // real buffer before showing an error/short-output overlay, so a
-    // blanket wipe here used to erase the visible file to a blank
-    // screen for however long the overlay stayed up. Any leftover text
-    // from a *taller* previous overlay is already handled: the very
-    // next keystroke resolves PendingView::Output with a real
-    // render_nav_frame redraw before doing anything else (see
-    // PendingView's own doc comment), so nothing stale can persist past
-    // one keypress.
+    // Rows above the overlay aren't blanked: over a file they show the
+    // buffer. A taller earlier overlay's leftovers last only until the next
+    // key, which redraws (see `PendingView`).
     for (i, line) in shown.iter().enumerate() {
         out.push_str(&format!("\x1b[{};1H", start_row + i + 1));
         out.push_str(&styled_full_width_line(line, bg, fg, term_cols));
@@ -10654,37 +10206,19 @@ fn build_command_output_overlay(output: &str, status: i32, term_rows: usize, ter
     out
 }
 
-// Shows one error message the exact same way a failed command's own
-// output would (render_command_output_overlay, status != 0 -- its own
-// error colors) -- what every "recognized but malformed input" arm
-// inside run_command_mode's own loop uses now, instead of sink_err.
-// Those arms stay in that same colon-line loop afterward (`buffer.
-// clear(); continue;`) rather than returning to the caller, so they
-// can't rely on the caller's own CommandModeOutcome::Ran-driven overlay
-// call the way a *successful* command's output does -- and sink_err
-// itself would silently go nowhere here: while a Frame::Edit pane's own
-// file-editor content is focused, it's rendered by writing straight to
-// the real terminal (render_editor_frame), bypassing the session's own
-// vt100 Screen grid model entirely until it later loses focus, exactly
-// where sink_err's Grid-sink path would otherwise land these bytes --
-// invisibly, since nothing repaints from that model again before the
-// next real keystroke arrives. A confirmed, previously-reported bug:
-// every error this function used to report this way was completely
-// silent in practice.
+// Shows an error as a failed command's output would be. For the
+// malformed-input arms of `run_command_mode`, which stay in the colon
+// line loop and so don't get the caller's overlay. `sink_err` would be
+// invisible here: a file pane draws straight to the terminal, and the
+// grid it would write to isn't repainted before the next key.
 fn show_command_mode_error(msg: &str, term_rows: usize, term_cols: usize) {
     render_command_output_overlay(msg, 1, term_rows, term_cols);
 }
 
-// Fills every row above command mode's own prompt row with `transcript`
-// (a session's whole SessionState::command_transcript -- every command
-// mode has actually run in this session, across every separate ':'
-// invocation, not just the current one), tail-aligned (the most recent
-// entries at the bottom, right above the prompt) so whatever just ran
-// is always visible without scrolling. Toggled by Ctrl-L, either while
-// composing a command mode line (run_command_mode) or from the
-// PendingView::Output overlay right after one's just run (run_normal_
-// mode_navigation) -- see PendingView's own doc comment for how the
-// latter is resolved away again.
+// Fills the rows above command mode's row with the session's whole
+// command transcript (every command run, across `:` invocations),
+// newest at the bottom so what just ran is visible. Ctrl-L toggles it,
+// while typing a command or from the output overlay after one ran.
 fn render_command_transcript(transcript: &[TranscriptEntry], term_rows: usize, term_cols: usize) {
     let available = command_mode_content_rows(term_rows).max(1);
     let prompt_row = command_mode_row(term_rows);
@@ -10713,108 +10247,43 @@ fn render_command_transcript(transcript: &[TranscriptEntry], term_rows: usize, t
     let _ = io::stdout().flush();
 }
 
-// How run_command_mode's one-shot loop ended -- see its own doc comment
-// for what each case means. Not Copy (Ran carries a String) -- handle_
-// command_mode's own match only ever binds Copy data out of it (Action's
-// WindowAction; Ran's own fields are matched by callers, not by handle_
-// command_mode itself), so it can still match by value and return the
-// same `outcome` afterward without needing Clone/Copy.
+// How `run_command_mode` ended; see it for each case. Not `Copy` (`Ran`
+// holds a `String`); `handle_command_mode` binds only `Copy` data from
+// it, so it still matches by value and returns `outcome` after.
 #[derive(Debug)]
 enum CommandModeOutcome {
     Action(WindowAction),
-    // The user typed vim's own ":q"/":q!" -- see run_command_mode's own
-    // doc comment for why these are special-cased rather than run as
-    // shell commands.
+    // `:q`/`:q!`; see `run_command_mode` for why they aren't run as shell
+    // commands.
     Quit,
     Cancelled,
-    // An ordinary command ran to completion (regardless of its own exit
-    // status) -- already appended to the session's own command_
-    // transcript by the time this is returned. `output` is the combined
-    // stdout+stderr it produced (may be empty); `status` is Shell::
-    // last_status right after it ran. The caller (run_normal_mode_
-    // navigation) is the one that actually shows this -- see its own
-    // doc comment on PendingView for how.
+    // An ordinary command ran, whatever its status, and is already in the
+    // transcript. `output` is its stdout and stderr (maybe empty), `status`
+    // its exit status. `run_normal_mode_navigation` shows it (see
+    // `PendingView`).
     Ran {
         output: String,
         status: i32,
     },
-    // `:noh`/`:nohlsearch` -- stop drawing the current search's matches.
-    //
-    // Handed back rather than done here for the reason `Symbols` is:
-    // the flag lives on `VimKeys`, which command mode does not have and
-    // the Normal-mode loop that owns the search does.
+    // `:noh`/`:nohlsearch`: stop drawing the search's matches. Handed back,
+    // as the flag lives on the Normal-mode loop's `VimKeys`.
     NoHighlight,
-    // `:normal {keys}` -- run `keys` as if they had been typed in
-    // Normal mode.
-    //
-    // Handed back for the same reason `NoHighlight` is: the keys go
-    // through `VimKeys`, which command mode does not have.
+    // `:normal {keys}`: run `keys` as if typed in Normal mode. Handed back,
+    // as the keys go through `VimKeys`.
     RunNormal(String),
-    /// `:s/.../.../c` -- the range has to be walked one match at a time
-    /// with the pane redrawn between each, which needs the caller's own
-    /// rect and `VimKeys`. Same reason `RunNormal` is handed back rather
-    /// than run here.
+    /// `:s/.../.../c`: walked one match at a time, redrawing the pane
+    /// between, which needs the caller's rect and `VimKeys`.
     ConfirmSubstitute(Box<SubstituteCmd>),
-    // `:sym QUERY` -- ask the language server for matching symbols
-    // across the whole project. Handed back rather than done here
-    // because the answer goes into the locations pane, and command mode
-    // has neither the pane's id nor the map it lives in; the Normal-mode
-    // loop that owns `gO`'s pane has both.
+    // `:sym QUERY`: matching symbols across the project. Handed back, as
+    // the answer goes into the locations pane, which the Normal-mode loop
+    // owns.
     Symbols(String),
 }
 
-// Command mode: reached only via bishedit normal mode's own ':' now (see
-// editor::ReadOutcome::NormalMode's doc comment and run_normal_mode_
-// navigation's own ':' handling) -- and, unchanged, via the M10c job-
-// detach path. Has its own history, separate from the shell's, and only
-// ever runs builtins directly -- `command NAME` is the escape hatch for
-// externals (see restrict_to_builtins in exec.rs).
-// Renders its own prompt via prompt::command_mode_prompt -- a bare ':',
-// deliberately *not* a variant of the normal shell prompt (see that
-// function's own doc comment). Global, not pane-relative: always the
-// row directly above the tab bar (command_mode_row), spanning the
-// terminal's whole width, independent of whichever pane/window happened
-// to be focused when it was entered.
-// One-shot, matching vim's ':' Ex command line: running an ordinary
-// command (Ran) drops straight back to the caller, same as every other
-// non-continuing outcome -- what to actually show for it is the
-// caller's job (run_normal_mode_navigation keeps it on screen until the
-// next keypress; see PendingView), not something worth looping this
-// function itself over. An empty line, Ctrl-C, Ctrl-D, or Esc
-// (regardless of what's been typed -- see read_line's esc_cancels
-// parameter) all cancel out the same way, with nothing run -- and so
-// does Backspace at an empty buffer (matching real vim: Backspace on an
-// empty Ex line drops back to Normal mode -- see read_line's own
-// Key::Backspace arm). Typing exactly "q" or "q!" as the whole
-// (complete, non-continuing) line is recognized directly, *before* ever
-// reaching the lex/parse/run pipeline -- these are vim's own Ex quit
-// commands, not shell builtins. A command_mode_violation or syntax
-// error deliberately does *not* return -- it's shown directly (sink_err)
-// and the buffer clears, so a typo can be retried at the same prompt
-// without re-entering command mode from scratch; neither one is
-// recorded to the session's command_transcript (matching how `history`
-// itself only ever records something that actually parsed).
-// Ctrl-L (ctrl_l_reports, below) toggles a view of the session's own
-// command_transcript -- accumulated across every previous ':'
-// invocation, not just this one -- while composing this line; toggled
-// off the same way, or left as-is when this function returns (the
-// caller's own compositor_redraw, wherever it ends up happening, clears
-// it).
-// The editor's own colon-line vocabulary: the command names the match
-// below answers to that are the editor's rather than the shell's.
-//
-// A copy of what that match spells out, and the only honest way to have
-// one -- a `match` arm is not a registry that can be read back, the way
-// `bishopt`'s own completion reads the option registry. What keeps the
-// copy honest is a test: every `:name` the help screen documents has to
-// appear here, which is exactly the gap that let `:preview` be a
-// documented command the colon line painted as an error.
-//
-// Two things need it, and would each have grown a list of their own
-// otherwise. The highlighter, so a real command is not shown red for
-// being absent from PATH -- it *is* absent from PATH, and so is every
-// other command on this line. And completion, so `:prev<Tab>` finishes
-// the word, which is the other half of the same question.
+// The editor's colon-line command names, beside the shell's. A copy of
+// the match below, kept honest by a test: every `:name` the help
+// documents must be here. The highlighter uses it so these don't show
+// red for not being on PATH, and completion so `:prev<Tab>` finishes.
 pub(crate) const COLON_COMMANDS: &[&str] = &[
     "dbg",
     "debug",
@@ -10853,51 +10322,50 @@ pub(crate) const COLON_COMMANDS: &[&str] = &[
     "x",
 ];
 
+// Command mode: entered by Normal mode's `:` or the job-detach path. Its
+// own history, separate from the shell's, and it runs only builtins;
+// `command NAME` reaches externals (see `restrict_to_builtins`). Its `:`
+// prompt (`prompt::command_mode_prompt`) is on the row above the tab bar,
+// full width, whatever pane is focused.
+//
+// One-shot, like vim's `:` line: a command that ran returns to the caller,
+// which shows the output (see `PendingView`). An empty line, Ctrl-C,
+// Ctrl-D, Esc or Backspace on an empty line cancels. `q`/`q!` are
+// recognised before parsing, as vim's quit commands. A violation or
+// syntax error is shown and the line cleared for another try, without
+// returning or entering the transcript. Ctrl-L toggles the transcript of
+// every command run in this session.
 fn run_command_mode(
     app: &mut App,
     session_id: SessionId,
-    // `Some` iff the pane driving this call is a `Frame::Edit` (the
-    // unified Normal-mode loop's own `NavBuffer::Editable` -- see that
-    // enum's doc comment) -- what makes `w`/`w <path>`/`wq`/`x`/`q`/`q!`/
-    // `diag`/`diag clear` mean anything here at all: they're the file's
-    // own save/quit/diagnose commands, not general window-management
-    // ones, so they only exist when there's an actual buffer for them to
-    // act on.
+    // `Some` iff the pane is a `Frame::Edit` (`NavBuffer::Editable`): what
+    // gives `w`, `w <path>`, `wq`, `x`, `q`, `q!`, `diag` and `diag clear`
+    // a buffer to act on.
     editing: Option<&mut TextBuffer>,
-    // Seeds the very first prompt with already-typed text, cursor at its
-    // end -- Ctrl+G mid-typing (below) uses this to carry the
-    // in-progress line into command mode's own next prompt rather than
-    // losing it. `None` (every other call site) starts with the ordinary
-    // empty buffer.
+    // Seeds the first prompt with text, cursor at its end, so Ctrl+G
+    // mid-typing (below) keeps the line. `None` elsewhere.
     seed: Option<String>,
-    // See editor::read_line's own `queued` parameter: a mapping whose
-    // right-hand side opened this colon line has more keys to deliver.
+    // See `editor::read_line`'s `queued`: a mapping whose right-hand side
+    // opened this line has more keys to deliver.
     mut queued: Vec<Key>,
-    // See handle_command_mode's own parameter of the same name.
+    // See `handle_command_mode`'s parameter of the same name.
     last_search: &str,
 ) -> CommandModeOutcome {
     let mut editing = editing;
     let mut buffer = String::new();
-    // The colon line's own copy of the prompt's rule (see
-    // starts_off_the_record). `: !make` is remembered; `:` space `!make`
-    // runs and is forgotten -- and the space costs the bang nothing,
-    // since history::expand trims before it looks for one.
+    // The prompt's rule (see `starts_off_the_record`): `: !make` is
+    // remembered; `:` space `!make` runs and is forgotten
+    // (`history::expand` trims before looking for the bang).
     let mut buffer_unrecorded = false;
     let mut transcript_visible = false;
-    // Set from `seed` on the very first iteration, or by Ctrl+G
-    // below (see that arm's own comment) on any later one -- consumed by
-    // the very next read_line call, then left None again either way.
+    // From `seed` on the first iteration, or Ctrl+G below later; taken by
+    // the next `read_line`.
     let mut pending_initial: Option<(String, usize)> = seed.map(|s| {
         let len = s.chars().count();
         (s, len)
     });
     loop {
-        // Recomputed every iteration (not just once up front) so a
-        // resize that arrives while this loop is blocked on a keystroke
-        // (see service_background_jobs's own on_idle-driven WINCH
-        // handling below) repositions this row correctly on the very
-        // next redraw, instead of staying pinned to wherever the old
-        // &mut app.term_rows put it.
+        // Each iteration, so a resize while waiting for a key moves the row.
         let prompt_row = command_mode_row(app.term_rows) + 1;
         let prompt_str = if buffer.is_empty() { prompt::command_mode_prompt() } else { prompt::continuation() };
         let mouse = app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse"));
@@ -10908,142 +10376,86 @@ fn run_command_mode(
         print!("\x1b[{};1H", prompt_row);
         let _ = io::stdout().flush();
 
-        // esc_cancels: true -- like a vim ':' command line, Esc (and an
-        // empty-buffer Backspace) should back out of command mode the
-        // same as Ctrl-C, regardless of what's been typed. ctrl_l_
-        // reports: true -- command mode gives Ctrl-L its own meaning
-        // (toggling the transcript view, below) rather than the
-        // ordinary shell prompt's "clear the real screen."
-        // The highlight context is `default()` but for one field: no
-        // single clearly-current session at this call site, and command
-        // mode types window-management subcommands, not shell command
-        // lines. The exception is `line_commands` -- this line answers to
-        // the editor's own commands as well as the shell's, and without
-        // them every one of those shows red for not being on PATH.
-        // cwd being None skips file/dir Link detection entirely;
-        // known_functions being None doesn't skip command-validity
-        // checking (that still runs against builtins/PATH), it just can't
-        // recognize a session-specific function as valid there -- a minor,
-        // accepted gap given what command mode is actually used for.
-        // Flag/subcommand/printf highlighting need neither field, so those
-        // work exactly as they do at the ordinary prompt.
-        // No meaningful *shell* completion context here, same reasoning
-        // as HighlightContext::default() above -- window-management
-        // subcommands, not shell command lines. What it does get is
-        // BuiltinCompletionProvider: the builtins whose arguments bish
-        // itself defines need no session, cwd or PATH to complete, and
-        // `:bishopt --set <Tab>` is worth as much here as at the prompt
-        // -- more, since changing a view option is something you do
-        // *while* looking at the buffer it changes. Which is also why it
-        // gets the one snapshot it cannot do without: `::bish hl`'s
-        // namespace is open, so what is *set* is knowable only from the
-        // session. It also gets `COLON_COMMANDS`, the other half of the
-        // same fix the highlight context above gets them for: a command
-        // that cannot be completed is one you have to have memorised.
-        // menu_capable: false
-        // -- this colon line has no row of its own to draw a menu into,
-        // so Tab cycles by splicing, which is what a one-line prompt
-        // wants anyway.
-        // Snapshotted before the call: the `on_idle` closure below takes
-        // `app.sessions` mutably for the whole of it, so this cannot be read
-        // inline as another argument.
+        // Taken before the call: the `on_idle` closure holds `app.sessions`
+        // mutably throughout.
         let command_mappings = app.sessions.get(&session_id).map(|s| s.shell.mappings.clone()).unwrap_or_default();
-        // O(1) Rc-clone, for the same reason -- see `History`'s own doc
-        // comment, which names this exact situation.
+        // An `Rc` clone, for the same reason; see `History`.
         let history_snapshot = app.cmd_history.clone();
         let outcome = app.with_registers(|app, registers| {
             editor::read_line(
                 &prompt_str,
                 &prompt_str,
                 &history_snapshot,
+                // Esc and an empty Backspace leave, as in vim; Ctrl-L is
+                // reported, for the transcript.
                 true,
                 true,
                 pending_initial.take(),
                 0,
                 app.term_cols,
-                // Not `default()` outright: this line's commands are the
-                // editor's own, and nothing else about the context is
-                // knowable here (see the note above on why).
+                // Only `line_commands`: this line takes the editor's
+                // commands as well as the shell's, which would otherwise
+                // show red for not being on PATH. Without a session's cwd
+                // or functions, links aren't detected and functions show as
+                // unknown.
                 HighlightContext { line_commands: Some(COLON_COMMANDS), ..HighlightContext::default() },
+                // The builtins whose arguments bish defines complete
+                // without a session; `:bishopt --set <Tab>` is most useful
+                // while looking at the buffer it changes.
                 Some(&builtin_completion),
                 None,
+                // No row to draw a menu in, so Tab cycles in place.
                 false,
                 None,
                 registers,
                 &[],
-                // No global row of its own to draw into here -- this colon-
-                // line already occupies that exact row with its own prompt
-                // (see read_line's own doc comment on this param) -- so a
-                // Ctrl-E search started while composing a `:` command falls
-                // back to the original in-place prompt substitution.
+                // No global row for a Ctrl-E search: this line is on it, so
+                // the search substitutes into the prompt in place.
                 None,
-                // Command mode's own colon line sits on the global status
-                // row with an output overlay of its own that no
-                // compositor_redraw knows how to put back, so it never asks
-                // for one -- whatever arrived shows up once this excursion
-                // ends and the caller repaints.
+                // Never asks for a redraw: this line and its overlay are on
+                // the global status row, which no `compositor_redraw`
+                // restores. What arrived shows when the caller repaints.
                 &mut || {
                     service_background_jobs(app);
                     false
                 },
-                // The `mouse` bishopt -- off keeps the terminal's own
-                // selection working here (see enable_maybe_mouse).
+                // The `mouse` bishopt; off keeps the terminal's own
+                // selection (see `enable_maybe_mouse`).
                 mouse,
-                // This colon line *is* command mode, so `::bish map -m
-                // command` applies to it.
+                // This line is command mode, so `::bish map -m command`
+                // applies.
                 command_mappings,
-                // ...and if a mapping's `:` is what opened it, the rest of
-                // that right-hand side arrives here.
+                // If a mapping's `:` opened this, the rest of its
+                // right-hand side.
                 std::mem::take(&mut queued),
             )
         });
         match outcome {
-            // Command mode discards whatever was typed either way, so
-            // `text` is nothing to it -- see that field's own doc comment
-            // for the caller that does need it.
+            // Command mode drops what was typed either way.
             Ok(ReadOutcome::Eof) | Ok(ReadOutcome::Interrupted { .. }) => return CommandModeOutcome::Cancelled,
-            // Directory navigation doesn't mean much inside command
-            // mode's own restricted context -- just ignore it and keep
-            // showing this same prompt, rather than wiring dir_history
-            // all the way through here too.
+            // Directory navigation means nothing here; keep the prompt.
             Ok(ReadOutcome::DirNav(_)) => {}
-            // Entering bishedit normal mode from inside command mode
-            // isn't a thing (you're already navigating a screen, not a
-            // live prompt) -- but unlike DirNav, this can no longer just
-            // be ignored outright: Ctrl+G is unconditional now (see
-            // its own doc comment), so simply dropping `text`/`cursor`
-            // here would silently discard whatever had already been
-            // typed the instant this fired mid-line. Feeding it back as
-            // the next read_line call's own `initial` keeps that text
-            // right where it was -- the same "don't lose in-progress
-            // typing" guarantee every other caller of this gets.
-            // `wheel` is ignored for the same reason: a colon line is
-            // already inside the scrollback view, so a notch has no
-            // second view to open.
+            // Normal mode can't be entered from here, but Ctrl+G must not
+            // lose what was typed, so it's fed back to the next
+            // `read_line`. `wheel` is ignored: the colon line is already
+            // over the view.
             Ok(ReadOutcome::NormalMode { text, cursor, wheel: _ }) => {
                 pending_initial = Some((text, cursor));
             }
-            // And the same for Ctrl+T: the opener's whole vocabulary is
-            // "go to this pane" or "open this in a window of its own",
-            // and a colon line is in the middle of saying something about
-            // the pane it is already in. Whatever was typed stays put.
+            // Ctrl+T too: the opener goes elsewhere, and this line is about
+            // the pane it's in. What was typed stays.
             Ok(ReadOutcome::Opener { text, cursor }) => {
                 pending_initial = Some((text, cursor));
             }
-            // Same reasoning as NormalMode just above: click-to-focus
-            // isn't a thing while editing a command-mode colon-line
-            // (you're not looking at any particular pane's content right
-            // now to click on), so just preserve whatever was typed and
-            // keep this same prompt going rather than acting on the
-            // click's own target.
+            // A click while typing a colon line keeps the line and does
+            // nothing else.
             Ok(ReadOutcome::Mouse { text, cursor, .. }) => {
                 pending_initial = Some((text, cursor));
             }
-            // Command mode stitches multi-line input the same way the
-            // shell prompt does, so a paste's finished lines join the
-            // buffer here and the unfinished one goes back to the
-            // prompt. Nothing runs until the line that completes it is
-            // submitted, which is the whole point.
+            // Multi-line input is stitched as at the prompt: a paste's
+            // finished lines join the buffer, the unfinished one goes back
+            // to the prompt, and nothing runs until the line completing it
+            // is submitted.
             Ok(ReadOutcome::Pasted { lines, rest, cursor }) => {
                 for line in lines {
                     if !buffer.is_empty() {
@@ -11062,15 +10474,12 @@ fn run_command_mode(
                 }
             }
             Ok(ReadOutcome::Line(line)) => {
-                // Same app.cmd_history expansion as the normal shell prompt (see
-                // history::expand's own doc comment), scoped the same
-                // way: only the first line of a fresh command, against
-                // command mode's own separate app.cmd_history. Command mode
-                // disallows subshells outright (command_mode_violation
-                // below), so an unrecognized leading `!` becomes
-                // `command <rest>` here instead of `(<rest>)` -- the
-                // same "force it to run as an external" escape hatch
-                // command mode already has, not a second one.
+                // History expansion as at the prompt (see
+                // `history::expand`): only the first line of a fresh
+                // command, against command mode's own history. Command mode
+                // forbids subshells (`command_mode_violation`), so an
+                // unrecognised leading `!` becomes `command <rest>`, not
+                // `(<rest>)`.
                 if buffer.is_empty() {
                     buffer_unrecorded = starts_off_the_record(&line);
                 }
@@ -11095,36 +10504,20 @@ fn run_command_mode(
                 if trimmed.is_empty() {
                     return CommandModeOutcome::Cancelled;
                 }
-                // `":"`: vim's own last-ex-command register, recorded
-                // regardless of what the command turns out to be
-                // (matching vim: even a failed `:nonsense` becomes the
-                // new `":`) -- now that `:` is genuinely one command
-                // mode, it records here rather than only when a
-                // `Frame::Edit` pane's own w/wq/x/q/q! handling ran.
+                // `":`, vim's last-command register, set whatever the
+                // command turns out to be; a failed `:nonsense` counts too,
+                // as in vim.
                 app.registers.set_last_ex_command(trimmed.clone());
 
-                // `w`/`w <path>`/`wq`/`x`/`q`/`q!`: the file's own
-                // save/quit commands -- only mean anything when this
-                // call is driving a `Frame::Edit` pane (`editing` is
-                // `Some`), checked *before* the general `q`/`q!` case
-                // just below so a dirty file's own `q` can be refused
-                // instead of falling into "leave command mode" -- the
-                // caller (the unified Normal-mode loop's own `:` arm,
-                // which already knows which `NavBuffer` variant it's
-                // driving) is what gives a plain `CommandModeOutcome::
-                // Quit` its actual meaning either way, same as
-                // `dispatch_window_cmd`'s existing "one outcome, meaning
-                // depends on the caller" pattern for `<C-w>`.
+                // The file's own save and quit commands, when driving a
+                // `Frame::Edit`. Checked before the general `q`/`q!` so a
+                // dirty file's `q` can be refused. The caller decides what
+                // `CommandModeOutcome::Quit` means.
                 if let Some(tb) = editing.as_deref_mut() {
-                    // `[range]s/pattern/replacement/[flags]`: checked
-                    // before the ordinary space-split (cmd, arg) parsing
-                    // just below, since this command's own syntax (an
-                    // optional leading range, then `s` glued directly to
-                    // its own delimiter -- no space at all) doesn't fit
-                    // that shape. `parse_substitute_command` returns
-                    // `None` -- not even a recognized attempt -- for
-                    // anything else (`w`, `diag`, ...), letting this
-                    // fall through to the ordinary dispatch unchanged.
+                    // `[range]s/pattern/replacement/[flags]` and its kin,
+                    // checked before the space-split parsing below, which
+                    // their syntax doesn't fit (`s` is glued to its
+                    // delimiter). `None` for anything else.
                     if let Some(parsed) = parse_global_command(&trimmed) {
                         match parsed.and_then(|cmd| run_global(tb, &cmd)) {
                             Ok(lines) => {
@@ -11144,15 +10537,10 @@ fn run_command_mode(
                         }
                     }
 
-                    // `:!cmd` -- vim's "run this through the shell".
-                    // Nearly free here, since this colon line already
-                    // ends in the shell (see the `run_program` call at
-                    // the bottom of this function): the `!` says the
-                    // rest wants vim's `%` expansion rather than the
-                    // shell's own reading of it, and then hands the
-                    // remainder straight down. Without this the `!` went
-                    // to the shell attached to the command name, and
-                    // `:!echo %` looked for a command called `!echo`.
+                    // `:!cmd`: the `!` asks for vim's `%` expansion, and
+                    // the rest goes to the shell as usual (see
+                    // `run_program` below). Otherwise `:!echo %` looked for
+                    // a command named `!echo`.
                     match parse_bang_command(&trimmed) {
                         Some(BangCommand::Filter { from, to, cmd }) => match filter_lines_through_command(app, session_id, tb, from, to, cmd) {
                             Ok(output) => {
@@ -11170,11 +10558,9 @@ fn run_command_mode(
                             }
                         },
                         Some(BangCommand::Run(rest)) => {
-                            // History gets what was typed, not what it
-                            // expanded to: `!ls %` recalled as `ls
-                            // sample.txt` would name whichever file
-                            // happened to be open when it ran, in a
-                            // buffer that has since moved on.
+                            // History gets what was typed: `!ls %` recalled
+                            // as `ls sample.txt` would name a file the
+                            // buffer has since moved on from.
                             if !buffer_unrecorded {
                                 app.cmd_history.record(&trimmed, None);
                             }
@@ -11218,24 +10604,21 @@ fn run_command_mode(
                         }
                     }
 
-                    // `:s`, `:&`, `:&&`, `:~` -- "that again". Checked
-                    // first, and deliberately narrow enough not to
-                    // shadow a real `:s/a/b/` (see
+                    // `:s`, `:&`, `:&&`, `:~`: "that again". Checked first,
+                    // and narrow enough not to shadow `:s/a/b/` (see
                     // `parse_repeat_substitute`).
                     let repeat = parse_repeat_substitute(&trimmed).map(|parsed| {
                         parsed.and_then(|(from, to, kind, flags)| repeat_substitute(app.last_substitute.as_ref(), last_search, from, to, kind, flags))
                     });
-                    // Either shape arrives here as the same thing: a
-                    // `SubstituteCmd`, or the reason there isn't one.
+                    // Either way, a `SubstituteCmd` or the reason there
+                    // isn't one.
                     if let Some(parsed) = repeat.or_else(|| parse_substitute_command(&trimmed)) {
-                        // A no-op for a repeat, which arrives with its
-                        // pattern and flags already decided -- the two
-                        // reach back for different things and
-                        // `repeat_substitute` documents why.
+                        // A no-op for a repeat, which arrives already
+                        // decided; the two reach back for different things
+                        // (see `repeat_substitute`).
                         let resolved = parsed.and_then(|cmd| resolve_substitute(cmd, app.last_substitute.as_ref(), last_search));
-                        // `c` cannot run here -- see the outcome's own
-                        // doc comment. Recorded first, so the `:s//x/`
-                        // after it still knows the pattern.
+                        // `c` can't run here (see the outcome). Recorded
+                        // first, so a later `:s//x/` knows the pattern.
                         if let Ok(cmd) = &resolved
                             && cmd.confirm
                         {
@@ -11245,14 +10628,13 @@ fn run_command_mode(
                         let ran = resolved.and_then(|cmd| run_substitute(tb, &cmd).map(|out| (cmd, out)));
                         match ran {
                             Ok((cmd, out)) => {
-                                // Remembered *after* resolving, so a
-                                // later `:s//x/` sees the pattern this
-                                // one actually used rather than the
-                                // empty one it was written with.
+                                // Remembered after resolving, so a later
+                                // `:s//x/` sees the pattern used, not the
+                                // empty one written.
                                 app.last_substitute = Some(LastSubstitute { cmd: cmd.clone(), search_then: last_search.to_string() });
                                 let (subs, lines) = (out.substitutions, out.lines);
-                                // `n` changed nothing, so saying it made
-                                // substitutions would be a lie.
+                                // `n` changed nothing, so it doesn't claim
+                                // substitutions.
                                 let what = if cmd.count_only { "match" } else { "substitution" };
                                 let plural = if subs == 1 {
                                     ""
@@ -11263,8 +10645,7 @@ fn run_command_mode(
                                 };
                                 let mut output = format!("{subs} {what}{plural} on {lines} line{}", if lines == 1 { "" } else { "s" });
                                 // `p`/`#`/`l` show the line the command
-                                // finished on, in place of the tally --
-                                // that is what was asked for.
+                                // finished on instead of the tally.
                                 if let (Some(style), Some(row)) = (cmd.print, out.last_row) {
                                     output = printed_line(tb, row, style);
                                 }
@@ -11288,17 +10669,12 @@ fn run_command_mode(
                         None => (trimmed.as_str(), None),
                     };
                     match cmd {
-                        // The file was rewritten under us since it was
-                        // read -- by a formatter, a branch switch,
-                        // another pane. vim's own E13, and it matters
-                        // more here than in a short-lived editor: a
-                        // detachable session can hold a buffer open for
-                        // days.
-                        //
-                        // Content, not mtime (see `changed_on_disk`), so
-                        // a `touch` or a formatter that changed nothing
-                        // does not stand in the way. `!` overrides, and
-                        // `:e!` is how you take the other side instead.
+                        // The file was rewritten since it was read (a
+                        // formatter, a branch switch, another pane): vim's
+                        // E13, which matters more when a session can hold a
+                        // buffer open for days. Compared by content (see
+                        // `changed_on_disk`), so a `touch` doesn't count.
+                        // `!` overrides; `:e!` takes the file's side.
                         "w" | "write" | "wq" | "x" if arg.is_none() && tb.changed_on_disk() => {
                             show_command_mode_error(
                                 "bish: E13: file changed on disk since it was read (`:w!` to overwrite, `:e!` to reload)",
@@ -11308,10 +10684,9 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `e!`: throw away what is in the buffer and read
-                        // the file again. Bang required, always -- unlike
-                        // `:q`, there is no unambiguous non-destructive
-                        // reading of "reload", so this never guesses.
+                        // `e!`: drop the buffer and reread the file. Always
+                        // needs the bang: unlike `:q`, reloading has no
+                        // non-destructive reading.
                         "e!" | "edit!" => match tb.reload() {
                             Ok(()) => {
                                 app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
@@ -11355,11 +10730,9 @@ fn run_command_mode(
                             match tb.save(arg.map(std::path::Path::new)) {
                                 Ok(()) => {
                                     fileeditor::set_last_filename(tb, &mut app.registers);
-                                    // After the bytes are really on
-                                    // disk, so a hook that formats or
-                                    // reloads is looking at what was
-                                    // written rather than what was
-                                    // about to be.
+                                    // After the bytes are on disk, so a hook
+                                    // that formats or reloads sees what was
+                                    // written.
                                     run_hooks(&mut app.sessions, session_id, "editor:file:write:post", tb);
                                     save_language_server_document(&mut app.sessions, session_id, tb);
                                     app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
@@ -11408,33 +10781,18 @@ fn run_command_mode(
                             });
                             return CommandModeOutcome::Quit;
                         }
-                        // `diag`/`diagnose` (no argument): runs every
-                        // diagnose tool configured for this buffer's
-                        // language (fileeditor::diagnose_buffer -- see its
-                        // own doc comment for why that's a list, not one
-                        // hardcoded linter) and stashes the result on the
-                        // buffer itself, exactly where build_editor_frame's
-                        // gutter/underline rendering already reads it from
-                        // (TextBuffer::diagnostics). Same "only means
-                        // something with a real buffer" gating as w/wq/x/q
-                        // above -- there's nothing to diagnose without one.
+                        // `diag`/`diagnose`: runs the diagnose tools
+                        // configured for this language
+                        // (`fileeditor::diagnose_buffer`) into
+                        // `TextBuffer::diagnostics`, which the gutter and
+                        // underlines read.
                         "diag" | "diagnose" if arg.is_none() => {
-                            // Replaces bish's own findings and leaves
-                            // a language server's alone -- the mirror
-                            // of what a publication does (see
-                            // apply_language_server_diagnostics). Both
-                            // write to this one list precisely so the
-                            // gutter, the underlines and the pane need
-                            // to know nothing about where a finding
-                            // came from, and that only works if each
-                            // source replaces exactly its own.
-                            // Diagnostics are pushed, never requested,
-                            // so after `:diag clear` the only copy of a
-                            // server's findings is the one it holds.
-                            // Asking for them again is what makes
-                            // `clear` reversible rather than permanent
-                            // until the next edit -- which for a file
-                            // nobody goes on to touch is never.
+                            // A server's findings are pushed, so after
+                            // `:diag clear` the server holds the only copy;
+                            // asking for them again makes `clear`
+                            // reversible. Then bish's own findings are
+                            // replaced and the server's kept, the mirror of
+                            // `apply_language_server_diagnostics`.
                             redeliver_language_server_diagnostics(&mut app.sessions, session_id, tb);
                             let mut merged = fileeditor::diagnose_buffer(tb);
                             merged.extend(tb.diagnostics.iter().filter(|d| d.source.is_some()).cloned());
@@ -11446,18 +10804,11 @@ fn run_command_mode(
                             } else {
                                 format!("{n} problem{} found.", if n == 1 { "" } else { "s" })
                             };
-                            // Creates the collapsed diagnostics split
-                            // (see split_diagnostics_pane's own doc
-                            // comment) the first time this runs for this
-                            // file, or just refreshes its title's count
-                            // on every later run. `edit_frame_id`: this
-                            // arm is only reachable while `editing` is
-                            // `Some` (see this function's own `editing`
-                            // param doc comment), which only happens for
-                            // a `Frame::Edit` pane -- and that frame is
-                            // still on top of this window's focused
-                            // pane's own stack for the whole time this
-                            // command-mode loop is driving it.
+                            // Creates the collapsed diagnostics split (see
+                            // `split_diagnostics_pane`) the first time, or
+                            // refreshes its count. A `Frame::Edit` is on
+                            // top of the focused pane's stack while
+                            // `editing` is `Some`.
                             if let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied() {
                                 sync_diagnostics_pane(app, edit_frame_id, &tb.diagnostics);
                             }
@@ -11466,37 +10817,20 @@ fn run_command_mode(
                                 output,
                                 status: 0,
                             });
-                            // Empty `Ran` output (not the count message
-                            // itself, still recorded above for `Ctrl-L`'s
-                            // own transcript) -- unlike every other
-                            // command here, the result of this one is
-                            // already visible as the diagnostics pane's
-                            // own persistent title bar. Returning the
-                            // count as `Ran`'s own output would draw a
-                            // second, redundant copy of it via
-                            // `render_command_output_overlay`, which
-                            // isn't pane-aware (it paints across the
-                            // *whole* terminal's own bottom rows, not
-                            // this pane's own shrunk rect) and would
-                            // paint straight over the diagnostics pane's
-                            // own divider/title the instant it ran.
+                            // Empty output: the count is in the diagnostics
+                            // pane's title, and the overlay, which spans
+                            // the terminal's bottom rows rather than this
+                            // pane, would paint over that title.
                             return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                         }
-                        // `diag clear`/`diagnose clear`: drops whatever
-                        // `:diag` last found, same as it self-clears the
-                        // instant a real edit would make its positions
-                        // stale (see TextBuffer::diagnostics's own doc
-                        // comment) -- this is just the explicit, no-edit
-                        // version of that. Also closes the diagnostics
-                        // split if `:diag` had created one, back to
-                        // exactly the pre-`:diag` state rather than
-                        // leaving a stale "0 problems" bar behind.
+                        // `diag clear`: drops what `:diag` found, as an
+                        // edit would (see `TextBuffer::diagnostics`), and
+                        // closes the diagnostics split rather than leave a
+                        // "0 problems" bar.
                         "diag" | "diagnose" if arg == Some("clear") => {
-                            // `clear` really does mean all of them: a
-                            // server's findings would come back on its
-                            // next publication anyway, and a `clear`
-                            // that visibly left some behind would read
-                            // as broken.
+                            // All of them: a server's come back on its next
+                            // publication anyway, and a `clear` that
+                            // visibly left some would look broken.
                             tb.diagnostics.clear();
                             if let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied()
                                 && let Some(pane_id) = diagnostics_sibling(&app.windows[app.current_window], edit_frame_id)
@@ -11520,11 +10854,9 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `noh`/`nohlsearch`: vim's own escape from a
-                        // search highlight that has outlived its
-                        // usefulness. Any later search brings it back,
-                        // `n` and `N` included, so this is never a mode
-                        // anyone has to leave.
+                        // `noh`/`nohlsearch`: hide a search highlight. Any
+                        // later search, `n` and `N` included, brings it
+                        // back.
                         "noh" | "nohl" | "nohlsearch" => {
                             app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                 command: trimmed.clone(),
@@ -11534,20 +10866,11 @@ fn run_command_mode(
                             return CommandModeOutcome::NoHighlight;
                         }
                         // `sym QUERY`: what the language server knows by
-                        // that name anywhere in the project, listed in
-                        // the same pane `gO`'s outline uses.
-                        //
-                        // A command rather than a key because it takes a
-                        // query, which is also why it is `:sym` and not
-                        // an extension of `gO`: `gO` answers "what is in
-                        // this file", this answers "where is the thing
-                        // called X", and the two only look alike because
-                        // both end up as a list of places.
-                        //
-                        // Empty is allowed and means "everything you
-                        // have" -- some servers answer that with the
-                        // whole index, which the pane's own cap keeps
-                        // survivable.
+                        // that name across the project, in the pane `gO`
+                        // uses. A command because it takes a query: `gO` is
+                        // what's in this file, this is where X is. Empty
+                        // means everything; the pane's cap keeps a whole
+                        // index manageable.
                         "sym" | "symbols" => {
                             let query = arg.unwrap_or_default().to_string();
                             app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
@@ -11557,12 +10880,11 @@ fn run_command_mode(
                             });
                             return CommandModeOutcome::Symbols(query);
                         }
-                        // `:review [git [REV]]` -- what `:diff` (or `:git
-                        // diff`) marks, as changes to decide on one at a
-                        // time. What is refused goes back to how the
-                        // other version has it; what is accepted, or not
-                        // ruled on, stays as it is in the buffer. All of
-                        // it one undo step, like any other command.
+                        // `:review [git [REV]]`: what `:diff` (or
+                        // `:git diff`) marks, as changes to decide on one
+                        // at a time. Refused changes go back to the other
+                        // version; accepted or undecided ones stay. One
+                        // undo step.
                         "review" => {
                             let old = match arg {
                                 None => fileeditor::disk_text(tb),
@@ -11617,17 +10939,12 @@ fn run_command_mode(
                             });
                             return CommandModeOutcome::Ran { output, status: 0 };
                         }
-                        // `diff` (bare, no `git` prefix): the same +/~/-
-                        // gutter marker toggle `:git diff` uses, but
-                        // answering a different question -- "what have I
-                        // typed since I last saved" instead of "what's
-                        // changed since the last commit" -- via a hand-
-                        // rolled Myers diff (fileeditor::toggle_buffer_
-                        // diff) against this buffer's own on-disk content,
-                        // no git repository (or git at all) required.
-                        // Shares the same buf.diff field/gutter rendering
-                        // `:git diff` already populates, so the two are
-                        // mutually exclusive toggle states.
+                        // `diff`: the `:git diff` gutter markers, but
+                        // against the file on disk
+                        // (`fileeditor::toggle_buffer_diff`): what was
+                        // typed since the last save, no git needed. Shares
+                        // `buf.diff` with `:git diff`, so one replaces the
+                        // other.
                         "diff" if arg.is_none() => match fileeditor::toggle_buffer_diff(tb) {
                             Ok(on) => {
                                 let output = if on { "Diff markers on.".to_string() } else { "Diff markers off.".to_string() };
@@ -11653,20 +10970,8 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `format`/`fmt`: the same per-filetype pre-save
-                        // hook `w`/`wq`/`x` already run silently right
-                        // before every save (fileeditor::run_pre_save_
-                        // hooks), just triggerable by hand and with real
-                        // feedback via the command-output overlay instead
-                        // of running invisibly. No `clear` subcommand the
-                        // way `diag` has one: there's no persistent
-                        // state this leaves behind to clear, just an
-                        // ordinary buffer edit `u` already undoes.
-                        // `:rename NEW` -- the new name is text, and the
-                        // colon line is where text arguments are typed,
-                        // so this is a command rather than a key. `:rn`
-                        // for the same reason `:fmt` exists beside
-                        // `:format`.
+                        // `:rename NEW`: a command, as the new name is text
+                        // typed on the colon line. `:rn` is its short form.
                         "rename" | "rn" => {
                             let Some(new_name) = arg.filter(|a| !a.trim().is_empty()) else {
                                 show_command_mode_error("bish: rename: usage: :rename NEW-NAME", app.term_rows, app.term_cols);
@@ -11689,11 +10994,13 @@ fn run_command_mode(
                                 }
                             }
                         }
+                        // `format`/`fmt`: the formatter `w` runs before
+                        // saving (`fileeditor::run_pre_save_hooks`), by
+                        // hand and with feedback. `u` undoes it.
                         "format" | "fmt" if arg.is_none() => {
-                            // The server first when there is one: it
-                            // knows the actual language, where
-                            // `format_buffer` knows bash. Everything
-                            // about the fallback is unchanged.
+                            // The server first when there is one: it knows
+                            // the language, where `format_buffer` knows
+                            // bash.
                             let served = format_via_server(app, session_id, tb);
                             let outcome = match served {
                                 Some(0) => fileeditor::FormatOutcome::AlreadyFormatted,
@@ -11730,20 +11037,12 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `dbg`/`debug <subcommand>`: everything the
-                        // script debugger can do, nested under one
-                        // command the same way `git`'s own subcommands
-                        // are just below -- see debugger.rs's own top-of-
-                        // file doc comment for the full shape (a real,
-                        // read-only `Frame::Edit` pane for the source,
-                        // plus a real `Frame::DebugRun` sibling that
-                        // becomes focused while the script is actually
-                        // running). Every arm below needs to know which
-                        // `Frame::Edit` pane it's attaching to/detaching
-                        // from -- always this same call's own pane (this
-                        // whole `if let Some(tb) = ...` block only ever
-                        // runs while that's true, same as `diag`'s own
-                        // identical lookup just above).
+                        // `dbg`/`debug <subcommand>`: the script debugger
+                        // (see debugger.rs): a read-only `Frame::Edit` pane
+                        // for the source, and a `Frame::DebugRun` sibling
+                        // focused while the script runs. Every arm acts on
+                        // this call's own `Frame::Edit` pane, looked up as
+                        // `diag` does.
                         "dbg" | "debug" => {
                             let Some(Frame::Edit(edit_frame_id)) = app.windows[app.current_window].stack().last().copied() else {
                                 unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
@@ -11756,14 +11055,11 @@ fn run_command_mode(
                                 None => ("", None),
                             };
                             match subcmd {
-                                // Bare `:dbg`: attach. Refuses on a dirty
-                                // buffer for the same reason the original
-                                // standalone debugger did -- it reads the
-                                // file fresh off disk (DebugSession::
-                                // attach), not this buffer's own in-
-                                // memory content, so an unsaved edit
-                                // would silently debug something other
-                                // than what's on screen.
+                                // Bare `:dbg`: attach. Refused on a dirty
+                                // buffer: `DebugSession::attach` reads the
+                                // file from disk, so unsaved edits would
+                                // debug something other than what's on
+                                // screen.
                                 "" if subarg.is_none() => {
                                     if app.debug_frames.contains_key(&edit_frame_id) {
                                         let output = "already attached -- :dbg run to start, :dbg quit to detach".to_string();
@@ -11813,29 +11109,18 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // `:dbg run`: the only thing that ever
-                                // starts a fresh execution (Shell::
-                                // run_source_here, blocking -- a paused
-                                // breakpoint blocks in place inside it,
-                                // see debugger.rs's own PauseState). A
-                                // *nested* RawGuard, same reasoning the
-                                // original standalone debugger had for
-                                // its own guard (term::RawGuard::
-                                // suspend_raw/resume_raw were specifically
-                                // fixed this session to derive fresh from
-                                // the live termios state rather than a
-                                // stored snapshot, exactly so nesting
-                                // like this is correct) -- its Drop turns
-                                // real mouse reporting back off, restored
-                                // explicitly below for the same reason
-                                // the original code did.
+                                // `:dbg run`: starts an execution
+                                // (`Shell::run_source_here`, blocking; a
+                                // breakpoint pauses inside it, see
+                                // `PauseState`). A nested `RawGuard`, which
+                                // works because `suspend_raw`/`resume_raw`
+                                // read the live termios; its drop turns
+                                // mouse reporting off, so it's turned back
+                                // on below.
                                 "run" if subarg.is_none() => {
-                                    // Only checked here; the session
-                                    // itself is taken out further down,
-                                    // right where it is used. Holding it
-                                    // across the pane arithmetic in
-                                    // between would hold a borrow of
-                                    // `app` across all of it.
+                                    // Only checked here; the session is taken
+                                    // where it's used, so `app` isn't borrowed
+                                    // across the pane arithmetic.
                                     if !app.debug_frames.contains_key(&edit_frame_id) {
                                         show_command_mode_error("bish: dbg: not attached -- use :dbg to attach", app.term_rows, app.term_cols);
                                         buffer.clear();
@@ -11861,12 +11146,9 @@ fn run_command_mode(
                                     app.windows[app.current_window].focused_pane = pane_id;
                                     compositor_redraw(app);
                                     let run_rect = pane_rect(&app.windows[app.current_window], pane_id, app.term_rows, app.term_cols);
-                                    // The real editor pane's own rect --
-                                    // a pause paints straight into this
-                                    // (see debugger.rs's own top-of-file
-                                    // doc comment), not `run_rect`, which
-                                    // stays reserved for the script's own
-                                    // live/handed-off output.
+                                    // The editor pane's rect, which a pause
+                                    // paints into (see debugger.rs);
+                                    // `run_rect` is for the script's output.
                                     let Some(editor_pane) = editor_pane_for(&app.windows[app.current_window], edit_frame_id) else {
                                         unreachable!("this whole match arm only runs while editing a real Frame::Edit pane")
                                     };
@@ -11914,12 +11196,10 @@ fn run_command_mode(
                                         children[idx].fixed = None;
                                     }
                                     app.windows[app.current_window].focused_pane = editor_pane;
-                                    // A pause navigated `tb`'s own stand-
-                                    // in copy around (debugger.rs's own
-                                    // `nav_buf`) -- carry that cursor
-                                    // over to the real buffer so leaving
-                                    // a run this way feels like leaving
-                                    // any other pane and coming back.
+                                    // A pause moved the stand-in buffer's
+                                    // cursor (debugger.rs's `nav_buf`); carry
+                                    // it to the real buffer, as when leaving
+                                    // and returning to any pane.
                                     if let Some((row, col)) = nav_cursor {
                                         tb.set_cursor(row, col);
                                     }
@@ -11943,26 +11223,12 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // `:dbg continue`/`next`/`step`: only ever
-                                // meaningful *while* genuinely paused,
-                                // which can only happen deep inside the
-                                // blocking `:dbg run` call just above --
-                                // there's no way to reach this arm from
-                                // there (the whole process is blocked in
-                                // PauseState::on_statement's own loop
-                                // instead, which recognizes this same
-                                // vocabulary directly -- see debugger.rs's
-                                // own top-of-file doc comment). Kept here,
-                                // sharing the name, purely for an honest
-                                // error instead of "unknown subcommand".
-                                // `:dbg launch [--adapter=CMD] PROGRAM`
-                                // -- the Debug Adapter Protocol half.
-                                // A separate verb from bare `:dbg`
-                                // because it debugs a *program*, not
-                                // this file: the source on screen is
-                                // what the adapter reports positions
-                                // in, and the thing that runs is
-                                // whatever was built from it.
+                                // `:dbg launch [--adapter=CMD] PROGRAM`:
+                                // the Debug Adapter Protocol half. Its own
+                                // verb because it debugs a program, not
+                                // this file: the adapter reports positions
+                                // in the source on screen, and what runs is
+                                // what was built from it.
                                 "launch" => {
                                     if app.debug_frames.contains_key(&edit_frame_id) {
                                         show_command_mode_error(
@@ -11985,12 +11251,10 @@ fn run_command_mode(
                                             continue;
                                         }
                                     };
-                                    // A named adapter is a program this
-                                    // shell is about to start, and
-                                    // `Session::start` has no `Shell` to
-                                    // ask -- so a restricted shell's
-                                    // rule about naming paths is applied
-                                    // here, where the name was given.
+                                    // A named adapter is a program about to be
+                                    // started, and `Session::start` has no
+                                    // `Shell` to ask, so a restricted shell's
+                                    // rule on naming paths is applied here.
                                     if let Some(named) = adapter.as_ref().and_then(|a: &Vec<String>| a.first()) {
                                         let named = named.clone();
                                         let sid = app.windows[app.current_window].owning_session();
@@ -12018,12 +11282,10 @@ fn run_command_mode(
                                         buffer.clear();
                                         continue;
                                     };
-                                    // Relative to the file being
-                                    // debugged, not to the shell: `:dbg
-                                    // launch ./prog` beside the source
-                                    // is what anyone would type, and
-                                    // the pane's own cwd may be
-                                    // anywhere.
+                                    // Relative to the file being debugged:
+                                    // `:dbg launch ./prog` beside the source
+                                    // is what anyone types, and the pane's cwd
+                                    // may be anywhere.
                                     let base = tb.path().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."));
                                     let program_path = base.join(&program);
                                     let program_path = std::fs::canonicalize(&program_path).unwrap_or(program_path);
@@ -12039,12 +11301,10 @@ fn run_command_mode(
                                             continue;
                                         }
                                     };
-                                    // Whatever is already marked in the
-                                    // gutter. Recorded now and sent by
-                                    // the session when the adapter says
-                                    // it is ready for them -- which is
-                                    // why they can be set before there
-                                    // is anything to set them on.
+                                    // Whatever the gutter marks, recorded now
+                                    // and sent when the adapter is ready,
+                                    // which is why breakpoints can be set
+                                    // before launching.
                                     if let Some(path) = tb.path() {
                                         let lines: Vec<usize> = tb.breakpoints.iter().copied().collect();
                                         session.set_breakpoints(path, &lines);
@@ -12075,12 +11335,9 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // The step commands, when the session is
-                                // an adapter's. The bish-script debugger
-                                // answers these from inside its own
-                                // paused run instead -- see the arm
-                                // below, which is what is left when
-                                // neither applies.
+                                // Step commands for an adapter session. The
+                                // script debugger answers them inside its
+                                // paused run; the arm below covers neither.
                                 "continue" | "next" | "step" | "out" | "finish"
                                     if subarg.is_none() && app.dap_frames.contains_key(&edit_frame_id) =>
                                 {
@@ -12105,11 +11362,9 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // `:dbg print EXPR` against an adapter
-                                // is `evaluate`, and the answer arrives
-                                // later -- so the request goes out here
-                                // and `sync_debug_adapter` shows what
-                                // comes back.
+                                // `:dbg print EXPR` with an adapter is
+                                // `evaluate`; the answer arrives later, and
+                                // `sync_debug_adapter` shows it.
                                 "print" | "p" if app.dap_frames.contains_key(&edit_frame_id) => {
                                     let Some(expression) = subarg else {
                                         show_command_mode_error("bish: dbg: usage: dbg print EXPRESSION", app.term_rows, app.term_cols);
@@ -12118,16 +11373,11 @@ fn run_command_mode(
                                     };
                                     let frame = app.dap_frames.get_mut(&edit_frame_id).expect("checked");
                                     let at = frame.current_frame();
-                                    // `watch`, not `repl`. The context
-                                    // is not decoration: gdb reads a
-                                    // `repl` evaluation as a *debugger
-                                    // command*, so `a + b` comes back
-                                    // as `Ambiguous command "a + b":
-                                    // actions, add-auto-load-...`
-                                    // rather than as 1. Every other
-                                    // context evaluates it as an
-                                    // expression, which is what
-                                    // `:dbg print` means.
+                                    // `watch`, not `repl`: gdb reads a `repl`
+                                    // evaluation as a debugger command, so
+                                    // `a + b` comes back as
+                                    // `Ambiguous command "a + b"`. Every other
+                                    // context evaluates an expression.
                                     let seq = frame.session.evaluate(expression, at, "watch");
                                     frame.awaiting_answer = Some((seq, expression.to_string()));
                                     let output = format!("{expression}...");
@@ -12138,10 +11388,8 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // Where the program is, and how it got
-                                // there. Answered from what the last
-                                // stop already fetched, so it costs
-                                // nothing and is always current.
+                                // Where the program is and how it got
+                                // there, from what the last stop fetched.
                                 "where" | "bt" if app.dap_frames.contains_key(&edit_frame_id) => {
                                     let frame = &app.dap_frames[&edit_frame_id];
                                     let output = match frame.frames.is_empty() {
@@ -12167,14 +11415,9 @@ fn run_command_mode(
                                     tb.debug_attached = false;
                                     if let Some(mut frame) = app.dap_frames.remove(&edit_frame_id) {
                                         frame.session.terminate();
-                                        // One tick so the request
-                                        // actually reaches the adapter
-                                        // before the session is dropped
-                                        // -- and dropping it kills the
-                                        // adapter, so a terminate it
-                                        // never saw would be a
-                                        // discourtesy rather than a
-                                        // shutdown.
+                                        // One tick so the terminate reaches the
+                                        // adapter before the session is dropped,
+                                        // which kills it.
                                         frame.session.service();
                                     }
                                     if let Some(pane_id) = debug_run_sibling(&app.windows[app.current_window], edit_frame_id) {
@@ -12189,6 +11432,12 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output: String::new(), status: 0 };
                                 }
+                                // Only meaningful while paused, and a pause
+                                // is handled inside `:dbg run`'s blocking
+                                // loop (`PauseState::on_statement`), so
+                                // this arm can't be reached then. It exists
+                                // for an honest error instead of "unknown
+                                // subcommand".
                                 "continue" | "next" | "step" if subarg.is_none() => {
                                     show_command_mode_error(
                                         "bish: dbg: not paused -- these only work while stopped at a breakpoint",
@@ -12198,19 +11447,12 @@ fn run_command_mode(
                                     buffer.clear();
                                     continue;
                                 }
-                                // `:dbg break [line]` / `:dbg break add|remove N`.
-                                //
-                                // Works with no session at all, which
-                                // it did not used to. A breakpoint is a
-                                // mark on a line meaning "stop here
-                                // when something runs this", and the
-                                // gutter already draws it; requiring an
-                                // attachment first was an artificial
-                                // order to do things in. `:dbg launch`
-                                // made that visible -- the marks have
-                                // to be settable *before* the program
-                                // runs, because the first stop is the
-                                // one worth having.
+                                // `:dbg break [line]` /
+                                // `:dbg break add|remove N`. Works with no
+                                // session: a breakpoint is a mark on a
+                                // line, and `:dbg launch` needs them set
+                                // before the program runs, as the first
+                                // stop is the one worth having.
                                 "break" => {
                                     let output = match subarg {
                                         None => {
@@ -12274,9 +11516,8 @@ fn run_command_mode(
                                             }
                                         }
                                     };
-                                    // `break add`/`remove N` reach the
-                                    // adapter here; the bare toggle
-                                    // above has already done it.
+                                    // `break add`/`remove N` reach the adapter
+                                    // here; the toggle above already did.
                                     sync_breakpoints_to_adapter(app, edit_frame_id, tb);
                                     app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                         command: trimmed,
@@ -12308,9 +11549,9 @@ fn run_command_mode(
                                     });
                                     return CommandModeOutcome::Ran { output, status: 0 };
                                 }
-                                // `:dbg quit`: detach -- writable again,
-                                // drops the app.debug_frames entry, closes
-                                // the DebugRun sibling if one exists.
+                                // `:dbg quit`: detach. The buffer is
+                                // writable again, the `debug_frames` entry
+                                // goes, and the `DebugRun` sibling closes.
                                 "quit" | "q" if subarg.is_none() => {
                                     if app.debug_frames.remove(&edit_frame_id).is_some() {
                                         tb.set_readonly(false);
@@ -12349,34 +11590,11 @@ fn run_command_mode(
                                 }
                             }
                         }
-                        // `help`/`h`/`?`: a single-screen quick reference
-                        // for this editor's own motions/operators/colon
-                        // commands -- real vim's own `:help` opens a full
-                        // multi-page manual in a split buffer; this is
-                        // deliberately much smaller in scope (one static
-                        // screen, no topics/tags/search of its own),
-                        // matching this codebase's usual "practical
-                        // subset" shape rather than building a whole help
-                        // system for a one-off ask. `?` is a real,
-                        // separate alias (not a typo-tolerant fuzzy
-                        // match) -- unlike real vim, where `?` in command
-                        // mode means "search backward" (a leftover from
-                        // ed-style line editors), bish's own colon-line
-                        // has no such meaning for a bare `?` at all (real
-                        // `/`/`?` search here is a Normal-mode motion via
-                        // vimkeys, entirely separate from this colon-line
-                        // -- see vimkeys.rs), so reusing it as a `-h`/
-                        // `--help`-style shorthand doesn't collide with
-                        // anything. Shown via the same command-output
-                        // overlay every other command's own output
-                        // already uses (`CommandModeOutcome::Ran`) --
-                        // free truncation-with-a-count-notice for a
-                        // shorter terminal, and the real content behind
-                        // it stays visible per the screen-wipe fix above.
-                        // `:help` and `:help options` -- the second
-                        // generated from the option registry itself
-                        // rather than written out, so a new bishopt is
-                        // documented by existing.
+                        // `help`/`h`/`?`: the editor's quick reference,
+                        // plus generated pages for `options`, `hooks` and
+                        // `keys`. A bare `?` means nothing else on the
+                        // colon line (search is a Normal-mode motion), so
+                        // it's free as a `--help` shorthand.
                         "help" | "h" | "?" if arg.is_none() || arg == Some("options") || arg == Some("hooks") || arg == Some("keys") => {
                             let title = match arg {
                                 Some("options") => "bish options  (q to close)",
@@ -12396,11 +11614,8 @@ fn run_command_mode(
                                 PagerSource {
                                     language: "markdown".to_string(),
                                     source,
-                                    // No file behind this one, so a
-                                    // relative target has nothing to
-                                    // resolve against -- which is fine,
-                                    // since the help page's own links
-                                    // are all absolute or none.
+                                    // No file behind this, and the help's
+                                    // links are all absolute.
                                     render: RenderOptions {
                                         hyperlinks: app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("hyperlinks")),
                                         base_dir: None,
@@ -12409,22 +11624,18 @@ fn run_command_mode(
                                     },
                                 },
                             );
-                            // Cancelled, not Ran: the pager has already
-                            // shown everything there was to show, and an
-                            // output overlay on top of the repaint would
-                            // be a second, emptier copy of it.
+                            // Cancelled, not `Ran`: the pager showed
+                            // everything, and an overlay would be an
+                            // emptier copy.
                             return CommandModeOutcome::Cancelled;
                         }
-                        // `:preview` -- this buffer's own markdown,
-                        // rendered. The same pipeline `:help` goes
-                        // through, pointed at the file being edited
-                        // instead of at the built-in document.
+                        // `:preview`: this buffer's markdown, rendered as
+                        // `:help` is.
                         "preview" | "prev" if arg.is_none() => {
                             let language = fileeditor::language_of(tb);
                             let source = fileeditor::buffer_source(tb);
-                            // The buffer's own directory, so a link to a
-                            // sibling document in a README resolves the
-                            // same way it does in the editor itself.
+                            // The buffer's directory, so a README's
+                            // relative links resolve.
                             let render = RenderOptions {
                                 hyperlinks: tb.hyperlinks,
                                 base_dir: tb.path().and_then(|p| p.parent()).map(|p| p.to_path_buf()),
@@ -12457,23 +11668,14 @@ fn run_command_mode(
                             buffer.clear();
                             continue;
                         }
-                        // `git SUBCOMMAND...`: the editor's own git
-                        // integration, entirely optional (see crate::git's
-                        // own module doc comment) -- shells out to the
-                        // real `git` executable rather than bish
-                        // implementing any of it itself, so a missing
-                        // `git` on $PATH just means these features don't
-                        // work, checked once up front regardless of which
-                        // subcommand was actually typed. `blame [REV]`/
-                        // `diff [REV]` each toggle their own gutter
-                        // column via fileeditor::toggle_git_blame/
-                        // toggle_git_diff, whose own Ok(bool)/Err(String)
-                        // already say exactly what happened and why not;
-                        // the optional REV is passed through untouched
-                        // for git itself to resolve (or reject, in which
-                        // case its own message is what gets shown --
-                        // bish has no business second-guessing what
-                        // counts as a valid revision).
+                        // `git SUBCOMMAND...`: the editor's git
+                        // integration, shelling out to `git` (see
+                        // `crate::git`); without `git` on PATH these report
+                        // so. `blame [REV]`/`diff [REV]` toggle gutter
+                        // columns
+                        // (`fileeditor::toggle_git_blame`/`toggle_git_diff`);
+                        // REV goes to git untouched, and git's own error is
+                        // shown if it rejects it.
                         "git" => {
                             if !crate::git::available() {
                                 show_command_mode_error("bish: git: git executable not found", app.term_rows, app.term_cols);
@@ -12495,11 +11697,9 @@ fn run_command_mode(
                                     continue;
                                 }
                             };
-                            // A REV is one word: `git blame HEAD~2`, not
-                            // `git blame HEAD~2 something`. Caught here
-                            // rather than handed to git, whose own error
-                            // for a stray second argument would be about
-                            // its command line rather than about `:git`'s.
+                            // A REV is one word. Caught here, as git's
+                            // error for a stray argument would be about its
+                            // own command line, not `:git`'s.
                             if subarg.is_some_and(|a| a.split_whitespace().count() > 1) {
                                 show_command_mode_error(
                                     &format!("bish: git: {subcmd}: expected at most one revision, got '{}'", subarg.unwrap_or_default()),
@@ -12509,21 +11709,19 @@ fn run_command_mode(
                                 buffer.clear();
                                 continue;
                             }
-                            // How an enabled column names what it's
-                            // showing: bare (the working tree for blame,
-                            // the index for diff -- each subcommand's own
-                            // git default) or the revision that was asked
-                            // for, so "on" against two different revisions
-                            // doesn't read identically.
+                            // How a column names what it shows: bare for
+                            // the subcommand's git default, or the revision
+                            // asked for, so two revisions don't both read
+                            // "on".
                             let against = match subarg {
                                 Some(rev) => format!(" ({rev})"),
                                 None => String::new(),
                             };
                             match subcmd {
                                 "blame" => {
-                                    // The `git` capability, from the file's own
-                                    // directory: an untrusted repo gets no blame
-                                    // gutter, because blame runs its filters.
+                                    // The `git` capability, from the file's
+                                    // directory: an untrusted repo gets no
+                                    // blame gutter, as blame runs its filters.
                                     let owned_default = app.sessions.get(&session_id).map(|s| s.shell.bishopt_str("trust_owned")).unwrap_or_default();
                                     let trusted = tb
                                         .path()
@@ -12546,12 +11744,9 @@ fn run_command_mode(
                                         }
                                     }
                                 }
-                                // `diff [REV]`: same toggle shape as
-                                // `blame` above, just against
-                                // fileeditor::toggle_git_diff -- gutter
-                                // +/~/- markers for lines added/changed/
-                                // removed relative to this file's tracked
-                                // state instead of per-line authorship.
+                                // `diff [REV]`: gutter markers for lines
+                                // added, changed or removed relative to git
+                                // (`fileeditor::toggle_git_diff`).
                                 "diff" => match fileeditor::toggle_git_diff(tb, subarg) {
                                     Ok(on) => {
                                         let output = if on { format!("Diff markers on{against}.") } else { "Diff markers off.".to_string() };
@@ -12568,12 +11763,12 @@ fn run_command_mode(
                                         continue;
                                     }
                                 },
-                                // `show [REV]`: the whole commit in the
-                                // diff view, read-only, opened at this
-                                // file when the commit touched it. With
-                                // no REV and blame on, the commit the
-                                // gutter names beside the cursor -- see
-                                // fileeditor::blamed_commit_at_cursor.
+                                // `show [REV]`: the commit in the diff
+                                // view, read-only, opened at this file when
+                                // the commit touched it. With no REV and
+                                // blame on, the commit the gutter shows at
+                                // the cursor
+                                // (`fileeditor::blamed_commit_at_cursor`).
                                 "show" => {
                                     let rev = match (subarg, fileeditor::blamed_commit_at_cursor(tb)) {
                                         (Some(rev), _) => rev.to_string(),
@@ -12599,12 +11794,11 @@ fn run_command_mode(
                                         }
                                     }
                                 }
-                                // `log [REV]`: this file's commits,
-                                // newest first and followed through
-                                // renames -- every commit, for a buffer
-                                // with no file. Enter opens one in the
-                                // diff view; closing that comes back to
-                                // the list.
+                                // `log [REV]`: this file's commits, newest
+                                // first, followed through renames; every
+                                // commit for a buffer with no file. Enter
+                                // opens one in the diff view; closing it
+                                // returns to the list.
                                 "log" => {
                                     let path = tb.path().map(Path::to_path_buf);
                                     let dir = match path.as_deref().and_then(Path::parent).filter(|d| !d.as_os_str().is_empty()) {
@@ -12657,17 +11851,10 @@ fn run_command_mode(
                 }
 
                 if trimmed == "q" || trimmed == "q!" {
-                    // Only reachable when `editing` is `None` (the block
-                    // above already returns for both cases otherwise) --
-                    // this pane isn't an editor, so `q`/`q!` mean "leave
-                    // command mode" instead (the caller resumes whatever
-                    // it was navigating, same as `dispatch_window_cmd`'s
-                    // reused-outcome pattern). Recorded same as any other
-                    // command that actually ran -- vim's own Ex quit
-                    // commands, not shell builtins, but still something
-                    // the user typed and command mode acted on, so
-                    // leaving it out of the transcript would read as if
-                    // it never happened.
+                    // Here `editing` is `None`, so `q`/`q!` leave command
+                    // mode and the caller resumes what it was navigating.
+                    // Recorded in the transcript like anything else the
+                    // user ran.
                     app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                         command: trimmed,
                         output: String::new(),
@@ -12685,14 +11872,8 @@ fn run_command_mode(
                                 show_command_mode_error(&format!("bish: {}", msg), app.term_rows, app.term_cols);
                                 buffer.clear();
                             } else {
-                                // No meaningful shell context here -- this
-                                // is command mode's own, entirely
-                                // separate app.cmd_history of window-management
-                                // commands, not shell command lines, so
-                                // there's no cwd worth tagging it with
-                                // (same reasoning its own read_line call
-                                // already uses for HighlightContext::default()
-                                // and a None completion provider).
+                                // Recorded with no cwd: these aren't shell
+                                // command lines.
                                 if !buffer_unrecorded {
                                     app.cmd_history.record(&buffer, None);
                                 }
@@ -12701,9 +11882,8 @@ fn run_command_mode(
                                     let captured = Rc::new(RefCell::new(String::new()));
                                     session.shell.set_sink_capture(captured.clone());
                                     session.shell.restrict_to_builtins = true;
-                                    // See the other run_program call site's
-                                    // own identical comment (repl.rs's main
-                                    // loop) for why this pair is needed.
+                                    // The other `run_program` call site (the
+                                    // main loop) says why this pair is needed.
                                     session.shell.sync_real_state_in();
                                     let result = session.shell.run_program(&prog);
                                     session.shell.sync_real_state_out();
@@ -12715,18 +11895,10 @@ fn run_command_mode(
                                 buffer.clear();
                                 match result {
                                     ExecResult::Window(action) => {
-                                        // Recorded too, same reasoning as
-                                        // "q"/"q!" above -- a `window`
-                                        // command genuinely ran (its
-                                        // WindowAction side effect is
-                                        // applied by the caller, handle_
-                                        // command_mode, which has the
-                                        // session/window state this
-                                        // function doesn't), it just
-                                        // doesn't drop CommandModeOutcome::
-                                        // Ran's own overlay treatment since
-                                        // it leaves normal mode entirely
-                                        // rather than returning to it.
+                                        // Recorded too: the `window` command ran;
+                                        // `handle_command_mode` applies its
+                                        // action, which leaves normal mode, so
+                                        // there's no overlay.
                                         app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
                                             command: trimmed,
                                             output: captured_text,
@@ -12734,25 +11906,15 @@ fn run_command_mode(
                                         });
                                         return CommandModeOutcome::Action(action);
                                     }
-                                    // `fg`'s poll loop needs repl.rs's own
-                                    // compositor state, which this
-                                    // restricted read-eval loop doesn't
-                                    // drive (see Shell::discard_pending_
-                                    // fg's doc comment) -- reject it here
-                                    // instead of silently leaving the job
-                                    // stashed and never driven. Returns
-                                    // `Ran{status: 1}` (not `Cancelled`,
-                                    // which stays silent) so the message
-                                    // actually reaches
-                                    // render_command_output_overlay via
-                                    // the caller's own `Ran` handling --
-                                    // `Cancelled`'s own arm there never
-                                    // shows anything, and a direct paint
-                                    // from in here would just get clobbered
-                                    // by handle_command_mode's own
-                                    // unconditional post-return
-                                    // compositor_redraw before the caller
-                                    // even sees this outcome.
+                                    // `fg` needs the compositor, which this
+                                    // restricted loop doesn't drive (see
+                                    // `Shell::discard_pending_fg`), so it's
+                                    // refused rather than leaving the job
+                                    // stashed. `Ran` with status 1, not
+                                    // `Cancelled`, so the message reaches the
+                                    // overlay through the caller; painting
+                                    // here would be erased by
+                                    // `handle_command_mode`'s redraw.
                                     ExecResult::Fg => {
                                         app.sessions.get_mut(&session_id).unwrap().shell.discard_pending_fg();
                                         let output = "bish: fg: not supported in command mode -- use it from the normal shell prompt".to_string();
@@ -12763,10 +11925,8 @@ fn run_command_mode(
                                         });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
-                                    // Same reasoning as Fg just above --
-                                    // this restricted read-eval loop has
-                                    // no way to drive an interactive
-                                    // editor session either.
+                                    // Likewise: this loop can't drive an
+                                    // editor session.
                                     ExecResult::Edit => {
                                         app.sessions.get_mut(&session_id).unwrap().shell.take_pending_edit();
                                         let output = "bish: e: not supported in command mode -- use it from the normal shell prompt".to_string();
@@ -12777,17 +11937,13 @@ fn run_command_mode(
                                         });
                                         return CommandModeOutcome::Ran { output, status: 1 };
                                     }
-                                    // Matches this codebase's prior behavior
-                                    // for `exit`/`set -e`/`set -u` (see the
-                                    // other run_program call site's own
-                                    // ExecResult::Exit arm above) -- the
-                                    // exit trap already ran wherever this
-                                    // was produced.
+                                    // As at the other `run_program` call site;
+                                    // the exit trap already ran where this was
+                                    // produced.
                                     ExecResult::Exit(code) => {
                                         session::stop_listening();
-                                        // The terminal's own title, given back:
-                                        // this path never reaches the end of
-                                        // `run`.
+                                        // Give the terminal its title back: this
+                                        // path never reaches the end of `run`.
                                         term::pop_window_title();
                                         std::process::exit(code)
                                     }
@@ -12818,10 +11974,8 @@ fn run_command_mode(
                     }
                 }
             }
-            // Same "Ran{status: 1}, not Cancelled" reasoning as the
-            // Fg/Edit arms above -- a genuine stdin read failure while
-            // composing the colon-line itself, before there was ever a
-            // real command to record to the transcript.
+            // `Ran` with status 1, as for `Fg`: a read failure while
+            // composing the line, before anything ran.
             Err(e) => {
                 return CommandModeOutcome::Ran { output: format!("bish: error reading input: {}", e), status: 1 };
             }
@@ -12829,8 +11983,8 @@ fn run_command_mode(
     }
 }
 
-// `[range]s/pattern/replacement/[flags]` -- vim's own Ex substitute
-// command. One line ref, either endpoint of a `LineRef` pair below.
+// `[range]s/pattern/replacement/[flags]`, vim's substitute. One end of a
+// range.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum LineRef {
     Current,
@@ -12839,10 +11993,8 @@ enum LineRef {
 }
 
 impl LineRef {
-    // 0-indexed row, clamped to this buffer's own current bounds --
-    // `Number` is vim's own 1-indexed convention (`:1` is the first
-    // line), so it needs the -1; `Current`/`Last` are already resolved
-    // against this exact buffer.
+    // 0-based row, clamped to the buffer. `Number` is 1-based (`:1` is the
+    // first line).
     fn resolve(self, current: usize, last: usize) -> usize {
         match self {
             LineRef::Current => current,
@@ -12858,46 +12010,39 @@ struct SubstituteCmd {
     to: LineRef,
     pattern: String,
     replacement: String,
-    /// `g` -- every match on a line, not just the first.
+    /// `g`: every match on a line, not just the first.
     global: bool,
-    /// `i` / `I`. `None` is "neither was given", which leaves the choice
-    /// to `'ignorecase'`/`'smartcase'` as it was before either flag
-    /// existed here.
+    /// `i`/`I`. `None` leaves it to `ignorecase`/`smartcase`.
     ignore_case: Option<bool>,
-    /// The count vim allows after the flags, which *replaces* the range
-    /// rather than narrowing it: `:1,2s/x/y/ 3` acts on three lines
-    /// starting at line 2 -- the range's own last line -- so it can name
-    /// lines the range never covered. Confirmed against real vim.
+    /// The count vim allows after the flags, which replaces the range:
+    /// `:1,2s/x/y/ 3` acts on three lines from line 2, the range's last, so
+    /// it can reach lines the range didn't name.
     count: Option<usize>,
-    /// `n` -- report how many matches there are and change nothing.
+    /// `n`: report how many matches and change nothing.
     count_only: bool,
-    /// `e` -- a pattern that matches nothing is not an error.
+    /// `e`: a pattern matching nothing isn't an error.
     no_error: bool,
-    /// `&` -- take the previous `:s`'s flags. Must be written first, as
-    /// it is in vim, and inherits the flags only: a count is not one,
-    /// confirmed by running vim.
+    /// `&`: take the previous `:s`'s flags. Written first, as in vim, and
+    /// only flags: not the count.
     keep_flags: bool,
-    /// `p` / `#` / `l` -- print the last line a substitution touched.
+    /// `p`/`#`/`l`: print the last line a substitution touched.
     print: Option<PrintStyle>,
-    /// `c` -- ask about each match before making it.
+    /// `c`: ask about each match before making it.
     confirm: bool,
 }
 
 /// How `p`, `#` and `l` each spell the line they print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrintStyle {
-    /// `p` -- the line's own text.
+    /// `p`: the line's text.
     Plain,
-    /// `#` -- with its line number in front, right-aligned the way vim
-    /// aligns it.
+    /// `#`: with its line number, right-aligned as vim does.
     Numbered,
-    /// `l` -- `:list` style, which marks the end of the line with `$`
-    /// and shows a tab as `^I`, so trailing space is visible.
+    /// `l`: `:list` style, `$` at the end and a tab as `^I`.
     List,
 }
 
-/// Everything after `:s/pat/repl/`, which is the same set of answers
-/// `SubstituteCmd` carries -- see its fields for what each one means.
+/// Everything after `:s/pat/repl/`; see `SubstituteCmd`'s fields.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SubstituteFlags {
     global: bool,
@@ -12906,28 +12051,22 @@ struct SubstituteFlags {
     count_only: bool,
     no_error: bool,
     keep_flags: bool,
-    /// `r` -- reach for the last *search* pattern rather than the last
-    /// substitute's. It means something on `:&r`, which is how vim
-    /// spells `:~` (see `repeat_substitute`); on a `:s//repl/` it
-    /// changes nothing, and `resolve_substitute` has the vim runs that
-    /// show why.
+    /// `r`: the last search pattern rather than the last substitute's. It
+    /// matters on `:&r`, vim's `:~` (see `repeat_substitute`); on
+    /// `:s//repl/` it changes nothing (see `resolve_substitute`).
     use_search_pattern: bool,
     print: Option<PrintStyle>,
     confirm: bool,
 }
 
-/// Reads them.
-///
-/// Unknown flags are refused rather than ignored. Silently dropping them
-/// is what made `:%s/a/Z/gi` quietly do a case-*sensitive* substitution
-/// and report success -- a wrong answer, where an error would at least
-/// have been true.
+/// Reads them. Unknown flags are refused: ignoring them made `:%s/a/Z/gi`
+/// silently case-sensitive.
 fn parse_substitute_flags(text: &str) -> Result<SubstituteFlags, String> {
     let mut f = SubstituteFlags::default();
     let mut digits: Option<usize> = None;
     for (at, c) in text.chars().enumerate() {
-        // A count ends the flags: everything from the first digit on is
-        // the number, and a letter after it is trailing junk.
+        // A count ends the flags: from the first digit on is the number,
+        // and a letter after it is junk.
         if let Some(n) = digits {
             match c.to_digit(10) {
                 Some(d) => {
@@ -12948,9 +12087,8 @@ fn parse_substitute_flags(text: &str) -> Result<SubstituteFlags, String> {
             'p' => f.print = Some(PrintStyle::Plain),
             '#' => f.print = Some(PrintStyle::Numbered),
             'l' => f.print = Some(PrintStyle::List),
-            // `&` means "the previous command's flags" and vim accepts
-            // it only in first position -- written anywhere else it
-            // rejects the command rather than reading it out of order.
+            // `&` keeps the previous flags, and only first: vim rejects it
+            // anywhere else.
             '&' if at == 0 => f.keep_flags = true,
             '&' => return Err("E488: Trailing characters: & (it only means anything written first)".to_string()),
             ' ' | '\t' => {}
@@ -12958,7 +12096,7 @@ fn parse_substitute_flags(text: &str) -> Result<SubstituteFlags, String> {
             _ => return Err(format!("E488: Trailing characters: {c}")),
         }
     }
-    // `:s/a/b/0` is not "zero lines", it is a typo.
+    // `:s/a/b/0` isn't zero lines, it's a typo.
     if digits == Some(0) {
         return Err("E939: Positive count required".to_string());
     }
@@ -12988,44 +12126,31 @@ fn parse_one_line_ref(chars: &[char], i: &mut usize) -> Option<LineRef> {
     }
 }
 
-// `%` (whole buffer, shorthand for `1,$`), a single ref (`.`/`$`/`N`,
-// meaning that same line for both ends), or `ref,ref` -- `None` (not an
-// error) whenever nothing recognizable starts right at `*i`, so the
-// caller knows no explicit range was given at all (defaults to the
-// current line only, same as bare vim `:s` with no range). Deliberately
-// doesn't support `'<,'>` (visual-mode marks), `;` (range separator that
-// also moves the cursor), or relative `+N`/`-N` offsets -- see plan.md's
-// own note on this feature's scope.
-/// The ex commands that are a line range and a letter: `:{n}` on its
-/// own, `:{range}d`, `:{range}m{dest}`, plus `:normal`, which is not one
-/// of those but is parsed here because it is the other command whose
-/// name runs straight into its argument.
+/// The ex commands that are a line range and a letter: `:{n}`,
+/// `:{range}d`, `:{range}m{dest}` and the rest, plus `:normal`, the other
+/// command whose name runs into its argument.
 #[derive(Debug, Clone, PartialEq)]
 enum LineCommand {
-    /// `:5` -- a bare address is "go there", vim's oldest command.
+    /// `:5`: go to that line.
     Goto(LineRef),
     Delete {
         from: LineRef,
         to: LineRef,
     },
-    /// `dest` is a 1-indexed line number to move *after*, so 0 means
-    /// "to the very top" -- vim's `:m0`. Deliberately not a row: `:m0`
-    /// and `:m1` are different destinations, and every 0-indexed row
-    /// would have to represent both.
+    /// `dest` is a 1-based line to move after, so 0 is the top (`:m0`). Not
+    /// a row: `:m0` and `:m1` differ, and a 0-based row couldn't say both.
     Move {
         from: LineRef,
         to: LineRef,
         dest: LineRef,
     },
-    /// `:1t$` -- `:m` that leaves the original where it is. Its other
-    /// spellings are `:copy` and `:co`.
+    /// `:1t$`: `:m` that leaves the original. Also `:copy` and `:co`.
     Copy {
         from: LineRef,
         to: LineRef,
         dest: LineRef,
     },
-    /// `:>` and `:<`, one shift per repeated character: `:>>` shifts
-    /// twice.
+    /// `:>` and `:<`, one shift per character: `:>>` shifts twice.
     Shift {
         from: LineRef,
         to: LineRef,
@@ -13033,8 +12158,8 @@ enum LineCommand {
         times: usize,
     },
     Normal(String),
-    /// `:fold`, `:foldopen[!]` and `:foldclose[!]` over a range, the
-    /// current line when there is none.
+    /// `:fold`, `:foldopen[!]` and `:foldclose[!]` over a range, or the
+    /// current line.
     Fold {
         from: LineRef,
         to: LineRef,
@@ -13042,8 +12167,7 @@ enum LineCommand {
     },
 }
 
-/// Which of the fold commands. `all` is the `!`: every level, rather
-/// than one.
+/// Which fold command. `all` is the `!`: every level, not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FoldAction {
     Create,
@@ -13051,28 +12175,22 @@ enum FoldAction {
     Close { all: bool },
 }
 
-/// What a `!` at the head of a colon line turned out to be. `None` from
-/// `parse_bang_command` means there was no `!` there at all, and every
-/// other command in this dispatch is untouched.
+/// What a `!` at the head of a colon line is. `None` from
+/// `parse_bang_command` means there was none.
 enum BangCommand<'a> {
-    /// `:!cmd` -- run it through the shell. The `&str` is everything
-    /// after the `!`, still unexpanded.
+    /// `:!cmd`: run it through the shell. The text after `!`, unexpanded.
     Run(&'a str),
-    /// `:[range]!cmd` -- vim's filter: those lines go in as the
-    /// command's stdin and whatever it writes out replaces them.
+    /// `:[range]!cmd`, a filter: the lines are the command's stdin, and its
+    /// output replaces them.
     Filter { from: LineRef, to: LineRef, cmd: &'a str },
 }
 
-/// A leading `!`, with or without a range in front of it. `:5!x` and
-/// `:%!x` are the filter; a bare `:!x` is the plain shell command.
-/// `:'<,'>!x` is *not* recognized as either, because `parse_range_prefix`
-/// does not read visual-mode marks -- see its own comment. It reaches
-/// the shell as a command named `'<,'>!x`, which is what it did before
-/// this existed.
+/// A leading `!`, with or without a range: `:5!x` and `:%!x` filter,
+/// `:!x` runs. `:'<,'>!x` is neither, as `parse_range_prefix` doesn't read
+/// visual marks; it reaches the shell as a command named `'<,'>!x`.
 ///
-/// Deliberately not folded into `parse_line_command`: that one answers
-/// with a `LineCommand` the buffer can carry out on its own, and both of
-/// these need a shell, which lives a long way up in the session.
+/// Separate from `parse_line_command`, whose commands the buffer carries
+/// out alone; these need a shell.
 fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
     if let Some(rest) = trimmed.strip_prefix('!') {
         return Some(BangCommand::Run(rest));
@@ -13083,9 +12201,8 @@ fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
     if chars.get(i) != Some(&'!') {
         return None;
     }
-    // Byte offset, not `i`: the range that precedes the `!` is ASCII by
-    // construction (digits, `%`, `.`, `$`, `,`), so the two agree here --
-    // but slicing `trimmed` wants the byte one regardless.
+    // Byte offset for slicing; the range before `!` is ASCII, so it equals
+    // `i` anyway.
     let at = trimmed.char_indices().nth(i).map(|(at, _)| at)?;
     Some(BangCommand::Filter { from, to, cmd: &trimmed[at + 1..] })
 }
@@ -13093,22 +12210,20 @@ fn parse_bang_command(trimmed: &str) -> Option<BangCommand<'_>> {
 /// Which of the three "do that again" commands this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepeatSubstitute {
-    /// `:s` on its own and `:&` -- the last substitute's pattern and
-    /// replacement, and *none* of its flags.
+    /// `:s` alone and `:&`: the last substitute's pattern and replacement,
+    /// none of its flags.
     Bare,
-    /// `:&&` -- the same, keeping the flags.
+    /// `:&&`: the same, keeping the flags.
     KeepFlags,
-    /// `:~` -- the last substitute's replacement, but the last *search*
-    /// pattern. `:&r` is spelled differently and means this.
+    /// `:~`: the last substitute's replacement with the last search
+    /// pattern. `:&r` means the same.
     LastSearch,
 }
 
-/// `:[range]s`, `:[range]&`, `:[range]&&`, `:[range]~`, each with its
-/// own optional flags and count after it.
-///
-/// Checked before `parse_substitute_command`, and careful not to shadow
-/// it: an `s` here has to be followed by the end of the line or a space,
-/// so `:s/a/b/` stays a substitute and `:set`/`:sort` stay themselves.
+/// `:[range]s`, `:[range]&`, `:[range]&&`, `:[range]~`, each with
+/// optional flags and count. Checked before `parse_substitute_command`;
+/// an `s` here must be followed by the end or a space, so `:s/a/b/`,
+/// `:set` and `:sort` stay themselves.
 fn parse_repeat_substitute(trimmed: &str) -> Option<Result<(LineRef, LineRef, RepeatSubstitute, SubstituteFlags), String>> {
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0;
@@ -13126,7 +12241,7 @@ fn parse_repeat_substitute(trimmed: &str) -> Option<Result<(LineRef, LineRef, Re
             i += 1;
             RepeatSubstitute::LastSearch
         }
-        // A bare `s`, and only a bare one.
+        // A bare `s` only.
         (Some('s'), None) | (Some('s'), Some(' ')) => {
             i += 1;
             RepeatSubstitute::Bare
@@ -13137,13 +12252,9 @@ fn parse_repeat_substitute(trimmed: &str) -> Option<Result<(LineRef, LineRef, Re
     Some(parse_substitute_flags(&flags).map(|f| (from, to, kind, f)))
 }
 
-/// Turns one of those into the `:s` it stands for.
-///
-/// The pattern is taken deliberately rather than through
-/// `resolve_substitute`'s "whichever was more recent" rule: `:&` means
-/// the last *substitute*'s pattern even when a `/` search has happened
-/// since, which is exactly where that rule and this one part company.
-/// Confirmed by running vim.
+/// Turns one of those into the `:s` it stands for. `:&` uses the last
+/// substitute's pattern even after a `/` search, unlike
+/// `resolve_substitute`'s most-recent rule.
 fn repeat_substitute(
     last: Option<&LastSubstitute>,
     last_search: &str,
@@ -13158,8 +12269,8 @@ fn repeat_substitute(
         true if !last_search.is_empty() => last_search.to_string(),
         _ => previous.cmd.pattern.clone(),
     };
-    // `:&&` starts from the previous flags and `:s`/`:&`/`:~` start from
-    // none, and either way the ones written here go on top.
+    // `:&&` starts from the previous flags, the others from none; written
+    // flags go on top.
     let base = match kind {
         RepeatSubstitute::KeepFlags => &previous.cmd,
         _ => &SubstituteCmd {
@@ -13179,8 +12290,7 @@ fn repeat_substitute(
         replacement: previous.cmd.replacement.clone(),
         global: base.global || flags.global,
         ignore_case: flags.ignore_case.or(base.ignore_case),
-        // A count belongs to the command that writes it and is never
-        // inherited -- see `SubstituteCmd::count`.
+        // A count is never inherited; see `SubstituteCmd::count`.
         count: flags.count,
         count_only: base.count_only || flags.count_only,
         no_error: base.no_error || flags.no_error,
@@ -13190,11 +12300,10 @@ fn repeat_substitute(
     })
 }
 
-/// `None` when `trimmed` is not one of these at all, so the ordinary
-/// dispatch still sees `w`, `set`, `diag` and the rest unchanged. The
-/// same shape `parse_substitute_command` uses, and for the same reason:
-/// these commands run their name into their argument with no space, so
-/// the `split_once(' ')` dispatch cannot see them.
+/// `None` when `trimmed` isn't one of these, so the ordinary dispatch
+/// sees `w`, `set` and the rest. These run their name into their
+/// argument, which the `split_once(' ')` dispatch can't see, as with
+/// `parse_substitute_command`.
 fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
     if let Some(rest) = trimmed.strip_prefix("normal ").or_else(|| trimmed.strip_prefix("norm ")) {
         return Some(LineCommand::Normal(rest.to_string()));
@@ -13203,11 +12312,10 @@ fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
     let mut i = 0;
     let range = parse_range_prefix(&chars, &mut i);
     match (chars.get(i), range) {
-        // A range and nothing after it: go to its last line. `:` alone
-        // is not this -- `parse_range_prefix` found no address at all.
+        // A range alone: go to its last line. `:` alone found no address and
+        // isn't this.
         (None, Some((_, to))) => Some(LineCommand::Goto(to)),
-        // A missing range means the current line, which is what makes
-        // a bare `:d` and a bare `:>` mean anything at all.
+        // No range means the current line, so `:d` and `:>` work bare.
         (Some('d'), range) if i + 1 == chars.len() => {
             let (from, to) = range.unwrap_or((LineRef::Current, LineRef::Current));
             Some(LineCommand::Delete { from, to })
@@ -13228,10 +12336,8 @@ fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
             let times = chars[i..].iter().take_while(|ch| **ch == c).count();
             (i + times == chars.len()).then_some(LineCommand::Shift { from, to, right, times })
         }
-        // `:fo[ld]`, `:foldo[pen][!]`, `:foldc[lose][!]` -- vim's own
-        // abbreviations, and like `:d` a missing range is this line.
-        // Any other word is not a line command, and goes on to the
-        // commands that are not.
+        // `:fo[ld]`, `:foldo[pen][!]`, `:foldc[lose][!]`, with no range
+        // meaning this line. Any other word isn't a line command.
         (Some(c), range) if c.is_ascii_alphabetic() => {
             let word: String = chars[i..].iter().collect();
             let (word, bang) = match word.strip_suffix('!') {
@@ -13251,8 +12357,8 @@ fn parse_line_command(trimmed: &str) -> Option<LineCommand> {
     }
 }
 
-/// Runs everything `parse_line_command` produces except `Normal`, which
-/// needs the Normal-mode loop's own `VimKeys` and is handed back to it.
+/// Runs what `parse_line_command` produces, except `Normal`, which needs
+/// the Normal-mode loop's `VimKeys`.
 fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String> {
     let last = tb.line_count().saturating_sub(1);
     let current = tb.cursor().0;
@@ -13276,7 +12382,7 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
         }
         LineCommand::Move { from, to, dest } => {
             let (a, b) = ordered(from, to, current, last);
-            // 1-indexed, and 0 is a real answer meaning "the top".
+            // 1-based, and 0 means the top.
             let dest = match dest {
                 LineRef::Current => current + 1,
                 LineRef::Last => last + 1,
@@ -13294,9 +12400,8 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
                 from: (a, 0),
                 to: (b, 0),
             });
-            // The destination counts lines that are no longer there once
-            // the block has been lifted out, so a destination below the
-            // block shifts up by its height.
+            // The destination counts lines the lifted block no longer
+            // occupies, so one below the block shifts up by its height.
             let height = b - a + 1;
             let row = if dest > b + 1 { dest - height } else { dest };
             let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
@@ -13311,9 +12416,8 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
                 LineRef::Last => last + 1,
                 LineRef::Number(n) => n.min(last + 1),
             };
-            // Nothing is lifted out, so unlike `:m` the destination
-            // needs no adjusting -- and copying a range into itself is
-            // perfectly well defined.
+            // Nothing is lifted out, so unlike `:m` the destination needs no
+            // adjusting, and copying a range into itself is well defined.
             let text = crate::bishedit::motion::extract_text(
                 &*tb,
                 &crate::bishedit::motion::MotionRange { shape: crate::bishedit::motion::MotionShape::Linewise, from: (a, 0), to: (b, 0) },
@@ -13349,27 +12453,21 @@ fn run_line_command(tb: &mut TextBuffer, cmd: &LineCommand) -> Result<(), String
     }
 }
 
-/// `:!cmd` -- vim's "run this through the shell". The buffer is not
-/// touched; what the command wrote is shown in the same overlay every
-/// other colon command's output uses.
+/// `:!cmd`: run it through the shell. The buffer isn't touched; the
+/// output goes in the usual command overlay.
 ///
-/// A child shell rather than the ordinary colon line, and for two
-/// reasons that point the same way. `:!make`, `:!git status`, `:!ls`
-/// are the whole point of `!`, and the colon line runs only builtins
-/// (its own escape hatch is `command NAME` -- an explicit "the external
-/// one", which is exactly what `!` says in vim's spelling). And an
-/// external's output cannot be seen by the colon line's capture sink
-/// anyway: it goes to a real descriptor, which under the editor's
-/// alternate screen means it flashes and is painted over by the next
-/// redraw. `filter_through_command` is the mechanism that catches it.
+/// A child shell, not the colon line: the colon line runs only builtins,
+/// and `!` is for externals (`:!make`, `:!git status`). Their output also
+/// goes to a real descriptor the colon line's capture can't see, and
+/// under the alternate screen it would be painted over;
+/// `filter_through_command` catches it.
 ///
-/// Its stdin is empty rather than the terminal, so `:!cat` ends at once
-/// instead of swallowing the keystrokes meant for the editor.
+/// Its stdin is empty, so `:!cat` ends at once instead of eating the
+/// editor's keys.
 fn run_bang_command(app: &mut App, session_id: SessionId, tb: &TextBuffer, cmd: &str) -> Result<String, String> {
     let cmd = crate::fileeditor::expand_filename_macros(cmd, tb)?;
     if cmd.trim().is_empty() {
-        // vim repeats the last `:!` here. bish keeps no such register
-        // yet, so it says so rather than running an empty line.
+        // vim repeats the last `:!` here; bish keeps no such register yet.
         return Err("E34: No previous command".to_string());
     }
     let session = app.sessions.get_mut(&session_id).expect("command mode always has a live session");
@@ -13377,19 +12475,13 @@ fn run_bang_command(app: &mut App, session_id: SessionId, tb: &TextBuffer, cmd: 
     let ran = session.shell.filter_through_command(&cmd, "");
     session.shell.sync_real_state_out();
     let (output, errors, _status) = ran.map_err(|e| format!("{cmd}: {e}"))?;
-    // Both streams, in the order a terminal would have interleaved them
-    // as well as this can be reconstructed after the fact -- what the
-    // command *did* first, then what it complained about.
+    // Both streams: what the command did, then what it complained about.
     Ok(format!("{output}{errors}").trim_end().to_string())
 }
 
-/// `:[range]!cmd` -- vim's filter. The lines go in as the command's
-/// stdin, and whatever it writes to stdout replaces them.
-///
-/// vim replaces the range whatever the command's exit status was, so
-/// `:%!false` empties the buffer -- and so does this. Only replacing on
-/// success would quietly do nothing for a command that legitimately
-/// exits non-zero, and `u` is right there for the mistake.
+/// `:[range]!cmd`, a filter: the lines are the command's stdin and its
+/// stdout replaces them. Whatever the exit status, as in vim, so
+/// `:%!false` empties the buffer; `u` undoes it.
 fn filter_lines_through_command(
     app: &mut App,
     session_id: SessionId,
@@ -13408,11 +12500,10 @@ fn filter_lines_through_command(
     let (a, b) = ordered(from, to, tb.cursor().0, last);
     let input = crate::bishedit::motion::extract_text(&*tb, &MotionRange { shape: MotionShape::Linewise, from: (a, 0), to: (b, 0) });
 
-    // Not `restrict_to_builtins` and not the capture sink -- see
-    // `Shell::filter_through_command`, which explains why an external's
-    // output can only be caught the way `$( )` catches it. `sort` and
-    // `column -t` are the entire point of a filter, so this is the one
-    // colon-line command that must reach past both.
+    // Not `restrict_to_builtins` nor the capture sink: an external's output
+    // is caught only the way `$( )` catches it (see
+    // `Shell::filter_through_command`), and externals like `sort` are the
+    // point of a filter.
     let session = app.sessions.get_mut(&session_id).expect("command mode always has a live session");
     session.shell.sync_real_state_in();
     let ran = session.shell.filter_through_command(&cmd, &input);
@@ -13420,22 +12511,16 @@ fn filter_lines_through_command(
     let (output, errors, _status) = ran.map_err(|e| format!("{cmd}: {e}"))?;
 
     replace_lines(tb, a, b, &output);
-    // stdout went into the buffer, so what is left to show is whatever
-    // the command complained about -- and a filter that worked
-    // complained about nothing, which is the empty overlay.
+    // stdout went into the buffer, so only complaints are left to show;
+    // none for a filter that worked.
     Ok(errors.trim_end().to_string())
 }
 
-/// Puts `output` in place of rows `a..=b`, the way a filter's result
-/// lands back in the buffer.
-///
-/// Its own function because the two edges here are the whole difficulty
-/// and neither needs a shell to exercise: the trailing newline every
-/// command writes is what *ends* the last line rather than starting an
-/// empty one after it, and a buffer always keeps at least one line -- so
-/// deleting every row leaves an empty one that has to be written into
-/// rather than inserted above, which is what made `:%!sort` come back a
-/// line longer than it went in.
+/// Puts `output` in place of rows `a..=b`. Two edges: the trailing
+/// newline ends the last line rather than starting an empty one, and a
+/// buffer always keeps one line, so replacing every row writes into the
+/// empty one left rather than inserting above it (or `:%!sort` came
+/// back a line longer).
 fn replace_lines(tb: &mut TextBuffer, a: usize, b: usize, output: &str) {
     use crate::bishedit::motion::{MotionRange, MotionShape};
     let whole = a == 0 && b >= tb.line_count().saturating_sub(1);
@@ -13443,7 +12528,7 @@ fn replace_lines(tb: &mut TextBuffer, a: usize, b: usize, output: &str) {
     tb.delete_range(&MotionRange { shape: MotionShape::Linewise, from: (a, 0), to: (b, 0) });
     let replacement = output.strip_suffix('\n').unwrap_or(output);
     if replacement.is_empty() {
-        // `:%!true` empties the buffer, exactly as it does in vim.
+        // `:%!true` empties the buffer, as in vim.
     } else if whole {
         tb.insert_text((0, 0), replacement);
     } else {
@@ -13452,15 +12537,15 @@ fn replace_lines(tb: &mut TextBuffer, a: usize, b: usize, output: &str) {
     tb.set_cursor(a.min(tb.line_count().saturating_sub(1)), 0);
 }
 
-/// Both ends of a range as 0-indexed rows, smaller first.
+/// Both ends of a range as 0-based rows, smaller first.
 fn ordered(from: LineRef, to: LineRef, current: usize, last: usize) -> (usize, usize) {
     let a = from.resolve(current, last);
     let b = to.resolve(current, last);
     if a <= b { (a, b) } else { (b, a) }
 }
 
-/// Splices `text` in as whole lines starting at row `at`, which may be
-/// one past the last line (appending at the end).
+/// Splices `text` in as whole lines at row `at`, which may be one past
+/// the end.
 fn insert_lines_at(tb: &mut TextBuffer, at: usize, text: &str) {
     let count = tb.line_count();
     if at >= count {
@@ -13473,6 +12558,10 @@ fn insert_lines_at(tb: &mut TextBuffer, at: usize, text: &str) {
     tb.set_cursor(at.min(tb.line_count().saturating_sub(1)), 0);
 }
 
+// `%` (`1,$`), a single ref (`.`, `$`, `N`) for both ends, or `ref,ref`.
+// `None` when nothing recognisable starts at `*i`, meaning no range was
+// given (the current line, as in vim). Not supported: `'<,'>`, `;`, and
+// relative `+N`/`-N`.
 fn parse_range_prefix(chars: &[char], i: &mut usize) -> Option<(LineRef, LineRef)> {
     if chars.get(*i) == Some(&'%') {
         *i += 1;
@@ -13488,13 +12577,9 @@ fn parse_range_prefix(chars: &[char], i: &mut usize) -> Option<(LineRef, LineRef
     }
 }
 
-// Scans from `*i` up to the next unescaped `delim`, unescaping `\<delim>`
-// back to a literal `delim` along the way (vim's own rule: the delimiter
-// can appear literally in the pattern/replacement if backslash-escaped).
-// Reaching the end of input without ever finding a bare `delim` isn't an
-// error -- the *final* delimiter of a `:s` command is optional in vim
-// (`:s/foo/bar` with no trailing `/` at all is valid, same as with one)
-// -- so this just returns everything scanned either way.
+// Scans from `*i` to the next unescaped `delim`, turning `\<delim>` into
+// `delim`. Running out isn't an error: `:s/foo/bar` needs no final
+// delimiter.
 fn scan_until_delim(chars: &[char], i: &mut usize, delim: char) -> String {
     let mut out = String::new();
     while let Some(&c) = chars.get(*i) {
@@ -13513,13 +12598,9 @@ fn scan_until_delim(chars: &[char], i: &mut usize, delim: char) -> String {
     out
 }
 
-// `None`: `trimmed` doesn't even look like `[range]s...` at all (no `s`
-// right after wherever the optional range parsed to), so the caller
-// should fall through to the ordinary space-split command dispatch
-// unchanged -- this never claims a command name it doesn't fully own.
-// `Some(Err(_))`: recognizable as an attempted substitute but malformed
-// (no pattern given at all, e.g. bare `:s` or `:s/`). `Some(Ok(_))`: a
-// complete, ready-to-run command.
+// `None`: not `[range]s...` at all, so the ordinary dispatch handles it.
+// `Some(Err(_))`: a malformed substitute (no pattern: `:s`, `:s/`).
+// `Some(Ok(_))`: ready to run.
 fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, String>> {
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0;
@@ -13529,19 +12610,16 @@ fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, Strin
         return None;
     }
     i += 1;
-    // The delimiter itself: any punctuation works in real vim (`s#..#..#`,
-    // `s,..,..,`, ...), not just `/` -- excluding letters/digits/`\\`
-    // keeps this from misfiring on an ordinary word starting with `s`
-    // (`set`, `sort`, ...) that isn't this command at all.
+    // Any punctuation delimits (`s#..#..#`), as in vim; letters, digits and
+    // `\` don't, so `set` and `sort` aren't taken for this.
     let delim = match chars.get(i) {
         Some(&c) if !c.is_alphanumeric() && c != '\\' => c,
         _ => return None,
     };
     i += 1;
 
-    // An empty pattern is `:s//repl/` -- "the last one again" -- and is
-    // filled in by `resolve_substitute`, which is the only place that
-    // knows what the last one was.
+    // An empty pattern (`:s//repl/`) means the last one, filled in by
+    // `resolve_substitute`.
     let pattern = scan_until_delim(&chars, &mut i, delim);
     let replacement = scan_until_delim(&chars, &mut i, delim);
     let flags: String = chars[i..].iter().collect();
@@ -13565,13 +12643,9 @@ fn parse_substitute_command(trimmed: &str) -> Option<Result<SubstituteCmd, Strin
     }))
 }
 
-// Applies `once` (the very next appended char only, `\u`/`\l`) or,
-// failing that, `sticky` (every appended char, `\U`/`\L`, until `\E`/
-// `\e` or the end of the replacement) to each char of `s` as it's
-// pushed -- shared by every expand_replacement call site that appends
-// more than a single literal character (a backreference or `&`) so a
-// case modifier immediately preceding one still applies to the whole
-// substituted span, not just its first char.
+// Applies `once` (`\u`/`\l`, the next char) or else `sticky`
+// (`\U`/`\L`, until `\E`/`\e` or the end) to each char of `s`, so a
+// modifier before a backreference or `&` covers the whole span.
 fn push_transformed(out: &mut String, s: &str, once: &mut Option<bool>, sticky: &mut Option<bool>) {
     for c in s.chars() {
         let transformed = if let Some(upper) = once.take() {
@@ -13585,16 +12659,10 @@ fn push_transformed(out: &mut String, s: &str, once: &mut Option<bool>, sticky: 
     }
 }
 
-// Expands a `:s` replacement string against one match's own captures
-// (`caps[0]` is the whole match, `caps[1..]` are groups 1.. -- same
-// shape crate::regex::Regex::find_at_with_captures returns) -- vim's own
-// replacement escapes: `&`/`\0` (whole match), `\1`-`\9` (group N,
-// silently empty if that group didn't participate or doesn't exist),
-// `\\` (literal backslash), `\&` (literal &), `\r` (a real newline,
-// splitting the line -- TextBuffer::insert_text already understands an
-// embedded '\n'), `\u`/`\l`/`\U`/`\L`/`\e`/`\E` (case modifiers, see
-// push_transformed). `\=` (the expression register) is deliberately not
-// supported -- see plan.md's own note on this feature's scope.
+// Expands a `:s` replacement against one match's captures (`caps[0]` the
+// match, `caps[1..]` the groups): `&`/`\0`, `\1`-`\9` (empty if the group
+// didn't take part), `\\`, `\&`, `\r` (a newline, splitting the line),
+// and the case modifiers (see `push_transformed`). No `\=`.
 fn expand_replacement(replacement: &str, caps: &[String]) -> String {
     let chars: Vec<char> = replacement.chars().collect();
     let mut out = String::new();
@@ -13634,26 +12702,13 @@ fn expand_replacement(replacement: &str, caps: &[String]) -> String {
     out
 }
 
-// One line's own worth of substitution -- every match if `global`,
-// otherwise just the first. Returns the line's new text (which may
-// itself now contain embedded newlines, from a `\r` in the replacement)
-// and how many matches were actually replaced. A zero-width match (e.g.
-// `s/x*/Y/g` against a line with no `x` at all) still advances by one
-// character afterward -- copying that character through unchanged --
-// rather than looping forever re-matching the same empty span.
+// Substitutes on one line, every match if `global`, else the first.
+// Returns the new text (with newlines from any `\r`) and the count. A
+// zero-width match copies one character through and moves on.
 //
-// Real vim's own `g` loop never tries a match starting at exactly the
-// line's own length (one past the last char) -- confirmed against real
-// vim (`vim -es -c '%s/x*/-/g'`): "ab" -> "-a-b" (not "-a-b-"), "abb"
-// against `b*` -> "-a-" (the real, non-zero-width "bb" match already
-// consumes to the end, and nothing further is tried there either) -- the
-// *one* exception is a genuinely empty line, where position 0 (which
-// also happens to equal the line's own length) is the only position
-// there is, and vim does substitute once there (`""` -> `"-"`). Handled
-// as its own upfront special case below rather than folding it into the
-// general loop's own bound, since "try position 0" and "never try
-// position == len" would otherwise directly contradict each other for
-// that one case.
+// As in vim, no match is tried at the line's end ("ab" with `s/x*/-/g`
+// is "-a-b", not "-a-b-"), except on an empty line, where position 0
+// is the end and vim substitutes once. That case is handled first.
 fn substitute_line(text: &str, re: &crate::regex::Regex, replacement: &str, global: bool) -> (String, usize) {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
@@ -13693,27 +12748,9 @@ fn substitute_line(text: &str, re: &crate::regex::Regex, replacement: &str, glob
     (out, count)
 }
 
-// `:s`'s own worker: runs `cmd` against `tb`, returning (total
-// substitutions, lines actually changed) on success. `Err` is vim's own
-// "E486: Pattern not found" message when the range had at least one
-// line to search but nothing in it ever matched -- real vim's own exact
-// wording, since this is meant to read like a familiar Ex error, not a
-// bish-specific one. Processes a changed line by replacing its *entire*
-// own content in place (delete_range then insert_text, the same
-// splice-in-place TextBuffer::put_over_selections already uses) rather
-// than trying to patch around just the matched span(s) -- simplest
-// correct way to let a `\r` in the replacement split a line into several
-// without this loop needing to special-case that itself; every
-// downstream line in the range is then addressed by its own shifted row
-// (`+= 1 + however many extra lines this one's own substitution added`)
-// so a growing range is still walked correctly to its (also shifting)
-// end.
-// `:[range]g/pattern/cmd` and its inverse `:g!` (`:v`) -- run `cmd` on
-// every line that matches, or on every line that does not.
-//
-// The operation people reach for when a substitution is not enough:
-// `:g/TODO/d`, `:g!/^$/d`, `:g/^fn /s/pub //`. Over the same hand-rolled
-// ERE engine `:s` already uses, and honouring the same `ignorecase`.
+// `:[range]g/pattern/cmd` and its inverse `:g!` (`:v`): run `cmd` on each
+// line that matches, or doesn't (`:g/TODO/d`, `:g!/^$/d`). Same regex
+// engine and `ignorecase` as `:s`.
 struct GlobalCmd {
     from: LineRef,
     to: LineRef,
@@ -13723,24 +12760,17 @@ struct GlobalCmd {
 }
 
 // `g`/`g!`/`v`, a delimiter, the pattern, the same delimiter, then the
-// command. `None` for anything that is not an attempt at one at all, so
-// an unrecognised `:gitfoo` still falls through to ordinary dispatch --
-// the same contract `parse_substitute_command` follows.
+// command. `None` for anything not attempting one, so `:gitfoo` falls
+// through, as with `parse_substitute_command`.
 fn parse_global_command(trimmed: &str) -> Option<Result<GlobalCmd, String>> {
     let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0;
-    // Default range is the *whole file*, not the current line -- `:g`'s
-    // own default in vim, and the opposite of `:s`'s.
+    // The default range is the whole file, unlike `:s`, as in vim.
     let (from, to) = parse_range_prefix(&chars, &mut i).unwrap_or((LineRef::Number(1), LineRef::Last));
 
     let invert = match chars.get(i) {
-        // `:g!` is parsed here and does not currently *reach* here from
-        // the colon line: bang-history expansion (history::expand, run
-        // on every command-mode line before dispatch) claims the `!`
-        // first and rewrites the line. `:v` is vim's own equally
-        // standard spelling of the same thing and is unaffected, so
-        // nothing is missing -- but this arm stays, because the moment
-        // bang-history goes the collision goes with it.
+        // `:g!` doesn't reach here from the colon line yet: history expansion
+        // claims the `!` first. `:v` means the same and works.
         Some('g') if chars.get(i + 1) == Some(&'!') => {
             i += 2;
             true
@@ -13755,8 +12785,8 @@ fn parse_global_command(trimmed: &str) -> Option<Result<GlobalCmd, String>> {
         }
         _ => return None,
     };
-    // A delimiter has to follow immediately, or this is some other
-    // command that merely starts with the same letter (`gi`, `version`).
+    // A delimiter must follow at once, or this is another command starting
+    // with the same letter (`gi`, `version`).
     let delimiter = match chars.get(i) {
         Some(c) if !c.is_alphanumeric() && !c.is_whitespace() => *c,
         _ => return None,
@@ -13786,16 +12816,11 @@ fn parse_global_command(trimmed: &str) -> Option<Result<GlobalCmd, String>> {
     Some(Err("g: unterminated pattern".to_string()))
 }
 
-// Returns how many lines the command actually ran on.
-//
-// Two passes, exactly as vim does it and for the same reason: every
-// matching line is found *first*, then the command runs on each. A
-// single pass would have the command's own edits decide which lines the
-// pattern still gets tested against -- so `:g/x/d` on consecutive
-// matches would skip every other one.
-//
-// The marked lines are then run highest-first, so a deletion earlier in
-// the file cannot shift a line that has not been reached yet.
+// Returns how many lines the command ran on. Two passes, as in vim:
+// every match is marked first, or the command's edits would change
+// which lines are tested (`:g/x/d` would skip every other consecutive
+// match). Marked lines run highest first, so a deletion can't shift
+// one not yet reached.
 fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
     let last = tb.line_count().saturating_sub(1);
     let current = tb.cursor().0;
@@ -13814,16 +12839,14 @@ fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
         return Ok(0);
     }
 
-    // Only the commands that mean something applied line by line. `d`
-    // and a substitution cover what `:g` is actually used for; anything
-    // else is refused by name rather than silently doing nothing.
+    // Only commands that make sense per line: `d` and a substitution.
+    // Anything else is refused by name.
     let body = cmd.command.trim();
     if body == "d" || body == "delete" {
         for &row in marked.iter().rev() {
             if tb.line_count() == 1 {
-                // Never leave zero lines -- `delete_range`'s own
-                // Linewise branch already restores that invariant, but
-                // deleting the only line should clear it, not remove it.
+                // Deleting the only line clears it rather than removing it;
+                // a buffer keeps one line.
                 let len = tb.line_len(0);
                 tb.delete_range(&motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (0, 0), to: (0, len) });
                 continue;
@@ -13840,9 +12863,7 @@ fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
             if row >= tb.line_count() {
                 continue;
             }
-            // Each marked line is substituted on its own, by handing the
-            // existing `:s` machinery a one-line range -- rather than a
-            // second substitution implementation living here.
+            // Each marked line goes through `:s` with a one-line range.
             let Some(parsed) = parse_substitute_command(body) else {
                 return Err("g: not a command this can run (expected `d` or `s/.../.../`)".to_string());
             };
@@ -13858,34 +12879,26 @@ fn run_global(tb: &mut TextBuffer, cmd: &GlobalCmd) -> Result<usize, String> {
     Err(format!("g: cannot run '{body}' on each line (expected `d` or `s/.../.../`)"))
 }
 
-/// The last `:s`, plus what the last `/` search was at the moment it
-/// ran.
-///
-/// The second half is how "whichever pattern was used most recently"
-/// gets answered without a clock. vim keeps one shared last-used
-/// pattern that both `/` and `:s` write, so `:s/a/b/` then `/cCc` then
-/// `:s//W/` substitutes `cCc` -- confirmed by running vim. Comparing the
-/// search pattern now against the one recorded here says whether a
-/// search has happened since, which is the same answer.
+/// The last `:s`, plus the last `/` search at the time. vim keeps one
+/// pattern that both `/` and `:s` write, so `:s/a/b/`, `/cCc`, `:s//W/`
+/// substitutes `cCc`. Comparing the current search with the recorded one
+/// says whether a search happened since, without a clock.
 #[derive(Debug, Clone)]
 struct LastSubstitute {
     cmd: SubstituteCmd,
     search_then: String,
 }
 
-/// Fills in the parts of a `:s` that refer to an earlier one: `&`
-/// (that command's flags), and an empty pattern (`:s//repl/`, "the last
-/// one again"), which `r` points at the last *search* instead.
-///
-/// `&` with nothing before it is not an error -- there are simply no
-/// flags to take, which is also what vim does.
+/// Fills in the parts of a `:s` that refer to an earlier one: `&` (its
+/// flags) and an empty pattern (`:s//repl/`), which `r` points at the
+/// last search instead. `&` with nothing before it just has no flags to
+/// take, as in vim.
 fn resolve_substitute(mut cmd: SubstituteCmd, last: Option<&LastSubstitute>, last_search: &str) -> Result<SubstituteCmd, String> {
     let previous = last.map(|l| &l.cmd);
     if cmd.keep_flags
         && let Some(p) = previous
     {
-        // The flags, and only the flags: a count is not one of them, and
-        // vim does not carry it over.
+        // The flags only; a count isn't one, and vim doesn't carry it over.
         cmd.global = p.global;
         cmd.ignore_case = p.ignore_case;
         cmd.count_only = p.count_only;
@@ -13894,19 +12907,12 @@ fn resolve_substitute(mut cmd: SubstituteCmd, last: Option<&LastSubstitute>, las
         cmd.print = p.print;
     }
     if cmd.pattern.is_empty() {
-        // Whichever of the two was used more recently, which is what
-        // vim's single shared pattern register amounts to: a search
-        // since the last `:s` is newer than it, otherwise the `:s` is.
+        // Whichever was used more recently, as vim's single pattern amounts
+        // to.
         //
-        // `r` does not enter into this, and that is not an oversight.
-        // Its job is to prefer the last *search* pattern over the last
-        // *substitute* pattern -- but `:s` writes the search pattern
-        // too, so after `/cCc` then `:s/a/Z/` the "previously used
-        // search pattern" is `a`, and real vim answers `:s//W/r` with
-        // `a` exactly as it answers `:s//W/`. Confirmed by running all
-        // four orderings. Where `r` does bite is `:&r`, which is `:~` --
-        // see `repeat_substitute`, whose whole point is that it reaches
-        // back deliberately rather than by recency.
+        // Not `r`: `:s` writes the search pattern too, so after `/cCc` then
+        // `:s/a/Z/`, `:s//W/r` uses `a`, the same as without `r`. `r`
+        // matters in `:&r`, which is `:~` (see `repeat_substitute`).
         let searched_since = last.is_none_or(|l| l.search_then != last_search);
         let substituted = previous.map(|p| p.pattern.as_str()).filter(|p| !p.is_empty());
         let pattern = match searched_since {
@@ -13921,23 +12927,16 @@ fn resolve_substitute(mut cmd: SubstituteCmd, last: Option<&LastSubstitute>, las
     Ok(cmd)
 }
 
-/// `:s/.../.../c` -- one match at a time, with the cursor on it and a
-/// question under it.
+/// `:s/.../.../c`: one match at a time, cursor on it, a question under it.
+/// Its own loop, as it draws, asks and waits between matches, and runs at
+/// the caller's level (`run_normal_mode_navigation`) like `:normal`,
+/// where the rect, `VimKeys` and redraw live.
 ///
-/// Its own loop rather than a flag threaded through `run_substitute`,
-/// because it is a different shape entirely: that one walks the range
-/// deciding nothing, and this one has to draw, ask, and wait between
-/// every match. It runs at the caller's level (`run_normal_mode_
-/// navigation`) for the same reason `:normal` does -- that is where the
-/// pane's rect, its `VimKeys` and its redraw live.
+/// vim's answers: `y` replace, `n` skip, `a` all the rest, `q`/Esc stop,
+/// `l` this one then stop. Anything else asks again.
 ///
-/// Answers are vim's: `y` replace, `n` skip, `a` all the rest without
-/// asking, `q`/`Esc` stop here, `l` this one and then stop. Anything
-/// else is ignored and the same match is asked about again.
-///
-/// The buffer is re-borrowed at each step rather than held: drawing the
-/// frame needs the whole `NavBuffer`, and the question cannot be asked
-/// without drawing what it is about.
+/// The buffer is re-borrowed each step: drawing needs the whole
+/// `NavBuffer`.
 fn confirm_substitute(
     buf: &mut NavBuffer,
     vk: &VimKeys,
@@ -13979,14 +12978,12 @@ fn confirm_substitute(
             let Some((start, match_end, replacement)) = found else { break };
 
             let answer = if ask {
-                // The cursor goes on the match before the question is
-                // drawn, so the thing being asked about is the thing
-                // under the cursor -- that *is* the question.
+                // The cursor goes on the match before asking: that's the
+                // question.
                 buf.as_editable_mut().ok_or(NOT_EDITABLE)?.set_cursor(row, start);
                 render_nav_frame(buf, vk, rect, term_rows, term_cols, color_overrides);
                 show_command_mode_error(&format!("replace with {replacement} (y/n/a/q/l)?"), term_rows, term_cols);
-                // A read that gives nothing is the terminal going away,
-                // which is a `q` as far as this loop is concerned.
+                // Nothing read means the terminal went away: a `q`.
                 match editor::read_key_idle(&mut || {}) {
                     Ok(Some(key)) => key,
                     _ => Key::Char('q'),
@@ -13997,15 +12994,14 @@ fn confirm_substitute(
             let (replace, last) = match answer {
                 Key::Char('y') => (true, false),
                 Key::Char('n') => (false, false),
-                // Every remaining match, without asking again.
+                // Every remaining match, without asking.
                 Key::Char('a') => {
                     ask = false;
                     (true, false)
                 }
                 Key::Char('l') => (true, true),
                 Key::Char('q') | Key::Escape => (false, true),
-                // vim ignores a key it has no answer for and asks the
-                // same question again.
+                // vim ignores keys it has no answer for and asks again.
                 _ => continue,
             };
             if replace {
@@ -14016,14 +13012,12 @@ fn confirm_substitute(
                 out.substitutions += 1;
                 out.last_row = Some(row);
                 touched = true;
-                // A replacement may carry newlines (a `\r` in the
-                // replacement text), which pushes the rest of the range
-                // down with it.
+                // A replacement can carry newlines (`\r`), pushing the
+                // range down.
                 let added = replacement.matches('\n').count();
                 end += added;
-                // `.max(start + 1)` so an empty replacement of an empty
-                // match still advances, rather than asking about the
-                // same position forever.
+                // `.max(start + 1)`, so an empty replacement of an empty
+                // match still advances.
                 col = (start + replacement.chars().count()).max(start + 1);
                 if added > 0 {
                     row += added;
@@ -14051,11 +13045,9 @@ fn confirm_substitute(
     Ok(out)
 }
 
-/// The rows a `:s` acts on, from its already-resolved range ends.
-///
-/// A trailing count replaces the range instead of narrowing it: vim
-/// reads `:1,2s/x/y/ 3` as "three lines from line 2", which can reach
-/// past where the range ended. See `SubstituteCmd::count`.
+/// The rows a `:s` acts on. A trailing count replaces the range: vim
+/// reads `:1,2s/x/y/ 3` as three lines from line 2. See
+/// `SubstituteCmd::count`.
 fn substitute_rows(a: usize, b: usize, cmd: &SubstituteCmd) -> (usize, usize) {
     match cmd.count {
         Some(n) => (a.max(b), a.max(b).saturating_add(n - 1)),
@@ -14063,18 +13055,15 @@ fn substitute_rows(a: usize, b: usize, cmd: &SubstituteCmd) -> (usize, usize) {
     }
 }
 
-/// One line as `p`, `#` or `l` would show it.
+/// One line as `p`, `#` or `l` shows it.
 fn printed_line(tb: &TextBuffer, row: usize, style: PrintStyle) -> String {
     let text: String = tb.line_chars(row).into_iter().collect();
     match style {
         PrintStyle::Plain => text,
-        // vim right-aligns the number in three columns and follows it
-        // with one space.
+        // vim right-aligns the number in three columns, then a space.
         PrintStyle::Numbered => format!("{:>3} {text}", row + 1),
-        // `:list` spelling: `$` marks where the line ends, so trailing
-        // whitespace is visible, and a tab shows as the two characters
-        // it would be typed as rather than as a jump the eye cannot
-        // measure.
+        // `:list`: `$` marks the line's end so trailing whitespace shows, and
+        // a tab shows as `^I`.
         PrintStyle::List => format!("{}$", text.replace('\\', "\\\\").replace('\t', "^I")),
     }
 }
@@ -14084,26 +13073,25 @@ fn printed_line(tb: &TextBuffer, row: usize, style: PrintStyle) -> String {
 struct SubstituteOutcome {
     substitutions: usize,
     lines: usize,
-    /// The last row a substitution touched, which is the line `p`, `#`
-    /// and `l` print -- vim shows where it finished, not where it began.
+    /// The last row a substitution touched, which `p`, `#` and `l` print, as
+    /// vim shows where it finished.
     last_row: Option<usize>,
 }
 
+// Runs `:s` on `tb`. `Err` is vim's "E486: Pattern not found" when the
+// range had lines but nothing matched. A changed line is replaced whole,
+// so a `\r` can split it, and later rows in the range are shifted by the
+// lines added.
 fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<SubstituteOutcome, String> {
     let last = tb.line_count().saturating_sub(1);
     let current = tb.cursor().0;
     let a = cmd.from.resolve(current, last);
     let b = cmd.to.resolve(current, last);
-    // A "backwards" range (e.g. `:5,2s/.../...`) is silently normalized
-    // rather than rejected -- real vim asks for confirmation
-    // (E493/"Backwards range given, OK to swap") since there's no
-    // interactive prompt plumbed through command mode for that; just
-    // swapping is the more useful default and matches what confirming
-    // that prompt would do anyway.
+    // A backwards range (`:5,2s/...`) is swapped. vim asks (E493), but
+    // command mode has no prompt for it, and swapping is what yes does.
     let (mut row, mut end) = substitute_rows(a, b, cmd);
-    // `i`/`I` when either was given, and only otherwise the
-    // 'ignorecase'/'smartcase' answer the buffer would have used on its
-    // own.
+    // `i`/`I` when given, else the buffer's `ignorecase`/`smartcase`
+    // answer.
     let fold = cmd.ignore_case.unwrap_or_else(|| tb.search_ignore_case(&cmd.pattern));
     let re = crate::regex::Regex::compile(&cmd.pattern, fold);
     let mut total = 0usize;
@@ -14116,8 +13104,7 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<Substitute
             total += count;
             lines_changed += 1;
             last_row = Some(row);
-            // `n` counts and leaves the buffer alone -- the whole point
-            // of asking is to find out before deciding.
+            // `n` counts and leaves the buffer alone.
             if !cmd.count_only {
                 let line_len = original.chars().count();
                 let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (row, 0), to: (row, line_len) };
@@ -14137,32 +13124,21 @@ fn run_substitute(tb: &mut TextBuffer, cmd: &SubstituteCmd) -> Result<Substitute
     Ok(SubstituteOutcome { substitutions: total, lines: lines_changed, last_row })
 }
 
-// Command mode allows full control-flow syntax (if/while/for/etc -- every
-// leaf command still funnels through the same restrict_to_builtins gate
-// regardless of nesting) but not `(...)` subshells, coproc, function
-// definitions, or multi-stage `|` pipelines: the first three self-exec (or
-// register something persistent) rather than running through that gate,
-// and would bypass the restriction entirely; function definitions would
-// leak a callable function out into normal shell mode later. Walked
-// recursively since these can be nested inside a control-flow body.
-// bash's `HISTCONTROL=ignorespace`, except always on, the way fish has
-// it -- there is no option here and none is planned. bash's default is
-// to record everything, which is a 1991 default nobody keeps; the
-// gesture is only useful if you can rely on it without having
-// configured anything first, and a shell that sometimes remembers your
-// password is worse than one that never does.
+// `HISTCONTROL=ignorespace`, always on: a leading space or tab keeps a
+// line out of history. Only useful if it can be relied on unconfigured;
+// a shell that sometimes remembers your password is worse than one that
+// never does.
 //
-// Tab and space both count, since either is what a terminal produces
-// when someone deliberately indents a line to hide it.
-//
-// Decided on the *first* line of a fresh command only. A continuation
-// line's own leading whitespace is content -- a heredoc body's
-// indentation, most obviously -- and has nothing to say about whether
-// the command it belongs to should be remembered.
+// Decided on a fresh command's first line only: a continuation line's
+// leading whitespace is content (a heredoc's indentation).
 fn starts_off_the_record(first_line: &str) -> bool {
     first_line.starts_with([' ', '\t'])
 }
 
+// Command mode allows control flow, as every leaf command still passes the
+// `restrict_to_builtins` gate, but not subshells, coproc or multi-stage
+// pipelines, which run outside that gate, nor function definitions, which
+// would outlive command mode. Walked recursively through nested bodies.
 fn command_mode_violation(prog: &Program) -> Option<&'static str> {
     prog.iter().find_map(|item| and_or_violation(&item.and_or))
 }
@@ -14199,12 +13175,8 @@ fn command_violation(c: &Command) -> Option<&'static str> {
 mod visual_mode_tests {
     use super::*;
 
-    // A `ScreenBuffer` fed with `text` (`\n` normalized to `\r\n` first,
-    // matching a real pty's own line endings) -- the same construction
-    // `run_normal_mode_navigation` itself goes through
-    // (`ScreenBuffer::new` over a freshly-fed `vt100::Screen`), just
-    // without the prompt-freezing/rect machinery this module's own tests
-    // have no use for.
+    // A `ScreenBuffer` fed `text` (`\n` as `\r\n`, as a pty sends), built as
+    // `run_normal_mode_navigation` builds one, minus the prompt and rect.
     fn make_screen_buffer(text: &str) -> ScreenBuffer {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(20, 40)));
         screen.borrow_mut().feed(text.replace('\n', "\r\n").as_bytes());
@@ -14279,20 +13251,13 @@ mod visual_mode_tests {
 mod alt_screen_addressing_tests {
     use super::*;
 
-    // Regression test for a real bug caught during interactive
-    // verification ("entering window/pane normal when a fullscreen app
-    // (vim) is open hides the content of the app"): with real
-    // pre-existing scrollback in a pane before a fullscreen program
-    // starts, `addressable_scrollback_len` returning the *primary*
-    // grid's real scrollback length while the *alternate* screen is
-    // active would push the combined-addressing cursor position (and
-    // thus the viewport) mostly or entirely into that stale scrollback
-    // instead of the program's own alternate-screen rows.
+    // With scrollback in the primary grid, entering normal mode over a
+    // full-screen program must address the alternate screen's rows, not the
+    // stale scrollback.
     #[test]
     fn addressable_scrollback_len_is_zero_on_the_alternate_screen_even_with_real_scrollback() {
         let mut screen = vt100::Screen::new(5, 20);
-        // Scroll the primary grid well past its own height so real
-        // scrollback accumulates.
+        // Scroll the primary grid past its height so scrollback accumulates.
         for i in 0..20 {
             screen.feed(format!("line {i}\r\n").as_bytes());
         }
@@ -14308,20 +13273,17 @@ mod alt_screen_addressing_tests {
         assert_eq!(addressable_scrollback_len(&screen), primary_len);
     }
 
-    // The other half of the same report, and the half that was still
-    // broken: a program that paints the whole grid parks its cursor
-    // wherever it likes -- vim leaves it on line 1 -- and clipping the
-    // addressable range at the cursor row showed one line of a full
-    // screen. See `addressable_len`.
+    // A program painting the whole grid can park its cursor anywhere (vim
+    // uses line 1); the addressable range mustn't stop at the cursor. See
+    // `addressable_len`.
     #[test]
     fn a_full_screen_program_is_addressable_below_its_own_cursor() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(6, 20)));
         {
             let mut s = screen.borrow_mut();
             s.feed(b"\x1b[?1049h");
-            // Paint every row, then send the cursor back to the top --
-            // exactly what a full-screen editor does before waiting for
-            // a key.
+            // Paint every row, then cursor to the top, as a full-screen
+            // editor does.
             for row in 0..6 {
                 s.feed(format!("\x1b[{};1Hrow {row}", row + 1).as_bytes());
             }
@@ -14331,13 +13293,12 @@ mod alt_screen_addressing_tests {
         let buf = ScreenBuffer::new(screen, 6);
         assert_eq!(buf.line_count(), 6, "the whole painted screen, not just the cursor's row");
         assert_eq!(buf.line_chars(5).into_iter().collect::<String>(), "row 5");
-        // Entering does not read as "5 new lines arrived" either.
+        // Entering doesn't read as "5 new lines arrived".
         assert_eq!(buf.new_lines(), 0);
     }
 
-    // ...and the rule that was there before still holds where it was
-    // right: a shell pane's rows below the cursor really are untouched
-    // padding, and counting them would let `G` walk into empty space.
+    // A shell pane's rows below the cursor are padding; counting them would
+    // let `G` walk into empty space.
     #[test]
     fn a_shell_panes_blank_rows_below_the_cursor_are_still_not_content() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(10, 20)));
@@ -14349,12 +13310,8 @@ mod alt_screen_addressing_tests {
         assert_eq!(buf.line_count(), 3, "three written rows, seven blank ones below");
     }
 
-    // Same bug, exercised through `ScreenBuffer` itself (the actual
-    // `Buffer` normal-mode navigation reads from) rather than the raw
-    // helper directly: with real pre-existing primary-grid scrollback,
-    // `line_count`/`char_at` must still address purely within the
-    // alternate screen's own rows while it's active, not the stale
-    // scrollback ahead of it.
+    // The same through `ScreenBuffer`: `line_count`/`char_at` address only
+    // the alternate screen's rows while it's active.
     #[test]
     fn screen_buffer_addresses_only_the_alternate_screens_own_rows() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(5, 20)));
@@ -14368,8 +13325,7 @@ mod alt_screen_addressing_tests {
             s.feed(b"vim content here");
         }
         let buf = ScreenBuffer::new(screen, 5);
-        // Only the one alternate-screen row with real content -- none of
-        // the primary grid's real scrollback should be counted.
+        // Only the one alternate-screen row with content.
         assert_eq!(buf.line_count(), 1);
         assert_eq!(buf.char_at(0, 0), Some('v'));
         let line: String = buf.line_chars(0).into_iter().collect();
@@ -14390,8 +13346,7 @@ mod completion_menu_geometry_tests {
 
     #[test]
     fn an_unpromoted_terminal_has_no_absolute_menu_row() {
-        // The relative `\n`/draw/`\x1b[1A` dance is the only option
-        // there, and it's safe precisely because there are no panes.
+        // Without panes the menu is drawn relative to the prompt.
         let w = WindowEntry::single(0, Frame::Session(0));
         assert_eq!(completion_menu_rows(&w, false, 0, 24, 80), None);
     }
@@ -14399,35 +13354,30 @@ mod completion_menu_geometry_tests {
     #[test]
     fn an_unsplit_pane_menu_sits_below_the_prompt_and_above_the_tab_bar() {
         let w = WindowEntry::single(0, Frame::Session(0));
-        // content_rows(24) == 22, so the pane owns rows 0..=21.
+        // `content_rows(24)` is 22, so the pane owns rows 0..=21.
         let (prompt_row, bottom) = completion_menu_rows(&w, true, 3, 24, 80).unwrap();
         assert_eq!((prompt_row, bottom), (3, 21));
     }
 
     #[test]
     fn a_split_pane_gets_a_menu_row_bounded_by_its_own_pane() {
-        // Regression: this returned None for any split window, so the
-        // menu was skipped entirely there -- Tab still cycled candidates
-        // but nothing showed them. The absolute path clamps to the pane
-        // on both axes (this row pair vertically, focused_col_origin
-        // horizontally), so a split needs no more than an unsplit one.
+        // A split window gets a menu too, clamped to the pane: these rows
+        // vertically, `focused_col_origin` horizontally.
         let w = split_window();
         let rect = pane_rect(&w, 1, 24, 80);
         let (prompt_row, bottom) = completion_menu_rows(&w, true, 2, 24, 80).unwrap();
         assert_eq!(prompt_row, rect.row + 2, "the prompt row is the pane's own, not the terminal's");
         assert_eq!(bottom, rect.row + rect.rows - 1, "and the menu can never be drawn past this pane");
         assert!(bottom < content_rows(24), "which is above the global status row and the tab bar");
-        // The lower pane genuinely starts partway down the screen -- if
-        // it didn't, this test would pass without proving anything.
+        // The lower pane starts partway down, or this proves nothing.
         assert!(rect.row > 0);
     }
 
     #[test]
     fn a_prompt_on_the_panes_last_row_leaves_no_room_and_the_menu_is_skipped() {
-        // redraw_with_completion_row draws at prompt_row + 1 and skips
-        // when that exceeds the bottom -- the documented graceful
-        // degradation, which this geometry has to keep reachable rather
-        // than reporting a row outside the pane.
+        // `redraw_with_completion_row` draws at `prompt_row + 1` and skips
+        // when that's past the bottom; the geometry must keep that
+        // reachable rather than report a row outside the pane.
         let w = split_window();
         let rect = pane_rect(&w, 1, 24, 80);
         let (prompt_row, bottom) = completion_menu_rows(&w, true, rect.rows - 1, 24, 80).unwrap();
@@ -14437,8 +13387,8 @@ mod completion_menu_geometry_tests {
 
     #[test]
     fn the_menu_never_spills_horizontally_either() {
-        // The other half of the clamp: the row is drawn at col_origin for
-        // `width` columns, both of which are the focused pane's own.
+        // The row is drawn at `col_origin` for `width` columns, both the
+        // pane's.
         let w = split_window();
         let (col_origin, width) = focused_col_origin(&w, true, 24, 80);
         let rect = pane_rect(&w, 1, 24, 80);
@@ -14464,14 +13414,13 @@ mod fg_click_tests {
 
     #[test]
     fn decode_fg_click_ignores_a_drag() {
-        // Bit 5 (0x20) set means "motion while a button is held" -- not a
-        // plain click (MouseEvent::is_left_click's own doc comment).
+        // Bit 5 (0x20) means motion with a button held, not a click.
         assert!(decode_fg_click(b"\x1b[<32;15;24M").is_none());
     }
 
     #[test]
     fn decode_fg_click_ignores_a_wheel_event() {
-        // Bit 6 (0x40) set means a wheel button.
+        // Bit 6 (0x40) means a wheel button.
         assert!(decode_fg_click(b"\x1b[<64;15;24M").is_none());
     }
 
@@ -14494,11 +13443,8 @@ mod fg_click_tests {
 
     #[test]
     fn decode_fg_click_decodes_the_first_report_even_with_a_paired_release_concatenated_after_it() {
-        // A press and its own release commonly arrive in the very same
-        // read over a local pty -- must not treat the whole buffer as
-        // one garbled report (this exact case previously fooled the
-        // detector into missing the click entirely, see this function's
-        // own doc comment).
+        // A press and its release often arrive in one read over a local pty;
+        // the buffer isn't one garbled report.
         let ev = decode_fg_click(b"\x1b[<0;15;24M\x1b[<0;15;24m").unwrap();
         assert_eq!((ev.button, ev.col, ev.row, ev.pressed), (0, 15, 24, true));
     }
@@ -14508,9 +13454,8 @@ mod fg_click_tests {
 mod compositor_diff_tests {
     use super::*;
 
-    // A blank rows*cols frame with plain-space cells everywhere, cursor
-    // parked at (0, 0) and visible -- the common starting point every
-    // test below mutates one piece of at a time.
+    // A blank frame of plain spaces, cursor visible at (0, 0), for each test
+    // to change one thing in.
     fn blank(rows: usize, cols: usize) -> TerminalFrame {
         TerminalFrame { rows, cols, cells: vec![vt100::Cell::default(); rows * cols], tab_bar: String::new(), cursor: (0, 0), cursor_visible: true }
     }
@@ -14532,9 +13477,8 @@ mod compositor_diff_tests {
         let mut new = blank(5, 10);
         set(&mut new, 2, 3, 'x');
         let out = diff_frames(&prev, &new, 5, 10);
-        // Row 2, col 3 (1-indexed: row 3, col 4), default SGR, the one
-        // changed glyph, then the cursor re-assertion (still (0,0) here,
-        // but always re-sent once anything was painted).
+        // Row 2, col 3 (1-based 3;4), default SGR, the changed glyph, then
+        // the cursor re-asserted, as anything was painted.
         assert!(out.starts_with("\x1b[3;4H"), "{out:?}");
         assert!(out.contains('x'), "{out:?}");
         assert!(out.ends_with("\x1b[1;1H\x1b[?25h"), "{out:?}");
@@ -14548,8 +13492,8 @@ mod compositor_diff_tests {
         set(&mut new, 1, 3, 'b');
         set(&mut new, 1, 4, 'c');
         let out = diff_frames(&prev, &new, 3, 10);
-        // Exactly one cursor-position escape for the whole run (row 1
-        // col 2 => 1-indexed "2;3"), not one per changed cell.
+        // One cursor move for the whole run (row 1 col 2, 1-based `2;3`), not
+        // one per cell.
         assert_eq!(out.matches("\x1b[2;3H").count(), 1, "{out:?}");
         assert!(out.contains("abc"), "{out:?}");
     }
@@ -14575,24 +13519,22 @@ mod compositor_diff_tests {
         assert!(out.contains(&vt100::sgr_codes(vt100::Color::Default, vt100::Color::Default, new.cells[0].attrs)), "{out:?}");
     }
 
-    // A window's label is a path now, not a pre-abbreviated one, so the
-    // bar is where it is made to fit -- a bar of full paths would run off
-    // the end of the line instead of ending at it.
+    // The bar fits each label, or full paths would run off the line.
     #[test]
     fn a_tabs_label_is_fitted_to_its_share_of_the_bar() {
-        // `" [0]  "` -- the id, its brackets and the spaces either side --
-        // plus the column that keeps the bar off the line's own end.
+        // `" [0]  "` (the id, brackets and spaces) plus the column keeping
+        // the bar off the line's end.
         assert_eq!(tab_label_budget(80, 1), 80 - 7);
         assert_eq!(tab_label_budget(80, 2), 40 - 7);
         assert_eq!(tab_label_budget(80, 8), 10 - 7);
-        // Narrower than the decoration: nothing left for a label, and no
-        // underflow either.
+        // Narrower than the decoration: no room for a label, and no
+        // underflow.
         assert_eq!(tab_label_budget(4, 2), 0);
 
         let deep = prompt::display_path("/home/jussi/work/clients/acme/backend/services/billing", "/home/jussi");
         let one = prompt::fit_path(&deep, tab_label_budget(80, 1));
         let four = prompt::fit_path(&deep, tab_label_budget(80, 4));
-        // One tab has room for the path as it is.
+        // One tab has room for the whole path.
         assert_eq!(one, deep);
         assert_eq!(four, "~/…/billing", "a quarter of the bar still says which directory it is");
         for (label, windows) in [(one, 1), (four, 4)] {
@@ -14600,10 +13542,8 @@ mod compositor_diff_tests {
         }
     }
 
-    // The dialog is the shell's, not a pane's, so it is placed against
-    // the terminal rather than against anything inside it.
-    // Both halves of "which destinations, starting where", including
-    // every way the two options can disagree with each other.
+    // Which destinations, starting where, including each way the two
+    // options can disagree.
     #[test]
     fn the_opener_offers_the_destinations_the_glob_matches() {
         use crate::opener::Destination;
@@ -14612,8 +13552,7 @@ mod compositor_diff_tests {
             shell.run_source_here(opts, "<test>");
             opener_destinations(&shell)
         };
-        // Shipped: all four, starting on a tab, which is what the
-        // opener did before it could be asked.
+        // The default: all four, starting on a tab.
         assert_eq!(read(""), (Destination::ALL.to_vec(), Destination::Tab));
         // A glob over their names, as `tabular` globs over languages.
         assert_eq!(
@@ -14622,13 +13561,11 @@ mod compositor_diff_tests {
             "the start falls to the first survivor when the one asked for was excluded"
         );
         assert_eq!(read("bishopt --set opener_targets here"), (vec![Destination::Here], Destination::Here));
-        // The start on its own.
+        // The start alone.
         assert_eq!(read("bishopt --set opener_target hsplit").1, Destination::HSplit);
         assert_eq!(read("bishopt --set opener_target here; bishopt --set opener_targets '*'").1, Destination::Here);
-        // Neither option can brick the dialog. A glob matching nothing
-        // is a typo, and a dialog that cannot open anything is a worse
-        // answer to it than ignoring it; a start naming nothing lands
-        // on the first thing that is enabled.
+        // Neither option can break the dialog: a glob matching nothing is
+        // ignored, and a start naming nothing lands on the first enabled.
         assert_eq!(read("bishopt --set opener_targets nosuchthing"), (Destination::ALL.to_vec(), Destination::Tab));
         assert_eq!(read("bishopt --set opener_target nosuchthing").1, Destination::Tab);
         assert_eq!(read("bishopt --set opener_target nope; bishopt --set opener_targets hsplit"), (vec![Destination::HSplit], Destination::HSplit));
@@ -14636,26 +13573,23 @@ mod compositor_diff_tests {
 
     #[test]
     fn the_opener_dialog_stays_inside_what_the_compositor_repaints() {
-        // 80x24, a long list: three quarters of the width, and two rows
-        // short of the content area, centred in it.
+        // 80x24, a long list: three quarters of the width, two rows short of
+        // the content area, centred.
         let r = opener_dialog_rect(143, 24, 80);
         assert_eq!((r.row, r.col, r.rows, r.cols), (1, 10, 20, 60));
         // A short list gets a short dialog, still centred.
         let r = opener_dialog_rect(2, 24, 80);
         assert_eq!((r.row, r.col, r.rows, r.cols), (8, 10, 6, 60));
-        // Wide terminal: capped, so the dialog does not become a wall.
+        // A wide terminal: capped.
         let r = opener_dialog_rect(143, 50, 200);
         assert_eq!((r.row, r.col, r.rows, r.cols), (1, 50, 46, 100));
-        // Narrow terminal: the floor wins, up to the width there is.
+        // A narrow terminal: the floor, up to the width there is.
         assert_eq!(opener_dialog_rect(143, 10, 30).cols, 24);
         assert_eq!(opener_dialog_rect(143, 10, 20).cols, 20, "never wider than the terminal");
 
-        // The property the dialog's own bottom border was left behind
-        // for: the last two rows of the terminal are the global status
-        // row and the pinned tab bar, and `compositor_redraw` paints
-        // neither the first of those nor anything below the content
-        // area -- so a dialog that reaches there is a dialog that never
-        // gets cleaned up.
+        // The last two rows are the global status row and the tab bar, which
+        // `compositor_redraw` doesn't repaint below the content area, so a
+        // dialog reaching them would leave its border behind.
         for term_rows in 1..=60 {
             let r = opener_dialog_rect(143, term_rows, 80);
             assert!(
@@ -14666,32 +13600,28 @@ mod compositor_diff_tests {
             );
             assert!(r.rows >= 1 && r.cols >= 1, "{term_rows} rows: nothing to draw");
         }
-        // Absurdly narrow, which only has to not wrap the arithmetic.
+        // Absurdly narrow only has to not wrap the arithmetic.
         for (rows, cols) in [(4, 10), (1, 1), (0, 0), (2, 3)] {
             let r = opener_dialog_rect(143, rows, cols);
             assert!(r.col + r.cols <= cols, "{rows}x{cols} -> {:?}", (r.row, r.col, r.rows, r.cols));
         }
     }
 
-    // The terminal's own title answers the same question the tab bar
-    // does -- which window is this -- except that a program in the pane
-    // may already have answered it.
+    // The title says which window this is, as the tab bar does, unless a
+    // program in the pane already said.
     #[test]
     fn a_program_that_named_its_window_keeps_that_name() {
-        // vim said so; bish has nothing to add.
+        // vim named it; bish has nothing to add.
         assert_eq!(window_title("README.md (~/bish) - VIM", None, "/home/jussi/bish", "/home/jussi"), "README.md (~/bish) - VIM");
-        // Said so *and* the window has a name of its own: the program
-        // wins, because it is what is actually on screen.
+        // A program's title beats the window's name: it's what's on screen.
         assert_eq!(window_title("htop", Some("monitors"), "/home/jussi", "/home/jussi"), "htop");
-        // Nothing said: the window's own name, prefixed so that a tab
-        // running bish is recognisable among a row of them.
+        // Nothing said: the window's name, prefixed.
         assert_eq!(window_title("", Some("monitors"), "/home/jussi/bish", "/home/jussi"), "bish: monitors");
         // Nothing said and no name: where it is.
         assert_eq!(window_title("", None, "/home/jussi/bish", "/home/jussi"), "bish: ~/bish");
         assert_eq!(window_title("", None, "/usr/local/bin", "/home/jussi"), "bish: /usr/local/bin");
-        // Unlike the tab bar, a title has no budget to fit -- the
-        // terminal shortens it however its own tabs need, and it is the
-        // only one that knows how much room they have.
+        // Unlike the tab bar, a title isn't shortened: the terminal fits it
+        // to its own tabs.
         let deep = "/home/jussi/work/clients/acme/backend/services/billing";
         assert_eq!(window_title("", None, deep, "/home/jussi"), format!("bish: {}", prompt::display_path(deep, "/home/jussi")));
     }
@@ -14702,9 +13632,8 @@ mod compositor_diff_tests {
         let mut new = blank(5, 20);
         new.tab_bar = "[1] bish".to_string();
         let out = diff_frames(&prev, &new, 6, 20);
-        // term_rows = 6 -> tab bar pinned to row 6, followed by the
-        // unchanged cursor's own re-assertion (still required once
-        // anything at all was painted).
+        // `term_rows` 6 puts the tab bar on row 6, then the cursor is
+        // re-asserted, as anything was painted.
         assert_eq!(out, "\x1b[6;1H\x1b[K[1] bish\x1b[1;1H\x1b[?25h");
     }
 
@@ -14728,12 +13657,8 @@ mod compositor_diff_tests {
 
     #[test]
     fn a_run_can_cross_what_would_be_a_pane_boundary_in_the_flattened_grid() {
-        // diff_frames itself has no notion of panes at all -- it only
-        // ever sees the flattened per-cell grid TerminalFrame::capture
-        // already produced, so a dirty run spanning what were two
-        // side-by-side panes' columns is indistinguishable from an
-        // ordinary single-pane run. Exercises that no pane-boundary
-        // assumption ever crept into the run-extension loop.
+        // `diff_frames` sees only the flattened grid, so a dirty run across
+        // two side-by-side panes is an ordinary run.
         let prev = blank(2, 10);
         let mut new = blank(2, 10);
         for col in 3..7 {
@@ -14749,14 +13674,9 @@ mod compositor_diff_tests {
 mod terminal_frame_capture_tests {
     use super::*;
 
-    // Regression: a pane's own cached `rect` (built once by
-    // run_fg_job_frame, refreshed only when the *focused* pane's screen
-    // size changes -- see TerminalFrame::capture's own doc comment) can
-    // describe a larger area than that pane's screen *currently* has,
-    // if a sibling pane's screen was independently resized in between --
-    // this used to panic inside vt100::Screen::cell with an index-out-
-    // of-bounds. `capture` must clamp to the screen's own live size
-    // instead of trusting `rect`.
+    // A pane's cached `rect` can be larger than its screen after a sibling
+    // was resized (see `TerminalFrame::capture`); `capture` must clamp to
+    // the screen's live size, not panic in `Screen::cell`.
     #[test]
     fn capture_clamps_a_panes_stale_rect_to_its_screens_own_live_size() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(2, 3)));
@@ -14797,7 +13717,7 @@ mod normal_mode_status_tests {
 
     fn status(buf: &ScreenBuffer, cols: usize) -> String {
         let plain = normal_mode_status_text(buf, &VimKeys::new(), None, cols);
-        // The chips carry their own SGR; strip it to assert on text.
+        // The chips carry SGR; strip it to check the text.
         let mut out = String::new();
         let mut chars = plain.chars().peekable();
         while let Some(c) = chars.next() {
@@ -14816,9 +13736,8 @@ mod normal_mode_status_tests {
 
     #[test]
     fn the_mode_line_always_says_how_to_get_back_out() {
-        // The whole point: Ctrl+G into normal mode over a shell pane
-        // is not something Escape or `q` gets you out of, so the way out
-        // has to be on screen rather than known in advance.
+        // Escape and `q` don't leave normal mode over a shell pane, so the
+        // way out has to be on screen.
         let buf = nav_buffer(10, b"$ echo hi\r\n");
         let text = status(&buf, 100);
         assert!(text.contains(NORMAL_MODE_EXIT_HINT), "{text:?}");
@@ -14830,7 +13749,7 @@ mod normal_mode_status_tests {
         let mut buf = nav_buffer(10, b"$ tail -f log\r\n");
         assert_eq!(buf.new_lines(), 0);
         assert!(!status(&buf, 100).contains("new line"));
-        // Two more lines land in the pane after the excursion started.
+        // Two more lines arrive after the excursion started.
         buf.screen.borrow_mut().feed(b"one\r\ntwo\r\n");
         assert_eq!(buf.new_lines(), 2);
         let text = status(&buf, 100);
@@ -14850,8 +13769,8 @@ mod normal_mode_status_tests {
     #[test]
     fn a_narrow_pane_shortens_the_hint_before_dropping_it() {
         let buf = nav_buffer(10, b"$ \r\n");
-        // Wide: the sentence. Narrow: the short form. Narrower still:
-        // nothing but the mode label and position, as before.
+        // Wide: the sentence. Narrow: the short form. Narrower: just the mode
+        // label and position.
         assert!(status(&buf, 100).contains(NORMAL_MODE_EXIT_HINT));
         let narrow = status(&buf, 44);
         assert!(narrow.contains(NORMAL_MODE_EXIT_HINT_SHORT), "{narrow:?}");
@@ -14885,7 +13804,6 @@ mod normal_mode_status_tests {
 #[cfg(test)]
 mod compositor_frame_output_tests {
     use super::*;
-    // Only this module builds a layout by hand.
 
     #[test]
     fn a_folded_divider_draws_what_it_stands_for() {
@@ -14895,14 +13813,11 @@ mod compositor_frame_output_tests {
         assert!(folded_divider_line(30, 1).contains("1 pane"), "singular");
     }
 
-    // Regression: `bish --promoted`, then Ctrl-C, visibly flashed the
-    // prompt. read_line draws the prompt straight to the real terminal
-    // and never into the session's grid, so the full repaint that
-    // follows Ctrl-C painted that row blank -- taking the `^C` with it --
-    // and the fresh prompt then drew over the top, one blank frame
-    // later. Recording the abandoned line into the grid first makes the
-    // repaint draw what's already on screen, so there's nothing to
-    // flash, and leaves the `^C` in the scrollback where bash leaves it.
+    // Ctrl-C at a promoted prompt mustn't flash. `read_line` draws the
+    // prompt to the terminal, not the grid, so the repaint after Ctrl-C
+    // blanked that row (and the `^C`) before the new prompt drew. Recording
+    // the abandoned line into the grid first makes the repaint draw what's
+    // on screen, and leaves the `^C` in the scrollback, as bash does.
     #[test]
     fn an_interrupted_line_is_recorded_in_the_grid_the_way_the_terminal_shows_it() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
@@ -14931,14 +13846,10 @@ mod compositor_frame_output_tests {
         assert_eq!(screen.borrow().cursor().0, 1, "and the next prompt gets the row below it");
     }
 
-    // Regression: an editor frame (`Frame::Edit`/`Frame::Hex`) used to
-    // wipe its session's whole grid on quit (`\x1b[2J\x1b[H`), destroying
-    // the shell scrollback underneath it -- the prompt, the `e` command
-    // that opened it, everything before that -- so a `bish --promoted`,
-    // `e FILE`, `:q!` sequence came back to an empty pane. It now uses
-    // the alternate screen `vt100::Screen` already implements, which is
-    // what a real full-screen terminal program does and what leaves the
-    // primary buffer (and its cursor) exactly as it was found.
+    // An editor frame (`Frame::Edit`/`Frame::Hex`) must leave its session's
+    // scrollback intact on quit: it uses the alternate screen, as a
+    // full-screen program does, so `e FILE`, `:q!` comes back to the shell
+    // as it was.
     #[test]
     fn leaving_an_editor_frame_restores_the_shell_scrollback_under_it() {
         let screen = Rc::new(RefCell::new(vt100::Screen::new(4, 40)));
@@ -14952,8 +13863,7 @@ mod compositor_frame_output_tests {
         assert_eq!(before[2], "$ e f.bash");
 
         enter_alt_screen(&screen);
-        // Whatever the editor freezes in while it owns the pane lands on
-        // the alternate buffer, not on top of any of that.
+        // What the editor freezes in lands on the alternate screen.
         screen.borrow_mut().feed(b"\x1b[H  1 export FOO=1");
         assert_ne!(rows(), before, "the alternate buffer is what shows while the editor is up");
 
@@ -14962,20 +13872,14 @@ mod compositor_frame_output_tests {
         assert_eq!(screen.borrow().cursor(), cursor_before, "including the row the next prompt draws on");
     }
 
-    // Regression: render_compositor_frame used to lead with `\x1b[2J`
-    // (erase whole display) before repainting every pane/divider/the tab
-    // bar -- all of which, together, already cover every cell of the
-    // terminal unconditionally (see build_compositor_frame_output's own
-    // doc comment). That extra erase was visibly reproducible as a
-    // flash on an otherwise perfectly ordinary discrete redraw (`bish
-    // --promoted`, Enter, then Ctrl-C at the fresh prompt): an explicit
-    // clear immediately followed by repainting the *same* content one
-    // real terminal can still render as a blank frame in between.
+    // `render_compositor_frame` writes no `\x1b[2J`: panes, dividers and the
+    // tab bar cover every cell (see `build_compositor_frame_output`), and an
+    // erase before the same content can show as a blank frame, a flash.
     #[test]
     fn minimizing_collapses_the_focused_pane_and_moves_off_it() {
         // Built directly rather than through a pty: this is layout
-        // arithmetic, and a screen-scrape cannot tell "collapsed to a
-        // divider" from "scrolled out of view".
+        // arithmetic, and a screen scrape can't tell collapsed from
+        // scrolled out of view.
         let mut w = WindowEntry::single(1, Frame::Session(0));
         let top = w.focused_pane;
         let bottom = w.add_pane(vec![Frame::Session(0)], false, false);
@@ -14991,16 +13895,14 @@ mod compositor_frame_output_tests {
         assert!(!minimized_of(&w, top), "its neighbour does not");
         assert_ne!(w.focused_pane, bottom, "focus leaves it -- one row is nowhere to type");
 
-        // Going back to it is what restores it; there is no second
-        // command to remember.
+        // Going back to it restores it.
         restore_if_minimized(&mut w, bottom);
         assert!(!minimized_of(&w, bottom));
     }
 
     #[test]
     fn a_lone_pane_will_not_minimize_itself_out_of_view() {
-        // Nowhere for focus to go, and a window showing nothing but a
-        // divider is not a state worth being able to reach.
+        // Nowhere for focus to go, so nothing happens.
         let mut w = WindowEntry::single(1, Frame::Session(0));
         let only = w.focused_pane;
         minimize_focused_pane(&mut w);
@@ -15010,15 +13912,13 @@ mod compositor_frame_output_tests {
 
     #[test]
     fn the_prompt_only_claims_the_mouse_once_it_has_something_to_do_with_it() {
-        // Unpromoted: nothing to hit-test and nowhere to scroll, so
-        // claiming reporting would take the terminal's wheel and
-        // selection and give nothing back.
+        // Unpromoted: nothing to click and nowhere to scroll, so reporting
+        // would take the terminal's wheel and selection for nothing.
         assert!(!prompt_claims_mouse(true, false));
-        // Promoted: tabs, panes and dividers exist and are clickable.
+        // Promoted: tabs, panes and dividers are clickable.
         assert!(prompt_claims_mouse(true, true));
-        // The bishopt still wins in both directions -- `mouse off` is
-        // how you ask for the terminal's own selection back even in a
-        // split.
+        // The bishopt still wins: `mouse off` gives the terminal its
+        // selection back even in a split.
         assert!(!prompt_claims_mouse(false, true));
         assert!(!prompt_claims_mouse(false, false));
     }
@@ -15048,25 +13948,14 @@ mod compositor_frame_output_tests {
         assert!(out.contains("\x1b[1;1H"), "{out:?}");
         assert!(out.contains("\x1b[2;1H"), "{out:?}");
         assert!(out.contains("ab"), "{out:?}");
-        // Tab bar pinned to the real last row (term_rows = 3), cleared
-        // to end-of-line before its own text.
+        // Tab bar on the last row (`term_rows` 3), cleared before its text.
         assert!(out.contains("\x1b[3;1H\x1b[K[0] tab"), "{out:?}");
     }
 }
 
-// Regression: run_command_mode's own "recognized but malformed input"
-// arms (unknown :git/:diag/:format subcommand, a failed :w, a syntax
-// error, ...) used to report via sink_err -- invisible in practice while
-// a Frame::Edit pane is focused, since that pane's own live content is
-// rendered by writing straight to the real terminal
-// (fileeditor::render_editor_frame), bypassing the session's own vt100
-// Screen grid model entirely (sink_err's Grid-sink destination) until it
-// later loses focus. show_command_mode_error is the fix: the exact same
-// direct-to-real-terminal overlay a *successful* command's own output
-// already used (build_command_output_overlay, status != 0 -> its own
-// error colors), reached without needing to return out of
-// run_command_mode's own loop the way CommandModeOutcome::Ran's overlay
-// call does.
+// `show_command_mode_error` draws straight to the terminal, as a failed
+// command's output does, so `run_command_mode`'s malformed-input arms
+// are visible over a file pane.
 #[cfg(test)]
 mod command_mode_error_visibility_tests {
     use super::*;
@@ -15089,9 +13978,8 @@ mod command_mode_error_visibility_tests {
 
     #[test]
     fn build_command_output_overlay_anchors_directly_above_the_prompt_row() {
-        // term_rows = 24 -> command_mode_row = 22 (0-indexed) -> the
-        // prompt itself lives at 1-indexed row 23; a single-line overlay
-        // must land immediately above that, at row 22.
+        // `term_rows` 24: `command_mode_row` is 22 (0-based), the prompt is
+        // on row 23 (1-based), and one line of overlay goes on row 22.
         let out = build_command_output_overlay("bish: an error", 1, 24, 80);
         assert!(out.contains("\x1b[22;1H"), "{out:?}");
         assert!(!out.contains("\x1b[23;1H"), "{out:?}");
@@ -15150,27 +14038,20 @@ mod substitute_command_tests {
         assert_eq!(parse_line_command("normal dd"), Some(Normal("dd".to_string())));
         assert_eq!(parse_line_command("norm x"), Some(Normal("x".to_string())));
 
-        // Everything else still belongs to the ordinary dispatch, which
-        // only ever sees it if this says no.
-        // A bare `d` and a bare `>` mean the current line, as they do
-        // in vim -- the rest still belong to the ordinary dispatch,
-        // which only ever sees them if this says no.
+        // A bare `d` and `>` mean the current line, as in vim; the rest still
+        // belong to the ordinary dispatch.
         assert_eq!(parse_line_command("d"), Some(Delete { from: LineRef::Current, to: LineRef::Current }));
         for other in ["w", "wq", "q!", "set number", "diag", "2dd", "2x", "1m", "normal"] {
             assert_eq!(parse_line_command(other), None, "{other:?}");
         }
     }
 
-    // `:preview` was a documented command that the colon line painted
-    // red and would not complete, because COLON_COMMANDS is a copy of a
-    // `match` and copies drift. This is what stops the next one:
-    // everything the help screen tells you to type has to be a name the
-    // line knows.
+    // Everything the help tells you to type has to be a name the colon line
+    // knows: `COLON_COMMANDS` is a copy of a `match`, and copies drift.
     #[test]
     fn every_documented_colon_command_is_one_the_line_knows() {
-        // The two documented entries that are not command *words*:
-        // `:!CMD` runs a shell command, and `:s/PAT/REPL/` reaches its
-        // own parser before the dispatch ever splits a word off.
+        // The documented entries that aren't command words: `:!CMD`, and
+        // `:s/PAT/REPL/`, which its own parser reaches first.
         let not_words = ["!CMD", "s"];
         let chars: Vec<char> = EDITOR_HELP_MARKDOWN.chars().collect();
         let mut documented = Vec::new();
@@ -15215,7 +14096,7 @@ mod substitute_command_tests {
         let mut buf = buffer_of("a\nb\nc");
         run_line_command(&mut buf, &LineCommand::Goto(LineRef::Number(2))).unwrap();
         assert_eq!(buf.cursor(), (1, 0));
-        // A bare address lands on the first non-blank, not column zero.
+        // A bare address lands on the first non-blank, not column 0.
         let mut buf = buffer_of("a\n    b");
         run_line_command(&mut buf, &LineCommand::Goto(LineRef::Last)).unwrap();
         assert_eq!(buf.cursor(), (1, 4));
@@ -15224,19 +14105,17 @@ mod substitute_command_tests {
         run_line_command(&mut buf, &LineCommand::Delete { from: LineRef::Number(2), to: LineRef::Number(3) }).unwrap();
         assert_eq!(lines_of(&buf), "a\nd");
 
-        // `:1m$` -- to the very end.
+        // `:1m$`: to the end.
         let mut buf = buffer_of("one\ntwo");
         run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(1), to: LineRef::Number(1), dest: LineRef::Last }).unwrap();
         assert_eq!(lines_of(&buf), "two\none");
 
-        // `:3m0` -- "after line zero" is the top, which is why the
-        // destination is a line number and not a row.
+        // `:3m0`: after line zero is the top.
         let mut buf = buffer_of("one\ntwo\nthree");
         run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(3), to: LineRef::Number(3), dest: LineRef::Number(0) }).unwrap();
         assert_eq!(lines_of(&buf), "three\none\ntwo");
 
-        // A range moved past itself, and the same range moved into
-        // itself, which vim refuses.
+        // A range moved past itself, and into itself, which vim refuses.
         let mut buf = buffer_of("a\nb\nc\nd");
         run_line_command(&mut buf, &LineCommand::Move { from: LineRef::Number(1), to: LineRef::Number(2), dest: LineRef::Last }).unwrap();
         assert_eq!(lines_of(&buf), "c\nd\na\nb");
@@ -15260,47 +14139,42 @@ mod substitute_command_tests {
     fn parse_accepts_g_flag_and_a_missing_trailing_delimiter() {
         let cmd = parse_substitute_command("s/foo/bar/g").unwrap().unwrap();
         assert!(cmd.global);
-        // No trailing "/" at all -- still valid, matches real vim.
+        // No trailing `/`, valid as in vim.
         let cmd = parse_substitute_command("s/foo/bar").unwrap().unwrap();
         assert_eq!(cmd.replacement, "bar");
         assert!(!cmd.global);
     }
 
-    // `!` at the head of the line, with or without a range in front of
-    // it -- and nothing else in this dispatch mistaken for one.
+    // `!` at the head, with or without a range, and nothing else taken for
+    // one.
     #[test]
     fn a_leading_bang_is_a_shell_command_and_a_range_before_it_is_a_filter() {
         assert!(matches!(parse_bang_command("!echo %"), Some(BangCommand::Run("echo %"))));
-        // Everything after the `!` is the command, spaces and all --
-        // `:! ls` is `: ls`, which the shell reads the same way.
+        // Everything after `!` is the command, spaces and all.
         assert!(matches!(parse_bang_command("! ls"), Some(BangCommand::Run(" ls"))));
         assert!(matches!(parse_bang_command("!"), Some(BangCommand::Run(""))));
 
         for line in ["%!sort", "1,5!sort", ".!date", "$!tac", "1,$!tac"] {
             assert!(matches!(parse_bang_command(line), Some(BangCommand::Filter { .. })), "{line}");
         }
-        // The range and the command both come back, and everything past
-        // the `!` is the command.
+        // The range and the command both come back.
         let Some(BangCommand::Filter { from, to, cmd }) = parse_bang_command("1,5!column -t") else { panic!() };
         assert_eq!((from, to), (LineRef::Number(1), LineRef::Number(5)));
         assert_eq!(cmd, "column -t");
         let Some(BangCommand::Filter { from, to, .. }) = parse_bang_command("%!sort") else { panic!() };
         assert_eq!((from, to), (LineRef::Number(1), LineRef::Last));
-        // Not a range this parser reads, so not a filter either -- see
-        // parse_range_prefix's own note on visual-mode marks.
+        // Not a range this parser reads, so not a filter (see
+        // `parse_range_prefix`).
         assert!(parse_bang_command("'<,'>!sort").is_none());
 
-        // Not a bang command at all, and the ordinary dispatch must
-        // still see every one of these unchanged.
+        // Not bang commands; the ordinary dispatch sees these unchanged.
         for line in ["w", "wq", "q!", "s/a/b/", "normal dd", "1,5d", "diag", "echo hi!"] {
             assert!(parse_bang_command(line).is_none(), "{line}");
         }
     }
 
-    // The two edges a filter's result has to land on, neither of which
-    // needs a shell to reach: the command's trailing newline, and the
-    // empty line a whole-buffer delete leaves behind. Checked against
-    // real vim, which is where the `:%!true` expectation comes from.
+    // The two edges a filter's result lands on: the trailing newline, and
+    // the empty line a whole-buffer delete leaves. `:%!true` matches vim.
     #[test]
     fn a_filters_output_replaces_exactly_the_lines_it_was_given() {
         let mut buf = buffer_of("c\na\nb");
@@ -15308,7 +14182,7 @@ mod substitute_command_tests {
         assert_eq!(buf.line_count(), 3, "the trailing newline ends the last line, it does not add one");
         assert_eq!(lines_of(&buf), "a\nb\nc");
 
-        // One line in the middle, and the rest untouched.
+        // One line in the middle, the rest untouched.
         let mut buf = buffer_of("c\na\nb");
         replace_lines(&mut buf, 1, 1, "A\n");
         assert_eq!(lines_of(&buf), "c\nA\nb");
@@ -15321,13 +14195,13 @@ mod substitute_command_tests {
         replace_lines(&mut buf, 2, 2, "x\ny\n");
         assert_eq!(lines_of(&buf), "c\na\nx\ny");
 
-        // `:%!true` -- no output at all empties the buffer.
+        // `:%!true`: no output empties the buffer.
         let mut buf = buffer_of("c\na\nb");
         replace_lines(&mut buf, 0, 2, "");
         assert_eq!(lines_of(&buf), "");
 
-        // A command that writes no trailing newline still gets its
-        // lines, rather than one line with an embedded newline.
+        // No trailing newline still gives lines, not one line with an
+        // embedded newline.
         let mut buf = buffer_of("c\na\nb");
         replace_lines(&mut buf, 0, 2, "x\ny");
         assert_eq!(lines_of(&buf), "x\ny");
@@ -15352,8 +14226,7 @@ mod substitute_command_tests {
 
     #[test]
     fn parse_supports_an_alternate_delimiter() {
-        // "/" is itself part of the pattern here -- "#" as the delimiter
-        // is what makes that possible without escaping.
+        // `#` as the delimiter lets `/` be in the pattern unescaped.
         let cmd = parse_substitute_command("s#/usr/bin#/opt/bin#").unwrap().unwrap();
         assert_eq!(cmd.pattern, "/usr/bin");
         assert_eq!(cmd.replacement, "/opt/bin");
@@ -15366,9 +14239,8 @@ mod substitute_command_tests {
         assert_eq!(cmd.replacement, "c");
     }
 
-    // Still an error, but no longer at parse time: `:s//bar/` is a real
-    // command meaning "that pattern again", so the parser accepts it and
-    // `resolve_substitute` is what finds there is no previous one.
+    // `:s//bar/` means the last pattern, so the parser accepts it and
+    // `resolve_substitute` finds there's none.
     #[test]
     fn an_empty_pattern_with_nothing_before_it_is_an_error() {
         let cmd = parse_substitute_command("s//bar/").unwrap().unwrap();
@@ -15415,11 +14287,9 @@ mod substitute_command_tests {
         assert_eq!(count, 2);
     }
 
-    // Every case here was checked against real vim first (`vim -es -c
-    // '%s/PATTERN/-/g'`) -- see substitute_line's own doc comment for
-    // the exact commands and why the line's own end is never itself a
-    // valid zero-width match position, except when the whole line is
-    // empty.
+    // Each case matches vim (`vim -es -c '%s/PATTERN/-/g'`); see
+    // `substitute_line` for why the line's end is never a match position
+    // except on an empty line.
     #[test]
     fn substitute_line_zero_width_match_makes_forward_progress_but_never_matches_past_the_last_char() {
         let re = crate::regex::Regex::compile("x*", false);
@@ -15464,14 +14334,14 @@ mod substitute_command_tests {
         assert!(g.invert, "`g!` is the inverse");
         let g = ok("v/TODO/d");
         assert!(g.invert, "and `v` is the same thing");
-        // Default range is the whole file, unlike `:s`'s current line.
+        // The whole file by default, unlike `:s`.
         assert_eq!((g.from, g.to), (LineRef::Number(1), LineRef::Last));
         let g = ok("2,4g/x/d");
         assert_eq!((g.from, g.to), (LineRef::Number(2), LineRef::Number(4)));
-        // Any non-alphanumeric delimiter, like `:s`.
+        // Any non-alphanumeric delimiter, as for `:s`.
         assert_eq!(ok("g#a/b#d").pattern, "a/b");
 
-        // Not an attempt at all: falls through to ordinary dispatch.
+        // Not an attempt: falls through to the ordinary dispatch.
         assert!(parse_global_command("git diff").is_none());
         assert!(parse_global_command("gi").is_none());
         assert!(parse_global_command("w").is_none());
@@ -15481,10 +14351,8 @@ mod substitute_command_tests {
         assert!(parse_global_command("g/x/").unwrap().is_err());
     }
 
-    // Every expectation here was read off real `vim -u NONE -i NONE -N`.
-    // Before this, everything after the last delimiter was parsed and
-    // thrown away, so `:%s/a/Z/gi` did a case-*sensitive* substitution
-    // and reported success -- the wrong answer, delivered confidently.
+    // Each expectation matches vim (`vim -u NONE -i NONE -N`). Flags after
+    // the last delimiter count: `:%s/a/Z/gi` is case-insensitive.
     #[test]
     fn substitute_flags_are_read_rather_than_dropped() {
         let parse = |line: &str| parse_substitute_command(line).expect("recognized as `s`");
@@ -15492,15 +14360,14 @@ mod substitute_command_tests {
         let cmd = parse("%s/a/Z/gi").unwrap();
         assert!(cmd.global);
         assert_eq!(cmd.ignore_case, Some(true));
-        // `I` is not the absence of `i`: it overrides 'ignorecase' the
-        // other way, which is why this is an Option and not a bool.
+        // `I` isn't the absence of `i`: it overrides `ignorecase` the other
+        // way, hence an `Option`.
         assert_eq!(parse("%s/a/Z/I").unwrap().ignore_case, Some(false));
         assert_eq!(parse("%s/a/Z/g").unwrap().ignore_case, None);
 
         assert!(parse("%s/a/Z/n").unwrap().count_only);
         assert!(parse("2s/a/Z/e").unwrap().no_error);
-        // A count, with or without the space vim allows before it, and
-        // with flags in front of it.
+        // A count, with or without the space vim allows, after flags.
         assert_eq!(parse("1,2s/A/Z/ 3").unwrap().count, Some(3));
         assert_eq!(parse("s/A/Z/12").unwrap().count, Some(12));
         assert_eq!(parse("s/A/Z/g 2").unwrap().count, Some(2));
@@ -15511,8 +14378,8 @@ mod substitute_command_tests {
         assert!(parse("%s/a/Z/0").is_err(), "a zero count is a typo, not an empty range");
     }
 
-    // `:s`, `:&`, `:&&`, `:~` -- and the `s` here must not shadow a
-    // real one, nor `:set`/`:sort`.
+    // `:s`, `:&`, `:&&`, `:~`, without shadowing a real `:s`, `:set` or
+    // `:sort`.
     #[test]
     fn the_repeat_commands_parse_without_shadowing_anything() {
         let kind = |line: &str| parse_repeat_substitute(line).map(|r| r.map(|(from, to, k, f)| (from, to, k, f.global)));
@@ -15520,27 +14387,26 @@ mod substitute_command_tests {
         assert!(matches!(kind("&"), Some(Ok((_, _, RepeatSubstitute::Bare, _)))));
         assert!(matches!(kind("&&"), Some(Ok((_, _, RepeatSubstitute::KeepFlags, _)))));
         assert!(matches!(kind("~"), Some(Ok((_, _, RepeatSubstitute::LastSearch, _)))));
-        // Ranges, own flags, own count.
+        // Ranges, flags and count of their own.
         assert!(matches!(kind("2,3&&"), Some(Ok((LineRef::Number(2), LineRef::Number(3), RepeatSubstitute::KeepFlags, _)))));
         assert!(matches!(kind("%~g"), Some(Ok((LineRef::Number(1), LineRef::Last, RepeatSubstitute::LastSearch, true)))));
         assert!(matches!(kind("s g"), Some(Ok((_, _, RepeatSubstitute::Bare, true)))));
 
-        // Not repeats: a real substitute, and two ordinary commands that
-        // merely start with the same letter.
+        // Not repeats: a real substitute, and commands starting with the same
+        // letter.
         for line in ["s/a/b/", "s/a/b/g", "set", "sort", "w", "1,5d"] {
             assert!(parse_repeat_substitute(line).is_none(), "{line}");
         }
     }
 
-    // What each of them reaches back for. The distinction the whole `r`
-    // flag exists for is here: `:&` takes the last *substitute*'s
-    // pattern even when a `/` search has happened since, where a
-    // `:s//x/` would have taken the search. Checked against real vim.
+    // What each reaches back for. `:&` takes the last substitute's pattern
+    // even after a `/` search, where `:s//x/` would take the search. As in
+    // vim.
     #[test]
     fn a_repeat_takes_its_pattern_deliberately_not_by_recency() {
         let previous = LastSubstitute {
             cmd: parse_substitute_command("%s/a/Z/g").unwrap().unwrap(),
-            // The search at the time -- a later `/cCc` is newer than it.
+            // The search at the time; a later `/cCc` is newer.
             search_then: String::new(),
         };
         let repeat = |line: &str| {
@@ -15548,8 +14414,8 @@ mod substitute_command_tests {
             repeat_substitute(Some(&previous), "cCc", from, to, kind, flags).unwrap()
         };
 
-        // `:&` and a bare `:s` take the substitute's pattern, and drop
-        // its flags.
+        // `:&` and bare `:s` take the substitute's pattern and drop its
+        // flags.
         for line in ["&", "s"] {
             let cmd = repeat(line);
             assert_eq!(cmd.pattern, "a", "{line}");
@@ -15558,10 +14424,10 @@ mod substitute_command_tests {
         }
         // `:&&` keeps them.
         assert!(repeat("&&").global);
-        // `:~` and `:&r` are the same command spelled two ways.
+        // `:~` and `:&r` are the same command.
         assert_eq!(repeat("~").pattern, "cCc");
         assert_eq!(repeat("&r").pattern, "cCc");
-        // Its own flags go on top of whichever base it started from.
+        // Its own flags go on top of whichever base.
         assert!(repeat("&g").global);
         assert_eq!(repeat("&& 2").count, Some(2), "a count is never inherited, only written");
 
@@ -15578,15 +14444,13 @@ mod substitute_command_tests {
         assert_eq!(parse("%s/a/Z/p").unwrap().print, Some(PrintStyle::Plain));
         assert_eq!(parse("%s/a/Z/#").unwrap().print, Some(PrintStyle::Numbered));
         assert_eq!(parse("%s/a/Z/l").unwrap().print, Some(PrintStyle::List));
-        // vim takes `&` only in first position and rejects the command
-        // otherwise rather than reading it out of order.
+        // vim takes `&` only first and rejects the command otherwise.
         assert!(parse("%s/a/Z/g&").is_err());
         assert!(parse("%s/a/Z/&g").is_ok());
     }
 
-    // `&` takes the previous command's flags -- and only its flags. A
-    // count is not one of them, which is the part I would have guessed
-    // wrong: `:1,2s/A/Z/ 3` then `:%s/a/Y/&` acts on the whole buffer.
+    // `&` takes the previous flags only, not the count: `:1,2s/A/Z/ 3` then
+    // `:%s/a/Y/&` acts on the whole buffer.
     #[test]
     fn ampersand_takes_the_previous_flags_but_not_its_count() {
         let previous = parse_substitute_command("1,2s/A/Z/gi 3").unwrap().unwrap();
@@ -15596,15 +14460,13 @@ mod substitute_command_tests {
         assert!(resolved.global);
         assert_eq!(resolved.ignore_case, Some(true));
         assert_eq!(resolved.count, None, "the count stays with the command that wrote it");
-        // Nothing before it is not an error -- there are simply no flags
-        // to take.
+        // Nothing before it isn't an error; there are no flags to take.
         let cmd = parse_substitute_command("%s/a/Y/&").unwrap().unwrap();
         assert!(resolve_substitute(cmd, None, "").is_ok());
     }
 
-    // `:s//repl/` means "that pattern again", and which one that is
-    // depends on whether a `/` search has happened since. All four
-    // orderings were checked against real vim.
+    // `:s//repl/` means the last pattern, which depends on whether a `/`
+    // search happened since. All four orderings match vim.
     #[test]
     fn an_empty_pattern_takes_whichever_was_used_more_recently() {
         let ran = |pattern: &str, search_then: &str| LastSubstitute {
@@ -15613,17 +14475,16 @@ mod substitute_command_tests {
         };
         let empty = || parse_substitute_command("%s//W/").unwrap().unwrap();
 
-        // A search since the `:s` is the newer of the two.
+        // A search since the `:s` is newer.
         let last = ran("a", "");
         assert_eq!(resolve_substitute(empty(), Some(&last), "cCc").unwrap().pattern, "cCc");
-        // No search since, so the substitute's own pattern stands.
+        // No search since, so the substitute's pattern stands.
         let last = ran("a", "cCc");
         assert_eq!(resolve_substitute(empty(), Some(&last), "cCc").unwrap().pattern, "a");
-        // `r` changes neither answer -- see resolve_substitute for the
-        // vim runs that show why.
+        // `r` changes neither; see `resolve_substitute`.
         let with_r = parse_substitute_command("%s//W/r").unwrap().unwrap();
         assert_eq!(resolve_substitute(with_r, Some(&last), "cCc").unwrap().pattern, "a");
-        // Nothing at all to fall back on.
+        // Nothing to fall back on.
         assert!(resolve_substitute(empty(), None, "").is_err());
         // A search, but no substitute yet.
         assert_eq!(resolve_substitute(empty(), None, "cCc").unwrap().pattern, "cCc");
@@ -15633,11 +14494,10 @@ mod substitute_command_tests {
     fn p_and_hash_and_l_spell_the_line_the_way_vim_does() {
         let buf = buf_from("aAa\nb\tb\naAa");
         assert_eq!(printed_line(&buf, 2, PrintStyle::Plain), "aAa");
-        // Right-aligned in three columns, then one space -- vim's own
-        // layout.
+        // Right-aligned in three columns, then a space, as vim lays it out.
         assert_eq!(printed_line(&buf, 2, PrintStyle::Numbered), "  3 aAa");
-        // `:list` style: the end of the line is marked, so trailing
-        // space shows, and a tab is spelled rather than jumped.
+        // `:list`: the line's end is marked, so trailing space shows, and a
+        // tab is spelled out.
         assert_eq!(printed_line(&buf, 1, PrintStyle::List), "b^Ib$");
     }
 
@@ -15654,9 +14514,9 @@ mod substitute_command_tests {
         assert_eq!(run("g").0, "ZAZ\nbBb\nZAZ", "neither flag leaves the buffer's own setting in charge");
     }
 
-    // vim's count *replaces* the range rather than narrowing it, and
-    // counts from the range's own last line -- so it can reach lines the
-    // range never named. `:1,2s/A/Z/ 3` acts on lines 2, 3 and 4.
+    // vim's count replaces the range, counting from its last line, so it
+    // can reach lines the range didn't name: `:1,2s/A/Z/ 3` acts on lines
+    // 2 to 4.
     #[test]
     fn a_trailing_count_replaces_the_range_from_its_last_line() {
         let mut buf = buf_from("aAa\nbBb\naAa\ncCc\naAa");
@@ -15673,11 +14533,11 @@ mod substitute_command_tests {
         assert_eq!((out.substitutions, out.lines), (4, 2));
         assert_eq!(text_of(&buf), "aAa\nbBb\naAa", "`n` answers the question and changes nothing");
 
-        // A pattern that matches nothing is an error...
+        // A pattern matching nothing is an error...
         let mut buf = buf_from("aAa");
         let cmd = parse_substitute_command("%s/zzz/Z/").unwrap().unwrap();
         assert!(run_substitute(&mut buf, &cmd).is_err());
-        // ...unless `e` says it is fine.
+        // ...unless `e` says it's fine.
         let cmd = parse_substitute_command("%s/zzz/Z/e").unwrap().unwrap();
         let out = run_substitute(&mut buf, &cmd).unwrap();
         assert_eq!((out.substitutions, out.lines), (0, 0));
@@ -15753,9 +14613,8 @@ mod substitute_command_tests {
 
     #[test]
     fn run_substitute_r_splits_a_line_and_still_advances_the_range_correctly() {
-        // Range is the whole 2-line buffer; line 0's own substitution
-        // splits it into two lines via \r -- line 1 (originally "b")
-        // must still be reached afterward, now at row 2.
+        // The range is the whole two-line buffer; line 0's `\r` splits it in
+        // two, and line 1 (`b`) must still be reached, now at row 2.
         let mut buf = buf_from("a,a\nb");
         let cmd = SubstituteCmd {
             from: LineRef::Number(1),
@@ -15800,8 +14659,7 @@ mod substitute_command_tests {
 
     #[test]
     fn end_to_end_percent_s_g_via_run_command_mode_parsing_path() {
-        // Confirms the two pieces (parse + run) compose correctly, not
-        // just each in isolation.
+        // Parse and run together, not just each alone.
         let mut buf = buf_from("cat cat\ndog");
         let parsed = parse_substitute_command("%s/cat/dog/g").unwrap().unwrap();
         let out = run_substitute(&mut buf, &parsed).unwrap();
@@ -15810,9 +14668,8 @@ mod substitute_command_tests {
         assert_eq!(text_of(&buf), "dog dog\ndog");
     }
 
-    // The rule itself. That it is consulted only on a fresh command's
-    // first line is the two call sites' own job -- both share the gate
-    // history expansion already uses.
+    // The rule itself; consulting it only on a fresh command's first line
+    // is the call sites' job.
     #[test]
     fn a_leading_space_or_tab_keeps_a_command_off_the_record() {
         assert!(starts_off_the_record(" echo secret"));
@@ -15821,7 +14678,7 @@ mod substitute_command_tests {
         assert!(!starts_off_the_record("echo remembered"));
         assert!(!starts_off_the_record("!make"));
         assert!(!starts_off_the_record(""));
-        // Trailing and interior whitespace say nothing about it.
+        // Trailing and interior whitespace don't matter.
         assert!(!starts_off_the_record("echo a  b "));
     }
 }
@@ -15830,10 +14687,9 @@ mod substitute_command_tests {
 mod capture_text_tests {
     use super::*;
 
-    // A view that paints the terminal directly -- the editor, the pager,
-    // a review -- is read back out of the frame it painted: only the
-    // pane's rectangle, positioned the way the frame positions itself,
-    // with nothing from outside it leaking in.
+    // A view that paints the terminal directly is read back from its frame:
+    // only the pane's rectangle, positioned as the frame positions itself,
+    // nothing from outside.
     #[test]
     fn a_painted_frame_is_read_back_inside_its_pane() {
         let rect = Rect { row: 1, col: 4, rows: 2, cols: 6 };
@@ -15850,8 +14706,8 @@ mod capture_text_tests {
         screen
     }
 
-    // focused_pane_text needs a whole App to find the focused pane; its
-    // interesting half is turning one grid into text, which this is.
+    // `focused_pane_text` needs a whole `App`; its interesting half, one
+    // grid to text, is this.
     fn text_of(screen: &vt100::Screen) -> String {
         let (rows, _cols) = screen.size();
         let mut lines: Vec<String> = (0..rows)
@@ -15872,35 +14728,32 @@ mod capture_text_tests {
 
     #[test]
     fn a_captured_screen_is_its_rows_without_the_padding() {
-        // A grid is a rectangle, so every row is `cols` wide whatever is
-        // on it. A script grepping the capture wants the words, not the
-        // spaces after them.
+        // Every grid row is `cols` wide; a script grepping the capture wants
+        // the words, not the spaces after.
         let screen = screen_showing(&["$ echo hi", "hi"], 10, 40);
         assert_eq!(text_of(&screen), "$ echo hi\nhi\n");
     }
 
     #[test]
     fn the_blank_bottom_of_the_screen_is_not_part_of_the_capture() {
-        // Eight empty rows under two lines of output is what the grid
-        // holds; it is not what the pane shows.
+        // Blank rows under the output are in the grid, not in what the pane
+        // shows.
         let screen = screen_showing(&["one", "two"], 10, 20);
         assert_eq!(text_of(&screen).lines().count(), 2);
     }
 
     #[test]
     fn a_blank_line_between_two_lines_of_output_survives() {
-        // Only the run at the *bottom* is padding. One in the middle is
-        // something the command printed.
+        // Only the blank run at the bottom is padding; one in the middle was
+        // printed.
         let screen = screen_showing(&["first", "", "third"], 8, 20);
         assert_eq!(text_of(&screen), "first\n\nthird\n");
     }
 
     #[test]
     fn an_empty_screen_captures_as_nothing_at_all() {
-        // Not even the trailing newline every other capture ends with:
-        // once every row has been trimmed away there is no last line
-        // for one to go after, and `capture` on a blank pane printing a
-        // stray blank line would be worse than printing nothing.
+        // Not even a trailing newline: with every row trimmed there's no last
+        // line, and a stray blank line would be worse than nothing.
         let screen = vt100::Screen::new(6, 20);
         assert_eq!(text_of(&screen), "");
     }
@@ -15910,10 +14763,8 @@ mod capture_text_tests {
 mod editorconfig_charset_tests {
     use super::*;
 
-    // The property that used to be parsed and then thrown away. A
-    // project that says its files are latin-1 gets latin-1 written
-    // back, and a name this shell cannot write leaves the file's own
-    // encoding in place rather than quietly converting it.
+    // A project saying latin-1 gets latin-1 written back, and a charset this
+    // shell can't write leaves the file's encoding alone.
     #[test]
     fn charset_decides_what_a_buffer_is_written_as() {
         let dir = std::env::temp_dir().join(format!("bish-editorconfig-charset-{}", std::process::id()));
@@ -15950,9 +14801,7 @@ mod watched_file_tests {
         dir
     }
 
-    /// The kernel delivers on its own schedule, so this waits for the
-    /// answer rather than reading once and calling the machine's mood a
-    /// result.
+    /// Events arrive on their own schedule, so this waits for the answer.
     fn settle(watcher: &mut crate::watch::Watcher, buf: &mut TextBuffer) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -15971,23 +14820,20 @@ mod watched_file_tests {
         std::fs::write(&path, "one\n").unwrap();
         let mut buf = TextBuffer::open(&path, 10).unwrap();
         let mut watcher = crate::watch::Watcher::new().unwrap();
-        // The first call takes the watch out and reports nothing --
-        // there is nothing to report yet.
+        // The first call starts the watch and reports nothing.
         assert!(!sync_watched_file(Some(&mut watcher), &mut buf));
 
         std::fs::write(&path, "two\n").unwrap();
         assert!(settle(&mut watcher, &mut buf), "the change was never noticed");
         assert!(buf.echoed_message.as_deref().is_some_and(|m| m.contains("W11")), "{:?}", buf.echoed_message);
-        // `changed_on_disk` keeps answering yes until the buffer reads
-        // or writes the file again, so the message must not be re-echoed
-        // on every tick from here on.
+        // `changed_on_disk` stays true until the buffer next reads or writes
+        // the file, so the message isn't re-echoed each tick.
         assert!(!sync_watched_file(Some(&mut watcher), &mut buf), "said twice");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // The reason inotify says *when* to look rather than what happened:
-    // a formatter that changed nothing, a `touch`, this editor's own
-    // save. Warning about any of those is crying wolf.
+    // A formatter that changed nothing, a `touch`, our own save: no
+    // warning for any of them.
     #[test]
     fn a_write_that_changed_nothing_is_not_a_change() {
         let dir = scratch("same");
@@ -16004,9 +14850,8 @@ mod watched_file_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // The case an inode watch cannot see, and the reason watch.rs
-    // watches directories: a formatter or a branch switch replaces the
-    // file rather than writing through it.
+    // What an inode watch can't see, and why watch.rs watches directories:
+    // a formatter or branch switch replaces the file.
     #[test]
     fn a_file_replaced_by_rename_is_noticed_too() {
         let dir = scratch("renamed");
@@ -16042,9 +14887,7 @@ mod gutter_hover_tests {
         tb
     }
 
-    // The marker in the gutter says only "something is wrong here". The
-    // hover is where it says what -- there is no room for a message in
-    // one coloured bullet.
+    // The gutter marker only says something is wrong; the hover says what.
     #[test]
     fn the_diagnostic_column_says_what_the_bullet_stands_for() {
         let mut tb = buf();
@@ -16058,8 +14901,8 @@ mod gutter_hover_tests {
             fix: None,
         }];
         assert_eq!(gutter_hover_lines(&tb, 1, fileeditor::GutterKind::Diagnostic), vec!["unquoted-expansion: wrap it in double quotes".to_string()]);
-        // A line with no diagnostic on it has nothing to say, and a
-        // popup that appeared there would be describing the line above.
+        // A line with no diagnostic has nothing to say; a popup there would
+        // describe the line above.
         assert!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Diagnostic).is_empty());
     }
 
@@ -16084,11 +14927,8 @@ mod gutter_hover_tests {
         assert!(gutter_hover_lines(&tb, 0, fileeditor::GutterKind::Diff).is_empty(), "an unchanged line has no marker to explain");
     }
 
-    // Blame and diff do nothing on purpose, and this is where that is
-    // held. Both have an obvious action waiting for them, and shipping
-    // an incidental "puts the cursor on the line" in the meantime is
-    // how a placeholder becomes something people rely on -- after
-    // which giving the click its real meaning takes something away.
+    // Blame and diff do nothing on purpose (see `gutter_action`); this
+    // holds them to it.
     #[test]
     fn the_undecided_columns_are_reserved_rather_than_given_a_default() {
         assert_eq!(gutter_action(fileeditor::GutterKind::Blame, 3), GutterAction::Nothing);
@@ -16098,15 +14938,13 @@ mod gutter_hover_tests {
 
     #[test]
     fn the_decided_columns_do_what_their_marker_says() {
-        // 1-based on the way out, because that is how breakpoints are
-        // numbered everywhere else.
+        // 1-based on the way out, as breakpoints are numbered.
         assert_eq!(gutter_action(fileeditor::GutterKind::Breakpoint, 3), GutterAction::ToggleBreakpoint(4));
         assert_eq!(gutter_action(fileeditor::GutterKind::LineNumber, 3), GutterAction::GoToLine(3));
     }
 
-    // These two are controls rather than descriptions: the breakpoint
-    // marker already says the whole of what a breakpoint is, and a line
-    // number says its own number. A popup on either would be noise.
+    // Controls, not descriptions: the breakpoint marker and the line number
+    // say it all, so a popup would be noise.
     #[test]
     fn the_columns_that_act_do_not_also_narrate() {
         let mut tb = buf();
@@ -16120,8 +14958,8 @@ mod gutter_hover_tests {
 mod debug_adapter_tests {
     use super::*;
 
-    /// Same skip-rather-than-fail contract the dapclient tests have:
-    /// this needs a C compiler and a gdb new enough to speak DAP.
+    /// Skips rather than fails, as the dapclient tests do: needs a C
+    /// compiler and a gdb that speaks DAP.
     fn fixture(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
         std::process::Command::new("gdb")
             .arg("--version")
@@ -16179,7 +15017,7 @@ mod debug_adapter_tests {
         ))
     }
 
-    /// Ticks the way the editor's own idle loop does, until `done`.
+    /// Ticks as the editor's idle loop does, until `done`.
     fn until(
         frame: &mut DapFrame,
         buf: &mut TextBuffer,
@@ -16198,8 +15036,7 @@ mod debug_adapter_tests {
         false
     }
 
-    /// The whole point of the feature: a program stops, and the cursor
-    /// is sitting on the line it stopped at.
+    /// A program stops, and the cursor is on the line it stopped at.
     #[test]
     fn a_stop_lands_the_cursor_on_the_line_it_stopped_at() {
         let Some((dir, source, program)) = fixture("land") else { return };
@@ -16213,8 +15050,7 @@ mod debug_adapter_tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(landed, "never stopped: {:?}", frame.session.log());
-        // Line 2 of the file is `int add(...)`, and the cursor counts
-        // from zero.
+        // Line 2 is `int add(...)`; the cursor counts from zero.
         assert_eq!(cursor, 1, "the cursor did not move to the breakpoint");
         assert_eq!(names.first().map(String::as_str), Some("add"), "{names:?}");
         let notice = notice.expect("the status line says where it is");
@@ -16223,14 +15059,13 @@ mod debug_adapter_tests {
         assert!(notice.contains("prog.c:2"), "{notice}");
     }
 
-    // A breakpoint set before there is anything to set it on: the marks
-    // go in the gutter first, and the session sends them when the
-    // adapter says it is ready. This is why `:dbg break` no longer
-    // insists on being attached first.
+    // A breakpoint set before there's anything to set it on: the marks go
+    // in the gutter, and the session sends them when the adapter is
+    // ready.
     #[test]
     fn breakpoints_set_before_the_program_ran_are_the_ones_that_stop_it() {
         let Some((dir, source, program)) = fixture("early") else { return };
-        // Line 4 is `int total = 0;`, the first statement of `main`.
+        // Line 4 is `int total = 0;`, `main`'s first statement.
         let (mut frame, mut buf) = launched(&source, &program, &[4]).expect("a session");
         let landed = until(&mut frame, &mut buf, None, 20, |f, _| !f.frames.is_empty());
         let (cursor, top) = (buf.cursor().0, frame.frames.first().map(|f| f.name.clone()));
@@ -16246,15 +15081,15 @@ mod debug_adapter_tests {
         let (mut frame, mut buf) = launched(&source, &program, &[2]).expect("a session");
         assert!(until(&mut frame, &mut buf, None, 20, |f, _| !f.frames.is_empty()), "{:?}", frame.session.log());
 
-        // What `:dbg print a + b` does: send it, then let the idle tick
-        // pick the answer up.
+        // As `:dbg print a + b`: send it, and the idle tick collects the
+        // answer.
         let at = frame.current_frame();
         let seq = frame.session.evaluate("a + b", at, "watch");
         frame.awaiting_answer = Some((seq, "a + b".to_string()));
         let answered = until(&mut frame, &mut buf, None, 10, |f, _| f.awaiting_answer.is_none());
         let shown = buf.echoed_message.clone();
 
-        // And a refusal reaches the user as the debugger's own words.
+        // A refusal reaches the user in the debugger's own words.
         let seq = frame.session.evaluate("no_such_symbol", at, "watch");
         frame.awaiting_answer = Some((seq, "no_such_symbol".to_string()));
         let refused = until(&mut frame, &mut buf, None, 10, |f, _| f.awaiting_answer.is_none());
@@ -16267,10 +15102,8 @@ mod debug_adapter_tests {
         assert!(refusal.is_some_and(|r| r.to_lowercase().contains("no symbol")), "the debugger's own words");
     }
 
-    // Program output belongs in the debug-run pane, and a bare newline
-    // has to become a carriage return and one -- a terminal grid moves
-    // down but not back, so without that the second line starts where
-    // the first ended.
+    // Program output goes to the debug-run pane, a bare newline as CR LF:
+    // a grid moves down but not back.
     #[test]
     fn the_programs_own_output_reaches_the_run_pane() {
         let Some((dir, source, program)) = fixture("output") else { return };
@@ -16288,20 +15121,17 @@ mod debug_adapter_tests {
 
         assert!(ran, "the program never finished: {:?}", frame.session.log());
         assert!(painted.contains('6'), "0+1+2+3, printed by the program: {painted:?}");
-        // The message names the program, not just "the program".
+        // The message names the program.
         assert!(notice.is_some_and(|n| n.contains("prog")), "the exit message names what exited");
     }
 
-    // A stop in a file that is not the one on screen moves nothing.
-    // Jumping to a line number belonging to another file would be worse
-    // than staying put.
+    // A stop in a file other than the one on screen moves nothing.
     #[test]
     fn a_stop_somewhere_else_leaves_the_cursor_alone() {
         let Some((dir, source, program)) = fixture("elsewhere") else { return };
         let (mut frame, mut _unused) = launched(&source, &program, &[2]).expect("a session");
-        // The buffer is pointed at a different file than the one the
-        // adapter will report, which is the situation a breakpoint
-        // inside a library produces.
+        // The buffer is a different file from the one the adapter reports, as
+        // with a breakpoint in a library.
         let other = dir.join("other.c");
         std::fs::write(&other, "int main(void) { return 0; }\n").unwrap();
         let mut elsewhere = TextBuffer::open(&other, 20).unwrap();
@@ -16314,8 +15144,7 @@ mod debug_adapter_tests {
 
         assert!(landed, "{:?}", frame.session.log());
         assert_eq!(cursor, 0, "the cursor stayed where it was");
-        // It still says what happened, which is the part that is useful
-        // wherever the stop was.
+        // It still says what happened.
         assert!(notice.is_some_and(|n| n.contains("add")), "the stop is still reported");
     }
 
@@ -16328,7 +15157,7 @@ mod debug_adapter_tests {
             Some(Some(vec!["gdb".to_string(), "-i=dap".to_string()])),
             "an adapter is a command line, not a word"
         );
-        // A program is the one thing with no default.
+        // The program is the one thing with no default.
         assert_eq!(parse_launch_arguments("--adapter=gdb"), None);
         assert_eq!(parse_launch_arguments(""), None);
     }
@@ -16338,9 +15167,8 @@ mod debug_adapter_tests {
         assert_eq!(default_debug_adapter("c"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
         assert_eq!(default_debug_adapter("rust"), Some(vec!["gdb".to_string(), "-i=dap".to_string()]));
         assert_eq!(default_debug_adapter("python"), None);
-        // Not an oversight -- see the function's own doc comment: gdb
-        // loads a Go binary and then misdescribes it, and delve's
-        // invocation is not guessed at.
+        // See `default_debug_adapter`: gdb misdescribes a Go binary, and
+        // delve's invocation isn't guessed at.
         assert_eq!(default_debug_adapter("go"), None);
         assert_eq!(default_debug_adapter("bash"), None, "bish debugs its own scripts, and not through an adapter");
     }
@@ -16350,15 +15178,9 @@ mod debug_adapter_tests {
 mod config_tests {
     use super::*;
 
-    /// The bug this exists for: a theme declared and activated in the
-    /// config, and `::bish hl` listing nothing at all.
-    ///
-    /// It was never the theme machinery -- that always worked from a
-    /// shell that had read the file. It was that a detachable session
-    /// never read the file, because loading it was the *caller's* job
-    /// and the session daemon was a caller nobody had told. So the test
-    /// is of the loading, and `repl::run` is now the only place that
-    /// does it.
+    /// A theme declared and activated in the config shows in `::bish hl`
+    /// for a detachable session too: `repl::run` is the one place that loads
+    /// the config.
     #[test]
     fn a_theme_declared_in_the_config_is_in_force_after_loading_it() {
         let mut shell = exec::Shell::new();
@@ -16375,10 +15197,8 @@ mod config_tests {
         assert_eq!(colours.get("string").map(String::as_str), Some("#78C953, -bish-green"));
     }
 
-    // A config that is never read leaves exactly the state the report
-    // described: a theme registered nowhere and an empty listing. Kept
-    // as the other half of the pair, so "it loaded" and "it did not"
-    // are both pinned rather than only the happy one.
+    // A config never read leaves no theme and an empty listing; the other
+    // half of the pair.
     #[test]
     fn without_the_config_there_is_nothing_to_list() {
         let shell = exec::Shell::new();
@@ -16386,11 +15206,8 @@ mod config_tests {
         assert_eq!(shell.hl_color("keyword"), None);
     }
 
-    /// Declaring a theme is not activating it -- the block only
-    /// registers, and the `bishopt --set theme` *after* it is what puts
-    /// it in force. Worth pinning because the config that prompted this
-    /// has the same line inside the block and after it, and only the
-    /// second one counts.
+    /// Declaring a theme only registers it; the `bishopt --set theme` after
+    /// the block activates it, and the same line inside the block doesn't.
     #[test]
     fn a_theme_that_is_declared_but_not_activated_is_not_in_force() {
         let mut shell = exec::Shell::new();
