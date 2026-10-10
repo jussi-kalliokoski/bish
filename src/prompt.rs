@@ -227,7 +227,12 @@ fn git_segment(cwd: &std::path::Path, budget: Option<usize>) -> String {
         Some(columns) => fit_branch(branch, columns.saturating_sub(taken)),
         None => branch.to_string(),
     };
-    match crate::git::head_status(cwd) {
+    // The `git` capability: in a directory you have not trusted, bish
+    // reads the branch from .git/HEAD and runs no git in the worktree
+    // (see git::head_status), so a repository's own config cannot turn a
+    // prompt draw into code execution.
+    let trusted = crate::trust::is_trusted(cwd, "git");
+    match crate::git::head_status(cwd, trusted) {
         Some(status) if status.dirty => format!(" {GIT_DIRTY_COLOR}({}*){RESET}", fitted(&status.branch, 3)),
         Some(status) => format!(" {GIT_CLEAN_COLOR}({}){RESET}", fitted(&status.branch, 2)),
         None => String::new(),

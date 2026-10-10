@@ -3988,7 +3988,7 @@ fn git_path(buf: &TextBuffer) -> Result<std::path::PathBuf, String> {
 // simply not present at that revision -- gets `None`, which the gutter
 // renders as its own marker rather than leaving blank (see
 // render_blame_cell).
-pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Result<bool, String> {
+pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>, trusted: bool) -> Result<bool, String> {
     if buf.blame.is_some() {
         buf.blame = None;
         return Ok(false);
@@ -4005,7 +4005,11 @@ pub(crate) fn toggle_git_blame(buf: &mut TextBuffer, rev: Option<&str>) -> Resul
             crate::encoding::decode(&bytes).text
         }
     };
-    let blamed = crate::git::blame(&path, rev)?;
+    // `trusted` is the caller's decision about the `git` capability,
+    // passed down rather than looked up here so this stays testable
+    // without a trust store -- blame runs the repository's
+    // filter/textconv (see git::blame), which is why it is gated at all.
+    let blamed = crate::git::blame(&path, rev, trusted)?;
     let old_lines: Vec<&str> = old.lines().collect();
     let current = buf.text();
     let current_lines: Vec<&str> = current.lines().collect();
@@ -7522,7 +7526,7 @@ mod git_blame_tests {
     #[test]
     fn toggle_git_blame_refuses_a_buffer_with_no_path() {
         let mut buf = TextBuffer::new_unnamed(10);
-        let err = toggle_git_blame(&mut buf, None).unwrap_err();
+        let err = toggle_git_blame(&mut buf, None, true).unwrap_err();
         assert!(err.contains("no file name"), "{err}");
     }
 
@@ -7534,13 +7538,13 @@ mod git_blame_tests {
         let dir = repo_with_history("blame-test");
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
         assert!(!buf.is_dirty());
-        assert!(toggle_git_blame(&mut buf, None).unwrap());
+        assert!(toggle_git_blame(&mut buf, None, true).unwrap());
         let blame = buf.blame.as_ref().unwrap();
         assert_eq!(blame.len(), 3);
         let first = blame[0].as_ref().unwrap();
         assert_eq!(first.author, "Test User");
         assert_eq!(first.short_commit.len(), 8);
-        assert!(!toggle_git_blame(&mut buf, None).unwrap());
+        assert!(!toggle_git_blame(&mut buf, None, true).unwrap());
         assert!(buf.blame.is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -7560,7 +7564,7 @@ mod git_blame_tests {
         buf.insert_text((0, 0), "TYPED JUST NOW\n");
         assert!(buf.is_dirty());
 
-        assert!(toggle_git_blame(&mut buf, None).unwrap());
+        assert!(toggle_git_blame(&mut buf, None, true).unwrap());
         let blame = buf.blame.as_ref().unwrap();
         assert_eq!(blame.len(), 4);
         assert!(blame[0].is_none(), "the typed line has no blame");
@@ -7582,7 +7586,7 @@ mod git_blame_tests {
         let dir = repo_with_history("blame-rev-test");
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
 
-        assert!(toggle_git_blame(&mut buf, Some("HEAD~1")).unwrap());
+        assert!(toggle_git_blame(&mut buf, Some("HEAD~1"), true).unwrap());
         let blame = buf.blame.as_ref().unwrap();
         assert_eq!(blame.len(), 3);
         assert!(blame[0].is_some(), "`one` is unchanged since HEAD~1");
@@ -7607,7 +7611,7 @@ mod git_blame_tests {
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
         assert_eq!(blamed_commit_at_cursor(&buf), None, "with blame off there is nothing to say, so `:git show` stays HEAD");
 
-        assert!(toggle_git_blame(&mut buf, None).unwrap());
+        assert!(toggle_git_blame(&mut buf, None, true).unwrap());
         buf.set_cursor(0, 0);
         assert_eq!(blamed_commit_at_cursor(&buf), Some(Ok(rev("HEAD~1"))), "`one` came in with the first commit");
         buf.set_cursor(1, 0);
@@ -7625,7 +7629,7 @@ mod git_blame_tests {
         }
         let dir = repo_with_history("blame-badrev-test");
         let mut buf = TextBuffer::open(&dir.join("f.txt"), 10).unwrap();
-        let err = toggle_git_blame(&mut buf, Some("no-such-rev")).unwrap_err();
+        let err = toggle_git_blame(&mut buf, Some("no-such-rev"), true).unwrap_err();
         assert!(err.contains("no-such-rev"), "{err}");
         assert!(buf.blame.is_none());
 

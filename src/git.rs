@@ -11,7 +11,7 @@
 // don't work, not a broken build/editor.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 // Every `git` this module runs, built in one place so that what it
@@ -137,7 +137,17 @@ pub struct HeadStatus {
 // `None` covers "git not installed" and "not inside a repo" alike --
 // prompt.rs's own caller treats both the same (no segment shown), so
 // there's no need to tell them apart.
-pub fn head_status(dir: &Path) -> Option<HeadStatus> {
+pub fn head_status(dir: &Path, trusted: bool) -> Option<HeadStatus> {
+    // In a directory you have not vouched for, bish runs no git in the
+    // working tree at all -- not even to ask whether it is dirty.
+    // Deciding dirtiness is what runs a repository's `clean` filter (see
+    // `command`), so the branch is read out of `.git/HEAD` directly
+    // instead, with no subprocess for any repo-configured driver to hook.
+    // The cost is honest and visible: an untrusted repo shows its branch
+    // and no dirty marker, until `::bish trust` says more is wanted.
+    if !trusted {
+        return branch_from_head(dir).map(|branch| HeadStatus { branch, dirty: false });
+    }
     let output = command(dir).arg("status").arg("--porcelain=v2").arg("--branch").output().ok()?;
     if !output.status.success() {
         return None;
@@ -172,6 +182,60 @@ fn short_head(dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The branch name from `.git/HEAD`, read as a plain file rather than
+/// asked of git -- the untrusted `head_status` path, where the point is
+/// that no git process touches the working tree.
+///
+/// `None` when `dir` is not in a repository, so the prompt shows no git
+/// segment there, exactly as it does when `git status` returns nothing.
+/// A detached HEAD comes back as the short hash, matching what the
+/// trusted path's `short_head` would have shown.
+///
+/// It reimplements only the two steps git would take to answer this one
+/// question: find the git directory, read HEAD. HEAD is always a loose
+/// file (git never packs it), so there is no ref database to consult --
+/// a `ref: refs/heads/NAME` line or a bare object id, and nothing else.
+fn branch_from_head(dir: &Path) -> Option<String> {
+    let git_dir = find_git_dir(dir)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        // `ref: refs/heads/main` -> `main`; any other ref target shows
+        // its last component, which is what a human reads off it too.
+        Some(target) => target.rsplit('/').next().map(str::to_string).filter(|s| !s.is_empty()),
+        // Detached: a bare object id. Abbreviated to git's own default
+        // length, so it reads the same as the trusted path's answer.
+        None if head.chars().all(|c| c.is_ascii_hexdigit()) && head.len() >= 7 => Some(head[..head.len().min(8)].to_string()),
+        None => None,
+    }
+}
+
+/// The repository's git directory for `dir`, by walking up and looking
+/// for `.git` -- the same search git does, reduced to what reading HEAD
+/// needs. `.git` is usually a directory; in a linked worktree or a
+/// submodule it is a file holding `gitdir: <path>`, which may be
+/// relative to the `.git` file's own directory.
+fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+    let start = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    for ancestor in start.ancestors() {
+        let dot_git = ancestor.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        if dot_git.is_file()
+            && let Ok(contents) = std::fs::read_to_string(&dot_git)
+            && let Some(rest) = contents.trim().strip_prefix("gitdir:")
+        {
+            let target = Path::new(rest.trim());
+            return Some(match target.is_absolute() {
+                true => target.to_path_buf(),
+                false => ancestor.join(target),
+            });
+        }
+    }
+    None
+}
+
 // One buffer line's worth of `git blame` info -- deliberately minimal
 // (just enough for a gutter cell, not every field real `git blame`
 // reports): `short_commit` is the first 8 hex digits (matching `git`'s own
@@ -197,7 +261,14 @@ pub struct BlameLine {
 // that file's own directory would resolve. `Err` covers both "git itself
 // failed" (not a repo, file not tracked, path doesn't exist, ...) and a
 // malformed/unexpected porcelain response.
-pub fn blame(path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
+pub fn blame(path: &Path, rev: Option<&str>, trusted: bool) -> Result<Vec<BlameLine>, String> {
+    // `git blame` runs the repository's `clean` filter on the working
+    // copy and its `textconv` on blobs (both measured), so it is gated
+    // on the same `git` capability the prompt is: in an untrusted
+    // directory there is no blame gutter until `::bish trust` grants it.
+    if !trusted {
+        return Err("blame: this directory is not trusted (`::bish trust` to allow)".to_string());
+    }
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let filename = path.file_name().ok_or_else(|| "no filename".to_string())?;
     let mut blame = command(dir);
@@ -677,9 +748,9 @@ mod tests {
 
         // Every automatic query, not just the prompt's: the opener asks
         // for the file list and a buffer asks for blame.
-        let status = head_status(&dir);
+        let status = head_status(&dir, true);
         let files = tracked_files(&dir);
-        let blamed = blame(&dir.join("a.txt"), None);
+        let blamed = blame(&dir.join("a.txt"), None, true);
 
         let ran = marker.exists();
         std::fs::remove_dir_all(&dir).ok();
@@ -697,6 +768,74 @@ mod tests {
     // and cannot be used for this one: it makes `blame` stop treating
     // `--` as the revision/path separator, so the path becomes a second
     // revision and the call fails outright.
+    // The trust gate: in an untrusted directory bish runs no git in the
+    // working tree, so a repository's own `clean` filter never executes
+    // on a prompt draw. The branch still comes back -- read out of
+    // .git/HEAD -- and `dirty` is always false, because deciding
+    // dirtiness is the part that would have run the filter.
+    #[test]
+    fn untrusted_head_status_reads_the_branch_without_running_git() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-untrusted-{}", std::process::id()));
+        let marker = dir.join("FILTER_RAN");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join(".gitattributes"), "a.txt filter=x\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+        run(&["config", "filter.x.clean", &format!("touch {}; cat", marker.display())]);
+        // Dirty the tree so a trusted status would have something to
+        // filter, and bust the stat cache the same way.
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+
+        let status = head_status(&dir, false).expect("branch comes from HEAD");
+        assert_eq!(status.branch, "main");
+        assert!(!status.dirty, "an untrusted repo reports no dirtiness");
+        let ran = marker.exists();
+
+        // Blame is gated too: no gutter in an untrusted repo.
+        let blamed = blame(&dir.join("a.txt"), None, false);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!ran, "an untrusted directory ran git in its working tree");
+        assert!(blamed.is_err(), "blame must refuse an untrusted directory");
+    }
+
+    // The HEAD reader behind the untrusted path, on the forms it has to
+    // read without git's help.
+    #[test]
+    fn branch_from_head_reads_a_ref_and_a_detached_head() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-head-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+
+        // On a branch, read from a subdirectory: finds the git dir by
+        // walking up.
+        assert_eq!(branch_from_head(&dir.join("sub")).as_deref(), Some("main"));
+        // Not a repository at all: nothing, so the prompt shows no
+        // git segment.
+        assert_eq!(branch_from_head(std::path::Path::new("/")), None);
+        // Detached: the short hash, as the trusted path would show.
+        run(&["checkout", "-q", "--detach"]);
+        let detached = branch_from_head(&dir).expect("detached still has a HEAD");
+        assert_eq!(detached.len(), 8);
+        assert!(detached.chars().all(|c| c.is_ascii_hexdigit()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn blame_refuses_a_revision_shaped_like_an_option() {
         if !available() {
@@ -712,11 +851,11 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
 
-        assert_eq!(blame(&file, Some("-L1,1")).unwrap_err(), "bad revision '-L1,1'");
+        assert_eq!(blame(&file, Some("-L1,1"), true).unwrap_err(), "bad revision '-L1,1'");
         // And the ordinary pair still work, which is what the refusal
         // must not cost: a named revision, and none at all.
-        assert_eq!(blame(&file, Some("HEAD")).unwrap().len(), 1);
-        assert_eq!(blame(&file, None).unwrap().len(), 1);
+        assert_eq!(blame(&file, Some("HEAD"), true).unwrap().len(), 1);
+        assert_eq!(blame(&file, None, true).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -885,7 +1024,7 @@ mod tests {
         unsafe { std::env::set_var("GIT_DIR", "/nonexistent/somewhere-else.git") };
         unsafe { std::env::set_var("GIT_WORK_TREE", "/nonexistent") };
         let entries = log(dir, None, None);
-        let head = head_status(dir);
+        let head = head_status(dir, true);
         restore("GIT_DIR", had_dir);
         restore("GIT_WORK_TREE", had_tree);
 

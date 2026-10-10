@@ -14654,22 +14654,31 @@ fn run_command_mode(
                                 None => String::new(),
                             };
                             match subcmd {
-                                "blame" => match fileeditor::toggle_git_blame(tb, subarg) {
-                                    Ok(on) => {
-                                        let output = if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
-                                        app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
-                                            command: trimmed,
-                                            output: output.clone(),
-                                            status: 0,
-                                        });
-                                        return CommandModeOutcome::Ran { output, status: 0 };
+                                "blame" => {
+                                    // The `git` capability, from the file's own
+                                    // directory: an untrusted repo gets no blame
+                                    // gutter, because blame runs its filters.
+                                    let trusted = tb
+                                        .path()
+                                        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                                        .is_some_and(|d| crate::trust::is_trusted(&d, "git"));
+                                    match fileeditor::toggle_git_blame(tb, subarg, trusted) {
+                                        Ok(on) => {
+                                            let output = if on { format!("Blame on{against}.") } else { "Blame off.".to_string() };
+                                            app.sessions.get_mut(&session_id).unwrap().command_transcript.push(TranscriptEntry {
+                                                command: trimmed,
+                                                output: output.clone(),
+                                                status: 0,
+                                            });
+                                            return CommandModeOutcome::Ran { output, status: 0 };
+                                        }
+                                        Err(e) => {
+                                            show_command_mode_error(&format!("bish: git: blame: {e}"), app.term_rows, app.term_cols);
+                                            buffer.clear();
+                                            continue;
+                                        }
                                     }
-                                    Err(e) => {
-                                        show_command_mode_error(&format!("bish: git: blame: {e}"), app.term_rows, app.term_cols);
-                                        buffer.clear();
-                                        continue;
-                                    }
-                                },
+                                }
                                 // `diff [REV]`: same toggle shape as
                                 // `blame` above, just against
                                 // fileeditor::toggle_git_diff -- gutter
