@@ -1,19 +1,16 @@
-//! What Linux's own numbers and structs are. Tables, not logic -- see
-//! this directory's `mod.rs` for why they are collected here.
+//! What Linux's numbers and structs are: tables, not logic (see this
+//! directory's `mod.rs`).
 
-// A table entry is a fact about this OS, and some facts are only ever
-// consumed by the *other* OS's implementation -- `F_SETFD` is how Darwin
-// sets close-on-exec where Linux passes `O_CLOEXEC` to `pipe2`, and each
-// is dead on the side that does not need it. They are both here because
-// the pairing test next door says a name missing from one table is a
-// port that half-happened, which is the error worth catching; an unused
-// constant is not.
+// A table entry is a fact about this OS, and some are used only by the
+// other OS's implementation (`F_SETFD` is how Darwin sets close-on-exec,
+// where Linux passes `O_CLOEXEC` to `pipe2`). Both tables keep them, since
+// the pairing test treats a name missing from one as a half-done port,
+// which matters; an unused constant doesn't.
 #![allow(dead_code)]
 
-// mmap(2)/mprotect(2). The protection bits agree across every Unix bish
-// targets; the mapping flags do not -- an anonymous mapping is 0x20
-// here and 0x1000 on Darwin, and nothing but the wrong pages would say
-// so.
+// mmap(2)/mprotect(2). Protection bits agree across bish's Unixes;
+// mapping flags don't: anonymous is 0x20 here and 0x1000 on Darwin, and
+// only the wrong pages would show it.
 pub(crate) const PROT_NONE: i32 = 0;
 pub(crate) const PROT_READ: i32 = 1;
 pub(crate) const PROT_WRITE: i32 = 2;
@@ -65,20 +62,19 @@ pub(crate) const ICANON: Flag = 0o0000002;
 pub(crate) const ECHO: Flag = 0o0000010;
 pub(crate) const IEXTEN: Flag = 0o0100000;
 
-// Indices into `c_cc`, and the ones most likely to be got wrong: 6 and 5
-// here, 16 and 17 on Darwin. A raw mode that wrote them at the wrong
-// index would set two unrelated control characters and leave the read
-// behaviour alone, which looks like a terminal that will not answer.
+// Indices into `c_cc`, the likeliest to be got wrong: 6 and 5 here, 16
+// and 17 on Darwin. At the wrong index, raw mode would set two unrelated
+// control characters and leave reads alone, a terminal that won't
+// answer.
 pub(crate) const VMIN: usize = 6;
 pub(crate) const VTIME: usize = 5;
 
 // `tcsetattr`: apply this now rather than after the output drains.
 pub(crate) const TCSANOW: i32 = 0;
 
-// Signal numbers. Four of these agree with Darwin's and one does not:
-// `SIGTSTP` is 20 here and 18 there, where 20 is `SIGCHLD` -- so a
-// suspend-self written with this number would reap a child instead of
-// stopping the shell.
+// Signal numbers. Four agree with Darwin's and one doesn't: `SIGTSTP`
+// is 20 here and 18 there, where 20 is `SIGCHLD`, so stopping the shell
+// with this number would reap a child instead.
 pub(crate) const SIGHUP: i32 = 1;
 pub(crate) const SIGINT: i32 = 2;
 pub(crate) const SIGTSTP: i32 = 20;
@@ -89,11 +85,10 @@ pub(crate) const SIGTTOU: i32 = 22;
 // what the C declaration takes.
 pub(crate) const SIG_IGN: usize = 1;
 
-// `ioctl(2)` request numbers for a terminal. Linux's are small
-// sequential constants; Darwin encodes the direction and the argument
-// size into them, so not one of these four agrees -- and an `ioctl` with
-// the wrong number fails with ENOTTY at best and asks the terminal for
-// something else entirely at worst.
+// `ioctl(2)` terminal requests. Linux's are small sequential numbers;
+// Darwin packs direction and argument size into them, so none of these
+// four agree, and the wrong one fails with ENOTTY at best and asks the
+// terminal for something else at worst.
 pub(crate) const TIOCGWINSZ: u64 = 0x5413;
 pub(crate) const TIOCSWINSZ: u64 = 0x5414;
 pub(crate) const TIOCSCTTY: u64 = 0x540E;
@@ -112,22 +107,18 @@ pub(crate) const F_SETFL: i32 = 4;
 // half of `SIG_IGN`.
 pub(crate) const SIG_DFL: usize = 0;
 
-// `getrlimit`/`setrlimit` resources, and `sysconf`'s clock-tick name.
-//
-// Darwin renumbers most of these and simply does not have six of them,
-// so the mapping from `ulimit`'s own flags to resource numbers is a
-// per-OS fact rather than a shared table -- see `rlimit_number`.
+// `getrlimit`/`setrlimit` resources and `sysconf`'s clock-tick name.
+// Darwin renumbers most and lacks six, so `ulimit`'s flags map per OS
+// (`rlimit_number`).
 pub(crate) const RLIMIT_STACK: i32 = 3;
 // "No limit": every bit of `rlim_t` set.
 pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
 pub(crate) const SC_CLK_TCK: i32 = 2;
 
 /// Which `RLIMIT_*` a `ulimit` flag asks about, or `None` where this OS
-/// has no such limit.
-///
-/// Linux's numbers, in its own order: the six after `NOFILE` are
-/// Linux-only, which is why `ulimit -a` lists more here than on a Mac --
-/// as bash's own does.
+/// has none. Linux's numbers; the six after `NOFILE` are Linux-only,
+/// which is why `ulimit -a` lists more here than on a Mac, as bash's
+/// does.
 pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
     Some(match flag {
         't' => 0,            // CPU
@@ -154,24 +145,21 @@ pub(crate) fn rlimit_number(flag: char) -> Option<i32> {
 // `unsigned int` on Darwin. Same call, different width.
 pub(crate) type NFds = u64;
 
-// Terminal-resize signal. 28 on both, unlike the job-control numbers --
-// written out in both tables rather than shared, so one file answers
-// "which number is this signal here".
+// The resize signal: 28 on both, unlike job control's. Written in both
+// tables, so one file answers which number it is here.
 pub(crate) const SIGWINCH: i32 = 28;
 
-// `fcntl(2)` commands beyond `F_SETFD` above. `F_DUPFD_CLOEXEC` is 1030
-// here and 67 on Darwin -- one of the quieter wrong numbers available: a
-// duplicate that is not close-on-exec leaks into every child, and the
-// call does not fail.
+// `fcntl(2)` commands beyond `F_SETFD`. `F_DUPFD_CLOEXEC` is 1030 here
+// and 67 on Darwin, and the wrong one fails quietly: the duplicate isn't
+// close-on-exec and leaks into every child.
 pub(crate) const F_DUPFD_CLOEXEC: i32 = 1030;
 pub(crate) const F_GETFD: i32 = 1;
 
-// `struct sigaction` as glibc lays it out on Linux: the handler, then a
-// 128-byte signal set, the flags, and a restorer glibc fills in itself.
-// Darwin's is 16 bytes with a 32-bit set and no restorer at all, so a
-// struct of this shape passed there would be read as nonsense past the
-// handler -- and `sigaction` would be setting a mask out of whatever
-// happened to be on the stack.
+// `struct sigaction` as glibc lays it out: the handler, a 128-byte signal
+// set, the flags, and a restorer glibc fills in. Darwin's is 16 bytes
+// with a 32-bit set and no restorer, so this shape there would be
+// nonsense past the handler, with `sigaction` setting a mask from stack
+// garbage.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct SigAction {
@@ -194,12 +182,10 @@ pub(crate) const HIGHEST_SIGNAL: i32 = 64;
 /// referred to as `RTMIN+n`.
 pub(crate) const REALTIME_SIGNALS: Option<(i32, i32)> = Some((34, 64));
 
-/// Name to number for every signal a script can trap here.
-///
-/// KILL and STOP are deliberately absent: neither can be caught or
-/// ignored, and bash refuses to let `trap` name them. The numbers are
-/// Linux's -- more than a third of them differ from Darwin's, which is
-/// why this is a table per OS rather than one shared list.
+/// Name to number for every signal a script can trap. KILL and STOP are
+/// absent: neither can be caught or ignored, and bash won't let `trap`
+/// name them. Linux's numbers; over a third differ from Darwin's, hence a
+/// table per OS.
 pub(crate) const SIGNAL_NAMES: &[(&str, i32)] = &[
     ("HUP", 1),
     ("INT", 2),
