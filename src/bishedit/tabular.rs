@@ -1,18 +1,10 @@
-// Tabular display for delimiter-separated files: the columns of a CSV
-// line up on screen without a single character of the file changing.
+// Tabular display for delimiter-separated files: a CSV's columns line up
+// on screen without any character of the file changing. Only where
+// padding goes between characters is decided here; this module never gets
+// a mutable buffer.
 //
-// **Purely cosmetic, and that is the whole design.** The buffer holds
-// exactly what is on disk -- the commas are still there, still yours to
-// edit, still what gets saved. All this does is decide where padding
-// goes *between* the characters when a row is drawn, so field three of
-// one row starts in the same screen column as field three of the next.
-// Nothing here can change the text, because nothing here is given a
-// mutable buffer.
-//
-// The consequence to keep in mind while reading the editor side: a
-// screen column and a character index stop being the same number, the
-// way they already differ for a wide glyph. Every place that converts
-// between them goes through the maps this module builds.
+// So a screen column and a character index differ, as they do for a wide
+// glyph, and the editor converts between them with the maps built here.
 
 use super::unicode_width::char_width;
 
@@ -25,18 +17,15 @@ pub struct Style {
 }
 
 // How a delimiter that is content rather than a boundary is written.
-// Every tabular form needs an answer, because without one a row that
-// carries a delimiter of its own reads as having more columns than it
-// has, and the whole table lines up against a column that isn't there.
+// Without this, such a row reads as having an extra column, and the table
+// aligns against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escape {
     // RFC 4180: a field that opens with `"` runs to its closing quote,
     // and `""` inside it is an escaped quote.
     Quotes,
-    // Markdown: a backslash makes whatever follows it content. `\|` is
-    // the *only* way to write a pipe in a cell -- the table resolves it
-    // before anything else looks at the line -- so a table that needs a
-    // pipe has no alternative for this to miss.
+    // Markdown: a backslash makes what follows it content. `\|` is the only
+    // way to write a pipe in a cell.
     Backslash,
 }
 
@@ -44,21 +33,17 @@ pub enum Escape {
 // padding may go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    // `a,b` -- the delimiter ends the field before it and belongs to
-    // it. Padding goes after the delimiter, so the next field starts on
-    // the column, and one further space keeps it off the delimiter,
-    // since a row like this carries no space of its own.
+    // `a,b`: the delimiter ends the field before it. Padding goes after the
+    // delimiter, plus one space, since the row has no spaces of its own.
     Terminated,
-    // `| a | b |` -- the delimiters frame the cells between them.
-    // Padding goes before the delimiter instead, so it is the frame
-    // that lines up, and no extra gap is wanted because the cells
-    // already carry their own spaces.
+    // `| a | b |`: the delimiters frame the cells. Padding goes before the
+    // delimiter so the frame lines up, with no extra gap since the cells
+    // carry their own spaces.
     Framed,
 }
 
 impl Kind {
-    // Columns are separated by at least this much beyond the widest
-    // field.
+    // The minimum separation beyond the widest field.
     fn gap(self) -> usize {
         match self {
             Kind::Terminated => 1,
@@ -66,28 +51,23 @@ impl Kind {
         }
     }
 
-    // Whether a row of nothing but rule characters is exempt from
-    // deciding column widths. Markdown's `|:---|---:|` is such a row:
-    // this can only ever *insert spaces*, never stretch the dashes to
-    // fill a column, so letting a long dash run widen the column would
-    // buy nothing and cost the whole table its width. A row of dashes
-    // in a CSV, by contrast, is just data.
+    // Whether a row of rule characters is left out of the column widths.
+    // Markdown's `|:---|---:|` is: padding can only add spaces, not stretch
+    // the dashes, so a long dash run would widen the column for nothing. In
+    // a CSV a row of dashes is data.
     fn rule_rows(self) -> bool {
         matches!(self, Kind::Framed)
     }
 }
 
-// Which style a language's tabular form uses, or `None` for a language
-// that has no tabular form at all -- which is most of them, and is why
-// the `tabular` bishopt can default to matching everything: a language
-// nothing here knows about is simply left alone.
+// The style of a language's tabular form, or `None` for most languages,
+// which is why the `tabular` bishopt can default to matching everything.
 pub fn style(language: &str) -> Option<Style> {
     match language {
         "csv" => Some(Style { delimiter: ',', kind: Kind::Terminated, escape: Escape::Quotes }),
-        // A real `.tsv` holds literal tabs, which this editor's
-        // one-character-per-column rendering can't place correctly in
-        // the first place (see run_insert_mode's own Tab handling) --
-        // alignment here is only as good as that already is.
+        // A real `.tsv` holds literal tabs, which the editor's one char per
+        // column rendering can't place correctly anyway (see
+        // `run_insert_mode`).
         "tsv" | "tab" => Some(Style { delimiter: '\t', kind: Kind::Terminated, escape: Escape::Quotes }),
         "psv" => Some(Style { delimiter: '|', kind: Kind::Terminated, escape: Escape::Quotes }),
         "markdown" => Some(Style { delimiter: '|', kind: Kind::Framed, escape: Escape::Backslash }),
@@ -95,26 +75,20 @@ pub fn style(language: &str) -> Option<Style> {
     }
 }
 
-// A row of nothing but rule characters -- markdown's `|:---|---:|` and
-// nothing else. Deliberately whole-line: a *field* of dashes inside an
-// ordinary row is content, and only a row that is entirely rule is the
-// table's own separator.
+// A row of nothing but rule characters (`|:---|---:|`). Whole lines only:
+// a field of dashes in an ordinary row is content.
 fn is_rule_row(line: &[char]) -> bool {
     !line.is_empty() && line.iter().any(|c| *c == '-') && line.iter().all(|c| matches!(c, '-' | ':' | '|' | ' ' | '\t'))
 }
 
-// A pathological file must not produce a pathological layout: a column
-// wider than this is truncated for *alignment* purposes (its own text is
-// never cut, the row simply runs long), and columns past this many are
-// left unaligned.
+// A column wider than this is clamped for alignment (the text isn't cut;
+// the row runs long), and columns past the limit aren't aligned.
 const MAX_COLUMN_WIDTH: usize = 60;
 const MAX_COLUMNS: usize = 128;
 
-// One independently aligned run of lines, and the column widths it
-// agreed on. A CSV is a single region covering the file; a markdown
-// document is one per table, because two tables in one file have
-// nothing to do with each other and aligning them together would make
-// each as wide as the other needs.
+// An independently aligned run of lines and its column widths. A CSV is
+// one region; a markdown document has one per table, since unrelated
+// tables shouldn't widen each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Region {
     lines: std::ops::Range<usize>,
@@ -141,14 +115,14 @@ impl Layout {
     }
 }
 
-// The whole file as one aligned region -- what a CSV wants.
+// The whole file as one region, as a CSV wants.
 pub fn measure(lines: &[&[char]], style: Style) -> Layout {
     measure_regions(lines, style, &[0..lines.len()])
 }
 
-// The widest field in each column, per region. Measured across every
-// line of the region rather than the visible window, so a column doesn't
-// change width as you scroll; a line in no region is left alone.
+// The widest field per column, per region, across all its lines rather
+// than the visible ones, so widths don't change as you scroll. A line in
+// no region is left alone.
 pub fn measure_regions(lines: &[&[char]], style: Style, regions: &[std::ops::Range<usize>]) -> Layout {
     let mut out = Vec::new();
     for region in regions {
@@ -179,11 +153,9 @@ pub struct Field {
     pub end: usize,
 }
 
-// One line's fields, as character ranges, with the style's escape
-// honoured so that a delimiter the row means as content does not split
-// it. That matters for display exactly as much as it matters for
-// parsing -- a quoted address containing a comma is one column, and
-// aligning it as two would misrepresent the file.
+// One line's fields as character ranges, honouring the style's escape so
+// a delimiter meant as content doesn't split a field: a quoted address with
+// a comma is one column.
 pub fn fields(line: &[char], style: Style) -> Vec<Field> {
     let delimiter = style.delimiter;
     let mut out = Vec::new();
@@ -192,17 +164,15 @@ pub fn fields(line: &[char], style: Style) -> Vec<Field> {
     let mut quoted = false;
     while i < line.len() {
         let c = line[i];
-        // Whatever follows a backslash is content, delimiter included.
-        // A second backslash is content too, which is the point: it
-        // pairs with this one and leaves a delimiter after it a
-        // delimiter again.
+        // What follows a backslash is content, including a second backslash,
+        // which leaves a delimiter after the pair a delimiter.
         if style.escape == Escape::Backslash && c == '\\' {
             i += 2;
             continue;
         }
         if quoted {
             if c == '"' {
-                // A doubled quote is an escaped one and stays inside.
+                // A doubled quote is an escaped one.
                 if line.get(i + 1) == Some(&'"') {
                     i += 2;
                     continue;
@@ -233,46 +203,35 @@ pub fn fields(line: &[char], style: Style) -> Vec<Field> {
 // between a character of the line and the cell it occupies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    // What to draw -- the line's own characters, with padding spliced in.
+    // The line's characters with padding spliced in.
     pub cells: Vec<char>,
-    // For each cell, which character of the line it came from. `None`
-    // for a padding cell, which belongs to no character at all.
+    // For each cell, the character it came from; `None` for padding.
     pub source_at: Vec<Option<usize>>,
-    // For each character of the line, the cell it starts at. One longer
-    // than the line, so the position *after* the last character (where
-    // the cursor sits at end of line) has an answer too.
+    // For each character, the cell it starts at. One longer than the line,
+    // for the cursor at end of line.
     pub cell_of: Vec<usize>,
 }
 
 impl Row {
-    // The identity row: every character is its own cell, nothing added.
-    // What a language with no tabular form gets, and what makes the
-    // editor able to run one code path for both cases.
+    // The identity row, for a language with no tabular form, so the editor
+    // has one code path.
     pub fn plain(line: &[char]) -> Row {
         Row { cells: line.to_vec(), source_at: (0..line.len()).map(Some).collect(), cell_of: (0..=line.len()).collect() }
     }
 }
 
-// `line`, with padding inserted after each delimiter so that every
-// column starts where the layout says it should.
-//
-// The padding goes *after* the delimiter rather than before it, so a
-// comma stays visually attached to the field it terminates and each
-// field starts at a predictable column. A field wider than its column's
-// measured width (only possible once MAX_COLUMN_WIDTH has clamped that
-// width) simply pushes the rest of its row along rather than being cut.
+// `line` padded so each column starts where the layout says, before or
+// after each delimiter as the style decides. A field wider than its
+// clamped column pushes the rest of the row along rather than being cut.
 pub fn row(line: &[char], line_number: usize, layout: &Layout) -> Row {
-    // A line outside every region -- prose around a markdown table, or
-    // anything at all in a file whose language has no tabular form -- is
-    // drawn exactly as it is.
+    // A line outside every region (prose around a markdown table) is drawn
+    // as it is.
     let Some(widths) = layout.widths_for(line_number) else { return Row::plain(line) };
     let fields = fields(line, layout.style);
     let mut cells = Vec::with_capacity(line.len());
     let mut source_at: Vec<Option<usize>> = Vec::with_capacity(line.len());
     let mut cell_of = vec![0usize; line.len() + 1];
-    // A line with no delimiter at all -- a comment, a blank line, a
-    // trailing newline's empty last row -- is not a row of a table and
-    // is left exactly as it is.
+    // A line with no delimiter (a comment, a blank line) isn't a table row.
     if fields.len() <= 1 {
         return Row::plain(line);
     }
@@ -282,10 +241,8 @@ pub fn row(line: &[char], line_number: usize, layout: &Layout) -> Row {
             cells.push(line[i]);
             source_at.push(Some(i));
         }
-        // The delimiter, and the padding that squares the column up --
-        // in whichever order this style puts them. The last field has
-        // neither, since there is no delimiter after it and nothing
-        // beyond it to line up with.
+        // The delimiter and the padding, in the style's order. The last
+        // field has neither.
         if field.end < line.len() {
             let width: usize = line[field.start..field.end].iter().map(|c| char_width(*c)).sum();
             let target = widths.get(index).copied().unwrap_or(width);
@@ -332,8 +289,7 @@ mod tests {
         assert_eq!(style("rust"), None);
     }
 
-    // The two differ in more than the delimiter: a CSV row carries no
-    // space of its own, a markdown row already carries its own.
+    // A CSV row carries no spaces of its own; a markdown row does.
     #[test]
     fn csv_terminates_its_fields_and_markdown_frames_them() {
         assert_eq!(style("csv").unwrap().kind, Kind::Terminated);
@@ -348,8 +304,7 @@ mod tests {
         assert_eq!(split("solo", csv()), vec!["solo"]);
     }
 
-    // A quoted field holding a delimiter is one column. Aligning it as
-    // two would misrepresent the file.
+    // A quoted field holding a delimiter is one column.
     #[test]
     fn a_delimiter_inside_quotes_does_not_split() {
         assert_eq!(split("a,\"b,c\",d", csv()), vec!["a", "\"b,c\"", "d"]);
@@ -361,33 +316,26 @@ mod tests {
         assert_eq!(split("\"say \"\"hi\"\", ok\",next", csv()), vec!["\"say \"\"hi\"\", ok\"", "next"]);
     }
 
-    // A quote that isn't at the start of a field is just a character.
     #[test]
     fn a_quote_mid_field_does_not_open_a_quoted_field() {
         assert_eq!(split("a\"b,c", csv()), vec!["a\"b", "c"]);
     }
 
-    // Markdown's own escape, and the reason it exists: `\|` is the only
-    // way to write a pipe in a cell, so a row that uses one has fewer
-    // columns than its pipes suggest. Reading it as a delimiter puts a
-    // column boundary in the middle of a cell and drags the rest of the
-    // table along with it.
+    // `\|` is the only way to write a pipe in a markdown cell, so a row
+    // using one has fewer columns than pipes.
     #[test]
     fn an_escaped_pipe_does_not_split_a_markdown_row() {
         assert_eq!(split(r"| a \| b | c |", md()), vec!["", r" a \| b ", " c ", ""]);
         assert_eq!(split(r"| one `${s/:/\|}` | 2.13 |", md()), vec!["", r" one `${s/:/\|}` ", " 2.13 ", ""]);
     }
 
-    // A backslash escapes a backslash, so the pipe after a pair is a
-    // delimiter again.
     #[test]
     fn a_doubled_backslash_leaves_the_pipe_after_it_a_delimiter() {
         assert_eq!(split(r"| a \\| b |", md()), vec!["", r" a \\", " b ", ""]);
     }
 
-    // The two escapes are not interchangeable. A CSV has no backslash
-    // escape -- RFC 4180 says quotes -- and markdown has no quoting,
-    // where a `"` opening a cell is just the first character of it.
+    // The escapes aren't interchangeable: a CSV quotes (RFC 4180), and in
+    // markdown a `"` opening a cell is just a character.
     #[test]
     fn each_style_has_only_its_own_escape() {
         assert_eq!(split(r"a\,b", csv()), vec![r"a\", "b"]);
@@ -421,8 +369,7 @@ mod tests {
         assert_eq!(rendered(&["name,age,city", "alice,30,NYC", "bo,7,LA"], csv()), vec!["name,  age, city", "alice, 30,  NYC", "bo,    7,   LA"]);
     }
 
-    // Nothing is removed and nothing is reordered: the file's own
-    // characters come back in order, padding aside.
+    // The file's characters come back in order, padding aside.
     #[test]
     fn rendering_only_ever_inserts_spaces() {
         for line in ["a,b,c", "alice,30,NYC", "\"x,y\",z", "", "no delimiter here"] {
@@ -435,8 +382,7 @@ mod tests {
         }
     }
 
-    // The two maps have to agree, or the cursor lands somewhere the text
-    // isn't.
+    // The two maps agree, or the cursor lands where the text isn't.
     #[test]
     fn the_two_maps_are_inverses() {
         let cs = chars("alice,30,NYC");
@@ -445,7 +391,6 @@ mod tests {
         for (i, cell) in r.cell_of.iter().enumerate().take(cs.len()) {
             assert_eq!(r.source_at[*cell], Some(i), "character {i} maps to a cell that maps back to it");
         }
-        // And the position after the last character is one past the end.
         assert_eq!(r.cell_of[cs.len()], r.cells.len());
     }
 
@@ -456,12 +401,10 @@ mod tests {
         assert_eq!(row(&cs, 0, &layout), Row::plain(&cs));
     }
 
-    // Alignment is by display width, so a CJK field doesn't throw the
-    // column off.
+    // By display width, so a CJK field doesn't throw the column off.
     #[test]
     fn alignment_measures_display_width() {
         let out = rendered(&["\u{65e5}\u{672c},x", "ab,y"], csv());
-        // The CJK field draws 4 columns, so `ab` is padded to match.
         assert_eq!(out[0], "\u{65e5}\u{672c}, x");
         assert_eq!(out[1], "ab,   y");
     }
@@ -476,8 +419,7 @@ mod tests {
         let widths = &layout.regions[0].widths;
         assert!(widths.iter().all(|w| *w <= MAX_COLUMN_WIDTH));
         assert!(widths.len() <= MAX_COLUMNS);
-        // ...and a field wider than its clamped column still renders in
-        // full rather than being cut.
+        // ...and a field wider than its clamped column renders in full.
         let r = row(&all[0], 0, &layout);
         let back: String = r.cells.iter().zip(&r.source_at).filter(|(_, s)| s.is_some()).map(|(c, _)| *c).collect();
         assert_eq!(back, wide);
@@ -495,8 +437,7 @@ mod tests {
         );
     }
 
-    // ...and the layout follows: the cell holding the pipe is one cell,
-    // so the column after it is the column after it.
+    // ...and the cell holding the pipe is one cell in the layout too.
     #[test]
     fn an_escaped_pipe_lines_up_as_one_cell() {
         assert_eq!(
@@ -505,22 +446,18 @@ mod tests {
         );
     }
 
-    // The separator row is padded like any other, but a long dash run in
-    // it must not decide the column's width -- this can only insert
-    // spaces, never stretch the dashes to fill what it asked for.
+    // The separator row is padded, but its dashes don't set the width.
     #[test]
     fn a_rule_row_is_padded_but_does_not_set_the_width() {
         assert_eq!(rendered_regions(&["| a | b |", "|--------|--------|"], md(), &[0..2]), vec!["| a | b |", "|--------|--------|"]);
     }
 
-    // A row of dashes in a CSV is data, not a rule.
     #[test]
     fn csv_has_no_rule_rows() {
         assert_eq!(rendered(&["ab,cd", "--,--"], csv()), vec!["ab, cd", "--, --"]);
     }
 
-    // Prose around a table is outside every region, so it comes back
-    // untouched even though it contains the delimiter.
+    // Prose around a table is untouched despite containing the delimiter.
     #[test]
     fn a_line_outside_every_region_is_left_alone() {
         let out = rendered_regions(&["a | b in prose", "| x | yy |", "| zzz | w |"], md(), &[1..3]);
@@ -529,8 +466,6 @@ mod tests {
         assert_eq!(out[2], "| zzz | w  |");
     }
 
-    // Two tables in one document are unrelated: a wide column in one
-    // must not widen the other.
     #[test]
     fn each_region_has_its_own_widths() {
         let out = rendered_regions(&["| a | b |", "", "| aaaaaaaa | b |"], md(), &[0..1, 2..3]);
