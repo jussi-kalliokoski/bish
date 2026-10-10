@@ -436,58 +436,46 @@ enum Pending {
     Mark,
     GotoMarkExact,
     GotoMarkLine,
-    // `i`/`a` seen while an operator is armed -- awaiting the object
-    // character (`w`, `(`, `"`, ...). See `feed_fresh`'s own `i`/`a` arms
-    // for why this is only entered in that context, never standalone.
+    // `i`/`a` with an operator armed, awaiting the object character (`w`,
+    // `(`, `"`). Only entered with an operator armed (see `feed_fresh`).
     TextObject { around: bool },
-    // `[` / `]` -- vim's own bracket/section-motion leaders, awaiting the
-    // second character (`[(`, `])`, `[{`, `]}`, `[[`, `]]`, `[]`, `][`).
+    // `[` or `]`, awaiting the second character (`[(`, `])`, `[{`, `]}`,
+    // `[[`, `]]`, `[]`, `][`).
     BracketOpen,
     BracketClose,
-    // `ys{motion}`/`yss` -- awaiting the one delimiter character after
-    // the target (a motion, or `yss`'s own current-line shorthand) has
-    // already resolved. Reached via `feed`'s own `surround_armed`
-    // handling, not through `feed_inner`'s ordinary dispatch table (see
-    // that field's own doc comment) -- but still routed through
-    // `feed_inner` like every other `Pending` variant once it's set, for
-    // one uniform place that turns "the next key" into a resolved
-    // outcome.
+    // `ys{motion}`/`yss`, awaiting the delimiter once the target resolved.
+    // Set by `feed`'s `surround_armed` handling, then resolved by
+    // `feed_inner` like every other `Pending`.
     SurroundChar { target: SurroundTarget },
-    // `ds` -- awaiting its one target character (`ds(`, `ds"`, ...).
+    // `ds`, awaiting its target character.
     DeleteSurroundTarget,
     // `cs` -- awaiting its target character.
     ChangeSurroundTarget,
     // `cs{ch}` -- awaiting the replacement character.
     ChangeSurroundChar { ch: char },
-    // `r` -- awaiting its one replacement character.
+    // `r`, awaiting the replacement character.
     ReplaceChar,
     Z,
     Window,
-    // <C-w>g -- awaiting the second 'g' of <C-w>gg, mirroring plain `gg`'s
-    // own two-key shape one level under the window leader.
+    // `<C-w>g`, awaiting the second `g` of `<C-w>gg`.
     WindowG,
     Search { forward: bool, text: String },
-    // `"` -- awaiting exactly one register-name character
-    // (a-z/A-Z/+/"/_). Unlike every other `Pending` variant, resolving
-    // this one doesn't `emit()` anything: it stashes `pending_register`
-    // and drops straight back to `Pending::None`, ready for whatever
-    // operator or put comes next (see `feed_register`'s own doc comment).
+    // `"`, awaiting a register name. Doesn't `emit()`: it stashes
+    // `pending_register` and returns to `Pending::None` for the operator or
+    // put that follows (see `feed_register`).
     Register,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LastSearch {
     Pattern { forward: bool },
-    // `bounded` distinguishes `*`/`#` (word-boundary search) from `g*`/`g#`
-    // (plain substring search) -- `n`/`N` need to repeat whichever kind was
-    // actually used, not silently upgrade/downgrade it.
+    // `*`/`#` search on word boundaries, `g*`/`g#` don't; `n`/`N` repeat the
+    // kind used.
     Word { forward: bool, bounded: bool },
 }
 
-// A short display label for keys `feed` might reasonably want to echo
-// into `current_input`'s transcript -- `None` for keys with no natural
-// short label (Delete, AltLeft/Right/Up, ...), which just don't
-// contribute to the transcript rather than being an error.
+// A short label for `current_input`'s transcript, or `None` for keys
+// without one (Delete, Alt+arrows), which are left out.
 fn key_label(key: Key) -> Option<String> {
     Some(match key {
         Key::Char(c) => c.to_string(),
@@ -511,9 +499,7 @@ fn key_label(key: Key) -> Option<String> {
     })
 }
 
-// A Visual selection's own (shape, anchor, cursor) -- `gv`'s memory of the
-// last one, and what `end_visual` stashes there. A named alias rather than
-// spelling the nested tuple out at each of its two use sites below.
+// A Visual selection's (shape, anchor, cursor): what `gv` remembers.
 type VisualSelection = (RegisterShape, (usize, usize), (usize, usize));
 
 pub struct VimKeys {
@@ -521,69 +507,48 @@ pub struct VimKeys {
     pending: Pending,
     last_find: Option<(char, bool, bool)>, // (ch, till, forward)
     last_search_text: String,
-    // `:noh`. Vim's own rule exactly: the highlight goes away until the
-    // *next* search command, and `n`/`N`/`*` all count as one -- which
-    // is why this is cleared wherever `last_search` is set rather than
-    // being a setting anyone has to turn back on.
+    // `:noh`. As in vim, the highlight stays off until the next search
+    // command (`n`, `N` and `*` count), so it's cleared wherever
+    // `last_search` is set.
     search_highlight_off: bool,
     last_search: Option<LastSearch>,
-    // The operator waiting for a motion (or its own double-tap
-    // shorthand), and the count that had already accumulated in `count`
-    // at the moment it was armed -- stashed separately from `count` so a
-    // fresh count can accumulate for the motion that follows without the
-    // two clobbering each other (`2y3w`: operator_count becomes Some(2)
-    // when `y` arms, then `count` accumulates `3` fresh for `w`). See
-    // `feed`'s own doc comment for how these two combine.
+    // The operator awaiting a motion, and the count typed before it, kept
+    // apart from `count` so a second count can accumulate for the motion:
+    // in `2y3w`, `operator_count` is 2 when `y` arms and `count` collects 3
+    // (see `feed`).
     active_operator: Option<Op>,
     operator_count: Option<usize>,
-    // `ys{motion}`/`yss` -- set the moment `s` is seen right where `y`'s
-    // own double-tap (`yy`) or a motion would otherwise be expected,
-    // *without* touching `active_operator` itself (stays `Op::Yank`, so a
-    // stray second `y` here still resolves as an ordinary `yy` via the
-    // existing double-tap check). Consulted by `feed`'s own active-
-    // operator resolution to route what comes next -- an ordinary motion/
-    // text object, or `yss`'s own second `s` -- into `Pending::
-    // SurroundChar` (one more raw key, the delimiter) instead of an
-    // ordinary `Operator`/`OperatorLines`. See `KeyOutcome::AddSurround`'s
-    // own doc comment for the outcome this eventually produces.
+    // `ys{motion}`/`yss`: set when `s` comes where a motion or the doubled
+    // `y` would, leaving `active_operator` as `Op::Yank` so a second `y`
+    // still makes `yy`. Routes what follows (a motion, a text object, or
+    // `yss`'s second `s`) into `Pending::SurroundChar` instead of an
+    // `Operator` (see `KeyOutcome::AddSurround`).
     surround_armed: bool,
-    // `"x` -- the register the *next* operator or put should target.
-    // Survives across `Pending::Register` resolving back to
-    // `Pending::None` (unlike `count`/`pending`, a register selection
-    // isn't itself a sub-prefix continuation, it's a modifier on whatever
-    // comes after it), and is dropped by any successfully-resolved
-    // outcome that isn't an operator or put -- matching vim silently
-    // ignoring a register prefix in front of a bare motion.
+    // `"x`: the register for the next operator or put. Survives
+    // `Pending::Register` returning to `Pending::None`, since it modifies
+    // what follows, and is dropped by any other resolved outcome, as vim
+    // ignores a register before a bare motion.
     pending_register: Option<char>,
-    // A human-readable transcript of the keys fed since the last resolved
-    // motion (or the last aborted sequence) -- e.g. "20g" while typing
-    // `20gg`, or "/cher" while typing a search. Exists purely for a
-    // frontend's status-bar display (see repl.rs's normal-mode status
-    // bar); has no effect on how keys are interpreted.
+    // The keys fed since the last resolved motion or aborted sequence (`20g`
+    // while typing `20gg`, `/cher` during a search), for a status bar only.
     current_input: String,
-    // A snapshot of `current_input` taken at the moment it last resolved
-    // into a motion -- e.g. "20gg" -- kept around (not cleared) until the
-    // next key starts a new sequence, so a frontend can flash "here's what
-    // that just did" for a beat after the motion applies.
+    // `current_input` as it was when it last resolved (`20gg`), kept until
+    // the next key so a frontend can flash what just happened.
     last_completed: String,
-    // `.`'s own memory, in three parts: the keys of the command being
-    // typed right now, the keys of the last one that *changed* the
-    // buffer, and whether an Insert-mode excursion is still adding to
-    // the first of those.
+    // `.`'s memory: the keys of the command being typed, the keys of the last
+    // command that changed the buffer, and whether an Insert excursion is
+    // still adding to the first.
     //
-    // Keys, not an edit description: a change is replayed by feeding
-    // its keystrokes back through the same replay queue macros use, so
-    // `.` needs no separate notion of what any command does and gains
-    // every command at once. What it costs is that a repeat re-resolves
-    // against the buffer's current state -- `dw` repeated deletes
-    // whatever word is under the cursor now, which is what vim does
-    // too.
+    // Keys, not an edit description: a change is replayed through the macro
+    // replay queue, so `.` covers every command without knowing what any of
+    // them does. A repeat re-resolves against the current buffer: `dw`
+    // repeated deletes the word under the cursor now, as in vim.
     current_change: Vec<Key>,
     last_change: Vec<Key>,
-    /// How many times an open Insert-mode excursion's text is to go in,
-    /// and whether each copy after the first starts a line of its own --
-    /// `3ihi<Esc>` and `3oX<Esc>`. Set by the command that opens the
-    /// excursion, spent on the escape that closes it.
+    /// Where a pending search's pattern starts in `current_input`. The
+    /// transcript records keys by label (`<BS>`), but for a search it's the
+    /// pattern being edited, so it's rebuilt from here on every key. Like
+    /// `insert_text_start`: what comes before belongs to the opening command.
     // Where a pending search's pattern begins inside `current_input`.
     //
     // The transcript is appended to before a key is dispatched, so a
@@ -594,53 +559,40 @@ pub struct VimKeys {
     // the same reason: the keys before it belong to the command that
     // opened this, and only what follows is the text.
     search_input_start: usize,
+    /// How many copies of an open Insert excursion's text go in, and
+    /// whether each copy after the first starts a new line: `3ihi<Esc>`,
+    /// `3oX<Esc>`. Set by the command that opens it, spent by the escape.
     insert_repeat: Option<(usize, bool)>,
     /// Where in `current_change` the text typed during the open
     /// excursion starts.
     insert_text_start: usize,
-    // Set when a command opens Insert mode, cleared when the escape that
-    // closes it comes back through `next_key`. While it is set, the
-    // host's own Insert-mode reads are part of the change being
-    // recorded -- which is what makes `cwfoo<Esc>` repeat as a whole
-    // rather than as a bare `cw`.
+    // Set when a command opens Insert mode, cleared when the closing escape
+    // comes through `next_key`. Meanwhile the host's Insert-mode reads join
+    // the change being recorded, so `cwfoo<Esc>` repeats whole.
     capturing_insert: bool,
-    // Visual mode's own state: the shape (`v`/`V`) and the anchor position
-    // (the cursor at the moment Visual was entered) a caller supplied via
-    // `begin_visual`. `None` means Normal mode. Deliberately not touched
-    // by ordinary motion resolution -- a `Motion` outcome while this is
-    // `Some` is still just a `Motion`, applied by the caller exactly as it
-    // always is; only the *rendering* of what's between this anchor and
-    // the buffer's current cursor, and what `y`/`Z`/Escape do, changes,
-    // and all of that lives in the caller (repl.rs), not here -- see
-    // `is_idle`'s own doc comment for why.
+    // Visual mode: the shape and the anchor given to `begin_visual`; `None`
+    // in Normal mode. Motion resolution ignores it: a `Motion` is applied
+    // as usual, and what Visual changes (drawing the selection, `y`, `Z`,
+    // Escape) lives in the caller (see `is_idle`).
     visual: Option<(RegisterShape, (usize, usize))>,
-    // `gv`'s own memory: the shape/anchor/cursor of the last Visual
-    // selection, stashed by `end_visual` whenever one ends. `None` until
-    // the first Visual selection ever ends.
+    // `gv`'s memory: the last Visual selection, stashed by `end_visual`.
     last_visual: Option<VisualSelection>,
-    // `Ctrl-O`/`Ctrl-I`'s own back/forward navigation history -- a plain
-    // two-stack model (same shape a browser's own back/forward history
-    // uses), not vim's real fixed-size ring buffer with its own
-    // deduplication/staleness rules. `push_jump` (called by a caller right
-    // before applying a `motion::is_jump` motion) moves the pre-jump
-    // position onto `jump_back` and clears `jump_forward` -- a fresh jump
-    // discards any old "redo" history, same as a browser navigating to a
-    // new page after going back does.
+    // `Ctrl-O`/`Ctrl-I` history as two stacks, like a browser's back and
+    // forward, not vim's fixed ring with deduplication. `push_jump` (before a
+    // `motion::is_jump` motion) pushes onto `jump_back` and clears
+    // `jump_forward`.
     jump_back: Vec<(usize, usize)>,
     jump_forward: Vec<(usize, usize)>,
-    // `q{a-z}`/`qA-Z`/bare `q`/`@{a-z}`/`@@` -- see `next_key`'s own doc
-    // comment for how these four fields work together. Always keyed (and
-    // recorded) by the lowercase letter -- `qA` appends onto the same
-    // slot `qa`/`@a` already use, matching vim's own convention.
+    // `q{a-z}`, `qA-Z`, `q`, `@{a-z}`, `@@` (see `next_key`). Keyed by the
+    // lowercase letter: `qA` appends to `qa`'s slot, as in vim.
     macros: HashMap<char, Vec<Key>>,
     recording: Option<(char, Vec<Key>)>,
     replay_queue: VecDeque<Key>,
-    // `::bish map`. Empty unless the session has mappings, and consulted
-    // only by `next_command_key` -- see there for why not by `next_key`.
+    // `::bish map`. Empty without mappings; only `next_command_key` consults
+    // it (see there for why not `next_key`).
     matcher: crate::keymap::Matcher,
-    // Characters a speculative mapping put on screen that the caller
-    // has to take back before dispatching what it returned -- see
-    // `take_pending_revert`.
+    // Characters a speculative mapping put on screen that the caller must
+    // take back first; see `take_pending_revert`.
     pending_revert: usize,
     last_macro_register: Option<char>,
 }
@@ -679,58 +631,48 @@ impl VimKeys {
         }
     }
 
-    /// What's been typed so far toward the motion/search/command in
-    /// progress -- empty when nothing is pending. Display only.
+    /// What's been typed toward the command in progress; empty when nothing
+    /// is pending. Display only.
     pub fn pending_display(&self) -> &str {
         &self.current_input
     }
 
-    /// The keys that produced the most recently applied motion -- stays
-    /// populated (for a frontend to flash briefly) until the next key
-    /// starts a new sequence. Display only.
+    /// The keys of the last applied motion, kept until the next key starts a
+    /// sequence. Display only.
     pub fn last_motion_display(&self) -> &str {
         &self.last_completed
     }
 
-    /// The pattern text of the last resolved `/`/`?` search -- empty if
-    /// the last search (if any) was word-based (`*`/`#`) instead, or if
-    /// there's been no search yet. A frontend rendering search-match
-    /// highlighting combines this with `pending_display()` (for a search
-    /// still being typed) and, when `last_search_is_word()` is true,
-    /// `motion::word_under_cursor` at the buffer's own current cursor --
-    /// see that function's own doc comment for why that reliably recovers
-    /// a word-search's pattern without this needing to store it itself.
+    /// The pattern of the last `/` or `?` search; empty if the last was
+    /// `*`/`#` or there was none. Search highlighting combines this with
+    /// `pending_display()` and, for a word search,
+    /// `motion::word_under_cursor`, which recovers the searched word.
     pub fn last_search_text(&self) -> &str {
         &self.last_search_text
     }
 
-    /// `:noh` -- stop drawing the current search's matches. Any later
-    /// search brings the highlight back on its own.
+    /// `:noh`: stop drawing the current search's matches until the next
+    /// search.
     pub fn suppress_search_highlight(&mut self) {
         self.search_highlight_off = true;
     }
 
-    /// Whether search matches should be drawn at all right now. Every
-    /// view that highlights asks this before working out *what* to
-    /// highlight.
+    /// Whether search matches should be drawn now.
     pub fn search_highlight_on(&self) -> bool {
         !self.search_highlight_off
     }
 
-    /// Whether the last resolved search was word-based (`*`/`#`) rather
-    /// than pattern-based (`/`/`?`) -- see `last_search_text`'s own doc
-    /// comment for why this matters to a caller.
+    /// Whether the last search was `*`/`#` rather than `/`/`?` (see
+    /// `last_search_text`).
     pub fn last_search_is_word(&self) -> bool {
         matches!(self.last_search, Some(LastSearch::Word { .. }))
     }
 
-    /// Whether a `/`/`?` pattern is actively being typed right now --
-    /// distinct from `pending_display()` being non-empty (that's also
-    /// true mid-count, mid-`g`/`Z`/`<C-w>` prefix, etc.). A caller uses
-    /// this to decide whether `Key::CtrlC`/`CtrlD`/`CtrlZ` should be
-    /// intercepted as "exit this whole mode" or left to reach `feed`
-    /// itself, where `feed_search`'s own `Key::CtrlC` arm cancels just
-    /// the search instead (see that arm's own doc comment).
+    /// Whether a `/` or `?` pattern is being typed, unlike
+    /// `pending_display()`, which is also non-empty mid-count or
+    /// mid-prefix. Tells a caller whether `CtrlC`/`CtrlD`/`CtrlZ` should
+    /// leave the mode or reach `feed_search`, where `CtrlC` cancels just
+    /// the search.
     pub fn is_search_pending(&self) -> bool {
         matches!(self.pending, Pending::Search { .. })
     }
@@ -740,96 +682,69 @@ impl VimKeys {
         self.visual.is_some()
     }
 
-    /// Visual mode's own shape and anchor, if active -- `None` in Normal
-    /// mode. A caller combines this with the buffer's own current cursor
-    /// to know what's actually selected right now (this crate never reads
-    /// a `Buffer` itself -- see the module's own doc comment).
-    /// Visual mode's own shape and anchor, if active -- `None` in Normal
-    /// mode. A caller combines this with the buffer's own current cursor
-    /// to know what's actually selected right now (this crate never reads
-    /// a `Buffer` itself -- see the module's own doc comment).
+    /// Visual mode's shape and anchor, `None` in Normal mode. With the
+    /// buffer's cursor, that's the selection.
     pub fn visual_anchor(&self) -> Option<(RegisterShape, (usize, usize))> {
         self.visual
     }
 
-    /// Moves the anchor without leaving Visual mode -- `SwapVisualEnds`'s
-    /// own counterpart, the way `begin_visual` is `EnterVisual`'s.
+    /// Moves the anchor without leaving Visual mode, for `SwapVisualEnds`.
     pub fn set_visual_anchor(&mut self, anchor: (usize, usize)) {
         if let Some((_, a)) = self.visual.as_mut() {
             *a = anchor;
         }
     }
 
-    /// Whether the next key must reach this machine unmapped.
-    ///
-    /// `f{char}`, `m{mark}`, `r{char}` and the surround delimiters all
-    /// take the next keystroke as a literal character rather than as a
-    /// command. Running one of those through the keymap would make
-    /// `fx` find whatever `x` is mapped to instead of an `x`, which is
-    /// never what anyone means -- vim draws the same line, and calls the
-    /// states this covers "pending an argument".
+    /// Whether the next key must arrive unmapped. `f{char}`, `m{mark}`,
+    /// `r{char}` and the surround delimiters take it as a literal character:
+    /// mapped, `fx` would find whatever `x` maps to. vim calls these states
+    /// "pending an argument".
     pub fn wants_raw_key(&self) -> bool {
         !matches!(self.pending, Pending::None)
     }
 
-    /// Which mode's mappings apply right now. Normal and visual share
-    /// this machine, so the answer is a property of its state rather
-    /// than of the caller.
+    /// Which mode's mappings apply. Normal and Visual share this machine, so
+    /// it's a property of its state.
     pub fn keymap_mode(&self) -> &'static str {
         if self.visual_anchor().is_some() { "visual" } else { "normal" }
     }
 
-    /// Enters Visual mode: called by a caller that just received
-    /// `KeyOutcome::EnterVisual(shape)`, with the buffer's own current
-    /// cursor as `anchor`.
+    /// Enters Visual mode on `KeyOutcome::EnterVisual`, with the cursor as
+    /// `anchor`.
     pub fn begin_visual(&mut self, shape: RegisterShape, anchor: (usize, usize)) {
         self.visual = Some((shape, anchor));
     }
 
-    /// Leaves Visual mode -- called by a caller once it's done whatever it
-    /// needed the anchor for (committing a selection, yanking, or
-    /// cancelling). `cursor` is the buffer's own current cursor at the
-    /// moment Visual mode ends -- stashed (alongside the shape/anchor
-    /// already known) as `last_visual`, so `gv` can restore the exact
-    /// same selection later. Stashed even when leaving via Escape/cancel,
-    /// matching vim: `gv` reselects the last Visual selection regardless
-    /// of how it ended.
+    /// Leaves Visual mode once the caller is done with the anchor. `cursor`
+    /// is stashed with the shape and anchor as `last_visual` for `gv`, even
+    /// on Escape, as in vim.
     pub fn end_visual(&mut self, cursor: (usize, usize)) {
         if let Some((shape, anchor)) = self.visual.take() {
             self.last_visual = Some((shape, anchor, cursor));
         }
     }
 
-    /// `gv`'s own target, if any -- the shape/anchor/cursor of the last
-    /// Visual selection, however it most recently ended. `None` before any
-    /// Visual selection has ever ended yet. See `KeyOutcome::ReselectVisual`'s
-    /// own doc comment for how a caller uses this.
+    /// `gv`'s target: the last Visual selection; `None` before one has ended.
     pub fn last_visual(&self) -> Option<VisualSelection> {
         self.last_visual
     }
 
-    /// Records `pos` (the cursor's own position right before a
-    /// `motion::is_jump` motion is about to run) as a jump-list entry --
-    /// called by a caller ahead of applying such a motion (this crate
-    /// never touches a `Buffer` itself). Discards any `jump_forward`
-    /// history, same as a browser's own back/forward stack does once you
-    /// navigate somewhere new instead of pressing "forward".
+    /// Records `pos`, the cursor before a `motion::is_jump` motion runs, and
+    /// discards the forward history, as a browser does on new navigation.
     pub fn push_jump(&mut self, pos: (usize, usize)) {
         self.jump_back.push(pos);
         self.jump_forward.clear();
     }
 
-    /// `Ctrl-O`: steps one entry back through the jump list, if there is
-    /// one. `current` (the cursor's own position right now) is pushed onto
-    /// `jump_forward` so a following `Ctrl-I` can return here.
+    /// `Ctrl-O`: one entry back, if any. `current` goes onto the forward
+    /// stack so `Ctrl-I` can return.
     pub fn jump_back(&mut self, current: (usize, usize)) -> Option<(usize, usize)> {
         let target = self.jump_back.pop()?;
         self.jump_forward.push(current);
         Some(target)
     }
 
-    /// `Ctrl-I` (same raw byte as Tab -- see this crate's own `feed_fresh`
-    /// doc comment on why Normal mode can safely claim it): the mirror of
+    /// `Ctrl-I`, the same byte as Tab (see `feed_fresh`): the mirror of
     /// `jump_back`.
     pub fn jump_forward(&mut self, current: (usize, usize)) -> Option<(usize, usize)> {
         let target = self.jump_forward.pop()?;
@@ -837,86 +752,53 @@ impl VimKeys {
         Some(target)
     }
 
-    /// Takes (consuming) whatever register a `"x` prefix selected, if any.
-    /// `feed()` already applies this itself for any outcome it resolves
-    /// internally (an `Operator`/`Put`/...); this exists for a caller that
-    /// wants to consume it *without* going through `feed()` at all -- e.g.
-    /// repl.rs's own Visual-mode `y` handling, which intercepts the key
-    /// itself (see `is_idle`'s own doc comment for why) rather than
-    /// feeding it through here.
+    /// Takes the register a `"x` prefix selected. `feed()` applies it to
+    /// outcomes it resolves; this is for a caller that handles a key itself,
+    /// like repl.rs's Visual `y`.
     pub fn take_pending_register(&mut self) -> Option<char> {
         self.pending_register.take()
     }
 
-    /// Whether this is a genuinely fresh dispatch point right now -- no
-    /// in-progress count, sub-prefix (`f`/`g`/`m`/a search being typed/...),
-    /// or armed operator. A caller wanting to intercept a key *itself*,
-    /// ahead of `feed()` (repl.rs already does this for `Z`/`:` -- window
-    /// management and quit aren't things this crate should own, per its
-    /// own module doc comment; Visual mode's `y`/Escape join them for the
-    /// same reason: "are there committed selections" is state this crate
-    /// deliberately never sees), needs this first -- otherwise a target
-    /// character mid `f`/`F`/`t`/`T`, or a count digit, could be wrongly
-    /// stolen instead of reaching its own sub-prefix handler.
+    /// Whether this is a fresh dispatch point: no count, no pending prefix,
+    /// no armed operator. A caller handling a key itself before `feed()`
+    /// (repl.rs does for `Z`, `:` and Visual `y`/Escape) checks this first,
+    /// or it could steal an `f` target or a count digit.
     pub fn is_idle(&self) -> bool {
         matches!(self.pending, Pending::None) && self.count.is_none() && self.active_operator.is_none()
     }
 
-    /// `is_idle`, minus the count check -- `@`'s own gate. Unlike the
-    /// `is_idle()`-gated commands (`Z`/`S`/...), which silently discard a
-    /// count typed in front of them, `[count]@a` is a real repeat count
-    /// (see `take_count`), so `@` needs to still be recognized while one
-    /// is buffered.
+    /// `is_idle` without the count check, for `@`: `[count]@a` repeats, so
+    /// `@` must work with a count buffered (see `take_count`).
     pub fn is_idle_except_count(&self) -> bool {
         matches!(self.pending, Pending::None) && self.active_operator.is_none()
     }
 
-    /// Takes (consuming) whatever count had accumulated, if any -- `@`'s
-    /// own counterpart to `take_pending_register`, for a caller
-    /// intercepting a key ahead of `feed()` the same way (see
-    /// `is_idle_except_count`'s own doc comment).
+    /// Takes the accumulated count, for a caller handling `@` itself.
     pub fn take_count(&mut self) -> Option<usize> {
         self.count.take()
     }
 
-    /// Whether a `q{reg}`/`qA-Z` recording is currently in progress, and
-    /// which register (always lowercase) it's recording into.
+    /// The register being recorded into (lowercase), if recording.
     pub fn is_recording(&self) -> Option<char> {
         self.recording.as_ref().map(|(reg, _)| *reg)
     }
 
-    /// `q{reg}`: starts recording into `reg` (lowercased). An uppercase
-    /// `reg` seeds the recording with whatever that lowercase register
-    /// already held, so the new keys land after it rather than replacing
-    /// it -- vim's own append convention. A `start_recording` call while
-    /// already recording (shouldn't happen -- the host only calls this
-    /// when `is_recording()` was already `None`) just restarts cleanly
-    /// rather than nesting, since there's no sensible way to record two
-    /// registers from the same keystream at once.
+    /// `q{reg}`: starts recording into `reg`, lowercased. An uppercase `reg`
+    /// starts from the register's existing keys, so new ones append, as in
+    /// vim. Called while recording, it restarts rather than nesting.
     pub fn start_recording(&mut self, reg: char) {
         let lower = reg.to_ascii_lowercase();
         let seed = if reg.is_ascii_uppercase() { self.macros.get(&lower).cloned().unwrap_or_default() } else { Vec::new() };
         self.recording = Some((lower, seed));
     }
 
-    /// Bare `q` while recording: stops it, saving whatever was captured
-    /// (the stop key itself is never included -- the host never calls
-    /// `record_key` for it, see `next_key`'s own doc comment). A no-op if
-    /// nothing was recording.
+    /// Bare `q` while recording: stops and saves. A no-op when not recording.
     pub fn stop_recording(&mut self) {
         if let Some((reg, mut keys)) = self.recording.take() {
-            // Drop the `q` that ended the recording. `record_key`'s own
-            // doc comment says the host consumes that key before it can
-            // ever be recorded, and that used to be true -- but reading
-            // now goes through `next_key`/`next_command_key`, which
-            // record every key they read, including this one, well
-            // before the host decides what it means.
-            //
-            // A recorded stop key is not a cosmetic surplus: replaying
-            // the macro re-runs it, which starts a *new* recording, and
-            // that recording then swallows the next keystroke as its
-            // register name. `@a@a` lost its second `@` that way, and
-            // `@a` followed by anything at all lost that too.
+            // Drop the `q` that stopped the recording: `next_key` records
+            // every key it reads, this one included. Replaying it would
+            // start a new recording that swallows the next key as its
+            // register name.
             if keys.last() == Some(&Key::Char('q')) {
                 keys.pop();
             }
@@ -924,32 +806,19 @@ impl VimKeys {
         }
     }
 
-    /// Appends `key` to the in-progress recording, if any. Called by
-    /// `next_key` for every key it actually reads from the terminal --
-    /// never for one served from `replay_queue`, and never for the `q`
-    /// that stops a recording (the host consumes that one itself before
-    /// it ever reaches here). `pub(crate)` rather than private: a test
-    /// wanting to seed a macro's exact content without a real terminal to
-    /// read from (`fileeditor.rs`'s own macro_tests, driving a real
-    /// `run_insert_mode` call) calls this directly instead of routing
-    /// through `next_key`'s own real-read fallback.
+    /// Appends `key` to the recording, if any. Called by `next_key` for keys
+    /// read from the terminal, never for replayed ones. `pub(crate)` so
+    /// fileeditor.rs's macro tests can seed a macro without a terminal.
     pub(crate) fn record_key(&mut self, key: Key) {
         if let Some((_, keys)) = &mut self.recording {
             keys.push(key);
         }
     }
 
-    /// `@{reg}`/`@@`: queues `reg`'s recorded keys (repeated `count`
-    /// times) to be replayed via `next_key`, ahead of anything already
-    /// queued -- so a macro invoked from *within* another macro's own
-    /// replay plays out immediately, before the outer macro's remaining
-    /// keys. `reg == '@'` means "whatever `@` last targeted" (`@@`);
-    /// anything else becomes the new such target. Returns `false` (and
-    /// queues nothing) if `reg` doesn't resolve to a real, non-empty
-    /// register -- `@@` with nothing recorded yet, or `@x` for a letter
-    /// never recorded into -- matching this codebase's existing "quietly
-    /// no-op an invalid sequence" convention (e.g. a failed `f`) rather
-    /// than surfacing an error.
+    /// `@{reg}`/`@@`: queues the register's keys, `count` times, ahead of
+    /// anything queued, so a macro invoked inside another's replay runs at
+    /// once. `'@'` means the last register `@` used. `false`, queueing
+    /// nothing, for an empty or unknown register, quietly, like a failed `f`.
     pub fn queue_macro_replay(&mut self, reg: char, count: usize) -> bool {
         let target = if reg == '@' { self.last_macro_register } else { Some(reg.to_ascii_lowercase()) };
         let Some(target) = target else { return false };
@@ -963,46 +832,26 @@ impl VimKeys {
         true
     }
 
-    /// Puts `keys` at the front of the replay queue, so the host's own
-    /// next reads see them as if they had been typed. `:normal`'s own
-    /// entry point, and the same mechanism `@{reg}` and `.` use.
+    /// Puts `keys` at the front of the replay queue, so the host's next reads
+    /// see them as typed. Used by `:normal`, `@{reg}` and `.`.
     pub fn queue_keys(&mut self, keys: impl DoubleEndedIterator<Item = Key>) {
         for key in keys.rev() {
             self.replay_queue.push_front(key);
         }
     }
 
-    /// The one seam every host-level key read goes through (the main
-    /// per-iteration read, every lookahead read like `S`'s delimiter or
-    /// `Z`'s second `Z`, and `fileeditor::run_insert_mode`'s own read) --
-    /// what makes macro recording/replay work without either host loop
-    /// needing its own bespoke bookkeeping. Serves a queued replay key
-    /// first, if any (`queue_macro_replay` populated it) -- a replayed
-    /// key is never re-recorded, since it's already part of whatever
-    /// produced it (this is also what keeps a macro that itself invokes
-    /// another, e.g. `@b` typed while recording `a`, correct: the two
-    /// *literal* keystrokes `@`/`b` that triggered it get recorded into
-    /// `a`, not `b`'s own expansion). Otherwise calls `read` (a real
-    /// terminal read) and records whatever it returns.
-    /// Installs this session's `::bish map` table. Snapshotted when
-    /// normal mode is entered and refreshed after a command-mode
-    /// command, the same rule `color_overrides` follows here: `::bish
-    /// map` is reachable from the colon line, and a table captured once
-    /// for a whole navigation session would go stale the moment someone
-    /// changed it and expected to see the difference.
+    /// Installs this session's `::bish map` table, on entering Normal mode
+    /// and after each command-mode command, since `::bish map` can change
+    /// it from the colon line.
     pub fn set_mappings(&mut self, mappings: Vec<crate::keymap::Mapping>) {
         self.matcher = crate::keymap::Matcher::new(mappings);
     }
 
-    /// How many characters the caller must remove before dispatching
-    /// the key just returned.
-    ///
-    /// Insert mode types a mapping's prefix as it arrives rather than
-    /// holding it, so `j` shows the instant it is pressed. When the
-    /// sequence turns out to be `jk`, those characters have to come
-    /// back off before the mapping fires. Nothing is left in the undo
-    /// tree by the round trip: an Insert session is one undo step, so a
-    /// character typed and removed inside it is invisible to `u`.
+    /// How many characters the caller must remove before dispatching the
+    /// key just returned. Insert mode shows a mapping's prefix as it's
+    /// typed, so when `j` turns out to be `jk` it has to come back off. An
+    /// Insert session is one undo step, so this leaves nothing in the undo
+    /// tree.
     pub fn take_pending_revert(&mut self) -> usize {
         std::mem::take(&mut self.pending_revert)
     }
@@ -1137,6 +986,12 @@ impl VimKeys {
         key
     }
 
+    /// The seam every host key read goes through (the main read, lookahead
+    /// reads like `S`'s delimiter or `Z`'s second `Z`, and
+    /// `fileeditor::run_insert_mode`'s), so macros need no bookkeeping in
+    /// the hosts. A queued replay key is served first and never recorded:
+    /// recording `@b` inside macro `a` records the keys `@` and `b`, not
+    /// `b`'s expansion. Otherwise it calls `read` and records the key.
     pub fn next_key(&mut self, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         let key = match self.replay_queue.pop_front() {
             Some(key) => Some(key),
