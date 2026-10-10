@@ -1,15 +1,5 @@
-//! A temp directory that removes itself.
-//!
-//! Tests here name their scratch directories after the process id and
-//! delete them on the way out. Two never did at all -- so every run of
-//! the suite left one behind for good -- and the rest only delete on
-//! the success path, which a panicking test does not take. Six and a
-//! half thousand of them had collected under /tmp.
-//!
-//! Dropping is the fix for both: it runs when the test returns *and*
-//! while a panic unwinds, and it is one line at the call site rather
-//! than a cleanup that has to be repeated on every early return. A
-//! killed process is beyond reach either way.
+//! A temp directory that removes itself on drop: when a test returns and
+//! when a panic unwinds, which cleanup at the end of a test misses.
 
 #![cfg(test)]
 
@@ -20,14 +10,10 @@ pub(crate) struct TempDir {
 }
 
 impl TempDir {
-    /// A fresh directory under the system temp dir, named for `tag`,
-    /// this process, and a counter.
-    ///
-    /// The counter is not decoration. Tests run in parallel threads of
-    /// one process, so a name built from the tag and the pid alone is
-    /// shared by every test using that tag -- and the first one to
-    /// finish would delete the directory the others are still working
-    /// in. Every guard owns a directory nothing else can name.
+    /// A fresh directory under the system temp dir, named for `tag`, this
+    /// process and a counter. Tests run as threads of one process, so tag
+    /// and pid alone would be shared, and the first to finish would delete
+    /// the others' directory.
     pub(crate) fn new(tag: &str) -> TempDir {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -41,7 +27,7 @@ impl TempDir {
         &self.path
     }
 
-    /// `path().join(name)`, for the common case of one file in it.
+    /// `path().join(name)`, for one file in it.
     pub(crate) fn join(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
@@ -57,9 +43,7 @@ impl Drop for TempDir {
 mod tests {
     use super::TempDir;
 
-    /// The directory goes away when the test *panics*, not only when it
-    /// returns -- which is the half that was leaking, and the reason
-    /// this is a `Drop` rather than a line at the end of each test.
+    /// The directory goes even when the test panics.
     #[test]
     fn a_panicking_test_still_loses_its_directory() {
         let path = {
