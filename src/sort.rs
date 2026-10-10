@@ -1,34 +1,18 @@
-//! Every sort in bish, compiled once.
+//! Sorting with the sort algorithm compiled once.
 //!
-//! The standard library's slice sort is generic over the comparison as
-//! well as the element: each call site's closure is a type of its own,
-//! so each one gets its own copy of the whole algorithm -- run detection,
-//! quicksort, merges, small-sort networks. Measured on 2026-10-10 that
-//! was 265 functions and 131 KiB, 7% of the browser build's code, for 45
-//! call sites sorting a few dozen things each.
+//! `slice::sort_by` is instantiated per closure type, so every call site
+//! carries its own copy of the whole algorithm. These sort a vector of
+//! indices through a `dyn` comparator instead, then permute the elements
+//! into that order. Stable, like `slice::sort`.
 //!
-//! Here the algorithm runs on positions instead. `order` sorts the
-//! indices `0..len` through a `dyn` comparator, so the standard sort is
-//! instantiated exactly once, for `usize`; then the elements are moved
-//! into that order in place. What each call site still compiles is the
-//! closure that compares two positions and the cycle-following that
-//! applies the order -- a few hundred bytes rather than several
-//! kilobytes. The cost is an index vector and an indirect call per
-//! comparison, which nothing bish sorts is large enough to notice.
-//!
-//! Stable, like `slice::sort`: indices start in their original order and
-//! the sort that orders them is stable, so equal elements keep theirs.
-//! Use these and not the slice methods -- the guard test at the bottom
-//! fails the build when a slice sort appears anywhere else.
+//! The guard test at the bottom fails if a slice sort appears anywhere else.
 
 use std::cmp::Ordering;
 
-/// Sorts `items` ascending.
 pub(crate) fn sort<T: Ord>(items: &mut [T]) {
     sort_by(items, |a, b| a.cmp(b));
 }
 
-/// Sorts `items` by `compare`, keeping equal elements in their order.
 pub(crate) fn sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
     if items.len() < 2 {
         return;
@@ -40,34 +24,26 @@ pub(crate) fn sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ord
     apply(items, order);
 }
 
-/// Sorts `items` by the key `key` gives each, keeping equal keys in
-/// their order.
 pub(crate) fn sort_by_key<T, K: Ord>(items: &mut [T], mut key: impl FnMut(&T) -> K) {
     sort_by(items, |a, b| key(a).cmp(&key(b)));
 }
 
-/// A `BTreeMap` built by inserting, rather than by `collect()`.
-///
-/// Collecting into a `BTreeMap` sorts the input first -- with the slice
-/// sort, instantiated for that element type -- and only then builds the
-/// tree. Inserting one at a time keeps the map ordered anyway and never
-/// sorts anything; for the sizes bish builds maps of, the difference in
-/// speed is not measurable.
+/// Builds a `BTreeMap` by inserting; `collect()` would sort the input
+/// first, with the slice sort instantiated for its element type.
 pub(crate) fn btree_map<K: Ord, V>(items: impl IntoIterator<Item = (K, V)>) -> std::collections::BTreeMap<K, V> {
     let mut map = std::collections::BTreeMap::new();
     map.extend(items);
     map
 }
 
-/// A `BTreeSet` built by inserting, for the same reason as `btree_map`.
+/// Builds a `BTreeSet` by inserting, for the same reason as `btree_map`.
 pub(crate) fn btree_set<T: Ord>(items: impl IntoIterator<Item = T>) -> std::collections::BTreeSet<T> {
     let mut set = std::collections::BTreeSet::new();
     set.extend(items);
     set
 }
 
-/// The one instantiation of the standard sort: positions, compared
-/// through whatever the caller says about the elements at them.
+/// The one instantiation of the standard sort.
 #[inline(never)]
 fn order(len: usize, compare: &mut dyn FnMut(usize, usize) -> Ordering) -> Vec<usize> {
     let mut order: Vec<usize> = (0..len).collect();
@@ -75,13 +51,8 @@ fn order(len: usize, compare: &mut dyn FnMut(usize, usize) -> Ordering) -> Vec<u
     order
 }
 
-/// Moves `items` so that position `i` holds what was at `order[i]`.
-///
-/// Each cycle of the permutation is walked once, swapping as it goes:
-/// starting at `i`, swapping `i` with `order[i]` puts the right element
-/// at `i` and carries the displaced one forward to where the cycle needs
-/// it next. A visited position is marked so its cycle is not walked
-/// twice.
+/// Moves `items` so that position `i` holds what was at `order[i]`,
+/// walking each cycle of the permutation once.
 fn apply<T>(items: &mut [T], mut order: Vec<usize>) {
     const DONE: usize = usize::MAX;
     for start in 0..items.len() {
@@ -102,7 +73,7 @@ fn apply<T>(items: &mut [T], mut order: Vec<usize>) {
 mod tests {
     use super::*;
 
-    /// A small deterministic generator, so a failure reproduces.
+    /// Deterministic, so a failure reproduces.
     fn numbers(seed: u64, count: usize, range: u64) -> Vec<u64> {
         let mut state = seed;
         (0..count)
@@ -128,8 +99,7 @@ mod tests {
 
     #[test]
     fn equal_elements_keep_their_order() {
-        // Sorted by key alone, the second field records where each one
-        // started -- a stable sort leaves those ascending within a key.
+        // The second field is each element's original position.
         let keys = numbers(9, 300, 7);
         let mut tagged: Vec<(u64, usize)> = keys.iter().copied().zip(0..).collect();
         sort_by_key(&mut tagged, |&(key, _)| key);
@@ -145,21 +115,10 @@ mod tests {
         assert_eq!(words, ["pear", "fig", "apple", "apple"]);
     }
 
-    /// The point of this module is that there is one copy of the sort in
-    /// the binary; a slice sort anywhere else brings its own back. Read
-    /// as text, like `platform::os_guard`, skipping test modules wherever
-    /// they sit in a file -- test code is not in the binary, and may sort
-    /// however it likes. (An earlier version stopped at a file's *first*
-    /// test module, and three sorts after one in exec.rs and repl.rs went
-    /// unseen.)
-    ///
-    /// What this cannot see is a `collect()` into a `BTreeMap` or
-    /// `BTreeSet`, which sorts too but names no sort at the call site --
-    /// those go through `btree_map` / `btree_set` above by convention.
-    ///
-    /// `self.sort()` is not a slice method in this codebase (it is
-    /// `Folds::sort`, which itself sorts through here), so a call on
-    /// `self` is let through.
+    /// Reads the source as text, skipping test modules. `self.sort()` is
+    /// let through because it is `Folds::sort`. A `collect()` into a
+    /// B-tree sorts too but can't be seen here; that's what `btree_map` and
+    /// `btree_set` are for.
     #[test]
     fn nothing_outside_this_module_uses_a_slice_sort() {
         let methods = ["sort", "sort_by", "sort_by_key", "sort_by_cached_key", "sort_unstable", "sort_unstable_by", "sort_unstable_by_key"];
@@ -180,9 +139,8 @@ mod tests {
                 let mut in_tests = false;
                 let mut previous = "";
                 for (number, line) in source.lines().enumerate() {
-                    // A test module's body runs from `#[cfg(test)]` /
-                    // `mod name {` to the `}` rustfmt puts alone in the
-                    // first column -- skipped, wherever in the file it is.
+                    // A test module runs from `#[cfg(test)]` + `mod name {`
+                    // to the `}` rustfmt puts alone in column 1.
                     if !in_tests && previous.trim() == "#[cfg(test)]" && line.trim_start().starts_with("mod ") && line.trim_end().ends_with('{') {
                         in_tests = true;
                     }
