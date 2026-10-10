@@ -13202,8 +13202,8 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
                         }
                         clear_cloexec(*fd);
                     }
-                    // See the same arm in apply_fds_to_self: closing a
-                    // descriptor nothing opened is a no-op.
+                    // Closing an unopened descriptor is fine, as in
+                    // `apply_fds_to_self`.
                     FdAction::Close(fd) => crate::platform::close_fd(*fd),
                 }
             }
@@ -13212,49 +13212,20 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
     }
 }
 
-// Here-strings need a real Stdio for the child process; simplest portable
-// way to hand it literal content is a temp file, unlinked immediately after
-// opening (the open fd keeps the data alive on unix even once unlinked).
-
-// A capture buffer for `$( )` that never touches a filesystem.
-//
-// The child of a command substitution runs *in this process*, but it may
-// still spawn a real external command, which needs a real file descriptor
-// to write into -- so an in-memory `OutputSink` alone is not enough, and a
-// pipe would deadlock the moment the output outgrew the pipe buffer with
-// nobody on the read end. `platform::anonymous_file` gives both: a real
-// fd with no name, no directory entry and nothing to unlink, which on
-// Linux is `memfd_create(2)`.
-//
-// That replaces, per substitution, an open(O_CREAT) in $TMPDIR, the
-// directory-entry write it implies, and an unlink -- measured at ~23us of
-// a ~63us `x=$(printf hi)` on tmpfs, and considerably worse when $TMPDIR
-// is a real disk. (macOS has no such call and pays for the directory
-// entry either way; see that function's own note.) Falls back to a named
-// temp file where there is no anonymous one to be had at all.
-/// One stream of a child's output, held wherever this kernel lets it be
-/// held: an anonymous file where there is one, a named temp file where
-/// there is not. The same two-way choice `run_command_substitution`
-/// makes inline -- given a name here because a filter needs two of them
-/// and writing that dance twice more would be three copies.
+/// One stream of a child's output: an anonymous file where there is one,
+/// a named temp file where not, as `run_command_substitution` chooses.
+/// A filter needs two.
 struct Captured {
-    /// The only handle on the stream. Anonymous, or a named file whose
-    /// name is kept solely so it can be removed afterwards.
+    /// The only handle on the stream. A named file's name is kept only to
+    /// remove it.
     file: std::fs::File,
     path: Option<std::path::PathBuf>,
 }
 
 impl Captured {
     fn open() -> std::io::Result<Captured> {
-        // An anonymous file where the kernel gives one, and a named file
-        // created with O_EXCL where it does not. Either way what is kept
-        // is the *descriptor*: this used to keep only the fallback's
-        // path and then open it again by name, twice -- once to hand the
-        // child a writer and once to read the answer back -- and each of
-        // those was a name another user could have replaced with a
-        // symlink in between. A descriptor cannot be redirected after
-        // the fact, so the path that remains is only something to
-        // remove.
+        // Either way the descriptor is kept, and a named file is never opened
+        // again by name, where another user could have swapped in a symlink.
         match capture_file() {
             Some(f) => Ok(Captured { file: f, path: None }),
             None => {
@@ -13264,8 +13235,7 @@ impl Captured {
         }
     }
 
-    /// The handle to hand the child. Separate from the one kept here,
-    /// since reading the result back needs its own cursor.
+    /// The child's handle, separate so reading back has its own cursor.
     fn writer(&self) -> std::io::Result<std::fs::File> {
         self.file.try_clone()
     }
@@ -13279,11 +13249,14 @@ impl Captured {
     }
 }
 
+// A capture file for `$( )` with no name: a `memfd` on Linux. The child
+// runs in this process but may spawn an external command, which needs a
+// real fd, and a pipe would deadlock once output outgrew its buffer
+// with nobody reading. `None` where there's no anonymous file.
 fn capture_file() -> Option<std::fs::File> {
     crate::platform::anonymous_file()
 }
 
-// Reads back everything written to a `capture_file`, from the start.
 fn read_capture(mut f: std::fs::File) -> String {
     use std::io::{Read, Seek, SeekFrom};
     if f.seek(SeekFrom::Start(0)).is_err() {
@@ -13296,68 +13269,28 @@ fn read_capture(mut f: std::fs::File) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// A here-document's body, as a descriptor a command can read.
-///
-/// An anonymous file -- the same `capture_file` uses, which is a
-/// `memfd` on Linux and an immediately-unlinked file on macOS. It has no
-/// name at any point, which is the whole reason to use it here.
-///
-/// What this replaced wrote `$TMPDIR/bish-herestring-<pid>-<counter>`
-/// with `fs::write` and then re-opened it *by that name*. Every part of
-/// that was a hazard on a shared `/tmp`: the name was predictable from
-/// `/proc`, `fs::write` follows a symlink, so a pre-planted one let any
-/// local user have a here-doc truncate and overwrite any file its
-/// author could write; and the gap between the write and the re-open
-/// let the same user substitute the file the command then read as its
-/// stdin. Demonstrated, not theorised: a symlink planted at that name
-/// overwrote a file of 25 bytes with the here-doc's body.
-///
-/// A name with `O_EXCL` behind it would have closed the symlink half --
-/// `platform::unlinked_temp_file` has done exactly that, next door, the
-/// whole time -- but no name at all closes both halves and there is
-/// nothing left to race.
+/// A here-document's body as a readable descriptor: an anonymous file
+/// (`capture_file`), so there's never a name on a shared `/tmp` for
+/// another user to plant a symlink at or swap.
 fn here_string_file(content: &str) -> Result<std::fs::File, String> {
     use std::io::{Seek, SeekFrom, Write};
     let mut f = crate::platform::anonymous_file().ok_or_else(|| "here-string: no temporary file available".to_string())?;
     f.write_all(content.as_bytes()).map_err(|e| format!("here-string: {}", e))?;
-    // The command reads from the start; this descriptor is sitting at
-    // the end of what was just written.
+    // The command reads from the start; this descriptor is at the end.
     f.seek(SeekFrom::Start(0)).map_err(|e| format!("here-string: {}", e))?;
     Ok(f)
 }
 
-// `/dev/tcp/HOST/PORT` and `/dev/udp/HOST/PORT`: real bash's own special
-// pseudo-device redirect targets (`exec 3<>/dev/tcp/host/80`, most
-// commonly) -- recognized here rather than treated as real filesystem
-// paths, matching bash itself (these usually don't exist as real files
-// at all, and even on a system where /dev/tcp really is populated by a
-// kernel module, depending on that would be OS-specific in a way this
-// project doesn't want). `None` for anything that isn't exactly this
-// shape, so every caller (open_in/open_out) falls through to an
-// ordinary file open unchanged. No new dependency needed: on Unix, a
-// connected TcpStream/UdpSocket and a plain File are both just thin
-// wrappers around one real OS file descriptor supporting the same
-// read()/write() -- converting one into the other via its raw fd
-// (IntoRawFd/FromRawFd) is exactly what real bash's own C
-// implementation does under the hood too (a real socket fd, dup2'd like
-// any other).
 // `exec [-cl] [-a name] [command [argument ...]] [redirection ...]`.
-//
-// Three outcomes, because bash's own `exec` has three: run a command
-// (with argv[0] and the environment possibly rewritten), fail on a bad
-// option, or -- when no command word survives the options -- do nothing
-// but apply the redirects to this shell. That last case includes
-// `exec -a foo` with no command, which real bash accepts silently and
-// treats exactly like a bare `exec`.
+// `exec -a foo` with no command is a bare `exec`, as in bash.
 struct ExecFlags {
-    // `-a NAME`: argv[0] the new process sees, instead of the path.
+    // `-a NAME`: the argv[0] the new process sees.
     arg0: Option<String>,
-    // `-c`: start it with an empty environment.
+    // `-c`: an empty environment.
     clear_env: bool,
-    // `-l`: prefix argv[0] with a dash, the convention a login shell
-    // looks for.
+    // `-l`: a dash before argv[0], which a login shell looks for.
     login: bool,
-    // Index in argv of the command word.
+    // Index of the command word in argv.
     first: usize,
 }
 
@@ -13382,8 +13315,8 @@ fn parse_exec_opts(argv: &[String]) -> ExecOpts {
             match c {
                 'c' => flags.clear_env = true,
                 'l' => flags.login = true,
-                // Like getopt's `a:`, the value may be glued on
-                // (`-afoo`) or the next word (`-a foo`).
+                // The value may be glued on (`-afoo`) or the next word, as
+                // with getopt's `a:`.
                 'a' => {
                     let glued: String = chars.by_ref().collect();
                     if !glued.is_empty() {
@@ -13408,15 +13341,9 @@ fn parse_exec_opts(argv: &[String]) -> ExecOpts {
     ExecOpts::Run(flags)
 }
 
-// A builtin handed an option it does not have. bash's shape exactly:
-// the complaint, then that builtin's own usage line -- which is the
-// half that answers the question -- and status 2. Silently ignoring an
-// unknown option, which is what this shell used to do everywhere, turns
-// a typo into a behaviour change nobody sees.
-// The first `-X` in `args` whose letters aren't all in `accepted`,
-// spelled the way bash reports it (`-z`, one letter, even when it came
-// from a cluster). `--` ends the options, and a lone `-` is an operand
-// rather than an option, both as everywhere else.
+// The first `-X` in `args` with a letter not in `accepted`, as bash
+// reports it (one letter, even from a cluster). `--` ends options and a
+// lone `-` is an operand.
 pub(crate) fn first_unknown_option(args: &[String], accepted: &str) -> Option<String> {
     for a in args {
         if a == "--" {
@@ -13432,16 +13359,17 @@ pub(crate) fn first_unknown_option(args: &[String], accepted: &str) -> Option<St
     None
 }
 
+// A builtin given an option it doesn't have: the complaint, the
+// builtin's usage line and status 2, as bash does.
 pub(crate) fn bad_option_status(sh: &mut Shell, who: &str, opt: &str, usage: &str) -> i32 {
     sh_eprintln!(sh, "bish: {}: {}: invalid option", who, opt);
     sh_eprintln!(sh, "{}: usage: {}", who, usage);
     2
 }
 
-// Rust's `io::Error` Display appends " (os error N)". No shell prints
-// that, and a script that greps a message for "No such file or
-// directory" should not have to know about it -- this is the same text
-// without the tail, which is what strerror(3), and so bash, gives.
+// `io::Error`'s message without Rust's " (os error N)", as strerror
+// and bash give it, so a script can grep for "No such file or
+// directory".
 pub(crate) fn os_message(e: &std::io::Error) -> String {
     let text = e.to_string();
     match text.rfind(" (os error ") {
@@ -13450,6 +13378,9 @@ pub(crate) fn os_message(e: &std::io::Error) -> String {
     }
 }
 
+// `/dev/tcp/HOST/PORT` and `/dev/udp/HOST/PORT`, bash's socket redirect
+// targets, handled here rather than as paths. `None` for any other
+// path, which `open_in`/`open_out` then open normally.
 fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
     let (proto, rest) = path.strip_prefix("/dev/tcp/").map(|r| ("tcp", r)).or_else(|| path.strip_prefix("/dev/udp/").map(|r| ("udp", r)))?;
     let (host, port) = rest.split_once('/')?;
@@ -13459,20 +13390,9 @@ fn dev_socket_file(path: &str) -> Option<Result<std::fs::File, String>> {
     Some(connect_dev_socket(proto, host, port).map_err(|e| format!("{}: {}", path, os_message(&e))))
 }
 
-// A builtin's own output redirected onto an arbitrary already-open fd
-// (`>&3`/`2>&4`, most commonly a fd `exec N<>/dev/tcp/...` left open --
-// see push_builtin_output_sink's own `Redirect::FdDup` handling): `fd`
-// itself is owned/managed elsewhere (opened by `exec`'s own persistent
-// redirect, eventually closed by `exec N<&-`/FdClose), so this must not
-// end up closing it once this one builtin call's own sink is popped.
-// `dup()` (unlike `dup2`) always returns a brand-new fd number pointing
-// at the same open file description, safe to wrap in an ordinary File
-// (and let its own Drop close, same as any other Rc<RefCell<File>> this
-// sink already uses) without touching the original at all -- same "dup
-// aside, use the dup, close the dup" idiom save_fd012/restore_fd012
-// already use for a similar reason. `None` on a bad/closed fd (e.g. a
-// typo'd fd number) rather than erroring -- matches this codebase's
-// existing tolerance for a swallowed save/restore failure elsewhere.
+// A builtin's `>&3` onto a descriptor opened elsewhere (by `exec`). A
+// `dup`, so dropping the sink doesn't close the original. `None` for a
+// closed fd.
 fn dup_existing_fd(fd: i32) -> Option<std::fs::File> {
     crate::platform::duplicate_as_file(fd)
 }
@@ -13484,13 +13404,9 @@ fn connect_dev_socket(proto: &str, host: &str, port: &str) -> std::io::Result<st
         let stream = std::net::TcpStream::connect(&addr)?;
         return Ok(unsafe { std::fs::File::from_raw_fd(stream.into_raw_fd()) });
     }
-    // UDP's own connect() just records the peer address for subsequent
-    // send()/recv() (no handshake, unlike TCP) -- never blocks on an
-    // unreachable host; a real send is what would fail if nothing's
-    // listening. Bind a wildcard on whichever address family the target
-    // actually resolved to, not a hardcoded IPv4-only "0.0.0.0" -- an
-    // IPv6-only target would otherwise fail to connect for a reason
-    // that has nothing to do with the target itself.
+    // UDP's connect only records the peer, so it never blocks. The local
+    // bind matches the target's address family, so an IPv6-only target
+    // works.
     use std::net::ToSocketAddrs;
     let target = addr.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve host"))?;
     let bind_addr = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
@@ -13499,27 +13415,12 @@ fn connect_dev_socket(proto: &str, host: &str, port: &str) -> std::io::Result<st
     Ok(unsafe { std::fs::File::from_raw_fd(socket.into_raw_fd()) })
 }
 
-// Appends an expansion's value `v` to the in-progress word-split state.
-// Quoted values are never split (appended verbatim, like literal text).
-// Unquoted values are split on whitespace: interior separators end the
-// current field and start a new one; leading/trailing whitespace in `v`
-// forces a boundary even when the adjacent side has zero-or-one resulting
-// parts (e.g. `pre$x` where x=" y " must split into "pre" and "y", not
-// "prey"). A purely empty-or-whitespace unquoted value contributes nothing
-// (matching bash: an unquoted unset/empty variable standing alone
-// contributes zero arguments, not one empty one).
-// Real bash IFS semantics: a run of IFS-whitespace characters (IFS chars
-// that are also whitespace) collapses into a single delimiter and is
-// trimmed from the very start/end of the value; each occurrence of an
-// IFS *non*-whitespace character (e.g. ':') is its own separate delimiter,
-// significant even with nothing but another separator on either side (so
-// "a::b" with IFS=":" is three fields: "a", "", "b"). A whitespace run
-// immediately touching a non-whitespace separator on either side is
-// absorbed into that same delimiter ("a : b" with IFS=" :" is "a","b" --
-// not "a","","b"). Returns (parts, leading_sep, trailing_sep): the two
-// bools tell the caller whether the first/last part is a complete,
-// standalone field or should stitch onto whatever's pending from an
-// adjacent chunk (see append_splittable).
+// Splits `v` on IFS as bash does: a run of IFS whitespace is one
+// delimiter, trimmed at the ends; each other IFS character is a
+// delimiter of its own (`a::b` with `IFS=:` is `a`, ``, `b`), absorbing
+// adjacent whitespace (`a : b` with `IFS=" :"` is `a`, `b`). The bools
+// say whether `v` began or ended with a separator, so the caller knows
+// whether the edge parts join a neighbouring chunk.
 fn ifs_tokenize(v: &str, ifs: &str) -> (Vec<String>, bool, bool) {
     let is_ws = |c: char| c.is_whitespace() && ifs.contains(c);
     let is_sep = |c: char| ifs.contains(c);
@@ -13698,6 +13599,10 @@ fn close_field_even_if_empty(fields: &mut Vec<Field>, current: &mut Option<Field
     fields.push(current.take().unwrap_or_default().finish());
 }
 
+// Appends an expansion's value to the fields being built. Quoted, it's
+// literal text. Unquoted, it splits on IFS: leading or trailing
+// separators force a field boundary (`pre$x` with `x=" y "` is `pre`,
+// `y`), and a value that is all separators adds nothing.
 fn append_splittable(fields: &mut Vec<Field>, current: &mut Option<FieldBuilder>, v: &str, quoted: bool, ifs: &str) {
     if quoted {
         // One field, and never a pattern: quoting is exactly the thing
