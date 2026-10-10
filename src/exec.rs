@@ -17512,6 +17512,7 @@ pub fn bish_sub_subcommands(sub: &str) -> &'static [&'static str] {
         "hook" => &["ls", "add", "rm", "help"],
         "lsp" => &["ls", "add", "rm", "status", "log", "restart", "help"],
         "map" => &["--mode=", "--erase", "--list", "help"],
+        "trust" => &["--capabilities=", "--list", "--remove", "--check"],
         _ => &[],
     }
 }

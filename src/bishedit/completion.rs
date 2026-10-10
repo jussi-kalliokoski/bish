@@ -377,6 +377,14 @@ pub(crate) fn bish_candidates(args: &[String], prefix: &str, hl: &[String]) -> O
             // this cannot know; everything else is already complete.
             _ => Some(Vec::new()),
         },
+        // Only the flag forms are completed from the table; a directory
+        // or a capability is the user's to name, and the plain
+        // `::bish trust` with no flag takes a path, which the ordinary
+        // filename completion already offers.
+        "trust" => match rest {
+            [] => Some(rank(prefix, subs(sub))),
+            _ => Some(Vec::new()),
+        },
         _ => Some(Vec::new()),
     }
 }

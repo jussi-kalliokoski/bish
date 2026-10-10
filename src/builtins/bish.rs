@@ -14,7 +14,7 @@ use crate::exec::{
 // mean" beside it -- so a name added to a `match` below and forgotten
 // here shows up as a wrong error message rather than as a silently
 // unsuggestable command.
-const BISH_SUBCOMMANDS: &[&str] = &["theme", "window", "hook", "hl", "lsp", "map"];
+const BISH_SUBCOMMANDS: &[&str] = &["theme", "window", "hook", "hl", "lsp", "map", "trust"];
 const HOOK_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "help"];
 const LSP_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "status", "log", "restart", "help"];
 // `pub(crate)` so `exec::bish_sub_subcommands` can hand completion this
@@ -218,6 +218,7 @@ pub(crate) fn run_bish(sh: &mut Shell, args: &[String]) -> ExecResult {
         [sub, rest @ ..] if sub == "hl" => ExecResult::Status(run_hl(sh, rest)),
         [sub, rest @ ..] if sub == "lsp" => ExecResult::Status(run_lsp(sh, rest)),
         [sub, rest @ ..] if sub == "map" => ExecResult::Status(run_map(sh, rest)),
+        [sub, rest @ ..] if sub == "trust" => ExecResult::Status(run_trust(sh, rest)),
         [] => {
             sh_eprintln!(sh, "bish: ::bish: missing subcommand (expected: {})", listed(BISH_SUBCOMMANDS));
             ExecResult::Status(2)
@@ -226,6 +227,105 @@ pub(crate) fn run_bish(sh: &mut Shell, args: &[String]) -> ExecResult {
             let hint = crate::suggest::did_you_mean(other, BISH_SUBCOMMANDS.iter().copied());
             sh_eprintln!(sh, "bish: ::bish: unknown subcommand '{other}'{hint} (expected: {})", listed(BISH_SUBCOMMANDS));
             ExecResult::Status(2)
+        }
+    }
+}
+
+pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
+    let resolve = |sh: &Shell, dir: &str| -> std::path::PathBuf {
+        let p = std::path::Path::new(dir);
+        if p.is_absolute() { p.to_path_buf() } else { sh.cwd.join(p) }
+    };
+
+    match args.first().map(String::as_str) {
+        Some("--list") | Some("-l") => {
+            for entry in crate::trust::load() {
+                sh_println!(sh, "{}\t{}", entry.capabilities, entry.dir.display());
+            }
+            0
+        }
+        Some("--check") => {
+            let [_, capability, rest @ ..] = args else {
+                sh_eprintln!(sh, "bish: ::bish trust: --check: usage: ::bish trust --check CAPABILITY [DIR]");
+                return 2;
+            };
+            if rest.len() > 1 {
+                sh_eprintln!(sh, "bish: ::bish trust: --check takes one directory");
+                return 2;
+            }
+            let dir = resolve(sh, rest.first().map(String::as_str).unwrap_or("."));
+            // A predicate: silent, and the exit status is the answer --
+            // `::bish trust --check git && ...`, the way `test` is used.
+            i32::from(!crate::trust::is_trusted(&dir, capability))
+        }
+        Some("--remove") | Some("-r") => {
+            let default = [".".to_string()];
+            let dirs: &[String] = if args.len() > 1 { &args[1..] } else { &default };
+            let mut status = 0;
+            for dir in dirs {
+                let path = resolve(sh, dir);
+                match crate::trust::untrust(&path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        sh_eprintln!(sh, "bish: ::bish trust: {dir}: was not trusted");
+                        status = 1;
+                    }
+                    Err(e) => {
+                        sh_eprintln!(sh, "bish: ::bish trust: {e}");
+                        return 1;
+                    }
+                }
+            }
+            status
+        }
+        _ => {
+            // The default and the explicit `-c GLOB [DIR...]` form.
+            let mut capabilities = "*".to_string();
+            let mut dirs: Vec<String> = Vec::new();
+            let mut rest = args;
+            while let [head, tail @ ..] = rest {
+                match head.as_str() {
+                    "-c" | "--capabilities" => {
+                        let Some(glob) = tail.first() else {
+                            sh_eprintln!(sh, "bish: ::bish trust: {head}: requires a capability glob");
+                            return 2;
+                        };
+                        capabilities = glob.clone();
+                        rest = &tail[1..];
+                    }
+                    other if other.starts_with("--capabilities=") => {
+                        capabilities = other["--capabilities=".len()..].to_string();
+                        rest = tail;
+                    }
+                    other if other.starts_with('-') && other != "-" => {
+                        sh_eprintln!(sh, "bish: ::bish trust: unknown option '{other}'");
+                        return 2;
+                    }
+                    other => {
+                        dirs.push(other.to_string());
+                        rest = tail;
+                    }
+                }
+            }
+            if dirs.is_empty() {
+                dirs.push(".".to_string());
+            }
+            for dir in &dirs {
+                let path = resolve(sh, dir);
+                // A place you cannot name is a place you cannot have
+                // meant: trusting a directory that is not there is
+                // almost always a typo, and recording it would trust
+                // whatever later takes the name.
+                if !path.is_dir() {
+                    sh_eprintln!(sh, "bish: ::bish trust: {dir}: not a directory");
+                    return 1;
+                }
+                if let Err(e) = crate::trust::trust(&path, &capabilities) {
+                    sh_eprintln!(sh, "bish: ::bish trust: {e}");
+                    return 1;
+                }
+            }
+            0
         }
     }
 }
@@ -1180,5 +1280,86 @@ mod window_argument_tests {
     fn a_name_flag_with_no_name_is_an_error() {
         assert_eq!(parse_new_args(&args("--name")), Err("--name needs a name"));
         assert_eq!(parse_new_args(&args("--name -- make")), Err("--name needs a name"));
+    }
+}
+
+#[cfg(test)]
+mod trust_command_tests {
+    use super::*;
+    use crate::exec::Shell;
+
+    fn strs(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    // The builtin over a store of its own, so it touches neither the
+    // real trust file nor another test's. The store is keyed off the
+    // environment, so this serializes on its own lock and restores what
+    // it changed -- the shape session.rs's env-mutating tests use.
+    fn with_shell(body: impl FnOnce(&mut Shell, &std::path::Path)) {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = crate::tempdir::TempDir::new("trust-cmd");
+        let work = crate::tempdir::TempDir::new("trust-work");
+        let (saved_xdg, saved_home) = (std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"));
+        // SAFETY: under the lock, restored below.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+            std::env::remove_var("HOME");
+        }
+        let mut shell = Shell::new();
+        shell.cwd = work.path().to_path_buf();
+        body(&mut shell, work.path());
+        unsafe {
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match saved_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    // `--check` is the hook contract: silent, and the exit status is the
+    // whole of the answer, so a toolchain can write
+    // `::bish trust --check mise:env && setup`.
+    #[test]
+    fn check_is_a_silent_predicate_over_the_exit_status() {
+        with_shell(|sh, work| {
+            std::fs::create_dir_all(work.join("sub")).unwrap();
+            // Nothing trusted yet.
+            assert_eq!(run_trust(sh, &strs(&["--check", "git"])), 1);
+            // The default form trusts `.` -- bish's cwd -- for everything.
+            assert_eq!(run_trust(sh, &[]), 0);
+            assert_eq!(run_trust(sh, &strs(&["--check", "git"])), 0);
+            assert_eq!(run_trust(sh, &strs(&["--check", "anything"])), 0);
+            // and descends: a relative subdirectory resolves against cwd.
+            assert_eq!(run_trust(sh, &strs(&["--check", "git", "sub"])), 0);
+        });
+    }
+
+    // A capability glob narrows what a trust covers -- shown on a
+    // directory with no broader ancestor, since an ancestor trusted for
+    // `*` would cover everything under it regardless (trust descending,
+    // tested in the module itself).
+    #[test]
+    fn a_capability_glob_scopes_what_the_trust_covers() {
+        with_shell(|sh, work| {
+            std::fs::create_dir_all(work.join("tool")).unwrap();
+            assert_eq!(run_trust(sh, &strs(&["--capabilities=mise:*", "tool"])), 0);
+            assert_eq!(run_trust(sh, &strs(&["--check", "mise:env", "tool"])), 0);
+            assert_eq!(run_trust(sh, &strs(&["--check", "git", "tool"])), 1, "mise:* does not match git");
+        });
+    }
+
+    #[test]
+    fn trusting_a_nonexistent_directory_is_refused() {
+        with_shell(|sh, _work| {
+            assert_eq!(run_trust(sh, &strs(&["does-not-exist"])), 1);
+            // and nothing was recorded.
+            assert_eq!(run_trust(sh, &strs(&["--check", "git", "does-not-exist"])), 1);
+        });
     }
 }

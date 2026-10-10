@@ -64,6 +64,7 @@ mod time;
 mod toml;
 mod tool;
 mod toolpath;
+mod trust;
 mod url;
 #[cfg(test)]
 mod vimdiff;
