@@ -1,152 +1,106 @@
-// Command history: persisted to ~/.bish_history, one entry per file line
-// -- a stored entry's own newlines/backslashes are escaped so a
-// multi-line history entry, e.g. a whole recalled for-loop, round-trips
-// through the file as a single line rather than fragmenting on reload.
-// Each line an entry now carries its own metadata inline, ahead of the
-// command, in a shape that is still a runnable shell command; see
-// "The on-disk record format" below for what it looks like and why.
-// editor.rs is the only consumer of the search methods, driving fish-style
-// up/down: prefix-filtered rather than plain chronological recall.
+// Command history, persisted to ~/.bish_history one entry per line: an
+// entry's newlines and backslashes are escaped, so a recalled multi-line
+// loop stays one line. Each line carries its metadata inline, as a
+// runnable shell command (see "The on-disk record format" below).
+// editor.rs drives prefix-filtered Up/Down through the search methods.
 //
-// The file is bounded (the `history_size` bishopt, default 10,000
-// entries, dropped oldest-first). That bound is also the in-memory one,
-// since load() stops at it -- to_vec() re-walks the whole chain on every
-// keypress, so an unbounded file was an unbounded per-keystroke cost
-// too, and a session that now stays detached for weeks would have found
-// the other end of that. Trimming happens at load and, for a session
-// that never restarts, from record() once the file reaches twice the
-// bound; both go through compact(), under an flock.
+// The file keeps at most `history_size` entries (the bishopt, 10,000 by
+// default), oldest dropped first, which bounds memory too, since `load`
+// stops there and `to_vec` walks the chain on every keypress. It's
+// trimmed at load and, for a session that never restarts, by `record`
+// once the file reaches twice the bound, both through `compact` under
+// an flock. The filename is a parameter, so command mode keeps its own.
 //
-// The filename is parameterized (see History::load) so command mode can
-// keep a second, independent instance (its own file, own entries) without
-// colliding with the normal shell's history.
-//
-// A genuine persistent (immutable, structurally-shared) singly-linked
-// list, not a shared Vec with a per-session floor index: each entry is a
-// Node pointing at the entry before it, and a History value is just an
-// Rc handle onto its own newest Node (`tail`). Forking a session (`window
-// new`/split -- see History::fork) is an O(1) Rc clone of that pointer,
-// no copying, and from that moment the parent and child diverge --
-// record() only ever extends *this* History's own tail with a fresh
-// Node, so a command typed in one session's pane never becomes visible
-// to a sibling's, or to the parent's, own Up/Down browsing or `!`
-// expansion. This was the explicit reason for choosing a linked list
-// over a flat array in the first place: unlike a shared array + index
-// (which was tried here first, and looked observationally equivalent
-// for the single-branch case, but wasn't -- a lower-bound index into one
-// growing array can't stop a *later* sibling's entry from becoming
-// visible once appended), a persistent list's divergence is structural,
-// not just a numeric floor. Every session still shares the same on-disk
-// FILE (interleaved across every process, same as before) via each
-// History's own `path` -- forking clones that too (a cheap PathBuf
-// clone), so every fork still appends to the identical file, just with
-// an independently-diverging in-memory view.
+// The entries are a persistent linked list: each `Node` points at the one
+// before, and a `History` is an `Rc` to its newest node. Forking a
+// session (`window new`, a split) clones that pointer, and from then on
+// each side's `record` extends only its own tail, so one pane's commands
+// never show in a sibling's Up/Down or `!` expansion. A shared array with
+// a per-session index can't do that: a sibling's later entries would
+// still appear. All forks append to the same file.
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 struct Node {
     entry: String,
-    // The directory this entry was recorded from. Persisted as `-d`,
-    // so unlike before this survives a reload.
+    // The directory this entry was recorded from, persisted as `-d`.
     cwd: Option<PathBuf>,
-    // When this entry was recorded, for `history` under
-    // `HISTTIMEFORMAT`. `None` for a legacy line, which has no `-t` to
-    // read -- and shows no time rather than an invented one.
+    // When this entry was recorded, for `history` under `HISTTIMEFORMAT`.
+    // `None` for a legacy line with no `-t`, which shows no time.
     time: Option<i64>,
-    // This entry's own on-disk id, so a *later* entry can name it as
-    // its parent. Meaningless in memory beyond that -- the chain has
-    // real pointers and never looks an id up.
+    // This entry's on-disk id, so a later entry can name it as parent. In
+    // memory the chain has real pointers.
     id: u64,
-    // The command this one actually ran after, which is NOT the same as
-    // `prev`: `prev` is the previous line in a file every bish process
-    // appends to concurrently, while this is the real predecessor,
-    // resolved through `-p`. Keeping them apart is the whole point of
-    // writing a parent id rather than relying on file order.
+    // The command this one ran after, unlike `prev`, which is the previous
+    // line in a file every bish process appends to. Resolved through `-p`;
+    // keeping them apart is why a parent id is written.
     parent: Option<Rc<Node>>,
-    // Recorded live in this process, as opposed to loaded from disk. A
-    // fresh session's first command has no true predecessor -- whatever
-    // sits before it in the file is just another window's -- so
-    // `record` only takes a parent from a node that is `live`.
+    // Recorded in this process, not loaded. A session's first command has
+    // no true predecessor (what's before it in the file is another
+    // window's), so `record` takes a parent only from a live node.
     live: bool,
     prev: Option<Rc<Node>>,
 }
 
-// A directory-aware, borrowed view of one entry -- see History::entries.
+// A directory-aware view of one entry; see `History::entries`.
 pub struct HistoryEntry<'a> {
     pub text: &'a str,
     pub cwd: Option<&'a Path>,
     /// When it was recorded, if known.
     pub time: Option<i64>,
-    // The entry run immediately before this one. Now recovered from
-    // disk too, via the parent id each record carries -- which is what
-    // demotes `Confidence::Legacy` from "anything that was loaded" to
-    // "anything written before this format existed".
+    // The entry run just before this one, recovered from disk through the
+    // parent id, so `Confidence::Legacy` means written before this format.
     pub prev: Option<&'a str>,
 }
 
-// Clone is a plain, cheap Rc-clone of `tail` (identical to fork() below)
-// -- kept as a real derive, not just fork(), so a caller that needs a
-// standalone snapshot without the "new session" framing (e.g. repl.rs
-// taking one to pass into a call that also needs a live mutable borrow
-// of the session it came from) can just call .clone().
+// `Clone` is the same cheap `Rc` clone as `fork`, for a caller wanting a
+// snapshot without starting a session.
 #[derive(Clone)]
 pub struct History {
     path: Option<PathBuf>,
     tail: Option<Rc<Node>>,
-    // How many entries the file is allowed to keep -- the `history_size`
-    // bishopt, passed in rather than read here so history.rs keeps no
-    // opinion about where configuration lives. Also the in-memory bound,
-    // since load() stops at it: the chain is re-walked by to_vec() on
-    // every keypress, so an unbounded file was an unbounded per-keystroke
-    // cost as well as an unbounded file.
+    // The most entries the file keeps: the `history_size` bishopt, passed
+    // in so this file has no opinion on configuration. Also the in-memory
+    // bound, since `load` stops at it.
     limit: usize,
-    // Entries appended by this process since the last compaction. The
-    // high-water check in record() is against `limit + this`, so a
-    // session that stays attached (or detached) for weeks still
-    // compacts rather than growing until its next start-up.
+    // Entries appended by this process since the last compaction; the check
+    // in `record` is against `limit + appended`, so a long-lived session
+    // still compacts.
     appended: usize,
 }
 
-/// Takes group and other off an existing history file.
-///
-/// Only when there is something to take: a `set_permissions` on every
-/// append would be a syscall per command for nothing, and a file that is
-/// already 0600 is the overwhelmingly common case after the first time.
-/// Failure is ignored on purpose -- a history file on a filesystem that
-/// cannot represent the mode is still worth appending to.
+/// Takes group and other permissions off an existing history file, only
+/// when it has them, to avoid a syscall per append. Failure is ignored:
+/// a filesystem that can't represent the mode is still worth appending
+/// to.
 fn tighten_history_permissions(path: &Path) {
     crate::platform::restrict_to_owner(path);
 }
 
 impl History {
-    // `filename` is a bare filename under $HOME, e.g. ".bish_history" for
-    // the normal shell history or ".bish_cmd_history" for command mode's.
+    // `filename` is a bare name under $HOME: `.bish_history`, or
+    // `.bish_cmd_history` for command mode.
     pub fn load(filename: &str, limit: usize) -> History {
         History::load_at(history_path(filename), limit)
     }
 
-    // The half of load() that has a path already. Split out so tests can
-    // point at a real temp file rather than mutating $HOME, which two
-    // tests running at once cannot both do.
+    // `load` with a path in hand, so tests can use a temp file rather than
+    // change $HOME.
     fn load_at(path: Option<PathBuf>, limit: usize) -> History {
         let mut tail: Option<Rc<Node>> = None;
         if let Some(p) = &path {
             if let Ok(content) = std::fs::read_to_string(p) {
                 let lines: Vec<&str> = content.lines().collect();
                 let records: Vec<Record> = lines.iter().map(|l| parse_record(l)).collect();
-                // Trim *before* resolving parents, so an entry whose
-                // parent was trimmed away resolves to None rather than
-                // reaching for a node that is no longer here. Truncating
-                // a file that records a forest orphans branches, not
-                // just a prefix, and that has to be ordinary rather than
-                // exceptional.
+                // Trimmed before parents are resolved, so an entry whose
+                // parent was trimmed gets `None`. Truncating a file of a
+                // forest orphans branches, so that's ordinary.
                 let start = records.len().saturating_sub(limit);
                 let mut by_id: std::collections::HashMap<u64, Rc<Node>> = std::collections::HashMap::new();
                 for record in &records[start..] {
-                    // Last one wins on a duplicate id, the same rule a
-                    // repeated key follows elsewhere. A collision costs
-                    // one entry the wrong predecessor and nothing more.
+                    // On a duplicate id the last wins; a collision costs
+                    // one entry the wrong predecessor.
                     let parent = record.parent.and_then(|p| by_id.get(&p).cloned());
                     let node = Rc::new(Node {
                         entry: record.entry.clone(),
@@ -162,9 +116,8 @@ impl History {
                     }
                     tail = Some(node);
                 }
-                // The file was over the bound when this process opened
-                // it -- rewrite it now, while we already hold the whole
-                // content in memory and know exactly what survives.
+                // Over the bound at open: rewrite now, with the content in
+                // hand.
                 if records.len() > limit {
                     compact(p, limit);
                 }
@@ -173,29 +126,18 @@ impl History {
         History { path, tail, limit, appended: 0 }
     }
 
-    // Cheap, no-copy fork for a newly created session (`window new`/
-    // split_focused_pane): the child starts out able to see everything
-    // the parent could, via a plain Rc clone of the parent's current
-    // tail (O(1) regardless of how much history exists), but from this
-    // point on each side's own record() only ever extends its *own*
-    // tail -- see this struct's own doc comment for why that's the
-    // point of using a persistent list here at all.
+    // An O(1) fork for a new session (`window new`, a split): the child
+    // sees everything the parent does, then each side's `record` extends
+    // only its own tail.
     pub fn fork(&self) -> History {
         self.clone()
     }
 
-    // Records a submitted line (regardless of whether it later succeeds or
-    // fails -- bash and fish both do this). Skipped if blank or identical
-    // to the immediately preceding entry; this is a lighter touch than
-    // fish's full re-dedup-and-move-to-front, but keeps the common
-    // "pressed enter on the same command twice" case from cluttering
-    // history, which is what this is mainly for.
-    //
-    // `cwd`: the directory this command is about to run in, for the
-    // suggestions engine's directory/sequence heuristic (see
-    // HistoryEntry) -- None for callers with no meaningful shell context
-    // (command mode's own, entirely separate history instance, which
-    // isn't used for shell-command suggestions at all).
+    // Records a submitted line, whether or not it succeeds, as bash does.
+    // Skipped when blank or the same as the previous entry, so pressing
+    // Enter on one command twice doesn't clutter history. `cwd` is where the
+    // command runs, for the suggestion engine (see `HistoryEntry`); `None`
+    // for command mode's history.
     pub fn record(&mut self, entry: &str, cwd: Option<&Path>) {
         if entry.trim().is_empty() {
             return;
@@ -203,9 +145,8 @@ impl History {
         if self.tail.as_ref().map(|n| n.entry.as_str()) == Some(entry) {
             return;
         }
-        // Only a live node is a true predecessor: whatever sits at the
-        // tail of a freshly loaded chain is the previous line in a file
-        // every session appends to, not the command this one just ran.
+        // Only a live node is a true predecessor; a loaded tail is just the
+        // previous line in a shared file.
         let parent = self.tail.as_ref().filter(|n| n.live).map(Rc::clone);
         let id = fresh_id();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
@@ -219,30 +160,19 @@ impl History {
             prev: self.tail.take(),
         }));
 
-        // 0600, and not whatever the umask says. This file is every
-        // command anybody has typed at a bish prompt, which on a
-        // shared machine includes the ones with a password or a
-        // token in them -- it was being created 0644 under the
-        // ordinary 0022 umask, so every other user on the host could
-        // read all of it. bash creates its own history 0600;
-        // measured side by side with a fresh HOME for each.
-        //
-        // `mode` only applies to a file this call creates, so an
-        // install that already has one is tightened just below:
-        // nobody chose 0644, a umask did, and leaving it would mean
-        // the fix only ever helped new installs.
+        // Created 0600, not per the umask: this is every command typed at a
+        // prompt, passwords and tokens included. bash creates its history
+        // 0600 too. `mode` applies only to a new file, so an existing one
+        // is tightened below.
         if let Some(p) = &self.path
             && let Ok(mut f) = crate::platform::create_private_file(p, true)
         {
             tighten_history_permissions(p);
-            // One `write_all` of one line, deliberately -- not a
-            // `writeln!` per field and not a two-line record. A
-            // single write to a file opened O_APPEND is serialized
-            // on the inode, so concurrent sessions interleave
-            // whole entries and never halves of one. Every
-            // `window new`/split forks a History that keeps
-            // appending here, and a detached daemon makes
-            // concurrent writers ordinary rather than an edge case.
+            // One `write_all` of one line: a single write to an O_APPEND
+            // file is atomic on the inode, so concurrent sessions
+            // interleave whole entries. Every split forks a `History`
+            // appending here, and a detached daemon makes concurrent
+            // writers ordinary.
             let mut line = format_record(id, parent.map(|n| n.id), cwd, entry);
             line.push('\n');
             let _ = f.write_all(line.as_bytes());
@@ -251,11 +181,10 @@ impl History {
         self.maybe_compact();
     }
 
-    // Compaction for a session that never restarts. Deliberately
-    // hysteretic: the file is allowed to reach twice the bound before
-    // being rewritten, so a long session pays for this once every
-    // `limit` commands rather than on every one. Skipped entirely when
-    // this process has not appended enough to be the one responsible.
+    // Compaction for a session that never restarts, hysteretic: the file
+    // may reach twice the bound first, so a long session pays once per
+    // `limit` commands. Skipped unless this process appended enough to be
+    // responsible.
     fn maybe_compact(&mut self) {
         if self.limit == 0 || self.appended < self.limit {
             return;
@@ -269,13 +198,9 @@ impl History {
         compact(&path, self.limit);
     }
 
-    // Walks this History's own chain into a plain, oldest-first Vec --
-    // the same shape the old flat-array design already assumed, so
-    // every lookup below can stay simple index math instead of juggling
-    // `.prev` pointers directly. Re-walked fresh on every call rather
-    // than cached: history sizes here (hundreds to low thousands of
-    // entries) make that unmeasurable, and it sidesteps any risk of a
-    // stale cache after record() extends the chain.
+    // This chain as an oldest-first `Vec`, so lookups are index math. Walked
+    // on every call rather than cached: at these sizes it's unmeasurable,
+    // and nothing can go stale.
     fn to_vec(&self) -> Vec<&str> {
         let mut v = Vec::new();
         let mut cur = &self.tail;
@@ -287,19 +212,10 @@ impl History {
         v
     }
 
-    // A directory-aware, oldest-first view for the suggestions engine
-    // (bishedit::suggestion), which needs more than to_vec()'s bare
-    // strings: which directory an entry ran in, and what immediately
-    // preceded it. Re-walked fresh every call, same "no caching, cheap
-    // enough" reasoning as to_vec() above -- which is now bounded from
-    // the other end too, since load() stops at `limit`.
-    //
-    // `prev` reads straight off the node's own resolved parent. It used
-    // to be computed here, gated on both sides having a cwd, because a
-    // disk-loaded node's `.prev` is only the previous line in a shared
-    // file and had to be kept out of the sequence heuristic. With a
-    // parent id on disk that distinction lives in the data instead: a
-    // reloaded entry now knows what it actually followed.
+    // A directory-aware, oldest-first view for the suggestion engine
+    // (bishedit::suggestion): each entry's directory, and what ran just
+    // before it (`prev`, from the node's resolved parent). Walked on every
+    // call, like `to_vec`.
     pub fn entries(&self) -> Vec<HistoryEntry<'_>> {
         let mut v = Vec::new();
         let mut cur = &self.tail;
@@ -316,30 +232,28 @@ impl History {
         v
     }
 
-    // Nearest entry at or before index `from` (exclusive; None means
-    // "start from the newest") whose text starts with `prefix`,
-    // searching toward older entries. Used for Up.
+    // The nearest entry before index `from` (`None` starts at the newest)
+    // starting with `prefix`, searching older. Used for Up.
     pub fn search_backward(&self, prefix: &str, from: Option<usize>) -> Option<(usize, String)> {
         let v = self.to_vec();
         let end = from.unwrap_or(v.len());
         v[..end].iter().enumerate().rev().find(|(_, e)| e.starts_with(prefix)).map(|(i, e)| (i, e.to_string()))
     }
 
-    // Nearest entry after index `from` whose text starts with `prefix`,
-    // searching toward newer entries. Used for Down.
+    // The nearest entry after index `from` starting with `prefix`,
+    // searching newer. Used for Down.
     pub fn search_forward(&self, prefix: &str, from: usize) -> Option<(usize, String)> {
         let v = self.to_vec();
         v.iter().enumerate().skip(from + 1).find(|(_, e)| e.starts_with(prefix)).map(|(i, e)| (i, e.to_string()))
     }
 
-    // `!n`: absolute, 1-based (matches how bash numbers history events).
+    // `!n`: absolute, 1-based, as bash numbers events.
     fn entry_by_number(&self, n: usize) -> Option<String> {
         let idx = n.checked_sub(1)?;
         self.to_vec().get(idx).map(|s| s.to_string())
     }
 
-    // `!-n`: n events back from the most recent (1 = most recent, same
-    // as `!!`).
+    // `!-n`: n events back (1 is the latest, like `!!`).
     fn entry_back(&self, n: usize) -> Option<String> {
         if n == 0 {
             return None;
@@ -349,21 +263,20 @@ impl History {
         v.get(idx).map(|s| s.to_string())
     }
 
-    // `!/prefix` (bish's own spelling of bash's plain `!prefix`, freeing
-    // up a bare `!word` to mean "run in a child shell" instead -- see
-    // expand's own doc comment): most recent entry starting with it.
+    // `!/prefix`, bish's spelling of bash's `!prefix`, leaving a bare
+    // `!word` to mean run in a child shell (see `expand`): the latest entry
+    // starting with it.
     fn find_starting_with(&self, prefix: &str) -> Option<String> {
         self.to_vec().iter().rev().find(|e| e.starts_with(prefix)).map(|s| s.to_string())
     }
 
-    // `!?text`: most recent entry containing it anywhere.
+    // `!?text`: the latest entry containing it.
     fn find_containing(&self, substr: &str) -> Option<String> {
         self.to_vec().iter().rev().find(|e| e.contains(substr)).map(|s| s.to_string())
     }
 }
 
-// Recognized `!`-designator, and how much of the text right after the
-// `!` it consumes -- see find_designator.
+// A recognized `!` designator; see `find_designator`.
 enum Designator<'a> {
     Bang,
     LastArg,
@@ -373,12 +286,9 @@ enum Designator<'a> {
     StartsWith(&'a str),
 }
 
-// Tries to parse a `!`-designator starting right after the `!` itself
-// (`rest` is everything from there on). Returns the designator and how
-// many bytes of `rest` it consumes, or None if `rest` doesn't start with
-// any recognized form -- the `!` is then left alone (general scan) or,
-// if it was the line's own leading character, triggers the child-shell
-// fallback (see expand).
+// Parses a designator right after the `!` (`rest` is what follows).
+// Returns it and the bytes it consumes, or `None`, when the `!` is left
+// alone or, at the line's start, means a child shell (see `expand`).
 fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
     let mut chars = rest.chars();
     match chars.next()? {
@@ -394,7 +304,7 @@ fn find_designator(rest: &str) -> Option<(usize, Designator<'_>)> {
         }
         '?' => {
             let body = &rest[1..];
-            // `!?text?` (closed) or `!?text` up to the next blank/end.
+            // `!?text?`, or `!?text` up to a blank or the end.
             if let Some(end) = body.find('?') {
                 Some((1 + end + 1, Designator::Contains(&body[..end])))
             } else {
@@ -422,46 +332,27 @@ fn resolve(kind: &Designator, history: &History) -> Option<String> {
     }
 }
 
-// A freshly-typed line, after history expansion. Substituted is the
-// common case -- feed it into the lexer/parser exactly like the
-// original line. UnrecognizedBang is the "otherwise" case from expand's
-// own doc comment: the line started with a `!` that wasn't any
-// recognized designator, so the rest of it is meant to run in a child
-// shell instead -- callers decide exactly how (see expand's doc comment
-// for why that differs between the normal prompt and command mode).
+// A typed line after history expansion. `Substituted` goes to the lexer
+// as usual. `UnrecognizedBang`: the line started with a `!` that isn't a
+// designator, and the rest runs in a child shell, as the caller decides
+// (see `expand`).
 pub enum Expansion {
     Substituted(String),
     UnrecognizedBang(String),
 }
 
-// bash-style history expansion (`!!`, `!-n`, `!n`, `!$`, plus bish's own
-// `!?text` and `!/text` in place of bash's plain `!text`, freeing up a
-// bare `!word` at the start of a line to mean something else -- see
-// below) applied to one freshly-typed line, against `history`'s own
-// scope (whatever that particular session's chain can see -- see
-// History's own doc comment).
+// History expansion (`!!`, `!-n`, `!n`, `!$`, and bish's `!?text` and
+// `!/text` in place of bash's `!text`) on one typed line, over this
+// session's chain.
 //
-// If the line starts with `!` and what immediately follows isn't one of
-// the five designators above, this doesn't error the way bash's own
-// "event not found" would -- instead the rest of the line (after that
-// leading `!`) is meant to run in a child shell, the same idea as vim's
-// `:!cmd` or a plain `(cmd)` subshell. What "child shell" means
-// concretely differs by caller: the normal shell prompt has no
-// restriction on what it can wrap, so `(rest)` (a real subshell) is the
-// natural fit; command mode explicitly disallows subshells (see
-// command_mode_violation), so it prepends `command ` instead --
-// consistent with command mode's own existing "builtins only, `command
-// NAME` is the escape hatch for externals" model. Both are the caller's
-// job, not this function's -- it just reports which case happened.
+// A line starting with `!` and no designator isn't "event not found":
+// the rest runs in a child shell, like vim's `:!cmd`. The prompt wraps it
+// as `(rest)`; command mode, which allows no subshells, prepends
+// `command `. That's the caller's job; this reports the case.
 //
-// Every other `!` in the line (not just a leading one) is still
-// scanned and substituted normally -- `rm !$` doesn't require the `!` to
-// be the first character.
-//
-// Returns Err with a bash-style "event not found" message if a
-// recognized designator couldn't actually be resolved (no matching
-// history entry) -- the whole line is meant to be abandoned in that
-// case, nothing runs, matching bash's own behavior.
+// Any `!` in the line is expanded, not just a leading one (`rm !$`). A
+// designator that matches nothing is an `Err` with bash's "event not
+// found", and nothing runs.
 pub fn expand(line: &str, history: &History) -> Result<Expansion, String> {
     if !line.contains('!') {
         return Ok(Expansion::Substituted(line.to_string()));
@@ -504,27 +395,14 @@ fn history_path(filename: &str) -> Option<PathBuf> {
     std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(filename))
 }
 
-// Rewrites the history file down to its newest `limit` entries,
-// verbatim -- the surviving
-// lines are copied across exactly as they were read, never re-rendered,
-// so ids and timestamps stay what they were rather than every entry
-// claiming to have happened at compaction time.
-//
-// Held under an exclusive, non-blocking `flock` for the whole rewrite,
-// the same primitive (and the same reasoning) session.rs uses for its
-// pidfiles. Non-blocking on purpose: if another bish is already
-// compacting, the right move is to skip -- it is doing this exact work,
-// and a shell prompt is not somewhere to wait on a lock. The lock also
-// makes "read the survivors, write them back" a unit, so two sessions
-// crossing here cannot each write a different suffix over the other.
-//
-// Writes in place rather than through a temp file and a rename: every
-// other session holds an *append* fd on this inode, and renaming a new
-// file over it would send their next entries to an inode nothing will
-// ever read again. Truncating in place keeps every one of those fds
-// pointed at the file that survives. The cost of that choice is that a
-// crash mid-rewrite can leave the file short, which is why nothing here
-// treats a missing entry as an error.
+// Rewrites the history file to its newest `limit` lines, copied
+// verbatim so ids and times stay. Under a non-blocking exclusive
+// `flock`, as session.rs's pidfiles: if another bish is compacting,
+// skip rather than wait at a prompt, and the lock makes read-and-write
+// one unit. In place, not via a temp file and rename: other sessions
+// hold append fds on this inode, and a rename would send their entries
+// to a file nobody reads. A crash mid-rewrite can leave it short, so a
+// missing entry is never an error.
 fn compact(path: &Path, limit: usize) {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::AsRawFd;
@@ -533,11 +411,8 @@ fn compact(path: &Path, limit: usize) {
     if crate::platform::lock_exclusive(fd).is_err() {
         return;
     }
-    // Re-read here, under the lock, rather than reusing what the caller
-    // already has: between a caller's read and this rewrite another
-    // session can append, and that entry would be written straight back
-    // out of existence. Reading inside the lock makes the whole
-    // read-keep-write a unit.
+    // Re-read under the lock: another session may have appended since the
+    // caller read, and that entry would be lost.
     let mut content = String::new();
     if file.read_to_string(&mut content).is_err() {
         crate::platform::unlock(fd);
@@ -554,59 +429,31 @@ fn compact(path: &Path, limit: usize) {
     crate::platform::unlock(fd);
 }
 
-// ---------------------------------------------------------------------
-// The on-disk record format
-// ---------------------------------------------------------------------
-//
-// Still one line per entry, still appended with a single write -- see
-// record() for why that matters. An entry recorded by this version
-// carries its metadata inline, ahead of the command it describes:
+// The on-disk record format: one line per entry, one write each (see
+// `record`), metadata ahead of the command:
 //
 //   : --id 4f2a9c.. -p 91bce0.. -t '2026-09-01T03:45:00Z' -d '/home/j'; cargo test
 //
-// ...beginning with a space. Two properties fall out of that shape, and
-// both were the point of choosing it:
+// beginning with a space. So:
 //
-//   * The line is a valid shell command that does exactly what the bare
-//     command does. `:` is the null builtin -- exec.rs returns
-//     Status(0) without so much as looking at its arguments -- and `;`
-//     sequences the real command after it, so the exit status is the
-//     command's own. A line pasted back into a shell runs what it
-//     records. (Single-line entries only: a multi-line entry has its
-//     newlines escaped, exactly as it always did, and reads back as a
-//     literal `\n`.)
-//   * The leading space keeps it *out* of history if it is pasted back
-//     (repl.rs's starts_off_the_record), and going the other way
-//     guarantees a metadata line can never be mistaken for a legacy
-//     bare-command line -- a command beginning with a space was never
-//     recorded in the first place, so no pre-existing line can start
-//     with one.
+//   * The line is a shell command doing just what the bare command does:
+//     `:` ignores its arguments, and `;` runs the command after it with
+//     its own status. (A multi-line entry's newlines are escaped and read
+//     back as literal `\n`.)
+//   * The leading space keeps it out of history if pasted back
+//     (repl.rs's `starts_off_the_record`), and no legacy line starts with
+//     one, since such commands were never recorded.
 //
-// **Values are single-quoted, not double-quoted, and that is a security
-// property rather than a style choice.** The line is meant to be
-// executable, which is exactly what makes it exploitable if its values
-// expand. A directory name is attacker-influenceable -- unpack an
-// archive, `cd` into it, run anything -- and under double quotes a cwd
-// of `/tmp/$(...)` would put a live command substitution into the
-// history file that fires the moment the line is pasted back. Verified
-// against the real binary: double-quoted, the substitution runs; single
-// quoted, it does not. Single quotes expand nothing, and a `'` inside a
-// value uses the shell's own `'\''` idiom so the line still parses.
-//
-// Unknown flags are ignored on read, which is what makes the flag shape
-// worth its bytes: exit status, duration or anything else can be added
-// later without a second format migration.
+// Values are single-quoted as a security property: a pasted line runs, and
+// a cwd like `/tmp/$(...)` (an unpacked archive can name one) would run
+// under double quotes. A `'` inside uses the `'\''` idiom. Unknown flags
+// are ignored on read, so more can be added without a migration.
 
-// A random 64-bit id, hex-formatted. Random rather than a counter
-// because ids have to be unique across *processes* that append to one
-// file with no coordination between them, and position-independent so
-// that trimming renumbers nothing.
-//
-// A collision has no error path anywhere downstream and deliberately so
-// (see resolve_parents): two entries sharing an id means one of them
-// resolves to the wrong predecessor, which costs a worse suggestion and
-// nothing else. splitmix64 over a pid/nanosecond seed, the same shape
-// exec.rs's own fresh_rng_seed already uses for `$RANDOM`.
+// A random 64-bit id in hex: unique across processes appending to one
+// file without coordination, and independent of position, so trimming
+// renumbers nothing. A collision only gives one entry the wrong
+// predecessor (see `resolve_parents`). splitmix64 over a pid and
+// nanosecond seed, as `exec::fresh_rng_seed`.
 fn fresh_id() -> u64 {
     use std::cell::Cell;
     thread_local! { static STATE: Cell<u64> = const { Cell::new(0) }; }
@@ -628,10 +475,8 @@ fn fresh_id() -> u64 {
     })
 }
 
-// Wraps a value for the shell so the record stays a runnable line.
-// `escape` has already made it single-line; this only has to balance
-// the quotes, which for single quotes means the one classic idiom:
-// close, backslash-quote, reopen.
+// Single-quotes a value so the record stays runnable. `escape` already
+// made it one line; an embedded `'` becomes `'\''`.
 fn single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -646,11 +491,7 @@ fn single_quote(s: &str) -> String {
     out
 }
 
-// UTC, `YYYY-MM-DDTHH:MM:SSZ`. Nothing reads this yet -- it is written
-// so the format does not need revisiting when something does. Days are
-// converted with the standard civil-from-days algorithm rather than
-// shelling out to `date`, for the same reason roff.rs parses roff
-// itself.
+// UTC, `YYYY-MM-DDTHH:MM:SSZ`, by the civil-from-days algorithm.
 fn iso_from_epoch(secs: i64) -> String {
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -666,14 +507,9 @@ fn iso_from_epoch(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-// The epoch second an `iso_from_epoch` string names, or None for
-// anything that is not one.
-//
-// The inverse of the civil-from-days conversion above, and deliberately
-// strict: a timestamp that does not parse is a timestamp we do not
-// know, and `history` shows nothing for it rather than a plausible
-// wrong time. Assumes the `Z` these are always written with -- there is
-// no other producer.
+// The epoch second an `iso_from_epoch` string names, or `None`. Strict:
+// an unparseable time shows as nothing, not a plausible wrong one.
+// Assumes the `Z` these are always written with.
 fn epoch_from_iso(text: &str) -> Option<i64> {
     let b: Vec<char> = text.chars().collect();
     if b.len() != 20 || b[4] != '-' || b[7] != '-' || b[10] != 'T' || b[13] != ':' || b[16] != ':' || b[19] != 'Z' {
@@ -685,8 +521,8 @@ fn epoch_from_iso(text: &str) -> Option<i64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
         return None;
     }
-    // days_from_civil, Howard Hinnant's, the exact mirror of the
-    // civil_from_days in `iso_from_epoch`.
+    // Howard Hinnant's days_from_civil, the inverse of `iso_from_epoch`'s
+    // civil_from_days.
     let y = if mo <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -702,23 +538,21 @@ fn iso_now() -> String {
     iso_from_epoch(secs as i64)
 }
 
-// One parsed line. A legacy bare line yields a Record with no metadata
-// at all, which is the honest reading of it -- there is none to recover.
+// One parsed line. A legacy bare line has no metadata.
 #[derive(Debug, PartialEq)]
 struct Record {
     id: Option<u64>,
     parent: Option<u64>,
     cwd: Option<PathBuf>,
-    /// When it was recorded, from `-t`. `None` for a legacy bare line,
-    /// and for a `-t` that does not parse.
+    /// When it was recorded, from `-t`; `None` for a legacy line or an
+    /// unparseable `-t`.
     time: Option<i64>,
     entry: String,
 }
 
-// Renders one record. `cwd` goes through `escape` before quoting so a
-// directory containing a newline still leaves the record on one line;
-// a path that is not valid UTF-8 is stored lossily, which loses the
-// directory heuristic for that one entry rather than the entry itself.
+// Renders one record. `cwd` goes through `escape` first, so a directory
+// with a newline stays on one line; a non-UTF-8 path is stored lossily,
+// losing only that entry's directory.
 fn format_record(id: u64, parent: Option<u64>, cwd: Option<&Path>, entry: &str) -> String {
     let mut out = format!(" : --id {id:016x}");
     if let Some(p) = parent {
@@ -733,16 +567,11 @@ fn format_record(id: u64, parent: Option<u64>, cwd: Option<&Path>, entry: &str) 
     out
 }
 
-// Splits ` : <flags>; <command>` into its flag words and the command
-// text. Tokenized rather than split on the first `;`, because a
-// single-quoted value may legitimately contain one -- a directory can
-// be named anything at all, and a format that breaks on `mkdir 'a;b'`
-// would be a format that breaks.
-//
-// None for anything that is not a well-formed metadata line: no
-// prefix, an unterminated quote, or no `;` at all. Every one of those
-// reads as a legacy bare command instead, which is both the safe answer
-// and the right one for a file another version appended to.
+// Splits ` : <flags>; <command>` into flag words and the command,
+// tokenizing because a quoted value may contain `;` (`mkdir 'a;b'`).
+// `None` for anything else (no prefix, an unterminated quote, no `;`),
+// which reads as a legacy bare command, the right answer for a file
+// another version appended to.
 fn split_record(line: &str) -> Option<(Vec<String>, String)> {
     let rest = line.strip_prefix(" : ")?;
     let ch: Vec<char> = rest.chars().collect();
@@ -774,9 +603,8 @@ fn split_record(line: &str) -> Option<(Vec<String>, String)> {
                     return None;
                 }
                 i += 1;
-                // The `'\''` idiom: the section just closed, a literal
-                // quote follows, and the value continues in the next
-                // section -- which the outer loop picks up on its own.
+                // The `'\''` idiom: the section closed, a literal quote,
+                // and the value continues in the next section.
                 if i + 1 < ch.len() && ch[i] == '\\' && ch[i + 1] == '\'' {
                     cur.push('\'');
                     i += 2;
@@ -792,10 +620,9 @@ fn split_record(line: &str) -> Option<(Vec<String>, String)> {
     None
 }
 
-// Reads one file line. Anything that does not parse as a metadata
-// record is a bare command -- that covers every line written before
-// this format existed, and every line an older bish appends to a file
-// this one has already started writing.
+// Reads one file line. Anything that isn't a metadata record is a bare
+// command: every line from before this format, and lines an older bish
+// appends.
 fn parse_record(line: &str) -> Record {
     let Some((words, entry)) = split_record(line) else {
         return Record { id: None, parent: None, cwd: None, time: None, entry: unescape(line) };
@@ -848,11 +675,9 @@ fn unescape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    // A fully valid, filesystem-free empty history: record()'s own disk
-    // write is already a no-op whenever `path` is None, so tests built
-    // on this are deterministic with no temp files involved. Tests that
-    // need real file behaviour (loading, trimming, legacy lines) use
-    // load_at with a temp path instead.
+    // An empty history with no file: `record` writes nothing without a
+    // path, so tests on this need no temp files. Tests of file behaviour use
+    // `load_at` with a temp path.
     fn empty() -> History {
         History { path: None, tail: None, limit: 1000, appended: 0 }
     }
@@ -870,9 +695,9 @@ mod tests {
     #[test]
     fn the_line_is_shaped_to_run_as_the_command_it_records() {
         let line = format_record(1, None, Some(Path::new("/w")), "echo hi");
-        // ` : ` so the null builtin swallows the metadata, a leading
-        // space so pasting it back does not re-record it, and the real
-        // command after a `;` so the exit status is the command's own.
+        // ` : ` so `:` swallows the metadata, a leading space so pasting it
+        // back doesn't re-record it, and the command after `;` for its own
+        // status.
         assert!(line.starts_with(" : "), "{line}");
         assert!(line.ends_with("; echo hi"), "{line}");
         assert!(!line.contains('\n'), "one entry stays one line");
@@ -880,11 +705,8 @@ mod tests {
 
     #[test]
     fn a_value_is_single_quoted_so_the_line_cannot_execute_it() {
-        // Not a style preference. The line is meant to be runnable,
-        // which is what would make a double-quoted value runnable too --
-        // and a directory name is attacker-influenceable. Verified
-        // against the real binary: under double quotes the substitution
-        // fires, under single quotes it does not.
+        // Single quotes: a runnable line would run a double-quoted
+        // substitution from a directory name.
         let line = format_record(1, None, Some(Path::new("/tmp/$(echo pwned)")), "ls");
         assert!(line.contains("-d '/tmp/$(echo pwned)'"), "{line}");
         assert!(!line.contains('"'), "{line}");
@@ -893,15 +715,14 @@ mod tests {
 
     #[test]
     fn a_value_may_contain_the_delimiter_and_the_quote() {
-        // A directory can be named anything, so neither a `;` nor a `'`
-        // in one may break the split -- which is why the metadata is
-        // tokenized rather than cut at the first `;`.
+        // A directory can be named anything, so `;` and `'` in one can't
+        // break the split.
         for dir in ["/tmp/a;b", "/tmp/it's", "/tmp/;';", "/tmp/a b"] {
             let line = format_record(7, None, Some(Path::new(dir)), "echo x; echo y");
             let got = parse_record(&line);
             assert_eq!(got.cwd, Some(PathBuf::from(dir)), "{line}");
-            // ...and the command keeps its own `;`, which must not be
-            // escaped: escaping it would change what the line runs.
+            // The command's own `;` isn't escaped, which would change what
+            // runs.
             assert_eq!(got.entry, "echo x; echo y", "{line}");
         }
     }
@@ -915,8 +736,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_metadata_line_reads_as_a_plain_command() {
-        // Never an error: a truncated or foreign line is more useful
-        // read as the text it is than dropped.
+        // Never an error: a truncated or foreign line is read as its text.
         for line in [" : --id 00 -d 'unterminated; ls", " : --id 00 no semicolon here", "plain old command"] {
             let got = parse_record(line);
             assert!(!got.entry.is_empty(), "{line}");
@@ -926,8 +746,7 @@ mod tests {
 
     #[test]
     fn unknown_flags_are_ignored_rather_than_refused() {
-        // What the flag shape is for: a later version can add a field
-        // without a second format migration.
+        // A later version can add fields without a migration.
         let got = parse_record(" : --id 000000000000002a --exit 3 --duration '1.5' -d '/w'; make");
         assert_eq!(got.id, Some(42));
         assert_eq!(got.cwd, Some(PathBuf::from("/w")));
@@ -942,8 +761,8 @@ mod tests {
 
     #[test]
     fn a_timestamp_round_trips_through_the_record() {
-        // `history` under HISTTIMEFORMAT formats the epoch this
-        // recovers, so the two conversions have to be exact inverses.
+        // `history` formats the epoch this recovers, so the two must be exact
+        // inverses.
         for secs in [0_i64, 1_000_000_000, 1_756_697_100, 1_709_208_000] {
             assert_eq!(epoch_from_iso(&iso_from_epoch(secs)), Some(secs), "{secs}");
         }
@@ -951,8 +770,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_timestamp_is_no_timestamp_rather_than_a_wrong_one() {
-        // A legacy line has none at all, and a mangled one must not be
-        // guessed at -- `history` shows nothing for either.
+        // Legacy lines have none, and mangled ones aren't guessed at.
         for bad in ["", "not a time", "2001-09-09", "2001-09-09T01:46:40", "2001-13-09T01:46:40Z", "2001-09-32T01:46:40Z"] {
             assert_eq!(epoch_from_iso(bad), Option::None, "{bad}");
         }
@@ -964,8 +782,7 @@ mod tests {
     fn a_timestamp_is_utc_iso_8601() {
         assert_eq!(iso_from_epoch(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_from_epoch(1_756_697_100), "2025-09-01T03:25:00Z");
-        // A leap day, which is where a hand-rolled civil calendar goes
-        // wrong if it is going to.
+        // A leap day, where a hand-rolled calendar goes wrong if it will.
         assert_eq!(iso_from_epoch(1_709_208_000), "2024-02-29T12:00:00Z");
     }
 
@@ -980,12 +797,7 @@ mod tests {
         assert_eq!(entries[0].cwd, Some(cwd.as_path()));
     }
 
-    // Command mode's own history, which records window-management
-    // commands and has no shell cwd worth tagging them with. This used
-    // to double as a stand-in for a disk-loaded chain, back when a
-    // loaded entry never had a cwd either -- see
-    // prev_is_none_for_first_live_entry_after_a_disk_loaded_tail, which
-    // now loads a real file instead.
+    // Command mode's history, of window commands with no cwd to tag.
     #[test]
     fn an_entry_recorded_without_a_directory_reports_none() {
         let mut h = empty();
@@ -1007,11 +819,9 @@ mod tests {
         assert_eq!(entries[1].prev, Some("git status"));
     }
 
-    /// A real file, not a $HOME override -- see load_at.
-    ///
-    /// The directory comes back with the path because it owns it: this
-    /// used to leave one behind on every run, named after the tag and
-    /// the process, and nothing ever removed them.
+    /// A real file rather than a $HOME override (see `load_at`). The
+    /// directory comes back too because it owns the file and is removed when
+    /// dropped.
     fn temp_history(tag: &str, contents: &str) -> (crate::tempdir::TempDir, PathBuf) {
         let dir = crate::tempdir::TempDir::new(&format!("hist-{tag}"));
         let path = dir.join("history");
@@ -1019,10 +829,7 @@ mod tests {
         (dir, path)
     }
 
-    // The history file is every command anybody typed, so it is 0600 and
-    // not whatever the umask said. It was being created 0644 under the
-    // ordinary 0022 umask, which on a shared machine is every password
-    // ever typed at a prompt, readable by everyone.
+    // The history file is created 0600, not per the umask.
     #[test]
     fn the_history_file_is_readable_only_by_its_owner() {
         use std::os::unix::fs::PermissionsExt;
@@ -1034,22 +841,19 @@ mod tests {
         h.record("echo one", None);
         assert_eq!(mode(&path), 0o600, "a file this created must not be readable by anyone else");
 
-        // An install that already has a loose one is tightened rather
-        // than left: nobody chose 0644, a umask did.
+        // An existing loose one is tightened: a umask chose 0644, not a
+        // person.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         h.record("echo two", None);
         assert_eq!(mode(&path), 0o600);
-        // ...and the entries are still there, which is the half that
-        // makes it a fix.
+        // And the entries are still there.
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
     }
 
     #[test]
     fn prev_is_none_for_first_live_entry_after_a_disk_loaded_tail() {
-        // Genuinely loaded from a file, rather than approximated with a
-        // cwd-less record(): a disk entry now carries a cwd of its own,
-        // so "no cwd" stopped being a stand-in for "came from disk" and
-        // `live` is the real distinction.
+        // Loaded from a real file: `live`, not a missing cwd, marks a disk
+        // entry.
         let (_dir, path) = temp_history("first-live", " : --id 00000000000000a1 -d '/tmp/proj'; some old command\n");
         let mut h = History::load_at(Some(path), 100);
         assert_eq!(h.entries()[0].cwd, Some(Path::new("/tmp/proj")), "a loaded entry keeps its directory");
@@ -1057,16 +861,14 @@ mod tests {
         let cwd = PathBuf::from("/tmp/proj");
         h.record("cargo build", Some(&cwd));
         let entries = h.entries();
-        // The loaded entry is only the previous *line in a file every
-        // session appends to*. It is not what this session just ran, so
-        // it must not become a sequence link.
+        // The loaded entry is only the previous line in a shared file, not
+        // what this session ran, so it's no sequence link.
         assert_eq!(entries[1].prev, None);
     }
 
     #[test]
     fn a_reloaded_entry_keeps_the_command_it_actually_followed() {
-        // The point of writing a parent id at all: this used to be
-        // unrecoverable, and every reloaded entry ranked `Legacy`.
+        // A parent id recovers the link across a reload.
         let (_dir, path) = temp_history(
             "parents",
             " : --id 000000000000000a -d '/w'; git add -A\n : --id 000000000000000b -p 000000000000000a -d '/w'; git commit\n",
@@ -1079,9 +881,8 @@ mod tests {
 
     #[test]
     fn a_parent_that_was_trimmed_away_resolves_to_nothing() {
-        // Truncation orphans branches rather than a clean prefix, so an
-        // unresolvable parent has to be ordinary. `-p ...0a` survives
-        // into the kept window with nothing to point at.
+        // Truncation orphans branches, so an unresolvable parent is ordinary:
+        // `-p ...0a` survives with nothing to point at.
         let (_dir, path) =
             temp_history("orphan", " : --id 000000000000000a -d '/w'; oldest\n : --id 000000000000000b -p 000000000000000a -d '/w'; newest\n");
         let h = History::load_at(Some(path), 1);
@@ -1099,36 +900,32 @@ mod tests {
         assert_eq!(h.entries().len(), 4);
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk.lines().count(), 4, "the file is rewritten, not just the view");
-        // Verbatim, so ids and timestamps stay what they were rather
-        // than every survivor claiming to have happened just now.
+        // Verbatim, so ids and times stay.
         assert!(on_disk.starts_with(" : --id 0000000000000006 -d '/w'; echo 6\n"), "{on_disk}");
     }
 
     #[test]
     fn a_session_that_never_restarts_still_compacts() {
-        // The other half of the bound. Trimming at load covers every
-        // ordinary shell; a session detached for weeks never reaches
-        // one, and used to grow without limit.
+        // The other half of the bound: a session detached for weeks never
+        // reloads, so `record` compacts.
         let (_dir, path) = temp_history("highwater", "");
         let mut h = History::load_at(Some(path.clone()), 4);
         for i in 0..12 {
             h.record(&format!("echo {i}"), Some(Path::new("/w")));
         }
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        // Hysteretic on purpose: the file is allowed to reach twice the
-        // bound before a rewrite, so this costs one pass per `limit`
-        // commands rather than one per command.
+        // Hysteretic: up to twice the bound before a rewrite.
         assert!(on_disk.lines().count() <= 8, "{} lines", on_disk.lines().count());
         assert!(on_disk.lines().count() >= 4);
-        // Whatever survived is still the newest, and still parses.
+        // What survived is the newest, and still parses.
         let last = parse_record(on_disk.lines().last().unwrap());
         assert_eq!(last.entry, "echo 11");
     }
 
     #[test]
     fn a_legacy_bare_line_still_loads_as_a_command() {
-        // The 1,000-odd lines already in everyone's file, and anything
-        // an older bish appends to one this version has started writing.
+        // Lines from before this format, and from an older bish appending to
+        // the same file.
         let (_dir, path) = temp_history("legacy", "ls -la\ncargo test\n : --id 000000000000000c -d '/w'; git status\n");
         let h = History::load_at(Some(path), 100);
         let entries = h.entries();
@@ -1158,14 +955,10 @@ mod tests {
     }
 }
 
-// The shell's own view of this list -- see `exec::HistoryAccess` for why
-// the `history` builtin reaches it through a trait rather than through
-// a field.
-//
-// `clear` and `delete` rebuild the chain rather than mutating it,
-// because a `Node` may be shared with a forked child (`fork` is an
-// O(1) `Rc` clone -- see its own doc comment). Rebuilding is what keeps
-// `history -c` in one window from emptying another's.
+// The shell's view of this list (see `exec::HistoryAccess`). `clear`
+// and `delete` rebuild the chain rather than mutate it, since a `Node`
+// may be shared with a fork: `history -c` in one window mustn't empty
+// another's.
 impl crate::exec::HistoryAccess for History {
     fn entries(&self) -> Vec<(String, Option<i64>)> {
         History::entries(self).into_iter().map(|e| (e.text.to_string(), e.time)).collect()
@@ -1185,13 +978,9 @@ impl crate::exec::HistoryAccess for History {
             if i + 1 == n {
                 continue;
             }
-            // The rebuilt chain carries no cwd and no parent: neither is
-            // recoverable from `entries()`'s bare strings, and inventing
-            // either would feed the suggestion engine's own directory
-            // and sequence heuristics a lie. Losing them makes those
-            // entries rank as `Legacy` -- a real cost now that a
-            // reloaded entry would otherwise keep both, and still the
-            // honest answer for a chain rebuilt from text alone.
+            // The rebuilt chain has no cwd or parent, since entries' bare
+            // strings can't recover them, and inventing them would mislead
+            // the suggestion heuristics; those entries rank `Legacy`.
             tail = Some(Rc::new(Node { entry, cwd: None, time: None, id: fresh_id(), parent: None, live: false, prev: tail.take() }));
         }
         self.tail = tail;
@@ -1217,17 +1006,14 @@ mod history_access_tests {
         let h = built(&["one", "two", "three"]);
         let texts: Vec<String> = HistoryAccess::entries(&h).into_iter().map(|(t, _)| t).collect();
         assert_eq!(texts, vec!["one".to_string(), "two".to_string(), "three".to_string()]);
-        // ...and every live entry knows when it happened, which is what
-        // `HISTTIMEFORMAT` shows.
+        // Every live entry knows its time, for `HISTTIMEFORMAT`.
         assert!(HistoryAccess::entries(&h).iter().all(|(_, when)| when.is_some()));
     }
 
     #[test]
     fn clear_and_delete_rebuild_rather_than_mutate() {
         let mut h = built(&["one", "two", "three"]);
-        // A fork shares nodes (it is an O(1) `Rc` clone), so a change
-        // here must not reach it -- `history -c` in one window emptying
-        // another's is exactly what rebuilding prevents.
+        // A fork shares nodes, so a change here mustn't reach it.
         let forked = h.fork();
 
         assert!(h.delete(2));
