@@ -5,11 +5,9 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
-// Shims over the `std::process` plumbing that only exists where a child
-// can be spawned. On a target that cannot (WASI, and the browser on top
-// of it) the spawn fails on its own; these keep the code that *builds*
-// the command compiling, standing in a null stream or an "unsupported"
-// error for the conversion that is no longer available.
+// Shims over `std::process` plumbing that exists only where a child can
+// be spawned. On WASI the spawn fails by itself; these keep the code that
+// builds commands compiling, with a null stream or an "unsupported" error.
 #[cfg(unix)]
 fn stdio_from_owned(fd: std::os::fd::OwnedFd) -> Stdio {
     Stdio::from(fd)
@@ -57,78 +55,52 @@ use crate::parser::{
 use crate::pty;
 use crate::vt100;
 
-// Where a Shell's own output (builtin/diagnostic text -- never a spawned
-// external process's, which always writes straight to its real inherited
-// fds regardless) actually goes. `Real` -- writing directly to the
-// process's real stdout/stderr -- is what every session uses before
-// promotion, and after promotion for whichever session is momentarily
-// mid-transition. `Grid` -- feeding bytes into that session's own VT100
-// Screen (M8) -- is what every session uses once the M9 compositor is
-// driving the terminal: repl.rs is the only thing that can see the real
-// window list, so it's the one that flips a session's sink from Real to
-// Grid (see repl.rs's apply_window_action) and later reads the Grid back
-// out to render whichever window is currently focused.
+// Where a Shell's own output (builtins and diagnostics; an external
+// process always writes to its inherited fds) goes. `Real` writes to the
+// process's stdout and stderr, as before promotion. `Grid` feeds the
+// session's `vt100::Screen` once the compositor drives the terminal;
+// repl.rs switches a session to it (see `apply_window_action`) and renders
+// the focused window from it.
 #[derive(Clone)]
 pub(crate) enum OutputSink {
     Real,
     Grid(Rc<RefCell<vt100::Screen>>),
-    // repl.rs's command mode temporarily swaps a session's sink to this
-    // while running one command, so it can show that command's own
-    // combined stdout+stderr text as a dedicated overlay (see run_
-    // command_mode) instead of it landing mixed into the pane's own
-    // grid/scrollback. No onlcr translation here (unlike Grid) -- this
-    // is plain text repl.rs renders itself by splitting on '\n', not fed
-    // into a terminal emulator that needs CRLF.
+    // Command mode swaps a session's sink to this for one command, to show
+    // its combined output as an overlay (see `run_command_mode`). No ONLCR:
+    // repl.rs splits it on `\n` itself.
     Capture(Rc<RefCell<String>>),
-    // dispatch_builtin_or_external's own push_builtin_output_sink installs
-    // this around a single builtin call so its sh_println!/sh_eprintln!
-    // writes honor *that command's own* `>`/`>>`/`2>`/`&>`/`2>&1`/`1>&2`
-    // redirects -- previously builtins ignored per-command redirects
-    // entirely (see plan.md), which mattered for real activation scripts
-    // (mise, nvm, ...) relying on `declare -p foo >/dev/null 2>&1`-style
-    // guards being silent. Each stream says where it goes; a stream with
-    // no redirect of its own says so by naming the enclosing sink's
-    // matching side.
+    // Installed by `push_builtin_output_sink` around one builtin, so its
+    // output honours that command's own redirects (`>`, `>>`, `2>`, `&>`,
+    // `2>&1`, `1>&2`), which guards like `declare -p foo >/dev/null 2>&1` in
+    // activation scripts rely on. A stream without its own redirect names the
+    // enclosing sink's matching side.
     Builtin { previous: Box<OutputSink>, stdout: SinkStream, stderr: SinkStream },
 }
 
-// Where one of a redirected builtin's two streams ends up.
-//
-// A dup names the descriptor *as the command found it*, which is the
-// whole reason this is three cases and not a file plus a "follows the
-// other one" flag: in
-//
-//     echo e >&2 2>/dev/null
-//
-// `>&2` copies fd 2 before the `2>` rebinds it, so the line still
-// prints on the terminal. A flag can only point at this sink's own
-// stderr field, which by then is /dev/null -- the output vanished.
-// Naming the *enclosing* sink instead keeps the two apart.
+// Where one of a redirected builtin's streams ends up. A dup names the
+// descriptor as the command found it, which is why there are three cases:
+// in `echo e >&2 2>/dev/null`, `>&2` copies fd 2 before `2>` rebinds it,
+// so the line still prints. Pointing at this sink's own stderr would find
+// /dev/null; naming the enclosing sink keeps them apart.
 #[derive(Clone)]
 pub(crate) enum SinkStream {
     // The enclosing sink's stdout: no redirect of its own, or a `2>&1`
-    // whose fd 1 this command never rebound.
+    // whose fd 1 this command didn't rebind.
     OuterOut,
     // The enclosing sink's stderr, likewise.
     OuterErr,
-    // Where this command's own redirects put the stream. Two streams
-    // that end up on one destination hold the same `Rc`, and so share a
-    // write position -- `>file 2>&1` must not have them overwrite each
-    // other -- and, for a capture that is still only a buffer, one
-    // buffer rather than two.
+    // Where this command's redirects put the stream. Two streams on one
+    // destination share the `Rc`, so they share a write position (`>file
+    // 2>&1` mustn't overwrite itself) and, for an unmaterialised capture,
+    // one buffer.
     File(Rc<Capture>),
 }
 
-// Emulates the real terminal's ONLCR postprocessing (translating outgoing
-// LF into CRLF) for text landing in a session's Grid. Every existing
-// sh_println!-style call site was written assuming a directly-connected,
-// default-cooked-mode terminal, where the OS/tty layer inserts the \r
-// invisibly; vt100::Screen deliberately does NOT do this itself (real
-// VT100 semantics: LF moves the cursor down only, CR is separate -- M9b's
-// raw pty byte streams from curses apps need that distinction preserved,
-// since those programs explicitly manage when to emit \r). This bridges
-// the gap only at the Grid sink boundary, leaving both ends correct for
-// what they actually receive.
+// Translates LF to CRLF for text going into a Grid, as a terminal's ONLCR
+// would. Every `sh_println!` assumes a cooked terminal that inserts `\r`;
+// `vt100::Screen` doesn't, because curses programs writing through a pty
+// manage `\r` themselves. So the translation happens only at the Grid
+// sink.
 fn onlcr(s: &str) -> String {
     if !s.contains('\n') {
         return s.to_string();
@@ -148,49 +120,29 @@ fn onlcr(s: &str) -> String {
 impl OutputSink {
     fn write_out(&self, s: &str) {
         match self {
-            // Deliberately not the print! macro (and not sh_print! either
-            // -- this is the base case every sh_print!/sh_println!/etc
-            // call bottoms out into via Shell::sink_out; routing it back
-            // through the sink macro here would recurse forever). print!
-            // panics on a write error, which happens for real the moment
-            // output is piped into something that closes its end early
-            // (`ulimit -a | head -3`, `jobs | head -1`, ...) -- every
-            // builtin's multi-line output funnels through here now, so
-            // this is the one place that needs to treat a broken pipe as
-            // "stop writing, not fatal" instead of crashing the process.
+            // Not `print!` (nor `sh_print!`, which bottoms out here and
+            // would recurse): `print!` panics on a write error, which
+            // happens whenever output is piped into something that closes
+            // early (`ulimit -a | head -3`). Every builtin's output comes
+            // through here, so a broken pipe is treated as "stop writing",
+            // not fatal.
             OutputSink::Real => {
-                // Straight to the descriptor rather than through
-                // `std::io::stdout()`. Its buffering hides the one
-                // condition that matters here: a write into a pipeline
-                // stage's own full pipe returns from the buffer with
-                // `Ok`, and the `EAGAIN` surfaces later inside `flush`,
-                // where the error was dropped and the bytes with it.
-                // The sink flushes after every write anyway, so the
-                // buffer was never buying anything.
+                // Straight to the descriptor, not `std::io::stdout()`,
+                // whose buffer returns `Ok` for a write into a full
+                // pipeline pipe and surfaces the `EAGAIN` later in `flush`,
+                // where it was dropped with the bytes.
                 note_write(write_fd_parking(1, s.as_bytes()));
-                // Flushed here rather than left to the line buffer,
-                // because fd 1 is not this shell's alone: the next
-                // thing to write to it is very often a child process,
-                // and a half-line still sitting in `Stdout`'s buffer
-                // comes out *after* what the child wrote.
-                // `printf A; printf B | cat; printf C` printed `BAC`.
-                //
-                // A line-oriented write already costs one syscall, so
-                // this only adds one where output stops mid-line.
-                // Measured on 20,000 partial writes into /dev/null --
-                // the case buffering would help most -- 2.156s against
-                // 2.146s, which is noise: the loop is the interpreter's
-                // time, not the kernel's. Flushing before every spawn
-                // instead would keep the buffering, at the cost of
-                // having to find every place a child can start.
+                // Flushed at once: fd 1 isn't this shell's alone, and the
+                // next writer is often a child, so a half-line left
+                // buffered would come out after the child's output
+                // (`printf A; printf B | cat; printf C` printed `BAC`).
+                // This adds a syscall only where output stops mid-line.
             }
             OutputSink::Grid(screen) => {
-                // A pipeline's pty and this shell both write into the
-                // same grid, and only one of them is synchronous. Empty
-                // the pty first so what a stage printed lands before
-                // what the shell prints next: `echo a | { trap "echo P"
-                // EXIT; cat; }` otherwise showed `P` above the `a` that
-                // was written before it.
+                // A pipeline's pty and this shell write into the same grid,
+                // and only this shell writes synchronously. Draining the
+                // pty first keeps a stage's output ahead of what the shell
+                // prints next.
                 drain_pipeline_output();
                 screen.borrow_mut().feed(onlcr(s).as_bytes());
             }
@@ -210,7 +162,7 @@ impl OutputSink {
                 let _ = std::io::stderr().write_all(s.as_bytes());
             }
             OutputSink::Grid(screen) => {
-                // Same ordering rule as write_out just above.
+                // The same ordering rule as `write_out`.
                 drain_pipeline_output();
                 screen.borrow_mut().feed(onlcr(s).as_bytes());
             }
@@ -226,24 +178,16 @@ impl OutputSink {
     }
 }
 
-/// Where a construct's standard output goes.
-///
-/// A `$( )` starts here in memory and asks the kernel for a descriptor
-/// only if it turns out to need one -- which is to say only if the body
-/// spawns a process. A builtin's output goes through this shell's own
-/// sink and never near a file, so `$(pwd)`, `$(echo x)` and the rest of
-/// the substitutions a script actually runs now cost no syscalls at
-/// all. Before this they cost five: a memfd_create, a dup, an lseek, a
-/// read and a close, together about as long as running the body.
-///
-/// A real redirect (`> file`) starts in the Fd state and stays there.
-/// Once materialised a capture never goes back, so a body that mixes
-/// builtins and processes keeps their output in the order it was
-/// written.
+/// Where a construct's standard output goes. A `$( )` starts in memory and
+/// gets a descriptor only if the body spawns a process, so `$(pwd)` and
+/// `$(echo x)` cost no syscalls, where a memfd, dup, lseek, read and close
+/// cost about as much as the body. A real redirect starts as a file. Once
+/// materialised a capture stays so, keeping builtin and process output in
+/// order.
 pub(crate) struct Capture {
     inner: RefCell<CaptureInner>,
-    // Set only when the kernel would not give us an anonymous file and
-    // a named temporary had to stand in; removed again on drop.
+    // Set when no anonymous file was available and a named temporary stands
+    // in; removed on drop.
     temp: RefCell<Option<std::path::PathBuf>>,
 }
 
@@ -253,13 +197,12 @@ enum CaptureInner {
 }
 
 impl Capture {
-    /// A capture that has no descriptor yet and may never need one.
+    /// A capture with no descriptor yet, which may never need one.
     fn memory() -> Rc<Capture> {
         Rc::new(Capture { inner: RefCell::new(CaptureInner::Memory(Vec::new())), temp: RefCell::new(None) })
     }
 
-    /// A destination that is already a real file -- an ordinary
-    /// redirect, or a pipe some caller has built.
+    /// A destination that's already a real file: a redirect, or a pipe.
     fn file(f: std::fs::File) -> Rc<Capture> {
         Rc::new(Capture { inner: RefCell::new(CaptureInner::Fd(f)), temp: RefCell::new(None) })
     }
@@ -275,22 +218,20 @@ impl Capture {
         }
     }
 
-    /// A descriptor for something that genuinely needs one: a spawned
-    /// process, or a `2>&1` that has to name fd 1. Materialises the
-    /// buffer into a real file first, so nothing written so far is lost
-    /// and nothing written later arrives out of order.
+    /// A descriptor for what needs one: a spawned process, or a `2>&1` naming
+    /// fd 1. The buffer goes into a real file first, so nothing is lost or
+    /// reordered.
     fn descriptor(&self) -> Option<std::fs::File> {
         let mut inner = self.inner.borrow_mut();
         if let CaptureInner::Memory(buf) = &*inner {
             let (file, path) = match capture_file() {
                 Some(f) => (f, None),
-                // No anonymous file: fall back to a named temporary,
-                // which this Capture then owns and removes on drop.
+                // No anonymous file: a named temporary, which this Capture
+                // removes on drop.
                 None => {
-                    // Read as well as write: `take_text` reads the
-                    // result back through this same descriptor -- and
-                    // O_EXCL, so a name planted in advance is never the
-                    // one opened (see `exclusive_temp_file`).
+                    // Read and write, since `take_text` reads back through
+                    // this descriptor; O_EXCL, so a name planted in advance
+                    // is never opened (see `exclusive_temp_file`).
                     let (f, p) = crate::platform::exclusive_temp_file("procsub")?;
                     (f, Some(p))
                 }
@@ -308,7 +249,7 @@ impl Capture {
         }
     }
 
-    /// Everything written, for the caller that asked for the capture.
+    /// Everything written, for whoever asked for the capture.
     fn take_text(&self) -> String {
         let mut inner = self.inner.borrow_mut();
         match &mut *inner {
@@ -329,54 +270,40 @@ impl Drop for Capture {
     }
 }
 
-// A Shell's own idea of "what should an external command's stdin/stdout
-// default to when nothing more specific redirects it" -- consulted at
-// every `Stdio::inherit()` fallback site (spawn_stdin_stdio/
-// spawn_stdout_stdio below) instead of calling `Stdio::inherit()`
-// directly. Only meaningful for a Shell created by run_in_child_shell
-// (a foreground subshell/command-substitution/proc-sub now running
-// in-process instead of self-exec'ing -- see its own doc comment): once
-// that construct's own external commands stop being real *grandchild*
-// processes of a real re-exec'd child (which naturally inherited the
-// right fds for free, since `.output()`/`.status()`'s own pipe/redirect
-// was that child's real fd 1), something has to keep telling them where
-// their default stdio actually goes. `None` (the ordinary case for every
-// other Shell) means "really inherit the real process's own fds",
-// exactly matching plain `Stdio::inherit()`.
+// What an external command's stdin and stdout default to when nothing
+// redirects them, used at every `Stdio::inherit()` fallback
+// (`spawn_stdin_stdio`, `spawn_stdout_stdio`). Only set for a Shell made by
+// `run_in_child_shell` (a subshell or substitution running in-process),
+// whose commands would otherwise inherit the real process's fds instead
+// of the construct's. `None` means the real fds, as `Stdio::inherit()`.
 
-// Shell::run_in_child_shell's own redirect/capture argument -- see its own
-// doc comment. `Default` (every field `None`/`false`) means "this
-// construct has no redirect of its own," inheriting the parent's current
-// output/input destination exactly.
+// `run_in_child_shell`'s redirect and capture argument. `Default` means
+// no redirect of its own: inherit the parent's destinations.
 #[derive(Default)]
 struct ChildStdio {
     stdout: Option<Rc<Capture>>,
     stdin: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
-    // `2>&1` / `1>&2`: which stream follows the other, and what it was
-    // following at the point the dup appeared. A descriptor names what
-    // it names right then, so the two are different destinations:
-    // `{ echo e; } >&2 2>/dev/null` prints on the terminal, because
-    // `>&2` copied fd 2 before the `2>` rebound it, while
-    // `{ echo e; } 2>/dev/null >&2` prints nothing.
+    // `2>&1`/`1>&2`: which stream follows the other, and what it followed
+    // when the dup appeared. A descriptor names what it names then: `{ echo
+    // e; } >&2 2>/dev/null` prints, since `>&2` copied fd 2 before `2>`
+    // rebound it, while `{ echo e; } 2>/dev/null >&2` prints nothing.
     out_follows_err: Option<Follows>,
     err_follows_out: Option<Follows>,
 }
 
-// What a `2>&1`/`1>&2` was pointing at when it appeared.
+// What a `2>&1`/`1>&2` pointed at when it appeared.
 #[derive(Clone, Copy)]
 enum Follows {
-    // The file this same command had already opened for the other
-    // stream.
+    // The file this command had already opened for the other stream.
     OwnFile,
-    // The enclosing shell's descriptor for it -- the dup came first.
+    // The enclosing shell's descriptor: the dup came first.
     Outer,
 }
 
 impl ChildStdio {
-    // Does this construct redirect either output stream at all? When it
-    // doesn't, the child's sink should be *exactly* the parent's rather
-    // than a fresh wrapper around it.
+    // Whether either output stream is redirected. When not, the child's sink
+    // is exactly the parent's rather than a wrapper.
     fn redirects_output(&self) -> bool {
         self.stdout.is_some() || self.stderr.is_some() || self.out_follows_err.is_some() || self.err_follows_out.is_some()
     }
@@ -455,48 +382,34 @@ struct ProcessRestore {
 }
 
 struct StdioOverride {
-    // `Some` => read from here (a real, shared, sequentially-consumed
-    // reader) instead of the real stdin -- see SharedReaderState's own
-    // doc comment for why this needs more than a bare File.
+    // `Some`: read from this shared reader instead of the real stdin (see
+    // `SharedReaderState`).
     stdin: Option<Rc<RefCell<SharedReaderState>>>,
-    // `Some` => write here instead of the real stdout.
+    // `Some`: write here instead of the real stdout.
     stdout: Option<Rc<Capture>>,
-    // And the same for stderr. Without it a construct's `2>` reached
-    // the builtins inside it, through the output sink, and nothing
-    // else: `{ /bin/ls /nosuch; } 2>/dev/null` still printed the error,
-    // because an external command's stderr was always inherited.
+    // And stderr, so a construct's `2>` reaches the externals inside it, not
+    // only its builtins: `{ /bin/ls /nosuch; } 2>/dev/null` is silent.
     stderr: Option<std::fs::File>,
 }
 
-// Backs a converted construct's stdin override (see StdioOverride's own
-// doc comment): the real File, plus whatever's already been pulled from
-// it via a real read() syscall but not yet consumed by a BufRead::
-// consume() call. `read_input_source`'s own doc comment explains why a
-// fresh, throwaway BufReader on every call would silently drop
-// read-ahead bytes between separate `read` builtin invocations in the
-// same `while read` loop -- this is that same problem, solved the same
-// way (one persistent buffer, reused across calls) for the case where
-// the source is this override rather than the real process's own stdin.
+// Backs a converted construct's stdin override: the file plus bytes read
+// from it but not yet consumed. As with `read_input_source`, a fresh
+// BufReader per call would drop read-ahead between separate `read` calls
+// in one `while read` loop; one persistent buffer avoids that.
 struct SharedReaderState {
     file: std::fs::File,
     pending: Vec<u8>,
-    /// So a read from here can give a live coroutine a turn instead of
-    /// blocking on bytes only this thread can produce -- `while read
-    /// ... done < <(cmd)` names a pipe whose far end is one.
+    /// So a read can give a live coroutine a turn instead of blocking on
+    /// bytes only this thread produces: `while read ... done < <(cmd)`
+    /// reads a pipe a coroutine writes.
     coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
 }
 
-// A thin, freshly-built-per-call BufRead over a SharedReaderState --
-// read_input_source hands one of these out each time it's called, but
-// they all share (and correctly hand back and forth) the same
-// underlying pending-bytes buffer, so a sequence of separate calls
-// behaves like one persistent reader. Needed (rather than just handing
-// out `Rc<RefCell<SharedReaderState>>` directly wrapped in a
-// std::io::BufReader) because BufRead::fill_buf must return a `&[u8]`
-// borrowed from `&mut self` -- a RefCell borrow can't be smuggled out
-// through that signature, so this owns a local copy of "the currently
-// available slice" instead and reconciles it against the shared state
-// on fill/consume/drop.
+// A per-call BufRead over a SharedReaderState; successive ones share the
+// pending bytes, so separate calls act as one reader. Needed because
+// `fill_buf` returns a slice borrowed from `&mut self`, which a RefCell
+// borrow can't provide, so this keeps a local copy of the available slice
+// and reconciles it with the shared state.
 struct SharedStdinReader {
     state: Rc<RefCell<SharedReaderState>>,
     local: Vec<u8>,
@@ -513,32 +426,19 @@ impl std::io::Read for SharedStdinReader {
     }
 }
 
-/// `write_all`, except that a descriptor with no room hands the thread
-/// to another pipeline stage instead of failing.
+/// Runs `op` with `fd` non-blocking, then restores the flag. O_NONBLOCK is
+/// on the open file description, shared by everything that inherits the
+/// descriptor, so leaving it on a stage's pipe made every external that
+/// stage spawned fail with `Resource temporarily unavailable`. Set only
+/// around this shell's own read or write, it's never set when a child
+/// forks; a stage yields only at a park, never mid-syscall.
 ///
-/// Only a pipe between two stages running in this process is ever
-/// non-blocking, so outside one of those this loop takes its first
-/// branch every time and behaves exactly like `write_all`. Inside one,
-/// `WouldBlock` means the reader is behind, and the reader is another
-/// coroutine -- so the answer is to let it run, not to error.
-/// Runs `op` with `fd` non-blocking, and puts the flag back.
-///
-/// `O_NONBLOCK` lives on the open file *description*, which everything
-/// that inherits the descriptor shares -- so leaving it set on a
-/// pipeline stage's pipe made every external command that stage
-/// spawned fail with `Resource temporarily unavailable`. Setting it
-/// only around this shell's own read and write means it is never set
-/// at the moment a child is forked, which is the only moment that
-/// matters. Nothing else can run in between: a stage yields at a park,
-/// never mid-syscall.
-///
-/// Only inside a coroutine, where a blocking descriptor would take the
-/// whole thread down with it. Everywhere else this is the bare `op`.
+/// Only inside a coroutine, where blocking would take the whole thread;
+/// elsewhere it's just `op`.
 fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
-    // A coroutine must never block -- it would take the thread and
-    // every other stage with it. So must an in-process pipeline stage
-    // whose pane output only this thread will drain, for the same
-    // reason wearing a different hat (see PIPELINE_DRAIN).
+    // A coroutine must never block, taking every other stage with it; nor
+    // must an in-process stage whose pane output only this thread drains (see
+    // PIPELINE_DRAIN).
     if !crate::coroutine::in_coroutine() && !pipeline_drain_armed() {
         return op();
     }
@@ -548,42 +448,30 @@ fn briefly_nonblocking<T>(fd: i32, op: impl FnOnce() -> T) -> T {
     out
 }
 
-/// The pty a pipeline in a pane writes into, and the grid its bytes
-/// belong to.
-///
-/// A pipeline is spawned as real processes, and the streams nobody
-/// redirected are inherited -- which in a pane is the real terminal
-/// underneath, the one the compositor paints over. So `ls | grep x`
-/// printed nothing at all in a split window, and had never printed
-/// anything. This is the pane's own end of the pipeline: the last
-/// stage's stdout and every stage's stderr point at the slave, and
-/// this drains the master into the grid.
+/// The pty a pipeline in a pane writes into, and its grid. A pipeline's
+/// processes inherit the streams nobody redirected, which in a pane is the
+/// real terminal underneath the compositor, so `ls | grep x` printed
+/// nothing in a split window. Here the last stage's stdout and every
+/// stage's stderr point at the slave, and the master is drained into the
+/// grid.
 struct PaneOutput {
     master: std::fs::File,
     screen: Rc<RefCell<crate::vt100::Screen>>,
-    /// One slave descriptor, held open for as long as this exists and
-    /// never written to.
-    ///
-    /// Without it the master starts answering EIO the moment the last
-    /// stage exits and closes its own copy -- before anything has read
-    /// what that stage wrote. `seq 1 2 | { echo start; cat; }` lost
-    /// `cat`'s two lines exactly that way: they were sitting in the pty
-    /// and the drain that came looking for them was told the far end
-    /// had gone. Keeping one open means an empty pty reads as "nothing
-    /// yet" rather than "nothing ever".
+    /// One slave descriptor held open and never written. Without it the
+    /// master returns EIO once the last stage closes its copy, before its
+    /// output has been read; with it an empty pty reads as "nothing yet".
     _keepalive: std::fs::File,
 }
 
 impl PaneOutput {
-    /// Everything waiting right now, into the grid. Never blocks: the
-    /// master is non-blocking, and the `Err` arm covers both "nothing
-    /// yet" and the EIO Linux gives once every slave is closed.
+    /// Everything waiting, into the grid, without blocking: the master is
+    /// non-blocking, and `Err` covers both "nothing yet" and Linux's EIO once
+    /// every slave is closed.
     fn drain(&mut self) {
         use std::io::Read;
-        // `try_borrow_mut`, because this is called from inside the
-        // grid's own write path (see write_out): if something up the
-        // stack already holds the screen, the right answer is to leave
-        // its bytes in the pty until next time, not to panic.
+        // `try_borrow_mut`, since this runs inside the grid's own write
+        // path: if the screen is already borrowed up the stack, leave the
+        // bytes for next time.
         let Ok(mut screen) = self.screen.try_borrow_mut() else { return };
         let mut buf = [0u8; 4096];
         loop {
@@ -597,27 +485,22 @@ impl PaneOutput {
 }
 
 thread_local! {
-    /// Armed while this thread is running something that writes into a
-    /// pipeline it is also responsible for draining.
-    ///
-    /// The in-process stage of a pipeline runs to completion inline, so
-    /// nothing empties the pane's pty while it does. If the stage
-    /// upstream produces more than a pipe holds and the stage
-    /// downstream produces more than the pty holds, both stop: the
-    /// downstream blocked writing, so it stopped reading, so the
-    /// upstream blocked writing too. Draining from inside the write
-    /// that would otherwise block is what keeps that from being a hang.
+    /// Armed while this thread runs something writing into a pipeline it
+    /// also drains. The in-process stage runs inline, so nothing empties
+    /// the pane's pty meanwhile; if the upstream stage overfills its pipe
+    /// and the downstream one the pty, both stop. Draining from inside the
+    /// blocking write prevents that hang.
     static PIPELINE_DRAIN: RefCell<Option<PaneOutput>> = const { RefCell::new(None) };
 }
 
-/// Whether a write that would block should drain the pane's pty and
-/// try again rather than wait in the kernel.
+/// Whether a write that would block should drain the pty and retry
+/// instead of waiting in the kernel.
 fn pipeline_drain_armed() -> bool {
     PIPELINE_DRAIN.with(|d| d.borrow().is_some())
 }
 
-/// One pass of the armed drain. `false` if there is nothing armed, in
-/// which case the caller has to block after all.
+/// One pass of the armed drain; `false` if none is armed, and the caller
+/// has to block.
 pub(crate) fn drain_pipeline_output() -> bool {
     PIPELINE_DRAIN.with(|d| match d.borrow_mut().as_mut() {
         Some(output) => {
@@ -628,33 +511,32 @@ pub(crate) fn drain_pipeline_output() -> bool {
     })
 }
 
-/// A write into a redirect target that failed. A broken pipe is the
-/// one worth remembering -- it is how an in-process stage learns its
-/// reader is gone, since it cannot be told by SIGPIPE. Everything else
-/// is dropped, as it was before there was anywhere to put it.
+/// A failed write to a redirect target. A broken pipe is remembered: it's
+/// how an in-process stage learns its reader has gone, since SIGPIPE can't
+/// tell it. Other errors are dropped.
 fn note_write(result: std::io::Result<()>) {
     if result.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
         note_broken_pipe();
     }
 }
 
+/// `write_all`, except that a full descriptor hands the thread to another
+/// pipeline stage instead of failing. Only a pipe between two in-process
+/// stages is non-blocking, so elsewhere this is `write_all`; there,
+/// `WouldBlock` means the reader, a coroutine, is behind, so let it run.
 pub(crate) fn write_all_parking(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     write_fd_parking(file.as_raw_fd(), bytes)
 }
 
-/// How many turns a `<( )` producer gets to notice that nobody is
-/// reading it any more, once the command using it has finished.
+/// How many turns a `<( )` producer gets to notice nobody reads it any
+/// more, after its command finishes.
 const PROC_SUB_WINDDOWN_TURNS: usize = 8;
 
-/// A file this shell reads, which gives any live coroutine a turn
-/// rather than blocking in the kernel while one is waiting to run.
-///
-/// The case that needs it is `read v < <(echo hello)`: the name is a
-/// pipe a coroutine is on the far end of, and a plain blocking read
-/// here would wait for bytes that only this thread can produce. Where
-/// nothing is live -- every ordinary `< file` -- this is a bare read
-/// with one `poll` in front of it.
+/// A file this shell reads that gives a live coroutine a turn instead of
+/// blocking: in `read v < <(echo hello)` the name is a pipe a coroutine
+/// writes, and a blocking read would wait for bytes only this thread can
+/// produce. With nothing live it's a plain read with one `poll` first.
 struct PumpingFile {
     file: std::fs::File,
     coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
@@ -672,8 +554,8 @@ impl std::io::Read for PumpingFile {
                 return self.file.read(buf);
             };
             if scheduler.is_idle() {
-                // Nothing can produce anything, so waiting in the
-                // kernel is right after all.
+                // Nothing can produce anything, so waiting in the kernel is
+                // right.
                 drop(scheduler);
                 return self.file.read(buf);
             }
@@ -682,7 +564,7 @@ impl std::io::Read for PumpingFile {
     }
 }
 
-/// `write_all_parking` straight onto a descriptor.
+/// `write_all_parking` onto a descriptor.
 fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
@@ -696,9 +578,9 @@ fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
             Err(e) => e,
         };
         match e.kind() {
-            // Nothing downstream can take more yet. A coroutine parks;
-            // an in-process stage empties the pane's pty, which is what
-            // the process downstream is waiting on, and tries again.
+            // Nothing downstream can take more yet. A coroutine parks; an
+            // in-process stage drains the pane's pty, which the downstream
+            // process is waiting on, and retries.
             std::io::ErrorKind::WouldBlock => {
                 if !drain_pipeline_output() {
                     crate::scheduler::park_writable(fd);
@@ -708,32 +590,25 @@ fn write_fd_parking(fd: i32, bytes: &[u8]) -> std::io::Result<()> {
             _ => return Err(e),
         }
     }
-    // The write succeeded, so whatever is downstream now has something
-    // to read: hand it the thread before writing more.
-    //
-    // Nothing else here ever would. A stage only gives the thread up
-    // when it *blocks*, and a producer whose reader is keeping up never
-    // blocks -- so `while true; do echo x; done | { read a; ...; }` ran
-    // the producer 32768 times, until the pipe buffer filled, before
-    // the reader got its first turn. Separate processes do not behave
-    // that way, because the kernel preempts them; a cooperative
-    // scheduler has to be told where the fair point is, and the moment
-    // the data becomes readable is it.
+    // The write succeeded, so downstream has something to read: hand it the
+    // thread. A stage otherwise yields only when it blocks, and a producer
+    // whose reader keeps up never blocks, so a `while true; do echo x; done`
+    // producer ran until the pipe filled before its reader's first turn. The
+    // kernel preempts processes; a cooperative scheduler is told here.
     if crate::coroutine::in_coroutine() {
         crate::scheduler::park_ready();
     }
     Ok(())
 }
 
-/// `read`, with the same treatment: nothing to read yet means another
-/// stage has not written it yet, and that stage is a coroutine.
+/// `read`, likewise: nothing to read means a stage, a coroutine, hasn't
+/// written it yet.
 fn read_parking(file: &mut std::fs::File, buf: &mut [u8], coroutines: &Rc<RefCell<crate::scheduler::Scheduler>>) -> std::io::Result<usize> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
     loop {
-        // Inside a pipeline stage: hand the thread back to the
-        // scheduler, which is above this on the stack.
+        // Inside a stage: hand the thread back to the scheduler above us.
         if crate::coroutine::in_coroutine() {
             match briefly_nonblocking(fd, || file.read(buf)) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => crate::scheduler::park_readable(fd),
@@ -742,9 +617,8 @@ fn read_parking(file: &mut std::fs::File, buf: &mut [u8], coroutines: &Rc<RefCel
             }
             continue;
         }
-        // The shell itself, reading something a coroutine is feeding.
-        // Blocking here would wait for bytes only this thread can
-        // produce.
+        // The shell itself reading what a coroutine feeds; blocking would
+        // wait for bytes only this thread produces.
         if crate::poll::poll_readable_or_eof(fd, 0) {
             return file.read(buf);
         }
@@ -781,10 +655,8 @@ impl std::io::BufRead for SharedStdinReader {
 
 impl Drop for SharedStdinReader {
     fn drop(&mut self) {
-        // Hand back whatever this call fetched but never consumed (e.g.
-        // read_until found its delimiter partway through a bulk read),
-        // so the *next* SharedStdinReader -- the next `read` call in the
-        // same loop -- picks up exactly where this one left off.
+        // Hand back what this call fetched but didn't consume, so the next
+        // reader, the next `read` in the loop, continues from there.
         if !self.local.is_empty() {
             let mut state = self.state.borrow_mut();
             let mut rest = std::mem::take(&mut self.local);
@@ -794,13 +666,9 @@ impl Drop for SharedStdinReader {
     }
 }
 
-// Mirror std's print!/println!/eprint!/eprintln! but route through a
-// Shell's own sink instead of unconditionally going straight to the real
-// process stdout/stderr. `$self` needs `sink_out`/`sink_err` methods
-// (Shell has them); forwarding the raw `$($arg)*` tokens straight into
-// the real `format!` is what keeps this a faithful, low-risk mechanical
-// swap at every call site -- every existing format string/argument list
-// still means exactly what it did before, only the destination changes.
+// `print!` and friends through a Shell's sink instead of the real
+// stdout/stderr. `$self` needs `sink_out`/`sink_err`; the arguments go to
+// `format!` unchanged.
 macro_rules! sh_print {
     ($self:expr, $($arg:tt)*) => {
         $self.sink_out(&format!($($arg)*))
@@ -844,62 +712,30 @@ pub enum ExecResult {
     Break(u32),
     Continue(u32),
     Return(i32),
-    // `window`-family command result. Bubbles up through run_and_or/
-    // run_pipeline/run_program exactly like Break/Continue/Return, all the
-    // way to whoever called run_program -- repl.rs, which is the only
-    // thing that actually owns the session/window collection. This is
-    // deliberate, not an oversight: a session's own Shell can't hold a
-    // reference to "all sessions" (itself included) without creating an
-    // Rc<RefCell<_>> self-reference cycle that would panic the moment
-    // running code tried to borrow it while already borrowed one level up
-    // the call stack. Threading the action through the same signal
-    // mechanism control flow already uses avoids that entirely: run_window
-    // (below) only validates the request and returns it, never touches
-    // shared window state itself.
+    // A `window` command's result, bubbling up like Break and Return to
+    // whoever called `run_program`: repl.rs, which owns the sessions and
+    // windows. A session's Shell can't hold all sessions, itself included,
+    // without a RefCell cycle that panics when borrowed twice, so the action
+    // travels as a signal and `run_window` never touches window state.
     Window(WindowAction),
-    // `fg` on a job that was spawned pty-attached (see Job::pty_master)
-    // while promoted. Bubbles up exactly like Window, for exactly the
-    // same reason: rendering the job's output into the fg-ing window's
-    // grid and redrawing the real terminal both need repl.rs's own
-    // session/window state, which a session's own Shell can't hold a
-    // reference to (see Window's doc comment). run_fg only removes the
-    // job from the table and stashes it on `self.pending_fg`; repl.rs
-    // reacts to this signal by calling Shell::take_pending_fg to get an
-    // owned FgJob handle, pushing it as a Frame::Job on the current
-    // window's stack, and driving it directly (repl.rs's drive_fg_job) --
-    // unlike the Window action, this one hands over real ownership
-    // rather than just a callback, since the Frame stack needs to keep
-    // referencing the job across main-loop iterations, not just for the
-    // duration of one call.
+    // `fg` on a pty-attached job (see `Job::pty_master`) while promoted.
+    // Bubbles up like Window, since rendering the job needs repl.rs's state.
+    // `run_fg` moves the job to `pending_fg`; repl.rs takes it with
+    // `take_pending_fg`, pushes it as a `Frame::Job` and drives it
+    // (`drive_fg_job`), owning it across loop iterations.
     Fg,
-    // `e [ARG...]`. Bubbles up exactly like Fg, for exactly the same
-    // reason: a builtin has no raw-mode/keystroke/rendering access of
-    // its own, and `Registers` lives in `repl::run`'s own locals, not in
-    // `Shell` at all. Carries no payload itself (`ExecResult` stays
-    // `Copy`, same as every other variant here -- an owned argument
-    // vector wouldn't be) -- `run_single` stashes the actual arguments
-    // on `self.pending_edit` first, same as `run_fg` already does via
-    // `pending_fg`; repl.rs reacts to this signal by calling
-    // `Shell::take_pending_edit` to get them back out.
+    // `e [ARG...]`, bubbling up like Fg: a builtin has no raw mode, keys or
+    // rendering, and `Registers` lives in `repl::run`. `ExecResult` stays
+    // `Copy`, so the arguments go to `pending_edit` and repl.rs takes them
+    // with `take_pending_edit`.
     Edit,
-    // `exit`, a failing statement under `set -e`, a `set -u` violation,
-    // or a failed `exec` -- a request to terminate *this Shell's own
-    // top-level run*, not necessarily the real OS process. Bubbles up
-    // through run_and_or/run_pipeline/run_program exactly like the other
-    // signal variants; whoever called the outermost run_program decides
-    // what "terminate" means: the real top level (main.rs's run_source,
-    // repl.rs's two run_program call sites) turns this into a genuine
-    // std::process::exit (matching this codebase's prior behavior, where
-    // these four sites called std::process::exit directly, unconditionally
-    // killing the whole process no matter which session/pane triggered
-    // it); `run_in_child_shell` (a foreground subshell/command-substitution/
-    // proc-sub running in-process, see its own doc comment) instead
-    // unwraps this as *that child's own* exit status, matching real bash's
-    // fork isolation for `(exit 3)` -- the enclosing real shell must not
-    // die just because a subshell called `exit`. The exit trap has
-    // already been run by whichever site produced this (see e.g.
-    // run_program's own errexit arm) -- nothing downstream should run it
-    // again.
+    // `exit`, a failure under `set -e`, a `set -u` violation, or a failed
+    // `exec`: ending this Shell's top-level run, not necessarily the
+    // process. Bubbles up like the other signals, and the outermost caller
+    // decides: the real top level (main.rs's `run_source`, repl.rs) exits
+    // the process, while `run_in_child_shell` takes it as that child's
+    // status, so `(exit 3)` doesn't end the shell, as with bash's fork. The
+    // EXIT trap has already run.
     Exit(i32),
 }
 
@@ -928,57 +764,39 @@ impl ExecResult {
     }
 }
 
-// What a paused DebugHook decided to do next -- see DebugHook's own doc
-// comment.
+// What a paused DebugHook does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugAction {
-    // Keep running until the next breakpoint/step condition.
+    // Run to the next breakpoint or step condition.
     Continue,
-    // Stop at the next statement at this *same or shallower* depth --
-    // i.e. don't stop again just because execution descended into a
-    // function call or a converted foreground subshell/command-
-    // substitution in the meantime.
+    // Stop at the next statement at this depth or shallower, not inside a
+    // function or subshell entered meanwhile.
     StepOver,
-    // Stop at the very next statement, regardless of depth.
+    // Stop at the next statement, at any depth.
     StepInto,
-    // Unwind the whole running program, same as a real `exit` (see
-    // ExecResult::Exit) -- used to abandon a debug run entirely (`q` in
-    // the debugger UI) without killing the real process.
+    // Unwind the whole program, like `exit` (see `ExecResult::Exit`), to
+    // abandon a debug run without ending the process.
     Quit,
 }
 
-// Where the interpreter currently is, for DebugHook::on_statement's own
-// step-over/step-into bookkeeping. Compared subshell_depth first, then
-// call_depth: without the subshell half, a StepOver issued in the parent
-// at its own top level (subshell_depth 0, call_depth 0) could otherwise
-// be fooled by a converted foreground subshell/command-substitution
-// starting its own run_program at call_depth 0 too, aliasing two
-// genuinely different "frames" together.
+// Where the interpreter is, for stepping. Compares `subshell_depth`, then
+// `call_depth`: without the first, a subshell starting its own
+// `run_program` at call depth 0 would alias the parent's top level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DebugDepth {
     pub subshell_depth: u32,
     pub call_depth: usize,
 }
 
-// Called once per top-level ListItem, right before run_program actually
-// runs it (see run_program's own call site) -- the single hook point
-// every executed statement passes through uniformly, at every nesting
-// depth (if/while/for/case/function bodies all recurse back through
-// run_program). Defined here (using only exec.rs-level types) rather
-// than in the concrete debugger UI module, so exec.rs doesn't gain a
-// dependency on repl.rs/bishedit -- the concrete implementation (owning
-// breakpoints, rendering, blocking key-reads) lives on the other side of
-// this trait instead, depending on exec.rs, not the reverse.
+// Called before each top-level `ListItem` that `run_program` runs, at
+// every depth (compound bodies recurse through `run_program`). Defined
+// with exec.rs types so the debugger, which owns breakpoints, rendering
+// and key reads, depends on exec.rs and not the reverse.
 pub trait DebugHook {
-    // `shell: &mut Shell`, not `&Shell` -- deciding whether to keep
-    // running needs write access, not just a read-only variable peek:
-    // when the answer is "let this statement run for real, uninterrupted"
-    // (no pause), the hook needs to actually hand the real terminal over
-    // to it (DebugController::hand_off_to_script -- Shell::set_sink_real,
-    // so e.g. `read -p`'s own prompt shows up immediately instead of
-    // sitting invisibly captured until long after the moment it
-    // mattered) and reclaim it again once it's this hook's turn to
-    // decide again.
+    // `&mut Shell`: when a statement should run uninterrupted, the hook
+    // hands the terminal to the script (`PauseState::hand_off_to_script`,
+    // via `set_sink_real`), so `read -p`'s prompt shows at once, and takes
+    // it back when it's the hook's turn again.
     fn on_statement(&mut self, line: usize, depth: DebugDepth, shell: &mut Shell) -> DebugAction;
 }
 
@@ -1073,27 +891,22 @@ pub trait ServiceTable {
 /// answer: a trait exec.rs owns and repl.rs implements, so the
 /// dependency points the way it already does.
 pub trait HistoryAccess {
-    /// Every entry, oldest first, each with when it was recorded if
-    /// that is known. The index a caller prints is this position plus
-    /// one, matching bash's 1-based numbering.
-    ///
-    /// The time is `None` for anything written before the history file
-    /// carried one, and for an entry rebuilt by `delete` -- see
-    /// history.rs. `HISTTIMEFORMAT` shows nothing for those rather than
-    /// inventing a plausible wrong time.
+    /// Every entry, oldest first, with when it was recorded if known.
+    /// Callers print the position plus one, as bash numbers from 1. The
+    /// time is `None` for entries written before the file recorded times,
+    /// and for ones rebuilt by `delete` (see history.rs); `HISTTIMEFORMAT`
+    /// then shows nothing rather than a wrong time.
     fn entries(&self) -> Vec<(String, Option<i64>)>;
 
-    /// Drops everything -- `history -c`.
+    /// Drops everything: `history -c`.
     fn clear(&mut self);
 
-    /// Drops the entry with 1-based number `n`. `false` when there is
-    /// no such entry, which the caller reports.
+    /// Drops entry `n` (1-based); `false` if there's none.
     fn delete(&mut self, n: usize) -> bool;
 }
 
-/// What a shell has before anything installs a real one -- and what
-/// every non-interactive shell keeps, since a script has no interactive
-/// history to have.
+/// Before a real history is installed, and for every non-interactive
+/// shell, which has none.
 pub struct NoHistory;
 
 impl HistoryAccess for NoHistory {
@@ -1108,9 +921,8 @@ impl HistoryAccess for NoHistory {
     }
 }
 
-/// What a shell has before anything installs a real table -- and what
-/// every non-interactive shell keeps, since nothing there ever starts a
-/// language server.
+/// Before a real table is installed, and for every non-interactive shell,
+/// which never starts a language server.
 pub struct NoServices;
 
 impl ServiceTable for NoServices {
@@ -1126,110 +938,66 @@ impl ServiceTable for NoServices {
 }
 
 /// One declared language server: what to run, for which languages, and
-/// how to find the root of the project it should be given.
-///
-/// A *declaration*, not a running process -- nothing here starts
-/// anything. `repl::run` owns the servers that are actually running
-/// (keyed by command and project root, so one server serves every pane
-/// editing the same project), the same way it owns job and edit frames;
-/// this is the config a shell carries so a bishrc can say which servers
-/// exist at all. `lspclient::Server` is the other half.
+/// how to find the project root. A declaration only: `repl::run` owns the
+/// running servers (keyed by command and root, so one serves every pane on
+/// a project); this is what a bishrc declares. `lspclient::Server` is the
+/// other half.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspServer {
-    /// From a per-shell counter, never reused -- `rm` always names the
-    /// thing `ls` showed. Same contract as `Hook::id`.
+    /// From a per-shell counter, never reused, as `Hook::id`.
     pub id: u64,
-    /// `--lang=`: a glob over the language of the file being edited
-    /// (`fileeditor::language_of`), the same shape and matcher
-    /// `hook --lang` and `abbr --lang` use. `*` when unscoped.
+    /// `--lang=`: a glob over the edited file's language
+    /// (`fileeditor::language_of`), as for `hook` and `abbr`. `*` when
+    /// unscoped.
     pub lang: String,
     /// The command line to run, split into words at registration time.
     pub command: Vec<String>,
-    /// `--root=`: file names that mark the top of a project, tried in
-    /// order, walking up from the file being edited. `.git` when
-    /// unspecified, which is what gitignore::Stack::for_directory
-    /// already treats as the boundary.
+    /// `--root=`: file names marking a project's top, tried in order
+    /// walking up from the file. `.git` by default, as
+    /// `gitignore::Stack::for_directory` uses.
     pub root_markers: Vec<String>,
-    /// `--root-cmd=`: a command that prints the project root on its
-    /// first line of stdout, run in the directory of the file being
-    /// opened. Empty when unset, which is the ordinary case.
-    ///
-    /// Exists because some roots are only knowable by asking the build
-    /// tool: a Cargo *workspace* member should usually be rooted at the
-    /// workspace, and only `cargo metadata` knows where that is. A
-    /// generic escape hatch rather than a Cargo special case, so any
-    /// language can answer the same question its own way -- and so this
-    /// client stays a language server client rather than accumulating
-    /// per-language knowledge.
+    /// `--root-cmd=`: a command printing the project root on its first line,
+    /// run in the file's directory; usually empty. Some roots only the build
+    /// tool knows (a Cargo workspace member belongs at the workspace, which
+    /// `cargo metadata` knows), and a generic command lets each language
+    /// answer without per-language code here.
     pub root_cmd: String,
-    /// `--apply-edits=`: how much authority this server has to change
-    /// files on its own.
-    ///
-    /// A server can ask the client to apply an edit at any moment
-    /// (`workspace/applyEdit`), not only in answer to something the
-    /// user asked for. That is how a command-style code action does its
-    /// work, and it is also how a server could rewrite a buffer nobody
-    /// invited it to touch -- so it is a policy rather than a fact.
-    ///
-    /// `scoped` (the default) accepts an edit only while a command the
-    /// *user chose* is still running; `never` refuses always, which is
-    /// what bish did before this existed; `always` accepts whenever
-    /// asked, which is what VS Code does.
+    /// `--apply-edits=`: how much a server may change files on its own. A
+    /// server can send `workspace/applyEdit` at any time, which is how
+    /// command code actions work, and also how one could rewrite a buffer
+    /// uninvited. `scoped` (default) accepts only while a user-chosen
+    /// command runs; `never` always refuses; `always` always accepts, as VS
+    /// Code does.
     pub apply_edits: String,
-    /// `--setting KEY=VALUE`, repeatable: what this server should be
-    /// told its configuration is.
-    ///
-    /// Kept as the flat `dotted.key=value` pairs they were given as,
-    /// not as a parsed tree, because that is what `ls` has to print
-    /// back and what a person has to be able to read. The nesting a
-    /// server expects (`rust-analyzer.check.command` is an object three
-    /// deep) is built where it is sent, from these.
-    ///
-    /// Values are JSON when they parse as JSON and strings otherwise,
-    /// so `--setting x.enable=true` is a boolean and
-    /// `--setting x.path=/usr/bin/foo` is a string without needing
-    /// quotes fought through two levels of shell.
+    /// `--setting KEY=VALUE`, repeatable: the server's configuration. Kept
+    /// as flat `dotted.key=value` pairs, as `ls` prints them; the nesting a
+    /// server expects is built when sending. Values are JSON if they parse,
+    /// else strings, so `x.enable=true` is a boolean and
+    /// `x.path=/usr/bin/foo` a string without quoting through two levels of
+    /// shell.
     pub settings: Vec<(String, String)>,
 }
 
-/// One `--setting` pass's result: the pair it found, if the flag was
-/// at the front, and whatever is left of the arguments.
+/// One `--setting` pass: the pair, if the flag was first, and the rest of
+/// the arguments.
 type ParsedSetting<'a> = (Option<(String, String)>, &'a [String]);
 
 impl LspServer {
-    /// What `ls` prints and what `status` echoes back -- the command as
-    /// one line, quoting only the words that would otherwise stop being
-    /// one word. `ls` is tab-separated so a script can read it, which
-    /// means this field is the one a person actually reads, and
-    /// `'rust-analyzer'` in quotes for no reason reads as though
-    /// something odd is going on.
+    /// The command as one line for `ls` and `status`, quoting only words that
+    /// would otherwise split.
     pub fn command_line(&self) -> String {
         let plain = |w: &String| !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || "-_./=:+@,".contains(c));
         self.command.iter().map(|w| if plain(w) { w.clone() } else { shell_quote(w) }).collect::<Vec<_>>().join(" ")
     }
 }
 
-/// Every event a hook can be attached to.
+/// Every event a hook can attach to.
 ///
-/// **Naming.** `pre`/`post` is a segment rather than a prefix
-/// (`editor:file:write:pre`, not `editor:file:prewrite`) because every
-/// established system treats it as a modifier on one event -- git's
-/// `pre-commit`/`post-commit`, vim's `BufWritePre`/`BufWritePost`,
-/// emacs's `before-save-hook`/`after-save-hook`, LSP's
-/// `willSave`/`didSave`. The practical half of that argument is that it
-/// keeps the hierarchy prefix-matchable: `editor:file:write` and
-/// `editor:file` are meaningful prefixes to glob or group by, which
-/// they cannot be with the verb buried inside a segment.
-///
-/// `open` and `close` carry no qualifier because each has only one
-/// useful moment: `open` fires once the buffer exists, and `close`
-/// fires *before* it goes away -- afterwards there is nothing left for
-/// a hook to look at, which is why vim's own `BufUnload`/`BufDelete`
-/// are both "before" too.
-///
-/// The `editor:` namespace is deliberate rather than decorative: it
-/// leaves room for `shell:` events (a preexec, a chpwd) to exist later
-/// without renaming any of these.
+/// `pre`/`post` is a segment, not a prefix (`editor:file:write:pre`), so
+/// the hierarchy stays prefix-matchable: `editor:file:write` and
+/// `editor:file` can be globbed. `open` and `close` have one useful moment
+/// each: `open` once the buffer exists, `close` before it goes. The
+/// `editor:` namespace leaves room for `shell:` events.
 pub const HOOK_EVENTS: &[&str] = &[
     "editor:file:open",
     "editor:file:write:pre",
@@ -1240,9 +1008,8 @@ pub const HOOK_EVENTS: &[&str] = &[
     "shell:cwd:change",
 ];
 
-/// `::bish hook help`: how to use it, and every event with what it
-/// means. Shared with the `:help hooks` page (repl.rs), so the two can't
-/// drift apart.
+/// `::bish hook help`: usage and every event, shared with `:help hooks`
+/// (repl.rs).
 pub fn hook_help() -> Vec<String> {
     let mut out = vec![
         "::bish hook ls [--lang=GLOB]           what is registered".to_string(),
@@ -1298,9 +1065,8 @@ pub fn lsp_help() -> Vec<String> {
     ]
 }
 
-/// One line about each event: when it fires, and what its argument is.
-/// A parallel table guarded by a test, for the same reason
-/// `BISHOPT_HELP` is one -- see `every_hook_event_is_described`.
+/// One line per event: when it fires and its argument. A parallel table
+/// guarded by `every_hook_event_is_described`, like `BISHOPT_HELP`.
 pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
     ("editor:file:open", "A file has been opened in the editor and its options are resolved. Argument: the path."),
     ("editor:file:write:pre", "A file is about to be written. Argument: the path."),
@@ -1314,158 +1080,104 @@ pub const HOOK_EVENT_HELP: &[(&str, &str)] = &[
 /// Where `::bish window move` puts the current window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowMove {
-    /// One place towards the front of the tab bar, or nowhere if it is
-    /// already there.
+    /// One place towards the front of the tab bar, if not already first.
     Left,
     /// One place towards the back, likewise.
     Right,
-    /// A 1-based position in the bar, clamped -- `move 1` is "make this
-    /// the first tab" however many there are.
+    /// A 1-based position, clamped: `move 1` makes this the first tab.
     To(usize),
 }
 
 #[derive(Debug, Clone)]
 pub enum WindowAction {
-    /// `window create [--name NAME] [--] [COMMAND...]`. A name is what
-    /// the tab bar shows for this window instead of its cwd, and what
-    /// `window select` finds it by -- the two halves of making a
-    /// workflow scriptable: something to call a window, and a way to
-    /// ask for it back. A command runs in the new window's shell as if
-    /// it had been typed there, tmux's `new-window <cmd>`.
+    /// `window create [--name NAME] [--] [COMMAND...]`. The name shows in the
+    /// tab bar instead of the cwd and is what `window select` finds; the
+    /// command runs in the new window's shell as if typed there.
     New {
         name: Option<String>,
         command: Option<String>,
     },
-    /// `window rename [NAME]` -- the current window. No name clears it
-    /// back to showing the cwd, which is what an unnamed window shows.
+    /// `window rename [NAME]`: the current window; no name clears it.
     Rename(Option<String>),
-    /// `::bish window select NAME|ID`. Only ever produced once the
-    /// target has been found in `Shell::windows` -- a miss is an
-    /// ordinary failing builtin (status 1) rather than an action,
-    /// which is what makes `select || create` work inside a function,
-    /// a subshell or an `if`.
+    /// `::bish window select NAME|ID`, produced only once the target is found
+    /// in `Shell::windows`: a miss is an ordinary status 1, so
+    /// `select || create` works anywhere.
     Select(usize),
     Next,
     Previous,
     Close,
-    /// `::bish window minimize`/`_`, and `<C-w> _`. Shrinks the focused
-    /// pane to just its divider and moves focus to a neighbour --
-    /// focusing it again restores it. The underlying `minimized` state
-    /// already existed for the diagnostics pane; this is what lets any
-    /// pane use it.
+    /// `::bish window minimize`/`_` and `<C-w>_`: shrinks the focused pane to
+    /// its divider and focuses a neighbour; focusing it restores it.
     Minimize,
-    // `window fg <window-id>`: push the target window's current top
-    // frame onto *this* window's stack too -- vim-like "the same
-    // session shown in multiple windows" (see WindowEntry::stack's doc
-    // comment in repl.rs). The u32 is the target window's id, not an
-    // index -- ids are stable identifiers, indices shift as windows
-    // close.
+    // `window fg <window-id>`: puts the target window's top frame on this
+    // window's stack too, one session shown in two windows (see
+    // `WindowEntry::stack`). An id, since indices shift as windows close.
     FgSession(u32),
-    // `window split`/`s` or `window vsplit`/`v`: divides the focused
-    // pane of the current window in two, the new half holding a freshly
-    // cloned session (same session-cloning primitive `New` already
-    // uses) and taking focus. See repl.rs's PaneLayout for how the
-    // split tree itself is represented.
+    // `window split`/`s` and `window vsplit`/`v`: divides the focused pane,
+    // the new half holding a cloned session and taking focus (see repl.rs's
+    // `PaneLayout`).
     //
-    // `horizontal` names the dividing LINE's own orientation -- true is
-    // a horizontal line, so the panes stack top and bottom. The two
-    // commands are named the other way round, by how the *panes* end up
-    // arranged, which is how people read the words: `vsplit` is panes
-    // arranged vertically (stacked, `horizontal: true`) and `split` is
-    // side by side (`horizontal: false`). See the dispatch in
-    // builtins/bish.rs, which says the same thing from the other end.
-    //
-    // This comment used to pair them the other way round -- `split`
-    // stacked, `vsplit` side by side -- which was true of neither the
-    // dispatch nor the screen. Checked against both before rewriting
-    // it.
+    // `horizontal` is the divider line's orientation, so `true` stacks the
+    // panes. The commands are named by how the panes end up, so `vsplit`
+    // (stacked) is `horizontal: true` and `split` (side by side) is
+    // `horizontal: false`; see builtins/bish.rs.
     Split {
         horizontal: bool,
-        // A command to run in the new pane's shell as if it had been
-        // typed there -- tmux's `split-window <cmd>`, the invocation
-        // that makes a split worth scripting.
+        // A command to run in the new pane's shell as if typed there.
         command: Option<String>,
     },
-    // `window h/left`, `j/below`, `k/above`, `l/right`: move focus to
-    // the nearest pane in that direction from the currently focused
-    // one, vim Ctrl-w-hjkl style. A no-op if the current window isn't
-    // split, or nothing lies in that direction.
+    // `window h/left`, `j/below`, `k/above`, `l/right`: focus the nearest
+    // pane that way, as vim's `<C-w>hjkl`. A no-op without one.
     FocusPane(PaneDirection),
-    /// `::bish window focus <n>`: focuses the nth pane of this window,
-    /// counting from 1 in layout order -- tmux's `select-pane -t`, and
-    /// what a saved layout uses to get back to a pane it made earlier.
+    /// `::bish window focus <n>`: the nth pane in layout order, from 1, which
+    /// a saved layout uses to return to a pane.
     FocusPosition(usize),
-    /// `::bish window save [file]`: writes the `::bish window` script
-    /// that rebuilds every window, pane and directory as they stand.
-    /// No file means print it, so it can be read or redirected.
+    /// `::bish window save [file]`: writes the `::bish window` script that
+    /// rebuilds every window, pane and directory; without a file, prints it.
     Save(Option<String>),
-    /// `::bish window restore <file>`: runs such a script, line by
-    /// line, as if each had been typed.
+    /// `::bish window restore <file>`: runs such a script line by line, as
+    /// typed.
     Restore(String),
-    /// `::bish window move <left|right|N>`: moves the *current window*
-    /// within the tab bar. Windows have always been in the order they
-    /// were created, with no way to change it.
-    ///
-    /// No `<C-w>` chord for this one on purpose: the keys that read as
-    /// "move it left/right" under a window leader are `<`/`>`, and in
-    /// vim those already mean narrower/wider. tmux types `swap-window`
-    /// out too.
+    /// `::bish window move <left|right|N>`: moves the current window in the
+    /// tab bar. No `<C-w>` key: `<`/`>` mean narrower and wider in vim.
     MoveWindow(WindowMove),
-    /// `::bish window layout <name>` / `layout next`, and
-    /// `<C-w><Space>`: rearranges every pane in the window into one of
-    /// the named arrangements. `None` means the next one in the cycle.
-    /// See window::NamedLayout.
+    /// `::bish window layout <name>` or `layout next`, and `<C-w><Space>`:
+    /// rearranges the window's panes into a named layout; `None` is the next
+    /// one (see `window::NamedLayout`).
     SetLayout(Option<crate::window::NamedLayout>),
-    /// `::bish window swap`/`x`, and `<C-w>x`: exchanges the focused
-    /// pane with the next one in the window, wrapping. Focus follows
-    /// the pane rather than the position, the way vim's own `<C-w>x`
-    /// leaves the cursor in the window that moved.
+    /// `::bish window swap`/`x` and `<C-w>x`: exchanges the focused pane with
+    /// the next, wrapping. Focus follows the pane, as in vim.
     SwapPane,
-    /// `::bish window break`, and `<C-w>T` (vim's own key for moving a
-    /// window out to a tab of its own): takes the focused pane out of
-    /// its window and gives it a new window all to itself.
+    /// `::bish window break` and `<C-w>T`: moves the focused pane into a new
+    /// window of its own.
     BreakPane,
-    /// `::bish window join <window-id>` / `vjoin`: the reverse. Takes
-    /// that window's focused pane and makes it a pane here, beside the
-    /// focused one; a window with nothing left in it goes away.
-    /// `horizontal` reads exactly as `Split`'s does.
+    /// `::bish window join <window-id>`/`vjoin`: the reverse, bringing that
+    /// window's focused pane here beside the focused one; an emptied window
+    /// goes away. `horizontal` reads as for `Split`.
     JoinPane {
         from: u32,
         horizontal: bool,
     },
-    /// `::bish window zoom`/`z`, and `<C-w>z`/`<C-w>o`: the focused
-    /// pane fills the whole window until the next zoom toggles it back.
-    /// The split tree underneath is untouched, so unzooming restores
-    /// the arrangement exactly -- see WindowEntry::zoomed.
+    /// `::bish window zoom`/`z` and `<C-w>z`/`<C-w>o`: the focused pane fills
+    /// the window until toggled back. The split tree is untouched, so
+    /// unzooming restores it (see `WindowEntry::zoomed`).
     Zoom,
-    // `window =`/`balance`: resets every pane's size weight throughout
-    // the current window's whole layout tree back to even.
+    // `window =`/`balance`: every pane's size weight back to even.
     Balance,
-    // `window +`/`sizeup` and `window -`/`sizedown`: grow/shrink the
-    // focused pane's own share of its immediate parent split by one
-    // step, relative to its siblings there. A no-op if the window isn't
-    // split.
+    // `window +`/`sizeup` and `-`/`sizedown`: grow or shrink the focused
+    // pane's share of its parent split by a step. A no-op unsplit.
     SizeUp,
     SizeDown,
-    // `window size <N>`/`<N>%`/`<N>/<M>`: set the focused pane's size
-    // directly along its parent split's own axis (rows for a stacked
-    // split, columns for a side-by-side one) -- see SizeSpec's own doc
-    // comment for what each form means. A no-op if the window isn't
-    // split.
+    // `window size <N>`, `<N>%`, `<N>/<M>`: sets the focused pane's size
+    // along its parent split's axis (see `SizeSpec`). A no-op unsplit.
     SetSize(SizeSpec),
 }
 
-// The parsed form of `window size <arg>`'s own argument -- see
-// run_window's own parsing for the three accepted spellings plan.md
-// documents: a bare integer is an absolute character count along the
-// parent split's axis, `N%` is a percentage of that axis, and `N/M` is
-// a plain fraction (equivalent to `(N/M)*100`%). All three ultimately
-// resolve to the same thing once applied: a target fraction of the
-// parent split's available space, converted into a size *weight*
-// relative to the other panes there (see repl.rs's set_focused_pane_
-// size) -- panes aren't given fixed sizes directly, since the whole
-// layout has to keep resizing sanely as the real terminal itself
-// resizes.
+// `window size`'s argument: a bare integer is a count of characters
+// along the parent split's axis, `N%` a percentage of it, `N/M` a
+// fraction. All become a target fraction converted to a size weight
+// relative to the siblings (see repl.rs's `set_focused_pane_size`), since
+// panes have to keep resizing with the terminal.
 #[derive(Debug, Clone, Copy)]
 pub enum SizeSpec {
     Characters(usize),
@@ -1481,13 +1193,9 @@ pub enum PaneDirection {
     Down,
 }
 
-// `window size <arg>`'s own argument, in the three forms plan.md
-// documents: `N%` (trailing percent sign), `N/M` (a literal slash --
-// bish's own arithmetic isn't involved, this is parsed directly as two
-// integers), or a bare `N` (absolute character count). Whichever form,
-// invalid input (unparseable numbers, `/0`) is reported as `None` so
-// run_window can print one consistent usage error rather than a parse
-// panic.
+// Parses `window size`'s argument: `N%`, `N/M` (two integers, not
+// arithmetic) or `N`. Invalid input, `/0` included, is `None`, for one
+// consistent usage error.
 pub(crate) fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
     if let Some(pct) = arg.strip_suffix('%') {
         return Some(SizeSpec::Percent(pct.parse().ok()?));
@@ -1503,93 +1211,62 @@ pub(crate) fn parse_size_spec(arg: &str) -> Option<SizeSpec> {
     Some(SizeSpec::Characters(arg.parse().ok()?))
 }
 
-// One entry per name a call frame shadowed: the name, the value it
-// displaced (None if there was none), and whether the name already
-// carried the array attribute. Both halves come back on return, or
-// `local -a x` would leave `x` an array after the function returned.
+// Per name a call frame shadowed: the name, the value it displaced
+// (`None` if none), and whether it had the array attribute, all restored
+// on return so `local -a x` doesn't leave `x` an array.
 type ArrayShadowStack<V> = Vec<Vec<(String, Option<V>, bool)>>;
 
 pub struct Shell {
     pub last_status: i32,
     pub(crate) functions: HashMap<String, parser::Command>,
-    /// How far into the current argument word `getopts` has read, or 0
-    /// before it has started one.
-    ///
-    /// `-ab` is two options in one word, and OPTIND names the word, so
-    /// the position within it has to live somewhere. bash keeps it out
-    /// of sight the same way; the only thing a script can do to it is
-    /// assign OPTIND, which resets it (see assign_var_impl).
+    /// How far into the current word `getopts` has read, 0 before starting
+    /// one. `-ab` is two options and OPTIND names the word, so the position
+    /// lives here, hidden as in bash; assigning OPTIND resets it (see
+    /// `assign_var_impl`).
     pub(crate) getopts_offset: usize,
-    /// How many `.`/`source` calls are running right now.
-    ///
-    /// `return` is legal inside a sourced file as well as inside a
-    /// function, and it ends the *file*, not the shell -- a guard
-    /// clause at the top of a library is the usual reason. Without
-    /// this, `return` there refused to do anything, the rest of the
-    /// file ran, and the `.` reported 0.
+    /// How many `.`/`source` calls are running. `return` in a sourced file
+    /// ends the file, not the shell, the usual guard clause at a library's
+    /// top.
     pub(crate) source_depth: usize,
-    /// What `$_` becomes once the command currently running finishes.
-    ///
-    /// A stack, because a command can contain commands: `f arg` records
-    /// `arg`, its body's commands record their own on top, and each is
-    /// taken back off by the same place that put it there. Without the
-    /// nesting, a function's body would decide its caller's `$_` --
-    /// bash's is the last argument of the call, whatever the body did.
+    /// What `$_` becomes when the running command finishes. A stack, since
+    /// commands nest: `f arg` records `arg` and the body's commands push
+    /// their own, so a body never decides its caller's `$_`.
     pub(crate) underscore_pending: Vec<String>,
-    // Stack of positional-parameter frames; last() is the current scope
-    // ($0 is tracked separately since it's never shifted/reassigned by calls).
+    // Positional-parameter frames; `last()` is the current one. `$0` is
+    // tracked separately.
     pub(crate) arg_frames: Vec<Vec<String>>,
-    // Stack of `local` overlays; empty unless we're inside a function call.
-    // A name only lives here if `local` explicitly declared it -- plain
-    // assignment still targets the global (process-env) variable unless it
-    // matches an existing local of the same name, matching bash semantics.
-    // `None` is a name declared local and *unset*: `local x` shadows
-    // whatever the caller had, and `${x-default}` and `set -u` both
-    // have to be able to tell that from an empty string -- which is
-    // how every "did my caller set this?" check in a function is
-    // written.
+    // `local` overlays, empty outside functions. Only names `local` declared
+    // live here; plain assignment targets the global unless a local of that
+    // name exists, as in bash. `None` is a name declared local and unset:
+    // `local x` shadows the caller's, and `${x-default}` and `set -u` must
+    // tell that from an empty string.
     pub(crate) var_scopes: Vec<HashMap<String, Option<String>>>,
     script_name: String,
-    // Whether this shell is running a named script file rather than
-    // `-c` text. The one thing it decides is whether the call stack has
-    // an outermost `main` frame -- see refresh_call_arrays.
+    // Whether this shell runs a named script rather than `-c` text, which
+    // decides whether the call stack has an outer `main` frame (see
+    // `refresh_call_arrays`).
     pub running_a_script: bool,
-    // Indexed arrays (`arr=(...)`). A BTreeMap (not Vec) so arrays are
-    // genuinely sparse like bash's: `arr[10]=x` doesn't materialize empty
-    // strings for indices 0..9, and `${#arr[@]}` counts only what's
-    // actually set. Kept as one flat global map (every read/write site
-    // just indexes straight into it) rather than a var_scopes-style stack,
-    // since only `local -a`/`-A` need scoping at all -- see
-    // array_local_stack/assoc_local_stack below for how that's retrofitted
-    // via save/restore instead of a parallel lookup chain.
+    // Indexed arrays. A BTreeMap so arrays are sparse as in bash:
+    // `arr[10]=x` doesn't create 0..9, and `${#arr[@]}` counts what's set.
+    // One flat map rather than a scope stack, since only `local -a`/`-A`
+    // need scoping (see `array_local_stack`).
     pub(crate) arrays: HashMap<String, std::collections::BTreeMap<usize, String>>,
-    // Associative arrays (`declare -A name`). Kept in a separate map from
-    // `arrays` since their keys are arbitrary strings, not indices -- a name
-    // in `assoc_names` is looked up here instead of `arrays` everywhere an
-    // array is read or written.
+    // Associative arrays (`declare -A`), apart from `arrays` since their keys
+    // are strings. Names in `assoc_names` are looked up here.
     pub(crate) assoc_arrays: HashMap<String, OrderedMap>,
-    // Carrying the array attribute is not the same as having an array
-    // *value*. `declare -a A` leaves A unset -- bash prints it as
-    // `declare -a A`, where `A=()` really is an assignment and prints
-    // `declare -a A=()`. `arrays`/`assoc_arrays` hold the values, these
-    // two hold the attribute, and a name is an array if it is in either
-    // half of its pair. The attribute is what makes a later plain
-    // `A=x` mean `A[0]=x` rather than a scalar shadowing the array.
-    // Names this shell has explicitly `unset`, so the real-environment
-    // fallback the three lookups end in does not hand the value back.
-    // That fallback is there for a name set behind the shell's back
-    // after startup (the session bridge's `XDG_RUNTIME_DIR`, `TZ` in a
-    // test); everything inherited is seeded into `globals` at startup
-    // instead. Without the tombstone it also answered for a name the
-    // shell had just removed, so `unset HOME` left `${HOME-gone}`
-    // saying `/home/jussi` -- and `unset` looked like it had worked,
-    // because a child's environment is built from `globals` and really
-    // had lost it.
-    // `c`, `s` or `i` -- how this shell was invoked, which is the last
-    // character of `$-`. `None` for a named script, which contributes
-    // no letter at all.
+    // `c`, `s` or `i`: how this shell was invoked, the last character of
+    // `$-`. `None` for a named script.
     pub invocation_flag: Option<char>,
+    // Names this shell explicitly unset, so the real-environment fallback
+    // the lookups end in doesn't hand the value back. That fallback is for
+    // names set behind the shell's back after startup (the session
+    // bridge's `XDG_RUNTIME_DIR`, `TZ` in a test); everything inherited
+    // is seeded into `globals` at startup.
     unset_names: std::collections::HashSet<String>,
+    // The array attribute, apart from the values: `declare -a A` leaves A
+    // unset (bash prints `declare -a A`, where `A=()` prints
+    // `declare -a A=()`). A name is an array if it's in either half of its
+    // pair. The attribute makes a later `A=x` mean `A[0]=x`.
     pub(crate) array_names: std::collections::HashSet<String>,
     pub(crate) assoc_names: std::collections::HashSet<String>,
     // `alias name=value`, expanded for real -- see
@@ -1737,244 +1414,143 @@ pub struct Shell {
     /// `Shell::new`.
     pub(crate) shell_pid: u32,
     pub(crate) bishopts: std::collections::HashMap<String, BishOptValue>,
-    // `::bish theme begin`/`::bish theme end`'s own registry -- theme
-    // name -> the bishopt overrides captured while declaring it (see
-    // pending_theme's own doc comment for how a declaration fills this
-    // in). Consulted by bishopt_value as a second-tier default, below an
-    // explicit self.bishopts override but above KNOWN_BISHOPTS' own
-    // hardcoded one, whenever the "theme" bishopt itself (an ordinary
-    // Str option, set the normal way -- outside any declaration) names
-    // one of these. A shell-wide table, cloned into a forked child the
-    // same way bishopts itself is.
+    // `::bish theme` declarations: theme name to the bishopt overrides
+    // captured while declaring it (see `pending_theme`). When the `theme`
+    // bishopt names one, `bishopt_value` uses it below explicit `bishopts`
+    // and above `KNOWN_BISHOPTS`' defaults. Cloned into a child like
+    // `bishopts`.
     pub(crate) themes: std::collections::HashMap<String, Theme>,
-    /// Syntax-highlighting colours, by name -- see `::bish hl`.
-    ///
-    /// A plain map rather than a registry, because the names are open:
-    /// `HighlightKind`'s own are what bish produces today, and a
-    /// language server's semantic token types will be more of the same
-    /// without any of them needing to be declared first. That is the
-    /// whole reason these are not bishopts, which are a closed set with
-    /// a default each.
+    /// Syntax-highlighting colours by name (see `::bish hl`). A plain map,
+    /// not a registry, because the names are open: a language server's
+    /// semantic token types needn't be declared first.
     pub(crate) hl: std::collections::HashMap<String, String>,
-    // `Some` for the entire span between `::bish theme begin` and its
-    // matching `::bish theme end` -- every `bishopt --set NAME VALUE` in
-    // between is diverted here (keyed by NAME) instead of applying live,
-    // exactly the values that end up under a new entry in `themes` once
-    // `end` runs (see run_bish_theme_end's own doc comment for how the
-    // "theme" key specifically is pulled back out to name that entry,
-    // rather than becoming part of the theme's own opts). `None` outside
-    // a declaration -- the ordinary, overwhelmingly common state. Reset
-    // to `None` (not cloned) in a forked child: a declaration in
-    // progress is transient, top-level-only state, not something that
-    // makes sense to carry into a subshell/command-substitution mid-way.
+    // `Some` between `::bish theme begin` and `end`: every `bishopt --set`
+    // between is captured here instead of applying, becoming a `themes`
+    // entry on `end` (see `run_bish_theme_end`). Reset to `None` in a
+    // child, since a declaration in progress belongs to the top level.
     pub(crate) pending_theme: Option<Theme>,
-    // `complete NAME`: registered completion specs, by command name -- see
-    // run_complete's own doc comment. Consulted both by `compgen`-adjacent
-    // introspection (`complete -p`/`-r`/`compopt`) and, via a per-prompt
-    // snapshot repl.rs builds the same way as cwd/known_functions, by
-    // bish's own interactive Tab completion (ShellCompletionProvider).
+    // `complete NAME` specs by command (see `run_complete`), for `complete
+    // -p`, `-r`, `compopt`, and through a per-prompt snapshot for Tab
+    // completion (`ShellCompletionProvider`).
     pub(crate) completions: std::collections::HashMap<String, compgen::CompgenSpec>,
     // `complete -D`: the fallback spec used when no exact name matches.
     pub(crate) default_completion: Option<compgen::CompgenSpec>,
-    // `readonly NAME`. Checked by assign_var, the single write path plain
-    // assignment/local/export/declare/arithmetic-assignment/read/getopts
-    // all funnel through, so marking a name here blocks writes everywhere
-    // at once.
+    // `readonly NAME`, checked by `assign_var`, which every kind of
+    // assignment goes through.
     pub(crate) readonly_names: std::collections::HashSet<String>,
-    // `declare -i`/`local -i`: assignments to these names are evaluated as
-    // arithmetic expressions instead of stored as literal text (checked in
-    // assign_var, the single write path).
+    // `declare -i`/`local -i`: assignments are evaluated as arithmetic (in
+    // `assign_var`).
     pub(crate) integer_names: std::collections::HashSet<String>,
-    // `declare -u`/`-l`: assignments to these names are case-folded
-    // (checked in assign_var alongside integer_names).
+    // `declare -u`/`-l`: assignments are case-folded (in `assign_var`).
     pub(crate) upper_names: std::collections::HashSet<String>,
     pub(crate) lower_names: std::collections::HashSet<String>,
-    // `declare -x`/`export -x NAME` on a name that's currently a `local`:
-    // globals are already unconditionally visible to children (assign_var
-    // writes them straight to the process env), so this only matters for a
-    // local -- assign_var additionally mirrors the value into the process
-    // env for any name in this set, so child processes can see it despite
-    // it living in var_scopes rather than env.
-    // Copy-on-write for the same reason as `globals`.
-    // What this shell has changed about the *process* it shares with
-    // everyone, and what it was before. See ProcessRestore.
+    // What this shell changed about the process it shares, and what it was
+    // before; see ProcessRestore.
     process_restore: ProcessRestore,
-    // Left by a bare `exec` naming the descriptors it moved, and taken
-    // by dispatch_builtin_or_external once that command's own redirect
-    // sink has been popped. The follow belongs on the sink that
-    // *survives* the command: while the arm runs, the sink is the one
-    // installed for that command's duration, and popping takes off one
-    // layer -- so a layer added there is the layer removed again. See
-    // follow_moved_descriptors.
+    // Left by a bare `exec` naming the descriptors it moved, taken by
+    // `dispatch_builtin_or_external` after the command's redirect sink is
+    // popped. The follow belongs on the sink that survives the command; the
+    // one installed for the command is removed with it. See
+    // `follow_moved_descriptors`.
     descriptors_to_follow: Option<Vec<i32>>,
-    // Bumped whenever the alias table changes, so run_program can tell
-    // that a statement defined or removed one and the statements after
-    // it must be read again. See aliases_mut.
+    // Bumped when the alias table changes, so `run_program` knows to reread
+    // the statements after one that defined or removed an alias. See
+    // `aliases_mut`.
     alias_epoch: u64,
+    // Exported names. Copy-on-write, like `globals`.
     pub(crate) exported_names: Rc<std::collections::HashSet<String>>,
-    // `_` lives here rather than in `globals`, because it is written
-    // once per command -- run_command_body sets it after every simple
-    // command -- and `globals` is a copy-on-write map whose write cost
-    // is the size of the whole environment. Inside a `$( )` or `( )`,
-    // where the map is shared with the parent, that one write was
-    // copying all of it: 39% of the cost of a command substitution went
-    // on setting a variable almost nothing ever reads.
-    //
-    // Nothing else knows: global_get, global_set, global_remove and
-    // global_names are the only places aware that `_` is kept apart,
-    // and every reader goes through them.
+    // `_` lives apart from `globals` because it's written after every simple
+    // command, and `globals` is copy-on-write: inside a `$( )`, where it's
+    // shared with the parent, each write copied the whole environment, 39% of
+    // a substitution's cost. `global_get`, `global_set`, `global_remove` and
+    // `global_names` are the only places aware of it.
     underscore: Option<String>,
-    // Parsed bodies of constructs that arrive as source text and are run
-    // over and over: `$( )`, `( )`, `<( )`. Shared with virtual children
-    // (that is who does the parsing), so a substitution inside a loop
-    // pays to lex and parse its body once rather than once per turn.
-    //
-    // Keyed by the text, which is sound only because lexing and parsing
-    // read no shell state -- with the single exception of alias
-    // expansion, which sits between them. Rather than track when an
-    // alias changes and hope no future edit forgets to, the cache
-    // declines to store anything while alias expansion could apply at
-    // all (see cached_program); a shell with live aliases simply parses
-    // as it did before.
+    // Parsed bodies of `$( )`, `( )` and `<( )`, shared with virtual
+    // children (which do the parsing), so a substitution in a loop is
+    // parsed once. Keyed by text, sound because lexing and parsing read no
+    // shell state except alias expansion; so nothing is cached while alias
+    // expansion could apply (see `cached_program`).
     parse_cache: Rc<RefCell<std::collections::HashMap<String, Rc<parser::Program>>>>,
-    // Every proc-sub temp file created for the command currently being
-    // built, deleted once it finishes (drain_proc_subs).
+    // The proc-sub temp files for the command being built, deleted when it
+    // finishes (`drain_proc_subs`).
     proc_sub_cleanup: Vec<String>,
-    /// Coroutines that outlive the command that started them -- a
-    /// `<( )` producer, for now.
-    ///
-    /// Shared with virtual children the way the job table is: a
-    /// substitution written inside a subshell is still something this
-    /// process has to keep running. Given time wherever the shell would
-    /// otherwise be idle in the kernel; see `pump_coroutines`.
+    /// Coroutines outliving the command that started them, such as a `<( )`
+    /// producer. Shared with virtual children like the job table, and run
+    /// wherever the shell would otherwise wait in the kernel; see
+    /// `pump_coroutines`.
     background_coroutines: Rc<RefCell<crate::scheduler::Scheduler>>,
-    /// This shell's own ends of the pipes a substitution is on the far
-    /// side of, held until the command using them is done.
+    /// This shell's ends of the pipes a substitution is on the far side of,
+    /// held until the command using them is done.
     proc_sub_pipes: Vec<std::os::fd::OwnedFd>,
-    /// Substitutions that are real processes, with whether this shell
-    /// may stop one that is still running -- a `<( )` producer may be,
-    /// a `>( )` consumer may not. Killing one of those cost `tee` its
-    /// buffered file: it had written to stdout and not yet flushed.
+    /// Substitutions that are real processes, and whether one still running
+    /// may be killed: a `<( )` producer may, a `>( )` consumer may not
+    /// (killing `tee` lost its unflushed output).
     proc_sub_children: Vec<(std::process::Child, bool)>,
-    // $RANDOM: xorshift64* state, reseeded from the current time at
-    // startup (no external RNG crate). Advanced on every read.
+    // `$RANDOM`: xorshift64* state seeded from the time, advanced per read.
     rng_state: u64,
-    // $SECONDS: wall-clock time the shell started, so `$SECONDS` reads as
-    // elapsed-since-start by default. `SECONDS=n` (bash lets you reset the
-    // counter) is handled by assign_var recording an offset instead of
-    // trying to rewind this.
+    // `$SECONDS`: when the shell started. `SECONDS=n` records an offset in
+    // `assign_var` rather than rewinding this.
     shell_start: std::time::Instant,
     seconds_offset: i64,
-    // Background jobs (`cmd &`), tracked well enough for `jobs`/`fg`/`bg`/
-    // `wait`/`kill %N` to work against real child processes. Real
-    // terminal job control -- process-group isolation, `tcsetpgrp`
-    // foreground reassignment, genuine Ctrl-Z/SIGTSTP suspend-to-stopped
-    // -- is layered on top of this (M11, gated on `set -m`/opt_monitor)
-    // for a single foreground external command run_single spawns directly
-    // (see its own pre_exec setpgid hook, tcsetpgrp reassignment, and
-    // Job::pgid): that's the one case a human interactively suspending a
-    // running command actually hits. A *backgrounded* multi-stage
-    // pipeline (run_multi) or redirected compound command (run_
-    // compound_redirected) also gets process-group isolation (every
-    // pipeline stage sharing one group, seeded from its first stage's
-    // pid) -- enough for `kill %N`/`bg`'s own SIGCONT to correctly reach
-    // every process in the job at once, without the terminal-foreground-
-    // reassignment/stop-handling machinery a *foreground* run of either
-    // construct would additionally need (not implemented -- Ctrl-Z on a
-    // foreground pipeline/redirected compound still does nothing useful,
-    // matching a plain foreground external command before M11 added
-    // that). The self-exec'd subshell/coproc spawn sites are still
-    // deliberately left with no isolation at all, backgrounded or not.
+    // Background jobs, enough for `jobs`, `fg`, `bg`, `wait` and `kill %N`.
+    // Under `set -m` (opt_monitor), a foreground external command gets its
+    // own process group, the terminal (`tcsetpgrp`) and Ctrl-Z stops (see
+    // `run_single`'s setpgid hook and `Job::pgid`). A backgrounded pipeline
+    // or redirected compound gets a process group, so `kill %N` and `bg`
+    // reach every process, but not foreground handling: Ctrl-Z on a
+    // foreground pipeline does nothing useful. Self-exec'd subshells and
+    // coprocs get no isolation.
     //
-    // Held behind Rc<RefCell<_>> (single-threaded, so plain interior
-    // mutability, no Arc/Mutex needed) rather than owned directly:
-    // std::process::Child (inside Job) isn't Clone, so this table can only
-    // ever be referenced, never duplicated -- the moment more than one
-    // Shell exists (planned: a `window new` virtual session sharing job
-    // control with the shell it was opened from), each one needs to point
-    // at the *same* table, not a copy of it. With only one Shell alive
-    // today, this is behaviorally invisible -- it just draws the seam that
-    // work needs.
+    // An `Rc<RefCell<_>>`, since `Child` isn't Clone and sessions sharing
+    // job control must point at one table.
     pub(crate) jobs: Rc<RefCell<JobTable>>,
-    // `trap CMD SIGNAL`. EXIT is handled separately (exit_trap below) since
-    // it isn't a real OS signal. Everything else here is a genuine
-    // sigaction-installed handler (see install_trap_handler) -- the numeric
-    // signal is the key since that's what the handler's async-signal-safe
-    // bookkeeping (PENDING_SIGNALS) uses; SIGNAL_NAMES maps both directions
-    // for `trap`'s own name-based syntax.
+    // `trap CMD SIGNAL` for real signals, installed with sigaction (see
+    // `install_trap_handler`), keyed by number as `PENDING_SIGNALS` records
+    // them. EXIT is `exit_trap`.
     traps: std::collections::HashMap<i32, TrapAction>,
-    // `trap CMD EXIT` handler. Not a real signal (there's no SIGEXIT), so
-    // it's run directly wherever the shell is about to terminate rather
-    // than through the sigaction/PENDING_SIGNALS machinery.
+    // `trap CMD EXIT`. Not a signal, so it runs wherever the shell is about
+    // to end.
     exit_trap: Option<String>,
-    // `$BASH_COMMAND`: the command being run, for a DEBUG or ERR trap
-    // to name. bash holds the *source text*, which needs spans this
-    // parser does not carry -- the same wall the
-    // `function-body-formatting` divergence describes -- so this is the
-    // command with its words expanded. It differs from bash only where
-    // the command contained an expansion, and is identical otherwise.
-    // An `Rc<str>` because it is replaced before every simple command:
-    // the text belongs to the command's own node, and this only points
-    // at it. See serialize::rendered_command.
+    // `$BASH_COMMAND`, for a DEBUG or ERR trap. bash holds the source text,
+    // which needs spans this parser doesn't carry (see the
+    // `function-body-formatting` divergence), so this is the command with
+    // its words expanded, differing only where it had an expansion. An
+    // `Rc<str>` pointing at the command node's text (see
+    // `serialize::rendered_command`).
     bash_command: Rc<str>,
-    // The subshell nesting depth the EXIT trap was set at. It fires for
-    // the exit of the shell that armed it and for no other -- see
-    // run_exit_trap.
+    // The subshell depth the EXIT trap was set at: it fires only for that
+    // shell's exit (see `run_exit_trap`).
     exit_trap_depth: u32,
-    // The other three pseudo-signals `trap` takes. Not signals at all --
-    // the interpreter fires them itself, at three places it already
-    // passes through: before each simple command, after a command fails
-    // under the rules `errexit` already uses, and on a function's
-    // return.
-    //
-    // Separate fields rather than entries in `traps` for the reason
-    // `exit_trap` is: `traps` is keyed by a real signal number, and
-    // these have none.
+    // The other pseudo-signals: DEBUG before each simple command, ERR after a
+    // failure under errexit's rules, RETURN on a function's return. Separate
+    // fields like `exit_trap`, since `traps` is keyed by real signal numbers.
     debug_trap: Option<String>,
     err_trap: Option<String>,
     return_trap: Option<String>,
-    // The call depth each pseudo-trap was set at. A pseudo-trap fires
-    // at the depth it was installed and nowhere else, unless the option
-    // that makes it inherited is on -- so a RETURN trap set inside a
-    // function runs when *that* function returns (no `set -T` needed),
-    // while one set at the top level does not follow calls into it.
-    // Gating on the option alone got the first case backwards and never
-    // ran it at all.
+    // The call depth each pseudo-trap was set at. It fires only there unless
+    // its inheriting option is on, so a RETURN trap set in a function runs
+    // when that function returns, without `set -T`.
     pseudo_trap_depth: [usize; 3],
-    // Whether a trap's own body is running. A DEBUG trap whose body is a
-    // command would otherwise fire DEBUG again, forever; bash guards the
-    // same way.
+    // Whether a trap body is running: a DEBUG trap's own commands would fire
+    // it forever. bash guards the same way.
     in_trap: bool,
-    // Whether `PROMPT_COMMAND` is running. It is invoked once per
-    // prompt from one place, so nothing can currently re-enter it --
-    // this exists so that stays true if a second call site ever appears.
+    // Whether `PROMPT_COMMAND` is running, so a second call site could never
+    // re-enter it.
     in_prompt_command: bool,
-    // Whether `command_not_found_handle` is running -- a handler that
-    // itself mistypes a command would otherwise call itself forever.
+    // Whether `command_not_found_handle` is running: a handler mistyping a
+    // command would call itself forever.
     in_command_not_found: bool,
-    // `set -T` / `set -o functrace` covers DEBUG and RETURN; `set -E` /
-    // `set -o errtrace` covers ERR. Two options and not one, because
-    // bash makes them two -- inheriting DEBUG into every function is a
-    // very different appetite from wanting an error handler to still
-    // fire inside one.
-    //
-    // Without them, none of the three is inherited by a shell function,
-    // which is why a trap set at the top level fires once for a failing
-    // function call rather than once inside and once outside.
+    // `set -T` (functrace) makes DEBUG and RETURN inherited by functions;
+    // `set -E` (errtrace) does so for ERR. Two options, as in bash. Without
+    // them, none of the three is inherited.
     opt_functrace: bool,
     opt_errtrace: bool,
-    // How many shell functions deep we are, which is the question
-    // `functrace` is really about.
+    // How many functions deep we are, which `functrace` is about.
     function_depth: usize,
-    // Set when a call has been refused for nesting too deeply, cleared
-    // once the stack it was refused on has unwound all the way out.
-    //
-    // Refusing the one call is not enough on its own. `f() { f; }` does
-    // unwind by itself, because the refused call is the last thing in
-    // the body -- but `f() { f; f; }` would call `f` again at every
-    // level on the way out and take exponential time to get nowhere.
-    // Real bash does not have this problem because it longjmps to the
-    // top level; this flag is what stands in for that jump.
+    // Set when a call was refused for nesting too deeply, cleared once that
+    // stack has unwound. Refusing the one call isn't enough: `f() { f; f; }`
+    // would call `f` again at every level on the way out, taking exponential
+    // time. bash longjmps to the top level; this flag stands in for that.
     nesting_unwind: bool,
     // `coproc`'s pipe halves that the *shell* keeps (the coprocess's own
     // ends are handed to the child and closed here after spawn). Kept
