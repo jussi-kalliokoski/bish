@@ -3861,26 +3861,15 @@ fn balance_panes(layout: &mut PaneLayout) {
     }
 }
 
-// `window size <N>`/`<N>%`/`<N>/<M>`: sets the focused pane's size
-// directly, along whichever axis its immediate parent split actually
-// divides (rows for a stacked split, columns for a side-by-side one).
-// A no-op if the window isn't split.
+// `window size <N>`/`<N>%`/`<N>/<M>`: sizes the focused pane along the
+// axis its parent split divides. A no-op if the window isn't split.
 //
-// Panes are sized by *weight*, not a fixed row/col count (see
-// SplitChild's own doc comment), so "set the size" here means solving
-// for whatever weight produces the requested share: given the parent's
-// other children's weights sum to `sum_others` and stay fixed, the
-// weight that makes the focused pane's own share equal `fraction` of
-// the total is `fraction * sum_others / (1 - fraction)` (algebra: from
-// `new / (new + sum_others) = fraction`). `fraction` itself comes from
-// whichever form was given -- % and N/M are already a fraction
-// directly; a bare character count is converted by first backing out
-// the parent split's own total usable space from the focused pane's
-// *currently rendered* size and weight ratio (`axis_size * total_weight
-// / old_weight`) -- an approximation (it ignores compute_regions' own
-// "last child absorbs the rounding remainder" rule), close enough for
-// an interactively-adjusted size and self-correcting on the very next
-// resize/redraw.
+// Panes are sized by weight (see `SplitChild`), so this solves for the
+// weight giving the requested share `f` with the siblings' weights
+// (`sum_others`) fixed: `f * sum_others / (1 - f)`. A cell count is
+// turned into a share using the pane's current rendered size and weight,
+// which ignores the rounding remainder `compute_regions` hands the last
+// child; close enough, and the next redraw settles it.
 fn set_focused_pane_size(window: &mut WindowEntry, spec: exec::SizeSpec, term_rows: usize, term_cols: usize) {
     let focused = window.focused_pane;
     let current_rect = pane_rect(window, focused, term_rows, term_cols);
@@ -3904,12 +3893,9 @@ fn set_focused_pane_size(window: &mut WindowEntry, spec: exec::SizeSpec, term_ro
     set_child_weight_to_fraction(children, idx, fraction);
 }
 
-// Resolves a window's layout against the real terminal size into a
-// CompositorLayout, resizing every involved session's grid (Screen::
-// resize, same primitive SIGWINCH already uses) to match its pane's
-// actual rectangle along the way -- a session's grid always matches
-// whatever pane last displayed it, the same way a plain unsplit
-// window's grid already tracked the whole content area.
+// Resolves a window's layout against the terminal size, resizing each
+// session's grid to its pane's rectangle on the way, so a grid always
+// matches the pane that last showed it.
 fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionState>, term_rows: usize, term_cols: usize) -> CompositorLayout {
     let area = Rect { row: 0, col: 0, rows: content_rows(term_rows), cols: term_cols };
     let mut regions = Vec::new();
@@ -3922,10 +3908,8 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
             let sid = window.pane(pane_id).owning_session();
             let screen = sessions[&sid].screen.clone();
             let (srows, scols) = screen.borrow().size();
-            // A folded pane has no room on screen (see collapsed_runs)
-            // and must keep whatever it had: resizing it to nothing
-            // would throw its content away, and folding is presentation,
-            // not a decision about the session's contents.
+            // A folded pane has no room on screen (see `collapsed_runs`);
+            // resizing it to nothing would throw its content away.
             if rect.rows > 0 && rect.cols > 0 && (srows, scols) != (rect.rows, rect.cols) {
                 screen.borrow_mut().resize(rect.rows, rect.cols);
             }
@@ -3943,36 +3927,20 @@ fn snapshot_window(window: &WindowEntry, sessions: &HashMap<SessionId, SessionSt
     }
 }
 
-// The actual drawing: shared by compositor_redraw (reads the tab bar
-// live from `sessions`) and drive_pending_fg's redraw callback (which
-// can't hold a live borrow of `sessions` for its whole poll loop -- see
-// that call site's comment -- so it passes a tab bar string snapshotted
-// once, up front, instead). Every pane in `layout` is drawn into its
-// own rectangle, followed by the divider lines between them (see
-// compute_regions) -- an unsplit window is just the single-pane case of
-// this, no divider lines drawn at all.
+// Draws every pane into its rectangle, then the dividers. Used by
+// `compositor_redraw`, and by `render_compositor_frame_diff` when it has
+// no frame to diff against.
 //
-// Deliberately no leading `\x1b[2J` (erase-whole-display): compute_regions
-// already tiles every pane plus every divider across the entire content
-// area with no gaps, render_row always emits exactly `pane.rect.cols`
-// characters per row regardless of what those cells actually hold (a
-// blank cell still writes a space), and the tab bar's own row gets an
-// explicit `\x1b[K` first -- between those three, every single cell of
-// the real terminal is already unconditionally overwritten every call,
-// making a separate whole-screen erase pure redundant work. It used to
-// be here, and was the actual cause of a reported flash on ordinary
-// discrete redraws (e.g. Ctrl-C at the live prompt): an explicit erase
-// followed immediately by repainting the exact same content one real
-// terminal can still render as a visible blank frame in between, even
-// though nothing (or almost nothing) about the actual content changed.
+// No `\x1b[2J`: the panes and dividers tile the whole content area,
+// `render_row` writes every column, and the tab bar row is cleared with
+// `\x1b[K`, so every cell is overwritten anyway. An erase followed by
+// the same content can show as a blank frame, a visible flash.
 fn render_compositor_frame(layout: &CompositorLayout, tab_bar: &str, term_rows: usize) {
     print!("{}", build_compositor_frame_output(layout, tab_bar, term_rows));
     let _ = io::stdout().flush();
 }
 
-// render_compositor_frame's own string-building half, split out purely
-// for testability -- same "pure builder plus a thin print wrapper"
-// shape diff_frames/render_compositor_frame_diff already established.
+// The string-building half of `render_compositor_frame`, for tests.
 fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_rows: usize) -> String {
     let mut out = String::new();
     out.push_str("\x1b[H");
@@ -4002,17 +3970,10 @@ fn build_compositor_frame_output(layout: &CompositorLayout, tab_bar: &str, term_
     out
 }
 
-// A cell-by-cell snapshot of exactly what's currently painted on the real
-// terminal's compositor content area -- every pane's own screen content,
-// flattened into one term_cols-wide grid, plus the tab bar text and
-// cursor position/visibility. What render_compositor_frame_diff diffs a
-// freshly-resolved CompositorLayout against, so only genuinely-changed
-// cells get repainted -- unlike render_compositor_frame's own
-// unconditional `\x1b[2J` clear+repaint. Deliberately does *not* capture
-// divider glyphs (see render_compositor_frame_diff's own doc comment on
-// why that's fine): only ever compared against another TerminalFrame
-// built the same way, so a divider cell always reads as
-// vt100::Cell::default() on both sides and never shows up as "changed."
+// What's painted on the terminal's content area: every pane flattened
+// into one grid, plus the tab bar and the cursor. Dividers aren't
+// captured; a divider cell reads as the default cell on both sides of a
+// comparison, so it never shows as changed.
 struct TerminalFrame {
     rows: usize,
     cols: usize,
@@ -4023,24 +3984,10 @@ struct TerminalFrame {
 }
 
 impl TerminalFrame {
-    // Flattens every pane's own screen content into one rows*cols grid --
-    // the same data render_compositor_frame's own per-pane render_row
-    // loop paints, just captured as data instead of escape codes.
-    //
-    // `pane.rect` can be stale relative to `pane.screen`'s own *current*
-    // size by the time this runs: render_compositor_frame_diff's caller
-    // (run_fg_job_frame) only re-snapshots its whole `layout` -- rects
-    // included -- when `sync_pty_size` notices the *focused* pane's own
-    // screen size changed, but a background WINCH tick's own
-    // poll_and_apply_resize/compositor_redraw pass can resize a
-    // *sibling* pane's screen independently (e.g. a fixed-size split
-    // child, or simply a different rounding remainder) without the
-    // focused one's size moving at all -- leaving this function's own
-    // `rect` for that sibling describing a larger area than its screen
-    // now actually has. Clamping each pane's own read range to its
-    // screen's own live size (not just `pane.rect`) is what avoids
-    // reading past it -- this was a real, reproducible crash (`Screen::
-    // cell`'s own index-out-of-bounds panic) before this clamp existed.
+    // `pane.rect` can be larger than `pane.screen` by now: the layout is
+    // re-snapshotted only when the focused pane's size changes, and a resize
+    // can shrink a sibling's grid without moving the focused one. Reads are
+    // clamped to the screen's live size, or `Screen::cell` panics.
     fn capture(layout: &CompositorLayout, tab_bar: &str, rows: usize, cols: usize) -> TerminalFrame {
         let mut cells = vec![vt100::Cell::default(); rows * cols];
         for pane in &layout.panes {
@@ -4051,11 +3998,10 @@ impl TerminalFrame {
                 for c in 0..last {
                     let (row, col) = (pane.rect.row + r, pane.rect.col + c);
                     if row < rows && col < cols {
-                        // A wide character whose second half falls
-                        // outside this pane is drawn as a space: half
-                        // of it would still be two columns on the
-                        // terminal, and the column it took would be the
-                        // neighbouring pane's.
+                        // A wide character whose second half falls outside
+                        // this pane is drawn as a space: the terminal would
+                        // draw it two columns wide, into the neighbouring
+                        // pane.
                         let clipped = c + 1 == last && c + 1 < screen_cols && screen.cell(r, c + 1).continuation;
                         cells[row * cols + col] = match clipped {
                             true => vt100::Cell { ch: ' ', continuation: false, ..screen.cell(r, c) },
@@ -4079,40 +4025,19 @@ impl TerminalFrame {
     }
 }
 
-// drive_fg_job's own hot redraw path (run_fg_job_frame's own redraw
-// closure) -- unlike compositor_redraw/render_compositor_frame (every
-// *discrete*-event redraw: window/pane switches, resizes, command-mode
-// overlays, ...), this fires on every single batch of a foreground job's
-// own pty output, often many times a second for a full-screen program (a
-// status line, spinner, or cursor-move tick with no actual visible
-// change). Always clearing and repainting the whole screen for that --
-// what render_compositor_frame does -- is exactly what produced the
-// reported flash (two Claude Code sessions, each in its own tab, each
-// streaming near-continuous low-level output while merely idling):
-// this instead diffs against `cache` (the previous call's own painted
-// content, see TerminalFrame) and only touches cells that actually
-// changed.
+// The redraw for a foreground job's output, which can arrive many times
+// a second from a full-screen program even when nothing visible changes.
+// A full repaint each time flashes, so this repaints only the cells that
+// differ from `cache`, the last painted frame.
 //
-// `*cache == None` means "start fresh": either the very first redraw for
-// this job, or the caller has explicitly invalidated it (run_fg_job_frame
-// does this on FgOutcome::Resized, since the geometry a stale cache
-// describes is no longer even the right shape) -- falls back to
-// render_compositor_frame's own full clear+repaint for the same
-// self-healing property that function's own doc comment describes
-// (anything that wrote to the real terminal directly in between, like
-// editor.rs's Ctrl-L, self-heals on the next full repaint), then seeds
-// `cache` from the result so the *next* call can diff.
+// `None` in `cache` means start fresh (the first redraw, or
+// `run_fg_job_frame` invalidated it on `FgOutcome::Resized`): a full
+// repaint, which also fixes anything written to the terminal directly
+// meanwhile, and the result seeds `cache`.
 //
-// Deliberately scoped to exactly this one redraw path: every other
-// redraw in this codebase (compositor_redraw's own callers -- window/
-// pane switches, resizes, command-mode overlays, the diagnostics pane,
-// ...) stays a full repaint, unchanged. Those are infrequent discrete
-// events, not a continuous loop, so there's nothing to gain and no
-// reason to widen this cache's invalidation surface to cover every other
-// function that ever writes to the real terminal directly
-// (render_diagnostics_list_frame, render_normal_mode_frame, ...) -- this
-// cache lives and dies entirely within one run_fg_job_frame call, and is
-// never read by (or invalidated on behalf of) anything else.
+// Only this path diffs. Every other redraw is a discrete event where a
+// full repaint costs nothing noticeable, and the cache lives within one
+// `run_fg_job_frame` call, so nothing else has to invalidate it.
 fn render_compositor_frame_diff(layout: &CompositorLayout, tab_bar: &str, term_rows: usize, term_cols: usize, cache: &mut Option<TerminalFrame>) {
     let rows = content_rows(term_rows);
     let stale = match cache {
@@ -4134,15 +4059,9 @@ fn render_compositor_frame_diff(layout: &CompositorLayout, tab_bar: &str, term_r
     *cache = Some(new_frame);
 }
 
-// The pure half of render_compositor_frame_diff: exactly the escape-code
-// text to write to bring the real terminal from `prev`'s own painted
-// state to `new`'s, assuming both describe the *same* `rows`/`term_cols`
-// shape (render_compositor_frame_diff's own stale check is what
-// guarantees that before this is ever called). Split out from the I/O
-// wrapper purely so this -- the actual diffing decision -- is unit
-// testable without a real terminal, matching this file's own existing
-// split between logic (compute_regions/split_sizes/render_row, all pure)
-// and thin print!-wrapping callers.
+// The escape codes taking the terminal from `prev` to `new`, both the
+// same shape (the caller checks). Separate from the printing so it can
+// be tested.
 fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term_cols: usize) -> String {
     let mut out = String::new();
 
@@ -4154,12 +4073,9 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
                 col += 1;
                 continue;
             }
-            // Extend the dirty run while cells keep differing, then paint
-            // the whole run with one cursor move -- same style-coalescing
-            // render_row itself uses, just scoped to this sub-span rather
-            // than the whole row (a span can cross pane boundaries in a
-            // side-by-side split; the flattened grid already makes that
-            // transparent here).
+            // Paint each run of differing cells with one cursor move. A run
+            // can cross pane boundaries; the flattened grid makes that
+            // transparent.
             let run_start = col;
             while col < term_cols && new.cells[row * term_cols + col] != prev.cells[row * term_cols + col] {
                 col += 1;
@@ -4188,10 +4104,8 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
         out.push_str(&new.tab_bar);
     }
 
-    // The cursor always needs re-asserting after painting anything above
-    // (each write already moved it), and whenever its own logical
-    // position/visibility changed even with zero cell writes (e.g. a job
-    // just moved its cursor without changing any visible glyph).
+    // The cursor needs re-asserting after any write, or when it moved or
+    // changed visibility without a cell changing.
     if !out.is_empty() || new.cursor != prev.cursor || new.cursor_visible != prev.cursor_visible {
         out.push_str(&format!("\x1b[{};{}H", new.cursor.0 + 1, new.cursor.1 + 1));
         out.push_str(if new.cursor_visible { "\x1b[?25h" } else { "\x1b[?25l" });
@@ -4200,22 +4114,16 @@ fn diff_frames(prev: &TerminalFrame, new: &TerminalFrame, term_rows: usize, term
     out
 }
 
-// Draws a plain single-line divider (box-drawing characters, no color)
-// along a reserved strip from compute_regions. Nested splits can leave
-// a T-junction where one divider meets another; those get whichever
-// line is drawn second rather than a proper junction glyph -- a small,
-// accepted cosmetic gap for this first pane-support pass rather than
-// tracking junction geometry across independently-drawn divider
-// segments.
+// Draws a plain single-line divider along a strip from
+// `compute_regions`. Where nested dividers meet, the one drawn second
+// wins; there are no junction glyphs.
 fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<usize>, sgr: &str) {
     out.push_str(sgr);
     if horizontal {
         out.push_str(&format!("\x1b[{};{}H", rect.row + 1, rect.col + 1));
         match folded {
-            // The same "pill set into an otherwise ordinary divider
-            // line" shape render_diagnostics_title already uses, so a
-            // folded run reads as a divider that has something to say
-            // rather than as a new kind of chrome.
+            // Drawn like `render_diagnostics_title`'s pill, so a folded run
+            // reads as a divider with something to say.
             Some(n) => out.push_str(&folded_divider_line(rect.cols, n)),
             None => out.push_str(&"─".repeat(rect.cols)),
         }
@@ -4230,9 +4138,8 @@ fn draw_divider(out: &mut String, rect: Rect, horizontal: bool, folded: Option<u
     }
 }
 
-// `───  4 panes  ─────` -- what a folded run draws instead of a plain
-// line. A vertical divider is one column wide and has nowhere to put
-// this, so it stays a plain line and the count simply isn't shown.
+// `───  4 panes  ─────`: what a folded run draws instead of a line. A
+// vertical divider is one column wide, so it stays a plain line.
 fn folded_divider_line(cols: usize, panes: usize) -> String {
     let pill: String = format!(" \u{22EF} {panes} pane{} ", if panes == 1 { "" } else { "s" }).chars().take(cols).collect();
     let pill_len = pill.chars().count();
@@ -4241,41 +4148,15 @@ fn folded_divider_line(cols: usize, panes: usize) -> String {
     format!("{}\x1b[7m{pill}\x1b[0m{}", "─".repeat(left), "─".repeat(right))
 }
 
-// vim/tmux Ctrl-w-hjkl-style spatial pane focus: moves to the nearest
-// other leaf in the requested direction. Among candidates whose
-// perpendicular span (row range for Left/Right, column range for
-// Up/Down) actually overlaps the focused pane's own -- i.e. a pane
-// genuinely alongside it, not just diagonally off in that general
-// direction -- the nearest by primary-axis distance wins; a candidate
-// with no such overlap is only ever picked if nothing overlapping
-// exists. Plain center-to-center distance (summing both axes) would
-// pick a diagonal neighbor over a directly-adjacent one whenever the
-// diagonal one's center happened to be closer in Manhattan terms --
-// wrong the moment panes of very different sizes are adjacent (e.g. a
-// wide top pane above a narrow bottom-right one: "left" from the
-// bottom-right pane must reach the bottom-left pane beside it, not the
-// top pane above-and-to-the-left of it). A no-op if the window isn't
-// split (single leaf) or nothing qualifies (e.g. `left` from the
-// leftmost pane).
 // Shrinks the focused pane to its divider and moves focus off it.
+// `fixed` is cleared too: `minimized` wins over it (see `SplitChild`).
 //
-// The `minimized` state has existed since the diagnostics pane, which
-// drives it through closures of its own; this is the same state made
-// reachable for any pane. `fixed` is cleared alongside it because the
-// two describe the same thing and `minimized` wins -- see SplitChild's
-// own doc comment.
+// Focus moves because a one-row pane is nowhere to type. It goes to a
+// sibling in the same split, chosen from the layout rather than the
+// geometry: any neighbour will do, unlike `<C-w>j`'s spatial question.
 //
-// Focus has to move: a pane showing one row is not somewhere to type,
-// and leaving the cursor there would send the next keystroke somewhere
-// invisible. It moves to a sibling in the same split, chosen from the
-// layout rather than by geometry -- `focus_pane_direction` answers
-// "which pane lies that way on screen", which is the right question for
-// `<C-w>j` and the wrong one here, where any neighbour will do and the
-// answer must not depend on rows and columns.
-//
-// A pane with no sibling is left alone. There is nowhere for focus to
-// go, and a window showing nothing but a divider is not a state worth
-// being able to reach.
+// A pane with no sibling is left alone: a window showing only a divider
+// isn't worth being able to reach.
 fn minimize_focused_pane(window: &mut WindowEntry) {
     let target = window.focused_pane;
     let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, target) else {
@@ -4300,10 +4181,9 @@ fn first_leaf_of(layout: &PaneLayout) -> Option<PaneId> {
     }
 }
 
-// Brings `pane` back if it was minimized. Called wherever focus lands
-// on a pane deliberately -- a `<C-w>` direction move or a click -- which
-// is what "restoring on activation" means: you get it back by going to
-// it, with no second command to remember.
+// Brings `pane` back if it was minimized. Called wherever focus lands on
+// a pane deliberately (a `<C-w>` move, a click), so going to a pane is
+// how you get it back.
 fn restore_if_minimized(window: &mut WindowEntry, pane: PaneId) {
     if let Some((_, children, idx)) = find_parent_split_mut(&mut window.layout, pane)
         && children[idx].minimized
@@ -4312,6 +4192,11 @@ fn restore_if_minimized(window: &mut WindowEntry, pane: PaneId) {
     }
 }
 
+// `<C-w>hjkl`: focuses the nearest pane in `direction`. Panes whose
+// span across the other axis overlaps the focused pane's win over ones
+// only diagonally that way; among those, the nearest along the axis.
+// Plain centre distance would pick a diagonal pane over an adjacent one
+// whenever sizes differ a lot. A no-op when nothing lies that way.
 fn focus_pane_direction(
     window: &mut WindowEntry,
     sessions: &mut HashMap<SessionId, SessionState>,
@@ -4360,12 +4245,9 @@ fn focus_pane_direction(
         }
     }
     if let Some((id, _, _)) = best {
-        // The currently focused pane is about to lose focus -- freeze
-        // its idle prompt into its own grid first (see
-        // freeze_idle_prompt's own doc comment), same as split does --
-        // but only if it's genuinely idle (top frame a Session, not a
-        // still-running detached job -- see split_focused_pane's own
-        // comment on why that case must skip this).
+        // The pane losing focus freezes its prompt into its grid (see
+        // `freeze_idle_prompt`), as split does, unless a detached job is
+        // still running there (see `split_focused_pane`).
         if matches!(window.stack().last(), Some(Frame::Session(_))) {
             let old_sid = window.owning_session();
             freeze_idle_prompt(sessions.get_mut(&old_sid).unwrap());
@@ -4384,46 +4266,31 @@ fn rect_center(rect: &Rect) -> (usize, usize) {
     (rect.col + rect.cols / 2, rect.row + rect.rows / 2)
 }
 
-// Whether the shell prompt should ask the terminal to report mouse
-// events, which is not the same question as the `mouse` bishopt alone.
+// Whether the prompt should ask the terminal for mouse reports, which
+// isn't the `mouse` bishopt alone.
 //
-// Turning reporting on takes the terminal's *own* wheel-to-scrollback
-// and click-drag selection away, so it is only worth doing where bish
-// has something to put in their place. Before promotion it has nothing:
-// the prompt's click handler hit-tests `if sinks_are_grid` and so finds
-// no target at all (there are no tabs, panes or dividers yet), and a
-// wheel notch falls into read_line's own catch-all, which decodes and
-// drops it. The whole gesture set was being claimed and none of it
-// used -- the terminal simply stopped scrolling, with nothing taking
-// over, which is the regression this fixes. It arrived with
-// e6d52ff, where read_line went from `RawGuard::enable` to
-// `enable_with_mouse` so that tabs and panes could be clicked; that
-// need is real, but only once there are tabs and panes.
-//
-// Once promoted, bish owns the scrollback and the layout, and reporting
-// earns its cost.
+// Reporting takes away the terminal's own wheel scrolling and drag
+// selection, so it's only worth it where bish has something in their
+// place. Before promotion there are no tabs, panes or dividers to click,
+// and `read_line` drops wheel events, so the terminal would just stop
+// scrolling. Once promoted, bish owns the scrollback and the layout.
 fn prompt_claims_mouse(mouse_bishopt: bool, sinks_are_grid: bool) -> bool {
     mouse_bishopt && sinks_are_grid
 }
 
 thread_local! {
-    // The last frame a view that paints the terminal directly -- the
-    // editor, the hex view, the browser, the list panes, the pager, a
-    // review -- put on screen, and where. See `focused_pane_text`.
-    //
-    // Plain thread-local state, for the reason `session.rs`'s bridge
-    // gives: this process is single-threaded, and "what was last painted"
-    // describes the whole process at this moment.
+    // The last frame painted by a view that draws the terminal directly
+    // (the editor, hex view, browser, list panes, pager, a review), and
+    // where. See `focused_pane_text`. Thread-local, as the process is
+    // single-threaded.
     static PAINTED: std::cell::RefCell<Option<(Rect, String)>> = const { std::cell::RefCell::new(None) };
-    // How many of the views that open *over* a pane (the pager, a review)
-    // are open now. Under one of those the pane's own frame -- a shell's
-    // grid, say -- is not what is on screen.
+    // How many views that open over a pane (the pager, a review) are open.
+    // Under one, the pane's own frame isn't what's on screen.
     static OVERLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Remembers `frame`, just painted into `rect`, as what that pane shows:
-/// the only record of it there is, for anything that paints the terminal
-/// directly rather than a pane's grid.
+/// Records `frame`, just painted into `rect`, as what that pane shows:
+/// the only record there is for views that bypass the pane's grid.
 pub(crate) fn record_paint(rect: Rect, frame: &str) {
     PAINTED.with(|p| *p.borrow_mut() = Some((rect, frame.to_string())));
 }
@@ -4444,17 +4311,13 @@ impl Drop for OverlayOpen {
     }
 }
 
-// What the focused pane currently shows, as plain text: one line per
-// row, trailing blanks trimmed off each, and wholly blank rows at the
-// bottom dropped. No colours or attributes -- this is what `bish
-// session capture` prints, and what a script grepping it wants is the
-// words, not the SGR codes around them.
+// What the focused pane shows, as plain text: a line per row, trailing
+// blanks trimmed, blank rows at the bottom dropped. No SGR codes; this is
+// what `bish session capture` prints, for scripts to grep.
 //
-// A pane showing an editor, a hex view, a browser or a list, or with the
-// pager or a review open over it, is not in its grid at all: those paint
-// the terminal directly. For them the answer is the last frame they
-// painted (see `record_paint`), cut down to the pane. Reading the grid
-// there answered with a blank screen.
+// An editor, hex view, browser or list, or the pager or a review over the
+// pane, isn't in the grid; for those it's the last frame they painted
+// (see `record_paint`), cut to the pane.
 fn focused_pane_text(app: &App) -> String {
     let window = &app.windows[app.current_window];
     let painted_over = OVERLAYS.with(|o| o.get()) > 0 || !matches!(window.focused().stack.last(), Some(Frame::Session(_) | Frame::Job(_)));
@@ -4483,10 +4346,9 @@ fn focused_pane_text(app: &App) -> String {
     lines.join("\n")
 }
 
-// What `frame` shows inside `rect`, a row per line. The frame places
-// itself absolutely on a terminal `term_rows` by `term_cols`, so it is
-// replayed onto one that size and the pane is read back out of it --
-// including the half of a wide character that is not a character.
+// What `frame` shows inside `rect`, a row per line. The frame positions
+// itself absolutely, so it's replayed onto a `term_rows` by `term_cols`
+// screen and the pane read back out.
 fn painted_rows(rect: Rect, frame: &str, term_rows: usize, term_cols: usize) -> Vec<String> {
     let mut screen = vt100::Screen::new(term_rows.max(rect.row + rect.rows), term_cols.max(rect.col + rect.cols));
     screen.feed(frame.as_bytes());
@@ -4500,16 +4362,13 @@ fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize)
     let (_, screen_cols) = screen.size();
     for c in 0..cols {
         let mut cell = screen.cell(row, c);
-        // Nothing is written for the second half of a wide character:
-        // the terminal moved two columns when it drew the first half,
-        // so writing anything here would push the rest of the row one
-        // column to the right.
+        // Nothing is written for a wide character's second half: the terminal
+        // already moved two columns for the first.
         if cell.continuation {
             continue;
         }
-        // ...and a wide character whose second half is past the edge of
-        // what is being drawn is written as a space, for the same
-        // reason: what it draws over is not this pane's column.
+        // A wide character whose second half is past the edge is written as a
+        // space, as its second column isn't this pane's.
         if c + 1 == cols && c + 1 < screen_cols && screen.cell(row, c + 1).continuation {
             cell.ch = ' ';
         }
@@ -4523,99 +4382,62 @@ fn render_row(out: &mut String, screen: &vt100::Screen, row: usize, cols: usize)
     out.push_str("\x1b[0m");
 }
 
-// A read-only bishedit::Buffer view over a pane's own rendered content --
-// its scrollback (oldest first) followed by its live grid, addressed as
-// one flat sequence of lines (see plan.md's own description of this
-// adapter). Its own (line, col) navigation cursor is kept separate from
-// the Screen's real cursor -- motions here never touch the live
-// session's actual content or cursor, purely read-only navigation over a
-// snapshot view. Marks (m/`/') are its own small addition on top of the
-// trait's baseline; nothing else in this milestone needs per-buffer
-// storage like this yet.
+// A read-only `bishedit::Buffer` over a pane's content: its scrollback,
+// oldest first, then its live grid, as one sequence of lines. Its
+// cursor is its own; nothing here touches the session's content or
+// cursor. Marks (m, `, ') live here too.
 struct ScreenBuffer {
     screen: Rc<RefCell<vt100::Screen>>,
     cursor: (usize, usize),
     vtop: usize,
     vheight: usize,
     marks: HashMap<char, (usize, usize)>,
-    // `ignorecase`/`smartcase`, set from the session's own shell at the
-    // moment normal mode is entered. A plain field rather than a live
-    // read for the reason every other snapshot here is one: this buffer
-    // has a screen and nothing else, and an excursion is short enough
-    // that a mid-flight change to either option is not worth chasing.
+    // `ignorecase`/`smartcase`, taken from the session's shell when normal
+    // mode starts. An excursion is short; a change meanwhile isn't worth
+    // following.
     ignorecase: bool,
     smartcase: bool,
-    // The `iskeyword` bishopt, snapshotted alongside them -- see
+    // The `iskeyword` bishopt, taken at the same time; see
     // `bishedit::Buffer::word_chars`.
     iskeyword: String,
-    // Visual mode's own committed selections (see vimkeys.rs's own
-    // `visual` field doc comment for the active, not-yet-committed one --
-    // that lives in `VimKeys`, not here, since it's just an anchor plus
-    // whatever this buffer's own live cursor already is). In commit
-    // order: `Z` pushes one, `y` reads every entry here (plus the active
-    // one) to build one concatenated yank, and both `y` and Escape clear
-    // this back to empty. A plain `Vec<motion::MotionRange>` rather than
-    // a new type -- `extract_text` already knows how to read one of these
-    // regardless of who built it.
+    // Visual mode's committed selections, in order; the active one is in
+    // `VimKeys`. `Z` pushes one, `y` yanks them all (plus the active one)
+    // joined, and `y` and Escape clear them.
     selections: Vec<motion::MotionRange>,
-    // `line_count()` at the moment this excursion started. Normal mode
-    // deliberately does *not* follow new output -- the whole point is to
-    // hold still while you read -- so anything the pane produces
-    // meanwhile lands below the viewport with nothing to show for it.
-    // The mode line reports the difference instead (see
-    // `normal_mode_status_text`), which is the only hint you'd otherwise
-    // get that a job you stepped away from is still talking.
+    // `line_count()` when the excursion started. Normal mode doesn't follow
+    // new output, so the mode line reports how much arrived (see
+    // `normal_mode_status_text`): the only hint that a job is still
+    // writing.
     entry_line_count: usize,
-    // The `new_lines()` value the mode line was last drawn with, so the
-    // idle loop can tell "something arrived since the last frame" from
-    // "nothing has moved" and only redraw for the former.
+    // The `new_lines()` value the mode line last showed, so the idle loop
+    // redraws only when something arrived.
     reported_new_lines: usize,
 }
 
-// The scrollback length to use for `ScreenBuffer`'s own combined
-// addressing (see its own doc comment) -- `s.scrollback.len()` normally,
-// but `0` whenever the grid currently showing is the *alternate* screen
-// (`s.using_alternate`, set for the duration of a fullscreen program like
-// vim/less that switched into it -- see `switch_alt_screen`'s own doc
-// comment). Real scrollback belongs to the *primary* grid only (a real
-// terminal never lets you scroll into history while an alt-screen program
-// owns the display either); treating it as if it sat "above" the alt
-// screen's own rows -- what plain `s.scrollback.len()` would do -- mixes
-// stale pre-alt-screen content into the addressing ahead of the program's
-// own rows, which is exactly what made normal mode read as "hides the
-// content of the app": with any pre-existing scrollback in that pane, the
-// combined cursor position (scrollback + the program's own cursor row)
-// could land the viewport almost entirely inside the stale scrollback
-// instead of the program's own screen.
+// The scrollback length for `ScreenBuffer`'s addressing: 0 while the
+// alternate screen is showing (a full-screen program like vim; see
+// `switch_alt_screen`). Scrollback belongs to the primary grid. Counting
+// it above the alternate screen put the program's cursor deep in stale
+// history, so normal mode opened showing that instead of the program.
 fn addressable_scrollback_len(s: &vt100::Screen) -> usize {
     if s.using_alternate { 0 } else { s.scrollback.len() }
 }
 
-// The last row of the live grid that holds anything, or `None` for a
-// grid that is entirely blank.
-//
-// A `vt100::Grid` is always allocated at its full height whether or not
-// anything has been written into it, so "how much of this grid is real
-// content" has to be asked rather than assumed. Scans upward, so the
-// ordinary case -- a shell pane whose lower rows really are untouched --
-// stops within a row or two.
+// The last row of the live grid that holds anything, `None` if it's all
+// blank. A grid is always allocated at full height. Scans upward, so a
+// shell pane with blank lower rows stops quickly.
 fn last_written_row(s: &vt100::Screen) -> Option<usize> {
     let (rows, cols) = s.size();
     (0..rows).rev().find(|&row| (0..cols).any(|col| s.cell(row, col).ch != ' '))
 }
 
-// How many lines of this screen normal mode can address: the scrollback
-// it is allowed to see, plus the part of the live grid that is real.
+// How many lines normal mode can address: the visible scrollback plus
+// the written part of the live grid.
 //
-// The live cursor's row is always real (freeze_idle_prompt writes the
-// prompt there before this is ever asked), and for a *shell* pane
-// nothing below it is -- output grows downward and the cursor sits at
-// the end. That was the whole rule, and it is wrong for a program that
-// paints the grid wholesale: vim parks its cursor on line 1 and fills
-// every row beneath, so clipping at the cursor left normal mode showing
-// one line of a full screen. Taking whichever is lower covers both --
-// for a shell pane the rows below the cursor are blank, so the answer is
-// unchanged.
+// For a shell pane nothing below the cursor is written (and
+// `freeze_idle_prompt` puts the prompt on its row), but a program like
+// vim parks the cursor on line 1 and fills every row. So the last line is
+// whichever is further down: the cursor's row or the last written row.
 fn addressable_len(s: &vt100::Screen) -> usize {
     let (cursor_row, _) = s.cursor();
     let last = last_written_row(s).unwrap_or(0).max(cursor_row);
@@ -4629,10 +4451,7 @@ impl ScreenBuffer {
             let (row, col) = s.cursor();
             (addressable_scrollback_len(&s), row, col)
         };
-        // Starts where the live cursor currently is -- translated into
-        // this combined addressing, where scrollback lines come first --
-        // the same convention tmux copy-mode uses (enter at the current
-        // cursor position, not always at the very top).
+        // Starts at the live cursor, in this combined addressing.
         let cursor = (sb_len + cur_row, cur_col);
         let vheight = vheight.max(1);
         let vtop = cursor.0.saturating_sub(vheight - 1);
@@ -4652,23 +4471,22 @@ impl ScreenBuffer {
         }
     }
 
-    // The two search options, from whichever session owns this pane.
+    // The two search options, from the session owning this pane.
     fn set_search_case(&mut self, shell: &exec::Shell) {
         self.iskeyword = shell.bishopt_str("iskeyword");
         self.ignorecase = shell.bishopt_bool("ignorecase");
         self.smartcase = shell.bishopt_bool("smartcase");
     }
 
-    // How many lines the pane has gained since this excursion started --
-    // see `entry_line_count`. Saturating rather than signed: a pane can
-    // lose lines too (a full-screen program clearing its alternate
-    // screen), and "-2 lines" is not news anyone can act on.
+    // How many lines the pane has gained since the excursion started (see
+    // `entry_line_count`). Saturating: a pane can lose lines (a full-screen
+    // program clearing), and a negative count tells nobody anything.
     fn new_lines(&self) -> usize {
         self.line_count().saturating_sub(self.entry_line_count)
     }
 
-    // Whether `new_lines()` has moved since the last time this was asked
-    // -- the idle loop's cue to redraw the mode line, and nothing else.
+    // Whether `new_lines()` moved since last asked: the idle loop's cue to
+    // redraw the mode line.
     fn new_lines_changed(&mut self) -> bool {
         let now = self.new_lines();
         if now == self.reported_new_lines {
@@ -4678,25 +4496,19 @@ impl ScreenBuffer {
         true
     }
 
-    // `line`'s own raw cell count -- the live grid's current width for a
-    // grid row, or that scrollback row's width *at the time it scrolled
-    // off* for a scrollback row, which can differ from the live grid's
-    // current width if the terminal was resized since. `char_at`/
-    // `line_len` trim trailing blanks off of this.
+    // `line`'s raw cell count: the grid's width for a grid row, or the
+    // width when it scrolled off for a scrollback row, which differs after
+    // a resize. `char_at`/`line_len` trim trailing blanks from it.
     fn raw_len(&self, line: usize) -> usize {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
         if line < sb_len { s.scrollback[line].len() } else { s.size().1 }
     }
 
-    // Addressed by *column*, not by character: moving right across a
-    // double-width character lands on its second column, which reads
-    // back as a space. That is what the column holds -- the cursor can
-    // be there and a rectangular selection can cut there -- but it does
-    // mean a search across a pane's own scrollback sees `漢 字` where
-    // the pane shows `漢字`. Fixing that means addressing this view by
-    // character while the grid underneath stays columns, which is a
-    // different piece of work than making the columns right.
+    // Addressed by column, not character: the second column of a
+    // double-width character reads as a space. The cursor and a rectangular
+    // selection can be there, but a search through the scrollback sees
+    // `漢 字` where the pane shows `漢字`.
     fn raw_char_at(&self, line: usize, col: usize) -> Option<char> {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
@@ -4711,12 +4523,9 @@ impl ScreenBuffer {
 }
 
 impl BisheditBuffer for ScreenBuffer {
-    // Deliberately *not* scrollback.len() + the grid's full (fixed) row
-    // count: a vt100::Grid is always allocated at its full height
-    // regardless of how much has actually been written into it, so
-    // counting every row would let G/j/Ctrl-D navigate past the end of
-    // the pane's content into empty space. See `addressable_len` for
-    // where the end actually is, and why the cursor alone does not say.
+    // Not the scrollback plus the grid's full height: the grid is always
+    // allocated full height, and counting every row would let G or Ctrl-D
+    // move into empty space. See `addressable_len` for where the end is.
     fn line_count(&self) -> usize {
         addressable_len(&self.screen.borrow())
     }
@@ -4770,12 +4579,8 @@ impl BisheditBuffer for ScreenBuffer {
         self.marks.get(&name).copied()
     }
 
-    // A real terminal grid, unlike a text file, can autowrap a line that
-    // just ran out of columns -- see vt100::Grid's own `wrapped` field
-    // doc comment. `raw_len`/`raw_char_at` already translate this
-    // combined line index into either a scrollback row or a live grid
-    // row the same way; this just reads the matching wrapped flag
-    // instead of a cell.
+    // A terminal grid can autowrap a line that ran out of columns (see
+    // `vt100::Grid`'s `wrapped`).
     fn line_wraps(&self, line: usize) -> bool {
         let s = self.screen.borrow();
         let sb_len = addressable_scrollback_len(&s);
@@ -4783,29 +4588,22 @@ impl BisheditBuffer for ScreenBuffer {
     }
 }
 
-// The one Normal-mode-navigation loop (`run_normal_mode_navigation`)
-// drives either a read-only view over a pane's own scrollback/live grid
-// (`ReadOnly`, backed by `ScreenBuffer`) or a real, mutable file buffer
-// (`Editable`, backed by `bishedit::textbuffer::TextBuffer`, while this
-// pane's top frame is a `Frame::Edit`) -- an editor pane is not a
-// different mode, it's this same Normal mode over a buffer that happens
-// to support mutation too. `impl BisheditBuffer` below delegates every
-// navigation method to whichever variant is live, which is what lets
-// every already buffer-generic helper (`motion::apply_motion`,
-// `editor::apply_motion_or_reselect`, `editor::yank_motion`, ...) work
-// unmodified against either one -- only the mutating `KeyOutcome`s
-// (`Put`, `Operator(Delete/Change)`, ...) need to match on this enum
-// directly, since mutation was never part of the shared `Buffer` trait
-// (see `TextBuffer`'s own doc comment on why that's deliberate).
+// What the Normal-mode loop (`run_normal_mode_navigation`) navigates:
+// a pane's scrollback and grid (`ReadOnly`), or a file while the pane's
+// top frame is a `Frame::Edit` (`Editable`). An editor pane is the same
+// Normal mode over a buffer that can also be changed. The `Buffer` impl
+// below delegates to the live variant, so the buffer-generic helpers
+// (`motion::apply_motion`, `editor::yank_motion`, ...) work on both;
+// only mutating outcomes match on this enum, as mutation isn't part of
+// `Buffer` (see `TextBuffer`).
 enum NavBuffer {
     ReadOnly(ScreenBuffer),
     Editable(TextBuffer),
 }
 
 impl NavBuffer {
-    // See ScreenBuffer::new_lines_changed. Only a shell pane grows under
-    // the reader like this: an `Editable` buffer is a file, and nothing
-    // else is writing to it while normal mode has it.
+    // See `ScreenBuffer::new_lines_changed`. Only a shell pane grows under
+    // the reader; nothing else writes to an `Editable` file meanwhile.
     fn new_lines_changed(&mut self) -> bool {
         match self {
             NavBuffer::ReadOnly(b) => b.new_lines_changed(),
@@ -4827,13 +4625,10 @@ impl NavBuffer {
         }
     }
 
-    // Deliberately NOT gated on `TextBuffer::is_readonly` -- this is what
-    // feeds `run_command_mode`'s own `editing` parameter, and `:dbg`
-    // itself (a command-mode command) needs `&mut TextBuffer` access
-    // regardless of whether content mutation is currently allowed, to
-    // toggle `set_readonly`/`breakpoints` in the first place. Vim-motion
-    // content mutation is gated separately, at each individual
-    // KeyOutcome/raw-key arm below, via `as_writable_mut`.
+    // Not gated on `TextBuffer::is_readonly`: this feeds
+    // `run_command_mode`'s `editing`, and `:dbg` needs the buffer to toggle
+    // `set_readonly` and breakpoints whether or not editing is allowed.
+    // Edits are gated separately through `as_writable_mut`.
     fn as_editable(&self) -> Option<&TextBuffer> {
         match self {
             NavBuffer::ReadOnly(_) => None,
@@ -4848,15 +4643,11 @@ impl NavBuffer {
         }
     }
 
-    // True only for a genuinely mutable `Editable` buffer -- false both
-    // for `ReadOnly` (matching what a bare `matches!(_, NavBuffer::
-    // Editable(_))` already meant) and for an `Editable` buffer currently
-    // under `:dbg` control (`TextBuffer::is_readonly` -- see that
-    // field's own doc comment). Every mutating `KeyOutcome`/raw-key arm
-    // in `run_normal_mode_navigation` uses this (or `as_writable_mut`)
-    // instead of matching `NavBuffer::Editable` directly, so "read-only
-    // while a debug session is attached" is enforced by omission the
-    // exact same way plain `ReadOnly` scrollback navigation already is.
+    // Whether the buffer can be edited: false for `ReadOnly`, and for an
+    // `Editable` buffer under `:dbg` (`TextBuffer::is_readonly`). Every
+    // mutating arm in `run_normal_mode_navigation` checks this (or uses
+    // `as_writable_mut`) rather than matching `Editable`, so a debugged file
+    // is read-only the same way scrollback is.
     fn is_writable(&self) -> bool {
         match self {
             NavBuffer::ReadOnly(_) => false,
@@ -4874,11 +4665,9 @@ impl NavBuffer {
 }
 
 impl BisheditBuffer for NavBuffer {
-    // Forwarded like everything else here, and easy to forget: a
-    // defaulted trait method that this wrapper does not pass down
-    // silently answers for both variants with the default -- which is
-    // how `/` kept searching case-sensitively while `:s`, reaching the
-    // same buffer directly, did not.
+    // Easy to forget: a defaulted method this wrapper doesn't forward
+    // answers with the default for both variants, which is how `/` stayed
+    // case-sensitive while `:s` didn't.
     fn search_ignore_case(&self, pattern: &str) -> bool {
         match self {
             NavBuffer::Editable(b) => b.search_ignore_case(pattern),
@@ -4942,10 +4731,8 @@ impl BisheditBuffer for NavBuffer {
         }
     }
 
-    // ReadOnly's own ScreenBuffer never overrides Buffer::viewport_left's
-    // default (always 0, see that method's own doc comment) -- delegated
-    // through anyway rather than just relying on NavBuffer's own default,
-    // so Editable's real TextBuffer value is actually used.
+    // Forwarded so `Editable` uses its real value; `ScreenBuffer` keeps the
+    // default 0.
     fn viewport_left(&self) -> usize {
         match self {
             NavBuffer::ReadOnly(b) => b.viewport_left(),
@@ -4996,14 +4783,10 @@ impl BisheditBuffer for NavBuffer {
     }
 }
 
-// Adjusts `buf`'s viewport so its navigation cursor's line is visible,
-// scrolling as little as possible -- matching vim's own scrolling, which
-// only jumps when the cursor would otherwise move off-screen, not
-// recentering on every motion. `content_cols`: this pane's own current
-// content width (see `nav_content_cols`) -- a no-op horizontally for a
-// `ReadOnly` `ScreenBuffer` (`Buffer::viewport_left`'s own doc comment
-// on why that one never actually scrolls), the real thing for `Editable`
-// (mirrors `fileeditor::scroll_to_show_cursor` exactly).
+// Scrolls `buf` as little as possible to keep the cursor's line in
+// view, as vim does. `content_cols` is the pane's content width (see
+// `nav_content_cols`). Horizontal scrolling is a no-op for a
+// `ScreenBuffer` (see `Buffer::viewport_left`).
 pub(crate) fn scroll_to_show_cursor(buf: &mut dyn BisheditBuffer, content_cols: usize) {
     let (line, col) = buf.cursor();
     let height = buf.viewport_height();
@@ -5012,10 +4795,8 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut dyn BisheditBuffer, content_cols: 
     } else if line >= buf.viewport_top() + height {
         buf.set_viewport_top(line + 1 - height);
     }
-    // `viewport_left` is a display column, not a char index (see
-    // bishedit::unicode_width's own doc comment) -- mirrors
-    // fileeditor::scroll_to_show_cursor exactly, see its own identical
-    // comment on why.
+    // `viewport_left` is a display column, not a char index; as in
+    // `fileeditor::scroll_to_show_cursor`.
     let cursor_col = col_of(&buf.line_chars(line), col);
     let width = content_cols.max(1);
     if cursor_col < buf.viewport_left() {
@@ -5025,16 +4806,10 @@ pub(crate) fn scroll_to_show_cursor(buf: &mut dyn BisheditBuffer, content_cols: 
     }
 }
 
-// `buf`'s own current content width for scroll_to_show_cursor's purposes
-// -- `ReadOnly`'s `ScreenBuffer` has no gutter at all (the whole pane
-// width is content), `Editable`'s `TextBuffer` does (see
-// fileeditor::editor_content_cols).
-// The nav loop drives both kinds of buffer, and a real file wants the
-// scrolling `fileeditor` does for it everywhere else: `scrolloff`, the
-// wrap-aware walk over visual rows, and drawn-column arithmetic for a
-// tabular file. The generic version below it is right for a
-// `ScreenBuffer`, whose content is already fixed-width pre-wrapped
-// terminal output with none of those questions to answer.
+// A file gets the scrolling `fileeditor` gives it everywhere else:
+// `scrolloff`, wrap-aware walking over visual rows, and drawn-column
+// arithmetic for a tabular file. The generic version suits a
+// `ScreenBuffer`, whose content is already wrapped terminal output.
 fn nav_scroll_to_show_cursor(buf: &mut NavBuffer, content_cols: usize) {
     match buf {
         NavBuffer::Editable(tb) => fileeditor::scroll_to_show_cursor(tb, content_cols),
@@ -5042,16 +4817,16 @@ fn nav_scroll_to_show_cursor(buf: &mut NavBuffer, content_cols: usize) {
     }
 }
 
-// A `ScreenBuffer`'s content is already fixed-width, pre-wrapped
-// terminal output with nothing off to the side to scroll into (see
-// `Buffer::viewport_left`'s own doc comment), so the horizontal wheel
-// only means anything over a real file.
+// Only a file scrolls sideways; a `ScreenBuffer` is already wrapped
+// (see `Buffer::viewport_left`).
 fn nav_scroll_horizontally(buf: &mut NavBuffer, columns: isize, content_cols: usize) {
     if let NavBuffer::Editable(tb) = buf {
         fileeditor::scroll_horizontally(tb, columns, content_cols);
     }
 }
 
+// The content width `buf` scrolls against: a `ScreenBuffer` has no
+// gutter, a file does (see `fileeditor::editor_content_cols`).
 fn nav_content_cols(buf: &NavBuffer, rect: Rect) -> usize {
     match buf {
         NavBuffer::ReadOnly(_) => rect.cols,
@@ -5059,15 +4834,11 @@ fn nav_content_cols(buf: &NavBuffer, rect: Rect) -> usize {
     }
 }
 
-// The (start, end) char-column range `range` covers on this one `line`,
-// if any -- `None` for a line outside `range.from.0..=range.to.0`
-// entirely. `Linewise` covers the whole row; `Inclusive` (Visual mode's
-// own charwise shape -- see `active_visual_range`'s own doc comment) is
-// full-width on any line strictly between the endpoints and clamped to
-// the true from/to column on the first/last line, mirroring exactly how
-// `motion::extract_text`'s own char-walk already treats a multi-line
-// charwise range -- `to.1 + 1` since Visual charwise is inclusive of the
-// character the cursor's on, unlike most charwise motions.
+// The (start, end) char columns `range` covers on `line`, or `None` if
+// it doesn't reach it. `Linewise` covers the whole row; `Inclusive`
+// (charwise Visual, see `active_visual_range`) is full width between
+// the endpoint lines and clamped on them, as `motion::extract_text`
+// reads it, with `to.1 + 1` because it includes the cursor's character.
 fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usize) -> Option<(usize, usize)> {
     if line < range.from.0 || line > range.to.0 {
         return None;
@@ -5075,7 +4846,7 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
     if range.shape == motion::MotionShape::Linewise {
         return Some((0, cols));
     }
-    // Same columns on every row it spans -- see fileeditor.rs's twin.
+    // The same columns on every row; see the twin in fileeditor.rs.
     if let Some((left, right)) = motion::block_columns(range) {
         return (right + 1 > left).then(|| (left, (right + 1).min(cols)));
     }
@@ -5084,15 +4855,11 @@ fn selection_columns_in_line(range: &motion::MotionRange, line: usize, cols: usi
     Some((start, end))
 }
 
-// `search_matches`: (start, end) char-column ranges on this one row to
-// render in reverse video -- vim's own `hlsearch` treatment, and the same
-// mechanism (toggling `CellAttrs::reverse`) editor.rs's own Ctrl-E search
-// highlighting uses. Applied by flipping the bit on whatever attrs a cell
-// already carries (e.g. `ls --color` output keeps its own fg/bg, just
-// with reverse forced on) rather than replacing them outright. Also
-// where Visual mode's own selection highlighting piggybacks -- see
-// render_normal_mode_frame's own doc comment on why that's simply more
-// entries on this same list rather than a separate rendering pass.
+// Draws one row with `search_matches`, (start, end) char columns, in
+// reverse video, as `hlsearch` does. The reverse bit is flipped on the
+// cell's own attributes, so coloured output keeps its colours. Visual
+// selections arrive as more entries on the same list (see
+// `render_normal_mode_frame`).
 fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, cols: usize, search_matches: &[(usize, usize)]) {
     let mut last: Option<(vt100::Color, vt100::Color, vt100::CellAttrs)> = None;
     let s = buf.screen.borrow();
@@ -5121,18 +4888,13 @@ fn render_normal_mode_row(out: &mut String, buf: &ScreenBuffer, line: usize, col
     out.push_str("\x1b[0m");
 }
 
-// How many rows of this pane's own rect are available for the
-// scrollback view -- all of them: the mode-line lives in the terminal's
-// own global status row now (render_global_status_row), not carved out
-// of this pane's own rect. `.max(1)`: a degenerate zero-height rect
-// still gets *some* content rather than a panicking view.
+// All of the pane's rows: the mode line is in the global status row
+// (`render_global_status_row`). At least 1, for a zero-height rect.
 fn normal_mode_content_rows(rect: Rect) -> usize {
     rect.rows.max(1)
 }
 
-// "-- NORMAL --"'s own mode-indicator text, swapped for Visual mode's two
-// shapes while `vk.is_visual()` -- matching real vim's own mode-line
-// convention (`-- VISUAL --` / `-- VISUAL LINE --`).
+// The mode line's label, as vim shows it.
 fn mode_label(vk: &VimKeys) -> &'static str {
     match vk.visual_anchor() {
         Some((RegisterShape::Char, _)) => "-- VISUAL --",
@@ -5175,23 +4937,18 @@ fn normal_mode_status_left(vk: &VimKeys, command_line: Option<&str>) -> String {
     format!("{}{}", recording, label)
 }
 
-// A chip set into the mode line: drawn *un*-reversed inside a row that
-// `render_global_status_row` has already put in reverse video, so it
-// reads as an inset label rather than as more status text -- the same
-// "pill" convention render_diagnostics_title and the `dbg:` pane
-// already use, inverted because this row's background is the reversed
-// one to begin with.
+// A chip in the mode line, drawn un-reversed inside the reversed row so
+// it reads as a label, not more status text. The same pill as
+// `render_diagnostics_title`, inverted for the reversed background.
 fn status_pill(text: &str) -> String {
     format!("\x1b[27m {text} \x1b[7m")
 }
 
-// How to leave. Normal mode over a shell pane is entered with
-// Ctrl+G and left with `i` (or any other insert command) or `:q` --
-// notably *not* Escape, which here only clears a selection, and not
-// `q`, which starts recording a macro. None of that is guessable, and
-// someone who hit Ctrl+G without meaning to has nothing at all to go
-// on, so the mode line says it outright for as long as the mode is up.
-// The short form is for panes too narrow to fit the sentence.
+// How to leave. Normal mode over a shell pane is entered with Ctrl+G
+// and left with `i` (or another insert command) or `:q`; not Escape,
+// which clears a selection, nor `q`, which records a macro. None of that
+// is guessable, so the mode line says it while the mode is up. The short
+// form is for narrow panes.
 const NORMAL_MODE_EXIT_HINT: &str = "i or :q to return to the prompt";
 const NORMAL_MODE_EXIT_HINT_SHORT: &str = "i to return";
 
@@ -5201,10 +4958,8 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
     let total = buf.line_count();
     let right = format!("{},{}  {}/{}", line + 1, col + 1, line + 1, total);
 
-    // While a `:`/`/` line is being typed the row *is* that line: no room
-    // for chips, and nothing worth advertising either -- Escape gets you
-    // back out of one, which is the one place here it does what people
-    // expect.
+    // While a `:`/`/` line is typed the row is that line; no room for
+    // chips, and Escape does what people expect there anyway.
     let news = (command_line.is_none() && buf.new_lines() > 0).then(|| {
         let n = buf.new_lines();
         format!("+{n} new line{}", if n == 1 { "" } else { "s" })
@@ -5212,10 +4967,9 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
     let chips: Vec<Vec<String>> = if command_line.is_some() {
         vec![Vec::new()]
     } else {
-        // Widest first; the first set that fits wins. The exit hint is
-        // the last thing to go, and only shrinks rather than vanishing
-        // while there's any room at all -- a narrow pane is exactly
-        // where someone stuck in here has least to work with.
+        // Widest first; the first that fits wins. The exit hint goes last
+        // and shrinks before it vanishes: a narrow pane is where someone
+        // stuck here has least to go on.
         let mut candidates = Vec::new();
         for hint in [NORMAL_MODE_EXIT_HINT, NORMAL_MODE_EXIT_HINT_SHORT] {
             if let Some(news) = &news {
@@ -5242,26 +4996,20 @@ fn normal_mode_status_text(buf: &ScreenBuffer, vk: &VimKeys, command_line: Optio
         }
         return format!("{body}{}{right}", " ".repeat(cols - body_len - right_len));
     }
-    // Not even the bare mode label and position fit -- same truncation
-    // this always did.
+    // Not even the label and position fit.
     let text: String = left.chars().take(cols).collect();
     let text_len = text.chars().count();
     format!("{text}{}", " ".repeat(cols.saturating_sub(text_len)))
 }
 
-// The search pattern to highlight (see render_normal_mode_row's own doc
-// comment) -- the in-progress `/`/`?` text while one is being typed
-// (incsearch-style live feedback for free), else the last resolved
-// search's own pattern, else nothing. Same rule editor.rs's own
-// normal_mode_prompt_and_matches uses for Ctrl-E's line-local Normal
-// mode, duplicated rather than shared: the two contexts drive different
-// `Buffer` impls (`LineBuffer` there, `ScreenBuffer` here), and this is
-// only a few lines either way.
+// The search pattern to highlight: the `/`/`?` text being typed (live
+// feedback), else the last search's pattern. The same rule as
+// `editor::normal_mode_prompt_and_matches`, which drives a different
+// `Buffer` type.
 fn active_search_pattern(vk: &VimKeys, buf: &ScreenBuffer) -> Option<String> {
     let pending = vk.pending_display();
-    // A pattern still being typed is always shown, `:noh` or not: that is
-    // live feedback about what you are typing, not the leftover
-    // highlight `:noh` is about.
+    // A pattern being typed is shown even after `:noh`: that's feedback on
+    // the typing, not a leftover highlight.
     if !vk.search_highlight_on() && !pending.starts_with('/') && !pending.starts_with('?') {
         return None;
     }
@@ -5276,44 +5024,30 @@ fn active_search_pattern(vk: &VimKeys, buf: &ScreenBuffer) -> Option<String> {
     }
 }
 
-// Draws `buf`'s current viewport into `rect` (the focused pane's own
-// rectangle -- see pane_rect), reusing sgr_codes the same way render_row
-// does for a live pane, plus the global mode-line row (render_global_
-// status_row) -- not part of `rect` at all, see that function's own doc
-// comment. Lines past the end of the buffer's content are left blank --
-// vim's own "~" convention for that is one more piece of scope this
-// first pass leaves out. Positions the real terminal cursor at the
-// navigation cursor's own screen location afterward -- not the mode-
-// line, so the blinking cursor stays where it's actually useful (showing
-// position in the content) even while the mode-line shows a pending
-// command/search line taking input from the very same keystream.
+// Draws `buf`'s viewport into `rect` (the focused pane's, see
+// `pane_rect`) plus the global mode line (`render_global_status_row`).
+// Rows past the end are left blank. The terminal cursor goes to the
+// navigation cursor, not the mode line, even while a command line is
+// being typed there.
 fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, command_line: Option<&str>, term_rows: usize, term_cols: usize) {
     let content_rows = normal_mode_content_rows(rect);
     let total = buf.line_count();
     let pattern = active_search_pattern(vk, buf);
-    // Every selection currently on screen -- every committed one, plus
-    // whatever's actively being extended right now (if Visual mode is
-    // active) -- computed once up front rather than per row, same as
-    // `pattern` just above.
+    // Every selection on screen, committed and active, computed once.
     let active = active_visual_range(vk, buf);
     let mut out = String::new();
     for r in 0..content_rows {
         let line = buf.viewport_top() + r;
         out.push_str(&format!("\x1b[{};{}H", rect.row + r + 1, rect.col + 1));
         if line < total {
-            // Only the currently-visible rows are ever scanned for
-            // matches -- correct, not just an optimization: a match
-            // outside the viewport can't be seen either way, and this
-            // avoids scanning potentially large scrollback on every
-            // redraw.
+            // Only the visible rows are searched: a match elsewhere can't
+            // be seen, and scrollback can be large.
             let mut matches = match &pattern {
                 Some(p) => motion::find_matches_in_line(buf, line, p),
                 None => Vec::new(),
             };
-            // Selections render exactly like a search match -- reverse
-            // video, same `render_normal_mode_row` mechanism -- by simply
-            // becoming more entries on this same list. No new visual
-            // style for this pass (see this feature's own plan doc).
+            // Selections draw as reverse video too, as more entries on the
+            // same list.
             for range in buf.selections.iter().chain(active.iter()) {
                 if let Some(cols) = selection_columns_in_line(range, line, rect.cols) {
                     matches.push(cols);
@@ -5336,10 +5070,8 @@ fn render_normal_mode_frame(buf: &ScreenBuffer, rect: Rect, vk: &VimKeys, comman
     let _ = io::stdout().flush();
 }
 
-// `GotoFirstWindow`/`GotoLastWindow` aren't included -- they don't have a
-// `WindowAction` equivalent (an absolute tab-position jump, not a
-// repeatable action) and are handled directly in dispatch_window_cmd's
-// own match, which never calls this for them.
+// `GotoFirstWindow`/`GotoLastWindow` aren't here: an absolute jump has
+// no `WindowAction`, and `dispatch_window_cmd` handles them itself.
 fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     match cmd {
         WindowCmd::Next => WindowAction::Next,
@@ -5364,26 +5096,13 @@ fn window_cmd_to_action(cmd: WindowCmd) -> WindowAction {
     }
 }
 
-// Actually applies a resolved `<C-w>{cmd}` -- called from run_normal_
-// mode_navigation's own single `KeyOutcome::Window` arm, regardless of
-// which `NavBuffer` variant produced it (a `<C-w>` typed inside a
-// `Frame::Edit` pane resolves the exact same `KeyOutcome::Window` a
-// read-only pane's own Normal mode does -- see `NavBuffer`'s own doc
-// comment). Doesn't redraw/return anything itself beyond what
-// apply_window_action (or the GotoFirst/GotoLast branch) already does on
-// its own -- the caller exits its whole loop afterward either way
-// (nothing left to resume, a window-focus change).
+// Applies a resolved `<C-w>{cmd}`, from either `NavBuffer` variant (see
+// `NavBuffer`). The caller leaves its loop afterwards, as focus moved.
 fn dispatch_window_cmd(app: &mut App, cmd: WindowCmd, count: Option<usize>) {
     match cmd {
-        // No WindowAction equivalent -- an absolute tab-position jump,
-        // not a repeatable action -- so this sets &mut app.current_window
-        // directly instead of going through apply_window_action,
-        // matching Motion::GotoFirstLine/GotoLastLine's own default-vs-
-        // explicit-target split (see KeyOutcome::Window's own doc
-        // comment). Still needs the same freeze apply_window_action
-        // itself does up front (see freeze_focused_idle_prompt's own
-        // doc comment) -- this is the one window-focus-changing path
-        // that doesn't go through apply_window_action at all.
+        // No `WindowAction` for an absolute jump, so `current_window` is
+        // set directly; it still needs the freeze `apply_window_action`
+        // does first (see `freeze_focused_idle_prompt`).
         WindowCmd::GotoFirstWindow | WindowCmd::GotoLastWindow => {
             freeze_focused_idle_prompt(app);
             let default = if cmd == WindowCmd::GotoFirstWindow { 1 } else { app.windows.len() };
@@ -5401,151 +5120,57 @@ fn dispatch_window_cmd(app: &mut App, cmd: WindowCmd, count: Option<usize>) {
     }
 }
 
-// What's covering normal mode's own view right now, on top of the
-// ordinary render_normal_mode_frame -- neither is an ephemeral "blocks
-// until dismissed" prompt the way the old design's overlay-wait was;
-// both just sit on screen until the *next* keypress arrives, at which
-// point run_normal_mode_navigation's own loop resolves it away (a full
-// compositor_redraw + render_normal_mode_frame) and then goes on to
-// process that same keypress normally -- so the key that clears an
-// Output overlay is never "spent" on dismissing it, it still moves the
-// cursor/opens a new ':' line/whatever it would have done anyway. The
-// one exception: from Output specifically, Ctrl-L doesn't clear -- it
-// upgrades to Transcript instead (see the resolution loop at the top of
-// run_normal_mode_navigation), matching command mode's own prompt-time
-// Ctrl-L toggle onto the exact same session-wide command_transcript.
+// What's covering normal mode's view. Each stays until the next key,
+// which `run_normal_mode_navigation` then handles as usual after
+// redrawing, so the key that clears an overlay isn't spent on it. From
+// `Output`, Ctrl-L switches to `Transcript` instead of clearing, as in
+// command mode.
 #[derive(Clone, Copy, PartialEq)]
 enum PendingView {
     None,
-    // A just-run command's result (CommandModeOutcome::Ran) -- shown via
-    // render_command_output_overlay. Also raised (with empty output) for
-    // a non-zero exit that produced no output at all, so a silent
-    // failure still gets a bare colored bar instead of no feedback.
+    // A just-run command's result (`CommandModeOutcome::Ran`), drawn by
+    // `render_command_output_overlay`. Raised with empty output for a failure
+    // that printed nothing, so it still gets a coloured bar.
     Output,
     Transcript,
 }
 
-// bishedit M1's first (and, so far, only) consumer: Ctrl+G
-// (editor::ReadOutcome::NormalMode, unconditional now -- see its own doc
-// comment) enters this -- read-only cursor navigation over the focused
-// pane's own rendered content (scrollback included), vim's normal-mode
-// motions applied via bishedit::motion/vimkeys. `:` hands off to the
-// real command-mode feature (handle_command_mode -- the same one the
-// M10c job-detach path uses) -- the only way command mode is reached now
-// that the old direct ':'-at-the-shell-prompt shortcut is gone (see
-// editor::ReadOutcome's own doc comment). `ZZ` and typing exactly
-// "q"/"q!" as a command both exit normal mode -- `ZZ` directly here,
-// "q"/"q!" via run_command_mode special-casing them as vim's own Ex quit
-// commands rather than trying to run them as shell builtins (see its own
-// doc comment). Cancelling out of the command line (Ctrl-C/Esc/empty-
-// Backspace/empty-Enter) returns to this navigation instead, matching
-// real vim staying in Normal mode after an aborted ':' command. An
-// ordinary command that actually ran (CommandModeOutcome::Ran) also
-// returns to this navigation -- command mode itself is one-shot again
-// (see its own doc comment) -- but keeps that command's result on
-// screen as a PendingView::Output overlay until the very next keypress.
-// `<C-w>{cmd}` (vimkeys' KeyOutcome::Window) reuses the exact same
-// exec.rs `WindowAction`/repl.rs `apply_window_action` machinery the
-// shell's own `window` command already drives, applied `count` times --
-// per plan.md, running one always exits normal mode too (e.g.
-// `<C-space><C-w>n` jumps to the next window and drops straight into its
-// live prompt, not back into this pane's own normal mode) -- matching
-// what a real command-mode `Action` outcome now does as well, for the
-// same reason.
-//
-// `i`/`a`/`I`/`A`/`s`/`S`/`C` (vimkeys' `KeyOutcome::EnterInsert`) all
-// return to the live prompt, same as `ZZ` -- but per this session's own
-// "as if we were just looking around" design, they act on `initial_text`/
-// `initial_cursor` (a snapshot of exactly what was typed and where the
-// cursor was the *moment* Ctrl+G was pressed), never on wherever
-// this function's own navigation cursor has since wandered off to in the
-// scrollback. So freely glancing around at prior output, then pressing
-// e.g. `A`, always resumes editing at the end of the *original* line --
-// not at the end of whatever line the nav cursor happens to be sitting
-// on. `apply_insert_cmd` (bishedit::vimkeys, shared with editor.rs's own
-// line-local Ctrl-E mode -- see that mode's own doc comment for the
-// contrast) does the actual text/cursor transformation. `:q` (a same-
-// window CommandModeOutcome::Quit) restores the same original text/
-// cursor, matching `ZZ`/`i`; an actual focus change (CommandModeOutcome::
-// Action, or KeyOutcome::Window) does not -- there's no per-session slot
-// to stash "unsubmitted line text" in for whatever window ends up
-// focused, so it's simply not carried over (matches today's behavior:
-// before this session, Ctrl+G was empty-buffer-only, so a focus
-// change never had anything to lose in the first place).
-//
-// Not yet resumable via the Frame stack (see plan.md's own scoping
-// note): switching to another window mid-navigation and coming back
-// later is a natural follow-up, staged the same way job control itself
-// was staged across M10a-c. This pass is a simple, blocking "enter,
-// navigate, exit" loop -- other windows' backgrounded jobs are still
-// kept alive via on_idle (service_background_jobs), but their panes
-// aren't repainted live while this loop owns the screen; any staleness
-// resolves itself once normal mode exits and the next compositor_redraw
-// runs.
-// What `run_normal_mode_navigation` is being entered to drive -- decides
-// both which `NavBuffer` variant it builds (see that enum's own doc
-// comment) and what its own `NavExit` return values actually mean once
-// it's done.
+// What `run_normal_mode_navigation` is driving: picks the `NavBuffer`
+// variant and decides what its `NavExit` means.
 enum NavStart {
-    // Ctrl+G from a live shell prompt, mid-typing `text` with the
-    // cursor at `cursor` -- resumable (see `NavExit::Resume`).
+    // Ctrl+G at a live prompt, mid-typing `text` with the cursor at
+    // `cursor`; resumable (see `NavExit::Resume`).
     //
-    // `wheel` is set instead when a wheel notch is what opened this view
-    // (see editor::ReadOutcome::NormalMode), and that notch scrolls once
-    // the buffer exists -- otherwise the gesture that got you here would
-    // be swallowed, and a wheel that opens a view without moving it is
-    // exactly what "the wheel doesn't work" looks like.
+    // `wheel` is set when a wheel notch opened this view (see
+    // `editor::ReadOutcome::NormalMode`), and scrolls once the buffer exists,
+    // or the gesture that opened the view would be swallowed.
     Prompt { text: String, cursor: usize, wheel: Option<editor::MouseEvent> },
-    // Ctrl+G detaching a running foreground job -- read-only, same
-    // as `Prompt`, but nothing to resume into (this pane's top frame
-    // stays `Frame::Job`, not a live prompt, so a caller-side "resume
-    // this text" would have nothing to apply it to).
+    // Ctrl+G detaching a running foreground job: read-only like `Prompt`,
+    // but the pane's top frame stays `Frame::Job`, so nothing to resume.
     JobDetach,
-    // Driving a `Frame::Edit` pane -- `TextBuffer`/`VimKeys` moved in for
-    // the duration, handed back (mutated) via the paired
-    // `Option<(TextBuffer, VimKeys)>` this function returns alongside
-    // its `NavExit`, regardless of which one that turns out to be.
-    // Both fields are boxed only to keep this enum's own size close to
-    // its other two (unit-ish) variants -- `Prompt`'s inline `String` is
-    // by far the common case, and clippy flags an enum whose largest
-    // variant dwarfs the rest, since every `NavStart` value pays that
-    // largest variant's stack size regardless of which one it is. The
-    // return type (`Option<(TextBuffer, VimKeys)>`) stays unboxed --
-    // that's a plain function return, not a value every other variant of
-    // some enum has to be sized against.
+    // A `Frame::Edit` pane: the buffer and keys are moved in and handed
+    // back with the `NavExit`. Boxed so the enum isn't sized by this variant.
     Edit(Box<TextBuffer>, Box<VimKeys>),
 }
 
-// What happened when `run_normal_mode_navigation` returns -- interpreted
-// differently depending on which `NavStart` produced it: only `Prompt`
-// ever produces `Resume` (hand typing back to the live prompt's own
-// editor); only `Edit` ever produces `Quit` (`:q`/`:wq`/`:x`/`:q!`/`ZZ`,
-// popping the `Frame::Edit`); `Detached` covers everything else for any
-// start -- focus moved via `<C-w>`/a `:window` action, or EOF -- exactly
-// `Ok(None)`'s existing meaning before this was named.
+// How `run_normal_mode_navigation` ended. Only `Prompt` produces
+// `Resume` (back to the prompt's editor), only `Edit` produces `Quit`
+// (`:q`, `:wq`, `:x`, `:q!`, `ZZ`, popping the `Frame::Edit`). `Detached`
+// covers the rest: focus moved, or EOF.
 enum NavExit {
     Resume(String, usize),
     Detached,
     Quit,
-    /// `gd` found a definition in a *different* file.
+    /// `gd` found a definition in another file.
     ///
-    /// A separate exit rather than something the navigation loop does
-    /// itself, because that loop cannot open a frame: it has neither
-    /// `edit_frames` nor the id counter, and giving it both would hand
-    /// the thing that drives one buffer the ability to create others.
-    /// Handing the request back up to `run_edit_frame`, which already
-    /// owns exactly that, is the same shape `Quit` and `Detached`
-    /// already use -- the loop reports what happened and its caller
-    /// decides what that means.
+    /// The loop can't open a frame (it has neither `edit_frames` nor the id
+    /// counter), so it hands the request to `run_edit_frame`, as `Quit` and
+    /// `Detached` do.
     ///
-    /// The position is still the server's own `(line, character)` in
-    /// `encoding`, because converting it needs the text of the file
-    /// being opened, which does not exist yet at the point this is
-    /// produced.
-    // `root`: the project root the buffer this jump *came from* was
-    // being served by, carried so the file being opened inherits it
-    // rather than working one out from its own ancestors -- see
-    // `TextBuffer::lsp_root`.
+    /// The position stays the server's `(line, character)` in `encoding`:
+    /// converting it needs the text of a file not yet opened.
+    // `root`: the project root serving the buffer the jump came from; the
+    // opened file inherits it (see `TextBuffer::lsp_root`).
     OpenAt {
         path: PathBuf,
         line: usize,
@@ -5555,13 +5180,9 @@ enum NavExit {
     },
 }
 
-// Packages this loop's own `buf`/`vk` locals back up for the caller once
-// it's done with them -- `Some` iff `buf` is `NavBuffer::Editable` (i.e.
-// iff this call started from `NavStart::Edit`), so `run_edit_frame` can
-// re-stash (or, on `NavExit::Quit`, just drop) the session; `None` for
-// either `ReadOnly` start, where there's nothing to hand back (both of
-// this function's other two callers already discard this half of the
-// return value entirely).
+// Hands `buf` and `vk` back to `run_edit_frame` when the loop started
+// from `NavStart::Edit`; `None` for the read-only starts, which have
+// nothing to return.
 fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer, VimKeys)> {
     match buf {
         NavBuffer::Editable(tb) => Some((tb, vk)),
@@ -5570,57 +5191,46 @@ fn nav_buffer_into_edit_state(buf: NavBuffer, vk: VimKeys) -> Option<(TextBuffer
 }
 
 // Gives a shell the opaque view of `table` that `::bish lsp` reports
-// through -- see `exec::ServiceTable`. The same `RefCell` the caller
-// keeps a concrete handle to, so the two can never describe different
-// tables.
+// through (see `exec::ServiceTable`). The same `RefCell` the caller
+// holds, so the two can't diverge.
 fn install_service_table(shell: &mut Shell, table: &Rc<RefCell<lspclient::Table>>) {
     shell.lsp = Rc::clone(table) as Rc<RefCell<dyn exec::ServiceTable>>;
 }
 
-// The same for the interactive history, which the `history` builtin
-// reaches through `exec::HistoryAccess` -- see that trait for why a
-// shell cannot simply own one.
+// The same for the history, which the `history` builtin reaches through
+// `exec::HistoryAccess`; see that trait for why a shell can't own one.
 fn install_history(shell: &mut Shell, history: &Rc<RefCell<History>>) {
     shell.history = Rc::clone(history) as Rc<RefCell<dyn exec::HistoryAccess>>;
 }
 
 /// One place a location list points at.
 ///
-/// Holds the server's own `(line, character)` and the encoding to read
-/// it in, rather than a resolved cursor position: resolving needs the
-/// text of the file, which for every entry outside the current buffer
-/// has not been read and may never be.
+/// Holds the server's `(line, character)` and encoding rather than a
+/// cursor position: resolving needs the file's text, which for entries
+/// outside the current buffer may never be read.
 struct LocationItem {
     path: PathBuf,
     line: usize,
     character: usize,
     encoding: crate::lsp::PositionEncoding,
-    /// What the row shows: where it is, and the source line if it could
-    /// be read cheaply.
+    /// What the row shows: where, and the source line if read cheaply.
     label: String,
 }
 
 struct LocationList {
-    /// The pill in the pane's own divider -- "12 references".
+    /// The pill in the pane's divider: "12 references".
     title: String,
     items: Vec<LocationItem>,
 }
 
-// How many entries a list keeps. A `gr` on something common in a large
-// project can answer with thousands; a pane capped at half the window
-// can show a few dozen. Truncating is honest and bounded, where
-// building the other nine hundred rows is work nobody asked for.
+// How many entries a list keeps. A `gr` on something common can answer
+// with thousands, and a pane shows a few dozen.
 const MAX_LOCATIONS: usize = 200;
 
 // Turns a server's answer into a list, reading each distinct file once
-// to put the actual source line on each row.
-//
-// Reading is what makes the list worth having -- `path:12` tells you
-// nothing about which use it is -- but it is bounded twice over: to
-// `MAX_LOCATIONS` entries, and to one read per file however many
-// entries land in it. A file that cannot be read still gets a row, just
-// without its line: a reference that exists is worth showing even if
-// the file moved out from under us.
+// for the source line on each row; `path:12` alone doesn't say which
+// use it is. Bounded to `MAX_LOCATIONS` entries and one read per file.
+// An unreadable file still gets a row, without its line.
 fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crate::lsp::PositionEncoding, base: Option<&Path>) -> LocationList {
     let mut cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
     let mut items = Vec::new();
@@ -5629,8 +5239,7 @@ fn location_list(title: &str, locations: &[crate::lsp::Location], encoding: crat
         let lines = cache
             .entry(path.clone())
             .or_insert_with(|| std::fs::read_to_string(&path).map(|text| text.lines().map(str::to_string).collect()).unwrap_or_default());
-        // Relative to the file the question was asked from, so the
-        // interesting part of a long path is what shows.
+        // Relative to the file asked from, so the interesting part shows.
         let shown = base.and_then(|base| path.strip_prefix(base).ok()).unwrap_or(&path).display().to_string();
         let text = lines.get(location.start.0).map(|l| l.trim()).unwrap_or("");
         let label = if text.is_empty() { format!("{shown}:{}", location.start.0 + 1) } else { format!("{shown}:{}  {text}", location.start.0 + 1) };
@@ -5662,12 +5271,9 @@ fn symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp
     LocationList { title: title.to_string(), items }
 }
 
-// `:sym`'s answer, as a location list.
-//
-// Not `symbol_list`: a workspace symbol comes from a file the user is
-// not looking at, so the file is the most useful thing to show and the
-// nesting depth (which a flat `SymbolInformation` does not have anyway)
-// is not.
+// `:sym`'s answer, as a location list. Unlike `symbol_list`, the file
+// is shown: a workspace symbol is usually in a file the user isn't
+// looking at.
 fn workspace_symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: crate::lsp::PositionEncoding, base: Option<&Path>) -> LocationList {
     let items = symbols
         .iter()
@@ -5683,35 +5289,22 @@ fn workspace_symbol_list(title: &str, symbols: &[crate::lsp::Symbol], encoding: 
     LocationList { title: title.to_string(), items }
 }
 
-// A session's live `::bish hl` colours (see bishedit::highlight::
-// HL_NAMES/ColorOverrides, exec::Shell::bishopt_color), resolved
-// fresh from `shell` -- every caller owns its own snapshot rather than
-// sharing one.
-//
-// A snapshot goes stale, and a caller that keeps one has to say when it
-// re-takes it. This comment used to claim the opposite -- that
-// `--set`/`--unset` "can only ever run from an actual shell prompt
-// (bishopt is a builtin, not reachable from inside the modal file
-// editor)" -- which was wrong: command mode runs builtins, so
-// `::bish hl --set string ...` from the colon line has always
-// worked. It just had no visible effect until the file was reopened,
-// because run_edit_frame had already taken its snapshot. The half of
-// that claim which *is* true is the diagnostics pane: it has no colon
-// line, and doesn't use these colors anyway.
-// The same, for bish's own chrome -- see theme.rs.
+// Bish's own chrome colours (see theme.rs), read fresh from `shell`.
 fn ui_colors(shell: &exec::Shell) -> crate::theme::UiColors {
     crate::theme::UI_COL_OPTIONS.iter().filter_map(|(element, name)| shell.bishopt_color(name).map(|c| (*element, c))).collect()
 }
 
+// A session's `::bish hl` colours (see `highlight::HL_NAMES`), read
+// fresh from `shell`. Callers keep a copy and re-take it when they can
+// change: command mode runs builtins, so `::bish hl --set` works from
+// the editor's colon line.
 fn syntax_color_overrides(shell: &exec::Shell) -> highlight::ColorOverrides {
     highlight::HL_NAMES.iter().filter_map(|(kind, name)| shell.hl_color(name).map(|c| (*kind, c))).collect()
 }
 
-// How the file editor should lay out a line wider than the pane, read
-// fresh off the live shell -- same shape (and same reason) as
-// `syntax_color_overrides` just above: these are bishopts, so a
-// `bishopt --set wrap on` has to take effect on the next redraw rather
-// than on the next time a buffer happens to be opened.
+// How the editor lays out a line wider than the pane, read fresh from
+// the shell like `syntax_color_overrides`, so `bishopt --set wrap on`
+// shows on the next redraw.
 fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
     crate::bishedit::wrap::Options {
         wrap: shell.bishopt_bool("wrap"),
@@ -5726,11 +5319,7 @@ fn wrap_options(shell: &exec::Shell) -> crate::bishedit::wrap::Options {
     }
 }
 
-// Applies those to whichever buffer is about to be rendered or driven.
-// Called twice: once as run_edit_frame starts driving a buffer, and
-// again after every command-mode command, since the colon line is the
-// one way these can change while the editor holds the terminal.
-// The settings a buffer gets from the shell alone, before any
+// The settings a buffer gets from the shell alone, before
 // `.editorconfig` has a say.
 fn apply_shell_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.expandtab = shell.bishopt_bool("expandtab");
@@ -5742,26 +5331,23 @@ fn apply_shell_options(shell: &exec::Shell, buf: &mut TextBuffer) {
         "unix" => buf.eol = crate::editorconfig::Eol::Lf,
         "dos" => buf.eol = crate::editorconfig::Eol::Crlf,
         "mac" => buf.eol = crate::editorconfig::Eol::Cr,
-        // Empty, the default: whatever the file already had, which is
-        // the only answer that doesn't rewrite a CRLF file on first
-        // save.
+        // Empty, the default: keep what the file had, so a CRLF file isn't
+        // rewritten on first save.
         _ => {}
     }
 }
 
-// ...and then what the project says, when the project is allowed to say
-// it. `.editorconfig` is applied *after* the shell's own settings and
-// overwrites them, which is the `editorconfig` bishopt's whole meaning:
-// your bishopts are your preference for everywhere else, and a project
-// that has written its conventions down is being specific. Turning the
-// option off is how you take a buffer back without editing the file.
+// What the project's `.editorconfig` says, if the `editorconfig`
+// bishopt allows it. Applied after the shell's settings and overriding
+// them: bishopts are a preference, a project's written conventions are
+// specific. Turning the option off takes a buffer back.
 fn apply_editorconfig(shell: &exec::Shell, buf: &mut TextBuffer) {
     if !shell.bishopt_bool("editorconfig") {
         return;
     }
     let Some(path) = buf.path().map(|p| p.to_path_buf()) else { return };
-    // Resolved against the absolute path: a `.editorconfig` cascade is
-    // about where a file *is*, and `e src/main.rs` gives a relative one.
+    // Against the absolute path: the `.editorconfig` cascade depends on where
+    // the file is, and `e src/main.rs` is relative.
     let path = std::fs::canonicalize(&path).unwrap_or(path);
     let properties = crate::editorconfig::for_file(&path);
     if let Some(style) = properties.indent_style {
@@ -5782,20 +5368,22 @@ fn apply_editorconfig(shell: &exec::Shell, buf: &mut TextBuffer) {
     if let Some(final_newline) = properties.insert_final_newline {
         buf.final_newline = final_newline;
     }
-    // `max_line_length` is `wrap_column` under another name -- an
-    // explicit `off` is what `wrap_column = 0` already means.
+    // `max_line_length` is `wrap_column`; `off` is `wrap_column = 0`.
     if let Some(max) = properties.max_line_length {
         buf.wrap.column = max.unwrap_or(0);
     }
-    // A charset this shell cannot write is left alone rather than
-    // approximated: the buffer keeps the encoding its own bytes were
-    // read as, and the file is written back as it came.
+    // A charset this shell can't write is left alone: the buffer keeps the
+    // encoding it was read as, and the file is written back as it came.
     if let Some((charset, encoding)) = properties.charset.as_deref().and_then(|c| Some((c, crate::encoding::parse(c)?))) {
         buf.encoding = encoding;
         buf.bom = crate::encoding::names_a_bom(charset) || encoding.requires_bom();
     }
 }
 
+// Applies the shell's and the project's settings to a buffer. Called as
+// `run_edit_frame` starts driving it and after every command-mode
+// command, the one way settings change while the editor holds the
+// terminal.
 fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.wrap = wrap_options(shell);
     buf.tabular = tabular_style(shell, &fileeditor::language_of(buf));
@@ -5809,18 +5397,15 @@ fn apply_view_options(shell: &exec::Shell, buf: &mut TextBuffer) {
     buf.iskeyword = shell.bishopt_str("iskeyword");
     buf.ignorecase = shell.bishopt_bool("ignorecase");
     buf.smartcase = shell.bishopt_bool("smartcase");
-    // In this order, and never the other way round: the shell's own
-    // settings are the base, and the project's are the override.
+    // Shell settings first, the project's over them.
     apply_shell_options(shell, buf);
     apply_editorconfig(shell, buf);
 }
 
-// Whether this buffer's columns line up, and on what. Two conditions,
-// in this order because they answer different questions: the `tabular`
-// bishopt's glob is the *user's* choice about which languages to do it
-// for, and `tabular::style` is whether the language has a tabular
-// form at all. A language nobody has implemented one for falls out
-// through the second, which is why the glob can default to `*`.
+// Whether this buffer's columns line up, and how. The `tabular`
+// bishopt's glob is the user's choice of languages; `tabular::style` is
+// whether the language has a tabular form at all, which is why the glob
+// can default to `*`.
 fn tabular_style(shell: &exec::Shell, language: &str) -> Option<crate::bishedit::tabular::Style> {
     let languages = shell.bishopt_str("tabular");
     if !crate::glob::matches(&languages, language) {
@@ -5829,42 +5414,21 @@ fn tabular_style(shell: &exec::Shell, language: &str) -> Option<crate::bishedit:
     crate::bishedit::tabular::style(language)
 }
 
-// Dispatches this loop's own per-keystroke redraw to whichever renderer
-// actually matches `buf`'s concrete backing -- `ScreenBuffer`'s own
-// `render_normal_mode_frame`, or `TextBuffer`'s own `fileeditor::
-// render_editor_frame` (gutter, syntax highlighting, Insert/Replace mode
-// labels, dirty flag -- everything a real file editor's Normal mode needs
-// that a read-only scrollback view never did). Always renders Normal
-// mode specifically -- Insert/Replace mode's own rendering happens
-// inside `fileeditor::run_insert_mode`'s own nested loop instead, which
-// is the only place either of those modes is ever live.
-// `&mut NavBuffer` (not `&NavBuffer`) specifically so the `Editable` arm
-// can call `checkpoint_undo` first -- this is the one call site every
-// top-level `KeyOutcome` arm reaches (including after `EnterInsert`/
-// `OpenLine`/`Change`'s own `fileeditor::run_insert_mode` call fully
-// returns), which is what makes it the right place to commit an undo-tree
-// node: an entire Insert-mode session collapses into a single checkpoint
-// here, not one per keystroke, with no changes needed to any of the
-// individual `Operator`/`OperatorLines`/`Put`/... arms that call this.
-// Insert mode's own idle tick: service everything, and when that says
-// to repaint, hand back the geometry to repaint *into* rather than
-// letting the caller reuse what it measured before Insert mode began.
-// See fileeditor::IdleRedraw for why the two can't be separated.
+// Insert mode's idle tick: services everything, and when a repaint is
+// due returns the geometry to repaint into, not what was measured
+// before Insert mode began. See `fileeditor::IdleRedraw`.
 fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Option<fileeditor::IdleRedraw> {
     let repaint = service_background_jobs(app);
-    // The Insert-mode counterpart of the navigation loop's own call --
-    // see `App::focus`. Typing moves the cursor too.
+    // The Insert-mode counterpart of the navigation loop's call (see
+    // `App::focus`); typing moves the cursor too.
     if publish_focus_buffer(app, buf) {
         notify_selection(app);
     }
-    // Typing is the case document synchronization exists for, and this
-    // is the only path that runs while it is happening -- keystrokes
-    // themselves never come back through here (the loop above only
-    // calls this while stdin is quiet), which is exactly the settling
-    // the debounce is measuring.
+    // Typing is what document sync is for. This runs only while stdin is
+    // quiet, which is the settling the debounce measures.
     sync_language_server_document(&mut app.sessions, session_id, buf);
-    // Diagnostics that arrived while the user was typing are drawn on
-    // the same tick they land, which is what makes them feel live.
+    // Diagnostics are drawn the tick they arrive, which is what makes them
+    // feel live.
     let diagnosed = apply_language_server_diagnostics(&mut app.sessions, session_id, buf);
     if diagnosed {
         refresh_diagnostics_title(app, &buf.diagnostics);
@@ -5872,12 +5436,11 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     let recoloured = sync_semantic_tokens(&mut app.sessions, session_id, buf);
     let reprogressed = sync_language_server_progress(&mut app.sessions, session_id, buf);
     let rewatched = sync_watched_file(app.file_watcher.as_mut(), buf);
-    // A debug adapter is deliberately *not* serviced here. This is the
-    // idle tick of Insert mode, and a program that hits a breakpoint
-    // while somebody is typing must not move the cursor out from under
-    // them -- the stop is noticed on the next tick in Normal mode,
-    // which is where every other `:dbg` answer appears anyway.
-    // Insert mode too: the marks follow the cursor, and typing moves it.
+    // Marks follow the cursor, and typing moves it.
+    //
+    // A debug adapter isn't serviced here: a breakpoint hit while someone
+    // types mustn't move their cursor. The stop shows on the next Normal
+    // mode tick, where `:dbg` answers appear anyway.
     let remarked = sync_document_highlights(&mut app.sessions, session_id, buf);
     let rehinted = sync_inlay_hints(&mut app.sessions, session_id, buf);
     (repaint || diagnosed || recoloured || reprogressed || rewatched || remarked || rehinted).then(|| fileeditor::IdleRedraw {
@@ -5887,10 +5450,9 @@ fn insert_idle(app: &mut App, session_id: SessionId, buf: &mut TextBuffer) -> Op
     })
 }
 
-// A cursor inside a closed fold sits on the row that stands for it --
-// vim's own rule, and the only place on screen it could be drawn. Motions
-// already see to this (motion::apply_motion); this is for everything else
-// that can put a cursor somewhere: `:N`, undo, a fold closing around it.
+// A cursor inside a closed fold sits on the row standing for it, as in
+// vim. Motions see to this (`motion::apply_motion`); this covers the
+// rest: `:N`, undo, a fold closing around the cursor.
 fn rest_on_fold(buf: &mut dyn BisheditBuffer) {
     let (line, col) = buf.cursor();
     let (start, _) = buf.fold_span(line);
@@ -5899,6 +5461,13 @@ fn rest_on_fold(buf: &mut dyn BisheditBuffer) {
     }
 }
 
+// Draws `buf` in Normal mode with the renderer for its kind:
+// `render_normal_mode_frame` or `fileeditor::render_editor_frame`.
+// Insert and Replace mode draw inside `fileeditor::run_insert_mode`.
+//
+// Takes `&mut` so the `Editable` arm can `checkpoint_undo`: every
+// top-level key outcome ends here, including after Insert mode returns,
+// so a whole Insert session becomes one undo step.
 fn render_nav_frame(
     buf: &mut NavBuffer,
     vk: &VimKeys,
@@ -5907,23 +5476,18 @@ fn render_nav_frame(
     term_cols: usize,
     color_overrides: Option<&highlight::ColorOverrides>,
 ) {
-    // The buffer's own viewport height is a stored field with no resize
-    // hook of its own, so every redraw resyncs it from the rect actually
-    // being drawn into. Without this a shrink leaves the scroll
-    // arithmetic working from a height the pane no longer has.
+    // The viewport height is a stored field with no resize hook, so each
+    // redraw resyncs it from the rect, or a shrink leaves scrolling working
+    // from the old height.
     buf.set_viewport_height(normal_mode_content_rows(rect));
-    // Not while selecting: a Visual selection is allowed to reach into a
-    // closed fold, and takes it whole when it is used.
+    // Not while selecting: a Visual selection may reach into a closed fold,
+    // and takes it whole.
     if !vk.is_visual() {
         rest_on_fold(buf);
     }
     match buf {
-        // ReadOnly (NavStart::Prompt/JobDetach) never carries file syntax
-        // highlighting to color-override at all -- it's replaying/
-        // searching an already-rendered grid, not re-highlighting bash
-        // source -- so every caller of those two starts just passes None
-        // here; only NavStart::Edit's own caller (run_edit_frame) has a
-        // real value to offer.
+        // A `ReadOnly` view replays a rendered grid; there's no syntax
+        // highlighting to override.
         NavBuffer::ReadOnly(sb) => render_normal_mode_frame(sb, rect, vk, None, term_rows, term_cols),
         NavBuffer::Editable(tb) => {
             tb.checkpoint_undo();
@@ -5932,70 +5496,59 @@ fn render_nav_frame(
     }
 }
 
-// Visual mode's own `Z`/`y`/`d`/`c`/`p`/`S`/Escape's shared first step:
-// if there's a currently-active (not yet committed) selection, commit it
-// -- a no-op if `vk` isn't actually mid a Visual selection right now
-// (`active_visual_range` returns `None`).
+// The first step of Visual mode's `Z`, `y`, `d`, `c`, `p`, `S` and
+// Escape: commit the active selection, if any.
 fn commit_active_selection(vk: &VimKeys, buf: &mut NavBuffer) {
     if let Some(range) = active_visual_range(vk, &*buf) {
         buf.selections_mut().push(range);
     }
 }
 
-// The one real Normal-mode loop -- drives a read-only view over a pane's
-// own scrollback/live grid (`NavStart::Prompt`/`JobDetach`, backed by
-// `NavBuffer::ReadOnly`) *or* a real, mutable file buffer
-// (`NavStart::Edit`, backed by `NavBuffer::Editable`, while this pane's
-// top frame is a `Frame::Edit`) -- an editor pane is not a categorically
-// different mode reached by detaching out of this one, it's this same
-// loop over a buffer that happens to support mutation too (see
-// `NavBuffer`'s own doc comment). Every already buffer-generic helper
-// (`motion::apply_motion`, `editor::apply_motion_or_reselect`,
-// `editor::yank_motion`/`yank_lines`, `active_visual_range`) runs
-// unmodified against either variant; only the mutating `KeyOutcome`s
-// (`Put`, `Operator`/`OperatorLines` for `Delete`/`Change`/case-ops,
-// `EnterInsert`/`EnterReplace`, ...) match on `NavBuffer` directly, since
-// mutation was never part of the shared `Buffer` trait.
+// The Normal-mode loop, over a pane's scrollback and grid
+// (`NavStart::Prompt`/`JobDetach`) or a file (`NavStart::Edit`); see
+// `NavBuffer`. Ctrl+G enters it. `:` opens command mode
+// (`handle_command_mode`): cancelling returns here, and a command that
+// ran leaves its output up as `PendingView::Output` until the next key.
+// `ZZ` and `:q` leave; so does `<C-w>{cmd}` (`apply_window_action`, run
+// `count` times) and a `:window` action, landing at the new pane's
+// prompt.
+//
+// Insert commands (`i`, `a`, `A`, ...) return to the prompt and apply to
+// the line as it was when Ctrl+G was pressed (`apply_insert_cmd`), not
+// to where the navigation cursor went; `:q` restores that line too. A
+// focus change drops it, as no per-session slot holds an unsubmitted
+// line.
+//
+// This loop blocks: other panes' jobs keep running via
+// `service_background_jobs`, but aren't repainted until it exits.
 fn run_normal_mode_navigation(
     app: &mut App,
     session_id: SessionId,
-    // `Some` iff `start` is `NavStart::Edit` -- the id `debug_frames`
-    // itself is keyed on (see Frame::DebugRun's own doc comment), needed
-    // both for `K`'s own live-value lookup below and threaded on into
-    // `handle_command_mode` so its `:dbg` handling can attach/detach a
-    // session. `None` for the other two starts (a plain prompt or a
-    // detached job's own frozen screen) -- neither has a file buffer
-    // `:dbg` could mean anything against, so `debug_frames` is simply
-    // never touched from those calls.
+    // `Some` iff `start` is `NavStart::Edit`: the key of `debug_frames`
+    // (see `Frame::DebugRun`), for `K`'s value lookup and `:dbg` in
+    // `handle_command_mode`. The read-only starts have no file to debug.
     edit_frame_id: Option<EditFrameId>,
     start: NavStart,
     color_overrides: Option<&highlight::ColorOverrides>,
 ) -> io::Result<(NavExit, Option<(TextBuffer, VimKeys)>)> {
-    // Owned rather than borrowed, and refreshed after every command-mode
-    // command: `:bishopt` is reachable from the colon line right here
-    // (command mode runs builtins), so a value captured once for this
-    // whole navigation session goes stale the moment someone changes it
-    // and expects to see the difference. Same reasoning as
-    // `insert_abbrs` below, which re-snapshots for `:abbr` for exactly
-    // this reason.
+    // Owned, and refreshed after every command: `:bishopt` runs from the
+    // colon line, so a copy taken once goes stale. `insert_abbrs` is
+    // refreshed for `:abbr` the same way.
     let mut color_overrides: Option<highlight::ColorOverrides> = color_overrides.cloned();
     let mut rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
 
-    // Only `Prompt` ever has real text/cursor to resume into (see
-    // `NavExit::Resume`'s own doc comment) -- kept as empty/0 for the
-    // other two starts anyway so `EnterInsert`/`EnterReplace`/`ZZ`/`:q`'s
-    // own `ReadOnly` handling below can stay one shared implementation:
-    // for `JobDetach` those are silently discarded by this function's own
-    // caller regardless (this pane's top frame is `Frame::Job`, not a
-    // live prompt), and `Edit` never reaches that code path at all.
+    // Only `Prompt` has text to resume into (see `NavExit::Resume`); the
+    // other starts get empty values so the `ReadOnly` handling of insert
+    // commands, `ZZ` and `:q` stays shared. `JobDetach`'s caller discards
+    // them, and `Edit` never gets there.
     let (initial_text, initial_cursor) = match &start {
         NavStart::Prompt { text, cursor, .. } => (text.clone(), *cursor),
         NavStart::JobDetach | NavStart::Edit(..) => (String::new(), 0),
     };
     let original_chars: Vec<char> = initial_text.chars().collect();
 
-    // The wheel notch that opened this view, if that is what did --
-    // applied once `buf` exists, just below.
+    // The wheel notch that opened this view, if one did; applied once `buf`
+    // exists.
     let entered_by_wheel = match &start {
         NavStart::Prompt { wheel, .. } => *wheel,
         NavStart::JobDetach | NavStart::Edit(..) => None,
@@ -6003,29 +5556,18 @@ fn run_normal_mode_navigation(
 
     let (mut buf, mut vk) = match start {
         NavStart::Prompt { text, cursor, .. } => {
-            // Same reasoning as freeze_idle_prompt's other call sites
-            // (splitting, switching pane focus): this session's live
-            // prompt has only ever been drawn straight to the real
-            // terminal by editor::read_line, never captured into its own
-            // grid -- fine as long as nothing needs to read that grid
-            // back, which is exactly what's about to happen. Ctrl+G
-            // doesn't change focus (unlike those other call sites), so
-            // without this the very first entry into normal mode in a
-            // session that's never lost focus before would render as a
-            // blank pane, not even showing the current prompt (or
-            // whatever had already been typed).
+            // `read_line` draws the prompt straight to the terminal, never
+            // into the grid, and this is about to read the grid. Ctrl+G
+            // doesn't change focus (the other `freeze_idle_prompt` callers
+            // do), so without this the first entry into normal mode would
+            // show a blank pane.
             let screen = app.sessions[&session_id].screen.clone();
             let mut sb = ScreenBuffer::new(screen, normal_mode_content_rows(rect));
             sb.set_search_case(&app.sessions[&session_id].shell);
             let prompt_str = freeze_input_with_text(app.sessions.get_mut(&session_id).unwrap(), &text);
-            // Explicitly positioned rather than trusting wherever
-            // ScreenBuffer::new's own default (or the vt100 grid's
-            // cursor, wherever feed() happened to leave it -- at the
-            // *end* of what was just fed, which is only right if the
-            // original cursor was already at the end of `text` too)
-            // lands: the navigation cursor should start exactly where
-            // editing was interrupted, matching real vim entering Normal
-            // mode from Insert.
+            // Placed explicitly: the grid's cursor is where `feed()` left
+            // it, at the end of `text`, but navigation should start where
+            // editing stopped, as vim's Normal mode does after Insert.
             let last_line = sb.line_count().saturating_sub(1);
             sb.set_cursor(last_line, editor::visible_len(&prompt_str) + cursor);
             (NavBuffer::ReadOnly(sb), VimKeys::new())
@@ -6063,16 +5605,12 @@ fn run_normal_mode_navigation(
     // report per cell of pure traffic. So it follows the buffer --
     // see the `set` at the top of the loop below.
     let hover_wanted = mouse && app.sessions.get(&session_id).is_none_or(|s| s.shell.bishopt_bool("mouse_hover"));
-    // Repaints the whole screen first -- necessary the very first time
-    // normal mode ever triggers promotion (the alternate screen buffer
-    // starts out blank), harmless otherwise -- then this pane's own
-    // rectangle on top of that with the current view.
+    // Repaints the whole screen first (needed the first time normal mode
+    // promotes, as the alternate screen starts blank), then the pane.
     compositor_redraw(app);
-    // The notch that opened this view scrolls it, before the first frame
-    // is drawn -- so a wheel flick moves the content in one step rather
-    // than spending its first notch silently entering a mode. Same
-    // motion, distance and follow-up as the wheel branch inside the key
-    // loop below, which handles every notch after this one.
+    // The notch that opened this view scrolls it before the first frame,
+    // so a wheel flick moves the content at once. As the wheel branch in
+    // the loop below does for later notches.
     if let Some(ev) = entered_by_wheel {
         let motion = if ev.is_scroll_down() { motion::Motion::Down } else { motion::Motion::Up };
         editor::apply_motion_or_reselect(&mut vk, &mut buf, motion, Some(fileeditor::MOUSE_WHEEL_LINES));
@@ -6081,88 +5619,51 @@ fn run_normal_mode_navigation(
     }
     render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
     let mut pending_view = PendingView::None;
-    // The last left press, for telling a double-click from two separate
-    // ones -- terminals report neither, so the timing and the "same cell"
-    // test have to happen here. `word_selected` suppresses the release
-    // handler's own "nothing was dragged, so drop the armed selection"
-    // rule, which would otherwise throw away a double-clicked word that
-    // happened to be a single character long.
+    // The last left press, to tell a double-click from two clicks: the
+    // terminal reports neither, so timing and same-cell checks happen here.
     let mut last_press: Option<(std::time::Instant, u16, u16)> = None;
-    // How many presses in a row have landed on the same cell inside the
-    // double-click window: 1 places the cursor, 2 selects the word, 3
-    // selects the line. Reset by any press elsewhere, or one that came
-    // too late.
+    // Presses in a row on the same cell within the double-click window: 1
+    // places the cursor, 2 selects the word, 3 the line.
     let mut click_streak: u32 = 0;
     let mut ranged_selection = false;
-    // Where the pointer came to rest and when, for hover -- and whether
-    // a popup is currently on screen because of it.
-    //
-    // A dwell rather than acting on the motion itself: the terminal
-    // reports every cell the pointer crosses, and looking each one up
-    // would ask a language server a question per cell of a sweep across
-    // the screen. Waiting for the pointer to *stop* is also what makes
-    // it a hover rather than a flicker -- see `HOVER_DWELL`.
+    // Where the pointer came to rest and when, for hover, and whether a
+    // popup is showing. A dwell, because the terminal reports every cell
+    // the pointer crosses, and a sweep would ask the language server once
+    // per cell. See `HOVER_DWELL`.
     let mut hover_at: Option<(std::time::Instant, u16, u16)> = None;
     let mut hover_shown = false;
-    // What `gd` (or `gy`/`gD`) last found, which one the cursor is on,
-    // and which question was asked -- the last so that cycling through
-    // the answers says "type definition 2/3" rather than mislabelling
-    // them all as definitions.
-    //
-    // `None` the rest of the time -- which is almost always, and is
-    // what keeps `n`/`N` meaning `repeat-search` everywhere else. Same
-    // shape as `PendingView` above: a state that the next unrelated
-    // keystroke resolves away rather than a mode to leave.
+    // What `gd` (or `gy`/`gD`) last found, which one the cursor is on, and
+    // which question was asked, so cycling says "type definition 2/3".
+    // `None` otherwise, which keeps `n`/`N` repeating the search. Like
+    // `PendingView`, the next unrelated key resolves it away.
     let mut definitions: Option<(GotoKind, Vec<crate::lsp::Location>, usize)> = None;
 
     let result: (NavExit, Option<(TextBuffer, VimKeys)>) = 'nav: loop {
-        // Recomputed every iteration, not just once up front: this pane's
-        // own rect can change mid-loop without this function ever
-        // exiting -- `:diag` (run from right inside this same loop's own
-        // `:` handling) can graft a sibling diagnostics pane below this
-        // one, shrinking it. Every other window/pane action that resizes
-        // anything (`<C-w>` chords, a click) already exits via
-        // `KeyOutcome::Window`/click handling, so this was never
-        // observable before `:diag` -- cheap enough to just always do.
+        // Recomputed each iteration: `:diag`, run from this loop's `:`, can
+        // put a diagnostics pane below this one and shrink it.
         rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
-        // Waits for a byte to actually be ready *before* calling
-        // vk.next_key below, rather than passing this same on_idle work
-        // as that call's own closure (editor::read_key_idle's usual
-        // shape, used everywhere else) -- vk.next_key(&mut self, ...)
-        // holds `vk` exclusively borrowed for its whole call, including
-        // while its own on_idle closure runs, which would make it
-        // impossible for that closure to also touch `buf`/`vk` to
-        // redraw them. Doing the wait out here instead, where neither
-        // is borrowed by anything else, is what actually lets a
-        // just-attached session client's blank real terminal get this
-        // pane's *real* content redrawn immediately -- not just once
-        // the next keystroke happens to arrive (which, for a client
-        // that reattaches and doesn't immediately type anything, could
-        // be never). Same IDLE_POLL_MS interval read_key_idle's own
-        // loop uses, so behavior is identical once a byte does arrive.
-        // A queued key -- a macro replay, or a mapping's expansion -- is
-        // not a byte on stdin, so polling for one would block with keys
-        // already in hand and hand them out one per real keystroke.
-        // On only while a real file is in front: a prompt has nothing
-        // to hover over, and the reports would go nowhere.
+        // Hover reports only while a file is in front: a prompt has nothing
+        // to hover over.
         term::set_hover_tracking(hover_wanted && matches!(buf, NavBuffer::Editable(_)));
+        // Wait for input here rather than in `vk.next_key`'s idle closure:
+        // that call borrows `vk` throughout, so its closure couldn't redraw
+        // `buf` and `vk`, and a newly attached client would see nothing until
+        // a key arrived. Keys already queued (a macro, a mapping) skip the
+        // wait.
         while !vk.has_pending_keys() && !term::stdin_ready(editor::IDLE_POLL_MS) {
-            // The pointer has stopped somewhere and the dwell has run
-            // out: say what `K` would say about that cell. This loop is
-            // the only place the editor is while nothing is being
-            // typed, which is exactly when a hover should appear -- and
-            // it is the one that can reach `buf` and `vk`, for the
-            // reason the comment above gives.
+            // The pointer has rested past the dwell: show what `K` would
+            // say about that cell. Here because this is where the editor
+            // waits while nothing is typed, and it can reach `buf` and
+            // `vk`.
             if let Some(popup) = hover_popup_due(app, session_id, edit_frame_id, &buf, rect, &mut hover_at, &mut hover_shown) {
                 print!("{popup}");
                 let _ = io::stdout().flush();
             }
             let mut attached = service_background_jobs(app);
-            // And here, the editor at rest in Normal mode -- see
-            // `pending_reviews`. The buffer in front is not in
-            // `edit_frames`, so `review_proposal` cannot reload it; it
-            // follows the file here instead, when it has nothing unsaved
-            // that reloading would lose.
+            // The editor at rest in Normal mode; see `pending_reviews`. The
+            // buffer in front isn't in `edit_frames`, so `review_proposal`
+            // can't reload it; it's followed here instead, unless it has
+            // unsaved changes.
             if open_pending_reviews(app) {
                 attached = true;
                 if let Some(tb) = buf.as_editable_mut()
@@ -6172,19 +5673,15 @@ fn run_normal_mode_navigation(
                     let _ = tb.reload();
                 }
             }
-            // Published from here because this is one of only two places
-            // holding both `App` and the buffer being edited -- see
-            // `App::focus`. Whether it changed is also what tells the
-            // notification below there is anything to say.
+            // From here because this is one of two places holding both
+            // `App` and the buffer (see `App::focus`). A change is also
+            // what triggers the notification below.
             if publish_focus(app, &buf) {
                 notify_selection(app);
             }
-            // Normal-mode edits (`dd`, `p`, `x`, `>>`, and everything
-            // an Insert-mode session left behind on its way out) reach
-            // the server from here. This is the idle path, so it also
-            // covers the case that matters most: the user has stopped
-            // touching the keyboard, which is exactly when they are
-            // waiting to see what the server has to say.
+            // Normal-mode edits (`dd`, `p`, what Insert mode left behind)
+            // reach the server from here, on the idle path: when the user
+            // has stopped typing and is waiting to hear back.
             let mut diagnosed = false;
             if let Some(tb) = buf.as_editable_mut() {
                 sync_language_server_document(&mut app.sessions, session_id, tb);
@@ -6201,68 +5698,48 @@ fn run_normal_mode_navigation(
                 diagnosed |= sync_document_highlights(&mut app.sessions, session_id, tb);
                 diagnosed |= sync_inlay_hints(&mut app.sessions, session_id, tb);
             }
-            // A job this pane stepped away from is still producing, and
-            // the mode line's own "+N new lines below" has to keep up
-            // with it -- otherwise the count is only ever as fresh as the
-            // last keystroke, which for someone sitting still and reading
-            // is never. Redrawing costs nothing visible: the viewport
-            // stays exactly where it was put (that's the whole point of
-            // this mode), so only the status row actually changes.
+            // A job this pane stepped away from may still be writing, and
+            // the mode line's "+N new lines below" should keep up. The
+            // viewport doesn't move, so only the status row changes.
             let grew = buf.new_lines_changed();
             if attached || grew || diagnosed {
-                // compositor_redraw already ran (inside
-                // service_background_jobs), but that alone paints this
-                // pane blank if it's a `Frame::Edit` (see that
-                // function's own doc comment) -- follow up with the
-                // real thing, the exact same call this function's own
-                // entry above already makes once, up front.
-                //
-                // Re-measured first: one of the reasons that bool comes
-                // back true is a terminal resize, after which this
-                // pane's own rect -- captured once, before the loop --
-                // describes geometry that no longer exists.
+                // `service_background_jobs` repainted, which blanks a
+                // `Frame::Edit` pane (see `compositor_redraw`), so redraw
+                // the buffer. Re-measured first, as a resize is one reason
+                // it repainted.
                 rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
                 if let Some(tb) = buf.as_editable_mut() {
-                    // The height a shrink took away may have left the
-                    // cursor below the viewport; the scroll needs the
-                    // *new* height to work that out, which is why the
-                    // resync comes first.
+                    // A shrink may have left the cursor below the viewport;
+                    // scrolling needs the new height to tell, so it's set
+                    // first.
                     tb.set_viewport_height(normal_mode_content_rows(rect));
                     fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
         }
-        // A byte is already known ready -- read_key_idle's own internal
-        // poll will see that immediately, so this on_idle closure is
-        // never actually called; kept only to match its existing
-        // signature rather than adding a second, idle-free entry point.
+        // A byte is ready, so `read_key_idle` returns without calling this
+        // closure.
         let mut key = match vk.next_command_key(|| editor::read_key_idle(&mut || {}))? {
             Some(k) => k,
-            // EOF: nothing sensible to resume into for any start -- for
-            // `Edit` specifically, that means dropping the session
-            // rather than leaving it attached with no way to ever drive
-            // it again.
+            // EOF: nothing to resume into. An `Edit` session is dropped
+            // rather than left attached with no way to drive it.
             None => {
                 let exit = if matches!(buf, NavBuffer::Editable(_)) { NavExit::Quit } else { NavExit::Detached };
                 break 'nav (exit, nav_buffer_into_edit_state(buf, vk));
             }
         };
 
-        // A key is the acknowledgement an echoed server message needs
-        // (see `TextBuffer::echoed_message`) -- the same convention vim's
-        // own echoed messages use, and the reason they need no
-        // dismissing. The redraw comes for free: whatever this key does
-        // ends in one.
+        // A key acknowledges an echoed server message (see
+        // `TextBuffer::echoed_message`), as in vim; whatever the key does
+        // ends in a redraw.
         if let Some(tb) = buf.as_editable_mut() {
             tb.echoed_message = None;
         }
 
-        // Resolve whatever PendingView is currently covering the screen
-        // before this key does anything else -- see PendingView's own
-        // doc comment. A loop, not a single check: Ctrl-L on Output
-        // upgrades to Transcript rather than clearing, which still needs
-        // a *further* real keypress to resolve away in turn.
+        // Resolve whatever `PendingView` covers the screen first. A loop:
+        // Ctrl-L on `Output` switches to `Transcript`, which takes another
+        // key.
         loop {
             match pending_view {
                 PendingView::None => break,
@@ -6290,33 +5767,15 @@ fn run_normal_mode_navigation(
             }
         }
 
-        // A qualifying left click (see MouseEvent::is_left_click),
-        // intercepted before vk.feed ever sees it -- mouse clicks are an
-        // orthogonal input channel to vim's own key-state-machine, same
-        // spirit as PendingView's own resolution just above. A genuine
-        // focus change exits normal mode (NavExit::Detached) exactly like
-        // the existing KeyOutcome::Window arm below already does for
-        // Ctrl-W chords -- see its own doc comment: "running one always
-        // exits normal mode too... jumps to the next window and drops
-        // straight into its live prompt, not back into this pane's own
-        // normal mode." A same-window pane-focus change via Ctrl-W h/j/
-        // k/l already detaches today, so a same-window pane click doing
-        // the same is consistent, not a new limitation. A wheel notch
-        // (MouseEvent::is_scroll_up/is_scroll_down) scrolls this pane's
-        // own view -- same Motion::ScrollLineDown/Up and the same
-        // apply_motion_or_reselect/scroll_to_show_cursor/render_nav_frame
-        // sequence as an ordinary KeyOutcome::Motion below, just reached
-        // directly here since a wheel event never goes through vk.feed at
-        // all (same "orthogonal input channel" reasoning as a click). A
-        // miss, a click on the already-focused tab/pane, or a non-
-        // qualifying mouse event (drag/release/some other button) is just
-        // a no-op -- re-render (in case a PendingView overlay was just
-        // cleared above) and keep navigating.
+        // Mouse events are handled here, before `vk.feed`. A click that moves
+        // focus leaves normal mode (`NavExit::Detached`), as `<C-w>` does. A
+        // wheel notch scrolls the view with the same motions as a key would.
+        // A miss, a click on what already has focus, or another event just
+        // re-renders, in case an overlay was cleared above.
         if let Key::Mouse(ev) = key {
-            // The pointer moving with nothing held. Noted, not acted on
-            // here: the dwell check further down is what decides it has
-            // come to rest. Any movement puts away a popup already on
-            // screen, since that one was about the cell just left.
+            // The pointer moving with nothing held: noted, and the dwell
+            // check below decides when it has rested. Any movement hides a
+            // popup, which was about the cell just left.
             if ev.is_hover() {
                 if hover_at.is_none_or(|(_, r, c)| (r, c) != (ev.row, ev.col)) {
                     hover_at = Some((std::time::Instant::now(), ev.row, ev.col));
@@ -6326,9 +5785,8 @@ fn run_normal_mode_navigation(
                 }
                 continue 'nav;
             }
-            // Anything else the mouse does -- a click, a drag, a wheel
-            // notch -- overtakes the popup; the arms below redraw on
-            // their own.
+            // Anything else the mouse does overtakes the popup; the arms
+            // below redraw.
             hover_at = None;
             hover_shown = false;
             if ev.is_left_click() {
@@ -6350,29 +5808,22 @@ fn run_normal_mode_navigation(
                         compositor_redraw(app);
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
-                    // A click inside the pane that already has focus:
-                    // put the cursor where it landed, and arm a Visual
-                    // selection anchored there so a drag out of it
-                    // selects. A press that turns out to be a plain
-                    // click disarms it again on release (below), so
-                    // clicking somewhere doesn't leave an empty
-                    // selection behind for Escape to clear.
+                    // A click in the focused pane: put the cursor there and
+                    // arm a Visual selection, so a drag selects. A plain
+                    // click disarms it on release (below), leaving no empty
+                    // selection for Escape to clear.
                     Some(ClickTarget::Divider(divider)) => {
                         drag_divider(app, &divider);
-                        // The pane this loop is drawing into may have
-                        // changed size under it; every later frame is
-                        // addressed against `rect`, recomputed at the top
-                        // of the next iteration.
+                        // The pane may have changed size; `rect` is
+                        // recomputed at the top of the next iteration.
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue 'nav;
                     }
                     Some(ClickTarget::Pane(_)) => {
                         let row0 = (ev.row as usize).saturating_sub(1);
                         let col0 = (ev.col as usize).saturating_sub(1);
-                        // The gutter is not the text, and a click there
-                        // used to be treated as one on the line's first
-                        // character. Each column means something of its
-                        // own instead -- see `gutter_click`.
+                        // A gutter click means something per column; see
+                        // `gutter_click`.
                         if let Some(tb) = buf.as_editable_mut()
                             && let Some((line, column)) = fileeditor::gutter_at_screen(tb, rect, row0, col0)
                         {
@@ -6387,9 +5838,8 @@ fn run_normal_mode_navigation(
                         }
                         let now = std::time::Instant::now();
                         let repeat = last_press.is_some_and(|(at, r, c)| (r, c) == (ev.row, ev.col) && now.duration_since(at) < DOUBLE_CLICK_WINDOW);
-                        // Caps at 3: a fourth press starts over rather
-                        // than doing nothing, so click-spamming cycles
-                        // cursor / word / line instead of dead-ending.
+                        // A fourth press starts over, so repeated clicking
+                        // cycles cursor, word, line.
                         click_streak = if repeat { click_streak % 3 + 1 } else { 1 };
                         last_press = Some((now, ev.row, ev.col));
                         ranged_selection = false;
@@ -6397,28 +5847,22 @@ fn run_normal_mode_navigation(
                             buf.selections_mut().clear();
                             vk.end_visual(buf.cursor());
                             match click_streak {
-                                // A second click on the same cell selects
-                                // the word under it -- the same `iw` text
-                                // object `viw` would give, so
-                                // "double-click a word" and "select a
-                                // word" can't disagree about where one
-                                // ends.
+                                // A double click selects the word, the same
+                                // `iw` that `viw` gives, so the two agree
+                                // on where a word ends.
                                 2 => match motion::text_object_range(&buf, motion::TextObjectKind::Word, false, None) {
                                     Some(range) => {
                                         vk.begin_visual(RegisterShape::Char, range.from);
                                         buf.set_cursor(range.to.0, range.to.1);
                                         ranged_selection = true;
                                     }
-                                    // Clicked on something with no word
-                                    // under it (blank space); fall back to
+                                    // No word under the click (blank space):
                                     // an ordinary caret.
                                     None => vk.begin_visual(RegisterShape::Char, buf.cursor()),
                                 },
-                                // A third selects the whole line, and
-                                // linewise -- so yanking it puts back as
-                                // its own line, the way `V` does and
-                                // unlike a charwise range that merely
-                                // happens to span one.
+                                // A triple click selects the line linewise,
+                                // as `V` does, so a yank puts it back as
+                                // its own line.
                                 3 => {
                                     vk.begin_visual(RegisterShape::Line, buf.cursor());
                                     ranged_selection = true;
@@ -6505,10 +5949,9 @@ fn run_normal_mode_navigation(
                         show_command_mode_error(&format!("{} {}/{}", kind.noun(), next + 1, locations.len()), app.term_rows, app.term_cols);
                         definitions = Some((kind, locations, next));
                     }
-                    // Stepping onto a definition in another file opens
-                    // it, which ends this loop -- and with it the
-                    // cycle, since the list belongs to the buffer the
-                    // question was asked in.
+                    // Stepping onto a definition in another file opens it,
+                    // ending this loop and the cycle, whose list belongs to
+                    // this buffer.
                     Goto::Elsewhere { path, line, character, encoding } => {
                         break 'nav (
                             NavExit::OpenAt {
@@ -6516,11 +5959,9 @@ fn run_normal_mode_navigation(
                                 line,
                                 character,
                                 encoding,
-                                // Inherited, not recomputed: the file being
-                                // opened is one this server already knows
-                                // about -- possibly a dependency's source,
-                                // whose own nearest project marker belongs
-                                // to something else entirely.
+                                // Inherited: the opened file may be a
+                                // dependency's source, whose nearest
+                                // project marker belongs to something else.
                                 root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
                             },
                             nav_buffer_into_edit_state(buf, vk),
@@ -6537,33 +5978,17 @@ fn run_normal_mode_navigation(
         }
 
         match key {
-            // Visual mode's own `Z`/`y`/`d`/`c`/`p`/`S`/Escape/Ctrl-C --
-            // kept at this same outer tier as `Z`(`Z`)/`:` below rather
-            // than inside vimkeys.rs's own `feed()`, because "is there a
-            // selection to act on" is `NavBuffer`-owned state
-            // (`selections`) vimkeys.rs deliberately never sees (see its
-            // own module doc comment). `vk.is_idle()` guards all of
-            // them: mid a sub-prefix (`f`, a count, ...) these keys keep
-            // their ordinary meaning instead (a find-char target, a
-            // count digit, ...) rather than being stolen here.
+            // Visual-mode keys, handled here rather than in `vk.feed`
+            // because the committed `selections` belong to `NavBuffer` (see
+            // vimkeys.rs's module doc). `vk.is_idle()` guards them, so
+            // after a prefix (`f`, a count) they keep their ordinary
+            // meaning.
             //
-            // `Z` (single, not `ZZ`)/`y`/Escape/Ctrl-C: meaningful for
-            // *either* buffer kind (committing/yanking/cancelling a
-            // selection doesn't require mutating anything), so these
-            // four apply the same way they always have for `ReadOnly`.
-            // Ctrl-C only cancels for `Editable` though (`key ==
-            // Key::Escape || matches!(buf, NavBuffer::Editable(_))`) --
-            // `ReadOnly`'s own normal-mode-navigation never gave Ctrl-C
-            // any meaning before this, and there's no reason to start
-            // now just because `Editable` also aliases it to Escape (see
-            // `fileeditor::run_insert_mode`'s own doc comment for why
-            // that alias exists there).
-            //
-            // `d`/`c`/`p`/`S` mutate a selection, so they're gated to
-            // `Editable` only (the extra `matches!` clause in each of
-            // their guards) -- for `ReadOnly` they fall through
-            // unchanged to `vk.feed`'s own ordinary operator-prefix
-            // handling, exactly as before this unification.
+            // `Z`, `y`, Escape and Ctrl-C work on either buffer; Ctrl-C
+            // cancels only in a file, where it's an alias for Escape (see
+            // `fileeditor::run_insert_mode`). `d`, `c`, `p` and `S` change
+            // text, so they're gated to writable buffers and otherwise fall
+            // through to `vk.feed`.
             Key::Char('Z') if vk.is_idle() && vk.is_visual() => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
@@ -6585,10 +6010,7 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `x` with a selection standing is `d` -- vim's own rule, and
-            // it was missing for every shape, not just blockwise: `x`
-            // always emitted `DeleteCharForward`, so it deleted one
-            // character and left the selection alone.
+            // `x` with a selection is `d`, as in vim.
             Key::Char('d') | Key::Char('x') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
@@ -6601,13 +6023,8 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `c`: every deleted selection's own gap (delete_selections'
-            // own return, not just its bool-ish "did anything happen")
-            // gets typed into at once -- run_insert_mode's own
-            // `extra_cursors` param replicates every keystroke across
-            // all of them, not just the one `buf.cursor()` happens to
-            // land on. A single selection is just the len-1 case of the
-            // exact same call, unchanged from before this existed.
+            // `c`: Insert mode types into every deleted selection's gap at
+            // once (`run_insert_mode`'s `extra_cursors`).
             Key::Char('c') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let register = vk.take_pending_register();
@@ -6622,11 +6039,9 @@ fn run_normal_mode_navigation(
                     && let Some(tb) = buf.as_writable_mut()
                 {
                     let (insert_term_rows, insert_term_cols) = (app.term_rows, app.term_cols);
-                    // Snapshotted fresh on each entry into Insert mode, not
-                    // once for this whole navigation session: `:abbr` is
-                    // reachable from command mode right here, so a table
-                    // captured at the top would go stale the moment
-                    // someone defined one and immediately went to use it.
+                    // Taken on each entry into Insert mode: `:abbr` runs
+                    // from the colon line, and a copy from the top would
+                    // miss one just defined.
                     let insert_abbrs = app.sessions[&session_id].shell.abbrs.clone();
                     app.with_registers(|app, registers| {
                         fileeditor::run_insert_mode(
@@ -6659,11 +6074,8 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // Visual `>`/`<`: same shape as `p`/`P` just above -- shifts
-            // every committed selection (plus the active one) whole-line
-            // via fileeditor::indent_selections/outdent_selections, then
-            // drops back to Normal mode at the first shifted line, same
-            // as vim's own Visual-mode `>`/`<`.
+            // Visual `>`/`<`: shift every selection linewise, then back to
+            // Normal mode at the first shifted line, as in vim.
             Key::Char('>') if vk.is_idle() && buf.is_writable() && (vk.is_visual() || !buf.selections().is_empty()) => {
                 commit_active_selection(&vk, &mut buf);
                 let end_cursor = buf.cursor();
@@ -6714,34 +6126,21 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `q`/`@` -- macro record/replay. Host-level, same tier as
-            // every other outer-tier arm here, for the same reason: `@`
-            // needs to re-enter this exact match (Visual `y`/`d`/`Z`/`:`,
-            // and `q`/`@` themselves) for each replayed key, which only
-            // this loop -- not vimkeys.rs's own `feed()` -- can drive
-            // (see `VimKeys::next_key`'s own doc comment). No `matches!
-            // (buf, NavBuffer::Editable(_))` gate the way `d`/`c`/`p`/`S`
-            // have: recording/replaying a pure navigation-and-yank macro
-            // over read-only scrollback is just as meaningful as one that
-            // edits a file. One real gap: `i` from `ReadOnly` exits this
-            // loop entirely (see `KeyOutcome::EnterInsert`'s own arm
-            // below), silently dropping an in-progress recording along
-            // with it -- same as every other piece of `vk` state already
-            // does on that path (`nav_buffer_into_edit_state` returns
-            // `None` for `ReadOnly`).
+            // `q`/`@`, macros. Handled here because replaying has to
+            // re-enter this match for each key (see `VimKeys::next_key`).
+            // Not gated to files: a navigate-and-yank macro over scrollback
+            // is as useful. An `i` from `ReadOnly` leaves the loop and
+            // drops a recording in progress, with the rest of `vk`.
             //
-            // Bare `q` while already recording always stops it, full
-            // stop -- checked first so it takes priority over the "start
-            // a new recording" arm below.
+            // Bare `q` while recording stops it; checked before the arm
+            // that starts one.
             Key::Char('q') if vk.is_idle() && vk.is_recording().is_some() => {
                 vk.stop_recording();
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `q{reg}`: starts recording. The register-name lookahead
-            // goes through `vk.next_key` too (not a bare `read_key_idle`
-            // like `S`'s delimiter), so a macro whose own recorded body
-            // contains `q{reg}` (recording-within-a-macro) still replays
+            // `q{reg}` starts recording. The register name is read through
+            // `vk.next_key`, so a macro containing `q{reg}` replays
             // correctly.
             Key::Char('q') if vk.is_idle() => {
                 if let Some(Key::Char(ch)) = vk.next_key(|| {
@@ -6755,10 +6154,8 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `@{reg}`/`@@`: replays. `is_idle_except_count` (not
-            // `is_idle`) plus `take_count`: unlike every other arm here,
-            // a count typed in front of `@` is a real repeat count
-            // (`3@a`), not one silently discarded.
+            // `@{reg}`/`@@` replays. A count in front is a repeat count
+            // (`3@a`), hence `is_idle_except_count` and `take_count`.
             Key::Char('@') if vk.is_idle_except_count() => {
                 let count = vk.take_count().unwrap_or(1).max(1);
                 if let Some(Key::Char(ch)) = vk.next_key(|| {
@@ -6772,16 +6169,10 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 continue;
             }
-            // `is_idle()`, like every other command intercepted ahead of
-            // `feed()` here -- and this one needs it twice over. Without
-            // the guard a `Z` typed while something is pending is stolen
-            // from whatever was waiting for it, and then this arm reads
-            // *another* key and drops that too when it isn't a second
-            // `Z`: `rZ` lost both the `Z` and the key after it, and the
-            // replace never happened. Counts are discarded in front of
-            // `ZZ` the same way they are in front of `S` and `q`, which
-            // is what `is_idle` (rather than `is_idle_except_count`)
-            // says.
+            // Needs `is_idle()` like every arm ahead of `feed()`: otherwise
+            // a `Z` typed while something is pending (`rZ`) is stolen, and
+            // the key read after it is lost too. A count before `ZZ` is
+            // discarded, as before `S` and `q`.
             Key::Char('Z') if vk.is_idle() => {
                 let k2 = vk.next_key(|| {
                     editor::read_key_idle(&mut || {
@@ -6792,7 +6183,7 @@ fn run_normal_mode_navigation(
                     continue;
                 }
                 if matches!(buf, NavBuffer::Editable(_)) {
-                    // `ZZ`: vim's own alias for `:x` -- save and quit.
+                    // `ZZ`: `:x`, save and quit.
                     let mut saved = true;
                     if let Some(tb) = buf.as_writable_mut() {
                         match tb.save(None) {
@@ -6811,34 +6202,20 @@ fn run_normal_mode_navigation(
                 }
                 break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
             }
-            // `K`: hover whatever's under the cursor -- same shared
-            // lookup (docs::hover_lines_at) debugger.rs's own pause loop
-            // used to build itself. Its live-value tier now comes from
-            // `app.debug_frames`: `Some` iff a `:dbg` session is actually
-            // attached to *this* edit frame, in which case the hovered
-            // identifier's current value (Shell::debug_peek_var) is
-            // shown same as it always was -- `|_| None` otherwise (no
-            // session attached, or this isn't even an Edit frame at
-            // all). Scoped to `Editable` only (matching `:help`/`:git`/
-            // `:format`'s own "only means something while editing a real
-            // file" convention) -- for `ReadOnly` scrollback navigation
-            // it just falls through to vimkeys' own handling (a no-op,
-            // since `K` isn't bound there either in real vim). The doc
-            // index is rebuilt fresh from this buffer's own *live* text
-            // every time (TextBuffer::text, not a re-read off disk) so
-            // an unsaved edit is reflected immediately -- moot while a
-            // debug session is attached (readonly, so there's never an
-            // unsaved edit to reflect), but this arm is shared with the
-            // ordinary, non-debugged case too.
+            // `K`: hover what's under the cursor (`docs::hover_lines_at`).
+            // With a `:dbg` session attached to this frame, the
+            // identifier's current value is shown too
+            // (`Shell::debug_peek_var`). Only in a file; `ReadOnly` falls
+            // through to vimkeys. The doc index is built from the buffer's
+            // live text, so unsaved edits count.
             Key::Char('K') if vk.is_idle() && matches!(buf, NavBuffer::Editable(_)) => {
                 let NavBuffer::Editable(tb) = &buf else { unreachable!("guarded by this arm's own match above") };
                 let (row, col) = tb.cursor();
                 let chars = tb.line_chars(row);
                 let hover_lines = match hover_lines_at(app, session_id, edit_frame_id, tb, row, col) {
-                    // A keypress deserves an answer even when there is
-                    // nothing under the cursor -- see
-                    // `NOTHING_UNDER_THE_CURSOR`. Hover, which nobody
-                    // asked for, says nothing instead.
+                    // A keypress deserves an answer even with nothing under
+                    // the cursor (see `NOTHING_UNDER_THE_CURSOR`); an
+                    // unasked hover says nothing.
                     lines if lines.is_empty() => vec![docs::NOTHING_UNDER_THE_CURSOR.to_string()],
                     lines => lines,
                 };
@@ -6851,47 +6228,35 @@ fn run_normal_mode_navigation(
                 let _ = io::stdout().flush();
                 continue;
             }
-            // ':' isn't routed through vimkeys -- it hands off to the
-            // real command-mode feature, global rather than pinned to
-            // this pane's own rect (run_command_mode positions its own
-            // prompt row itself). `buf.as_editable_mut()` is what makes
-            // `w`/`wq`/`x`/`q`/`q!` mean anything there (see run_
-            // command_mode's own `editing` parameter doc comment) -- the
-            // *same* call either way, not a separate file-command parser
-            // pre-empting it.
-            // Ahead of `feed()` like the rest, so it needs the same
-            // gate -- `r:` and `f:` are ordinary things to type and both
-            // lost their `:` to this arm. `is_idle_except_count` rather
-            // than `is_idle` because a count in front of `:` is already
-            // dropped here rather than refused, and gating on `is_idle`
-            // would newly swallow the `:` as well.
+            // `:` opens command mode, which places its own prompt row.
+            // `buf.as_editable_mut()` is what makes `w`, `wq`, `x`, `q` and
+            // `q!` mean something there (see `run_command_mode`'s
+            // `editing`).
+            //
+            // Gated like the arms ahead of `feed()`, or `r:` and `f:` lose
+            // their `:`. `is_idle_except_count`, because a count before `:`
+            // is dropped, not refused.
             Key::Char(':') if vk.is_idle_except_count() => {
-                // Read before the call, since `buf` is borrowed mutably
-                // by it and `vk` is read again inside.
+                // Read first: the call borrows `buf` mutably and reads `vk`.
                 let last_search = vk.last_search_text().to_string();
                 let outcome = handle_command_mode(
                     app,
                     session_id,
                     buf.as_editable_mut(),
                     None,
-                    // The rest of a mapping's right-hand side, when a mapped
-                    // `:` is what opened this colon line. Taken here rather
-                    // than left in the queue: `read_line` reads raw stdin and
-                    // never looks at it, so `<Esc>:w<CR>` would otherwise fire
-                    // its `:` and drop the `w<CR>`.
+                    // The rest of a mapping's right-hand side when a mapped
+                    // `:` opened this line. `read_line` reads stdin and
+                    // never sees the queue, so `<Esc>:w<CR>` would
+                    // otherwise fire `:` and drop `w<CR>`.
                     vk.take_replay_queue(),
                     &last_search,
                 );
-                // `:diag` (only command that can, today) may have grafted
-                // a sibling pane in below this one -- recomputed here,
-                // not just at the top of the next loop iteration, since
-                // `Ran`'s own `render_nav_frame` call just below still
-                // needs the *current* rect, not next keystroke's.
+                // `:diag` may have put a pane below this one; `Ran`'s
+                // redraw below needs the rect now, not at the next
+                // iteration.
                 rect = pane_rect(&app.windows[app.current_window], app.windows[app.current_window].focused_pane, app.term_rows, app.term_cols);
-                // ...and for the same reason, whatever `:bishopt` just
-                // changed has to be picked up before that redraw rather
-                // than on the next `e`. Command mode runs builtins, so
-                // the colon line is a live way to change any of these.
+                // Likewise anything `:bishopt` just changed has to apply
+                // before that redraw.
                 color_overrides = Some(syntax_color_overrides(&app.sessions[&session_id].shell));
                 vk.set_mappings(app.sessions[&session_id].shell.mappings.clone());
                 if let Some(tb) = buf.as_editable_mut() {
@@ -6899,45 +6264,35 @@ fn run_normal_mode_navigation(
                     fileeditor::scroll_to_show_cursor(tb, fileeditor::editor_content_cols(tb, rect));
                 }
                 match outcome {
-                    // Matches vim: an aborted/cancelled ':' command drops
-                    // back into Normal mode, not out of it entirely.
+                    // A cancelled `:` returns to Normal mode, as in vim.
                     CommandModeOutcome::Cancelled => {
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue;
                     }
-                    // Same `CommandModeOutcome::Quit` `"q"`/`"q!"` always
-                    // produced -- what it means depends on which buffer
-                    // this call is driving (see run_command_mode's own
-                    // `editing` doc comment): for `Editable`, `:q`/`:q!`/
-                    // `:wq`/`:x` genuinely quit the file; for `ReadOnly`,
-                    // same as `ZZ`/`i` -- restore the original text/
-                    // cursor rather than quitting anything.
+                    // `:q`/`:q!`. In a file, `:q`, `:q!`, `:wq` and `:x`
+                    // quit it; over scrollback, like `ZZ` and `i`, it
+                    // restores the original line.
                     CommandModeOutcome::Quit => {
                         if matches!(buf, NavBuffer::Editable(_)) {
                             break 'nav (NavExit::Quit, nav_buffer_into_edit_state(buf, vk));
                         }
                         break 'nav (NavExit::Resume(initial_text.clone(), initial_cursor), nav_buffer_into_edit_state(buf, vk));
                     }
-                    // Focus may have changed (apply_window_action already
-                    // handled that) -- nothing to resume here (see this
-                    // function's own doc comment on why a focus change
-                    // doesn't carry the original text over).
+                    // Focus may have moved (`apply_window_action` did
+                    // that); the original line isn't carried over.
                     CommandModeOutcome::Action(_) => {
                         return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
                     }
-                    // `:normal {keys}` -- queued rather than interpreted
-                    // here, so they arrive at this loop's own reads as
-                    // ordinary keystrokes and go through exactly the
-                    // path a person typing them would. Each character is
-                    // itself: `:normal` takes literal keys, so there is
-                    // no `<Esc>`-style notation to parse.
+                    // `:normal {keys}`: queued, so they reach this loop's
+                    // reads as typed keys. `:normal` takes literal keys;
+                    // there's no `<Esc>` notation.
                     CommandModeOutcome::RunNormal(keys) => {
                         vk.queue_keys(keys.chars().map(Key::Char));
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue;
                     }
-                    // `:s/.../.../c`. Driven here because every question
-                    // it asks needs the pane drawn under it first.
+                    // `:s/.../.../c`, driven here because each question
+                    // needs the pane drawn under it first.
                     CommandModeOutcome::ConfirmSubstitute(cmd) => {
                         let done = confirm_substitute(&mut buf, &vk, &cmd, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -6957,26 +6312,14 @@ fn run_normal_mode_navigation(
                         show_command_mode_error(&message, app.term_rows, app.term_cols);
                         continue;
                     }
-                    // Back to normal mode too, per this session's own
-                    // "go back to the original mode with the last output
-                    // shown until next keypress" design -- but keep the
-                    // result visible via PendingView::Output rather than
-                    // just render_nav_frame's ordinary status bar (see
-                    // PendingView's own doc comment for how it's resolved
-                    // on the very next key). render_nav_frame runs first
-                    // regardless of which branch this takes -- NOT just
-                    // handle_command_mode's own baseline compositor_
-                    // redraw (which reads this pane's session grid, and
-                    // for a `NavBuffer::Editable` pane that grid is never
-                    // actually fed while the real editor content is being
-                    // driven -- see fileeditor::freeze_editor_frame's own
-                    // doc comment -- so relying on it alone painted a
-                    // blank pane under any error/output overlay). Once
-                    // this repaints the real content, the overlay (when
-                    // shown) only ever overwrites its own reserved bottom
-                    // rows on top of it (see build_command_output_
-                    // overlay's own doc comment on why it no longer
-                    // blanks anything above them).
+                    // Back to Normal mode with the output up as
+                    // `PendingView::Output` until the next key.
+                    // `render_nav_frame` runs first in either case: the
+                    // compositor redraw reads the session grid, which a
+                    // file pane never feeds (see
+                    // `fileeditor::freeze_editor_frame`), so without it the
+                    // overlay sat over a blank pane. The overlay only draws
+                    // its own rows at the bottom.
                     CommandModeOutcome::Ran { output, status } => {
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         if !output.is_empty() || status != 0 {
@@ -6990,11 +6333,8 @@ fn run_normal_mode_navigation(
                         render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         continue;
                     }
-                    // `:sym QUERY` -- the project-wide half of `gO`,
-                    // into the very same pane. See the arm that builds
-                    // that pane for `gO` itself; the only differences
-                    // are the method and that a workspace symbol
-                    // already names its own file.
+                    // `:sym QUERY`: the project-wide `gO`, into the same
+                    // pane. A workspace symbol already names its file.
                     CommandModeOutcome::Symbols(query) => {
                         if let NavBuffer::Editable(tb) = &buf {
                             let encoding = server_encoding_for(&app.sessions, session_id, tb).unwrap_or(crate::lsp::PositionEncoding::Utf16);
@@ -7015,11 +6355,8 @@ fn run_normal_mode_navigation(
                                 n if n > MAX_LOCATIONS => format!("{MAX_LOCATIONS} of {n} symbols{named}"),
                                 n => format!("{n} symbols{named}"),
                             };
-                            // Paths shown relative to the file asked
-                            // from, the way a reference list does: a
-                            // project-wide answer is mostly other files,
-                            // and the whole absolute path of each is
-                            // noise.
+                            // Relative to the file asked from: a
+                            // project-wide answer is mostly other files.
                             let base = tb.path().and_then(|p| p.parent()).map(std::path::Path::to_path_buf);
                             let list = workspace_symbol_list(&title, &found, encoding, base.as_deref());
                             match edit_frame_id {
@@ -7044,24 +6381,8 @@ fn run_normal_mode_navigation(
         }
 
         match vk.feed(key) {
-            // `gd`: ask the language server where this is defined, and
-            // go there.
-            //
-            // Scoped to `Editable`, like `K`, for the same reason -- a
-            // scrollback view has no file for a server to answer about.
-            // A definition in *another* file is reported rather than
-            // opened: opening one needs this loop to hand a new frame
-            // back to its caller, which means a new `NavExit` variant
-            // and a change to all three of its call sites. That is a
-            // real design decision rather than an oversight, and it is
-            // deliberately not being made here (see plan.md).
-            // `gd`: ask the language server where this is defined, and
-            // go there. Several answers arm `n`/`N` to step through the
-            // rest, the way vim's own next/previous works everywhere
-            // else -- see the block that handles those keys.
-            //
-            // Scoped to `Editable`, like `K`, for the same reason: a
-            // scrollback view has no file for a server to answer about.
+            // `gd`: go to where this is defined. Several answers arm
+            // `n`/`N` to step through them. Only in a file, like `K`.
             KeyOutcome::GotoDefinition(kind) => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
@@ -7071,18 +6392,12 @@ fn run_normal_mode_navigation(
                         .unwrap_or_default();
                     match found.first().cloned() {
                         None => {
-                            // No server answer -- but in a shell script a
-                            // command word has an obvious definition, and
-                            // bish has both a roff parser and a real
-                            // pager to show it in. `man rsync` without
-                            // leaving the buffer, in bish's own renderer
-                            // rather than a subprocess.
-                            //
-                            // Only for `gd`: a manpage is a definition,
-                            // and is not this command's *type* or where
-                            // it was declared. Asking `gy` on a shell
-                            // word and getting a manpage would be the
-                            // wrong answer to the question asked.
+                            // No server answer, but in a shell script a
+                            // command word has a definition: its manpage,
+                            // in bish's own pager (`man rsync` without
+                            // leaving the buffer). Only for `gd`: a manpage
+                            // isn't the command's type (`gy`) or
+                            // declaration.
                             let manpage = (kind == GotoKind::Definition).then(|| man_page_under_cursor(tb)).flatten();
                             match manpage {
                                 Some((name, source)) => {
@@ -7109,18 +6424,16 @@ fn run_normal_mode_navigation(
                             }
                         }
                         Some(first) => {
-                            // One entry, here, before going anywhere:
-                            // `Ctrl-O` should come back to where the
-                            // question was asked.
+                            // Recorded before moving, so `Ctrl-O` returns
+                            // to where `gd` was asked.
                             record_jump(&mut app.windows, app.current_window, &buf);
                             match goto_location(&app.sessions, session_id, &mut buf, &first, kind.noun()) {
                                 Goto::Moved => {
                                     let content_cols = nav_content_cols(&buf, rect);
                                     nav_scroll_to_show_cursor(&mut buf, content_cols);
                                     render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
-                                    // Only worth saying -- and only worth
-                                    // arming -- when there is somewhere
-                                    // else to go.
+                                    // Said, and armed, only when there's
+                                    // somewhere else to go.
                                     if found.len() > 1 {
                                         show_command_mode_error(
                                             &format!("{} 1/{} (n/N to cycle)", kind.noun(), found.len()),
@@ -7137,12 +6450,10 @@ fn run_normal_mode_navigation(
                                             line,
                                             character,
                                             encoding,
-                                            // Inherited, not recomputed: the file
-                                            // being opened is one this server
-                                            // already knows about -- possibly a
-                                            // dependency's source, whose own
-                                            // nearest project marker belongs to
-                                            // something else entirely.
+                                            // Inherited: the opened file may be a
+                                            // dependency's source, whose nearest
+                                            // project marker belongs to something
+                                            // else.
                                             root: buf.as_editable().and_then(|tb| server_target(&app.sessions[&session_id], tb)).map(|t| t.root),
                                         },
                                         nav_buffer_into_edit_state(buf, vk),
@@ -7157,11 +6468,9 @@ fn run_normal_mode_navigation(
                     }
                 }
             }
-            // `gr`: everywhere this is used. Unlike `gd` there is no
-            // single answer to go to, so this fills the location-list
-            // pane below the editor rather than moving the cursor --
-            // and, like `:diag`, does not steal focus: you asked a
-            // question about the code, you did not ask to leave it.
+            // `gr`: everywhere this is used. No single answer, so it fills
+            // the location-list pane below the editor and, like `:diag`,
+            // leaves focus where it was.
             KeyOutcome::GotoReferences => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
@@ -7175,9 +6484,7 @@ fn run_normal_mode_navigation(
                         CursorRequest {
                             method: "textDocument/references",
                             capability: "referencesProvider",
-                            // Required by the spec, and the answer
-                            // people expect: "where is this used"
-                            // includes where it is declared.
+                            // "Where is this used" includes the declaration.
                             extra: &[(
                                 "context",
                                 crate::json::Value::Object(vec![("includeDeclaration".to_string(), crate::json::Value::Bool(true))]),
@@ -7186,8 +6493,7 @@ fn run_normal_mode_navigation(
                     )
                     .map(|result| crate::lsp::locations(&result))
                     .unwrap_or_default();
-                    // Relative to the project root when there is one, so
-                    // the interesting part of a long path is what shows.
+                    // Relative to the project root when there is one.
                     let base = server_target(&app.sessions[&session_id], tb).map(|t| t.root);
                     let title = match found.len() {
                         0 => "No references found".to_string(),
@@ -7201,8 +6507,8 @@ fn run_normal_mode_navigation(
                             sync_locations_pane(app, id, list);
                             render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                         }
-                        // No edit frame to hang a pane on -- which is
-                        // every navigation start except `Edit`.
+                        // No edit frame to hang a pane on: every start
+                        // except `Edit`.
                         None => {
                             render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                             show_command_mode_error(&list.title, app.term_rows, app.term_cols);
@@ -7210,9 +6516,8 @@ fn run_normal_mode_navigation(
                     }
                 }
             }
-            // `gO`: an outline of this file, into the same pane `gr`
-            // fills. Nothing is jumped to and focus does not move --
-            // an outline is something to look at while you keep working.
+            // `gO`: an outline of this file, in the same pane as `gr`,
+            // without moving focus.
             KeyOutcome::DocumentSymbols => {
                 if let NavBuffer::Editable(tb) = &buf {
                     let (row, col) = tb.cursor();
@@ -7247,9 +6552,9 @@ fn run_normal_mode_navigation(
                     }
                 }
             }
-            // `ga`: pick something for the server to do here. The
-            // buffer is handed in mutably because applying an action is
-            // an edit to it, and to any other file the change reaches.
+            // `ga`: pick an action for the server to do here. The buffer is
+            // passed mutably, as applying an action edits it (and maybe
+            // other files).
             KeyOutcome::CodeActions => {
                 let message = match buf.as_editable_mut() {
                     Some(tb) => code_actions_at_cursor(app, session_id, tb, rect),
@@ -7300,10 +6605,9 @@ fn run_normal_mode_navigation(
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
             KeyOutcome::Motion(m, count) => {
-                // `apply_motion_or_reselect` records this into `vk`'s
-                // own list too, which the editor no longer reads -- see
-                // `JumpList`. Recorded here as well because only this
-                // frontend knows which *file* the cursor is in.
+                // `apply_motion_or_reselect` records this in `vk` too,
+                // which the editor no longer reads (see `JumpList`); only
+                // here is the file known.
                 if motion::is_jump(&m) {
                     record_jump(&mut app.windows, app.current_window, &buf);
                 }
@@ -7312,25 +6616,11 @@ fn run_normal_mode_navigation(
                 nav_scroll_to_show_cursor(&mut buf, content_cols);
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // `ReadOnly`: hands typing back to the live prompt's own
-            // editor (`apply_insert_cmd` against `original_chars`,
-            // `NavExit::Resume` -- the mechanism that makes Ctrl+G
-            // feel like a temporary excursion out of Insert mode).
-            // `Editable`: there's no live prompt underneath to resume --
-            // this pane's own Normal mode already *is* the resting
-            // state, so Insert mode is instead a nested sub-loop
-            // (`fileeditor::run_insert_mode`) that returns straight back
-            // here once it's done, same as any other mutating
-            // `KeyOutcome`.
-            // `I`/`A` with a *block* standing are their own thing: they
-            // insert the same text at the same column on every row of the
-            // block, without deleting anything -- which is the gesture
-            // people actually reach for visual block to get (commenting
-            // a run of lines, adding a trailing comma to each).
-            //
-            // `I` goes to the block's left edge, `A` one past its right,
-            // and a row too short to reach that column is padded out to
-            // it so the edit stays a column.
+            // `I`/`A` with a block selection insert the same text at the
+            // same column on every row, deleting nothing (commenting a run
+            // of lines, adding a comma to each). `I` goes to the left edge,
+            // `A` one past the right; short rows are padded so the edit
+            // stays a column.
             KeyOutcome::EnterInsert(cmd @ (crate::bishedit::vimkeys::InsertCmd::LineStart | crate::bishedit::vimkeys::InsertCmd::LineEnd))
                 if vk.visual_anchor().map(|(shape, _)| shape) == Some(RegisterShape::Block) =>
             {
@@ -7374,6 +6664,11 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
+            // Over scrollback, Insert hands typing back to the prompt
+            // (`apply_insert_cmd`, `NavExit::Resume`): Ctrl+G is an
+            // excursion. In a file, Normal mode is the resting state and
+            // Insert mode a nested loop (`fileeditor::run_insert_mode`)
+            // that returns here.
             KeyOutcome::EnterInsert(cmd) => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
@@ -7402,13 +6697,10 @@ fn run_normal_mode_navigation(
                     break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
                 }
             }
-            // `R`: `ReadOnly` degrades to a plain insert entry right at
-            // the cursor (same simplification editor.rs's own identical
-            // arm documents -- true Replace-mode overtype-as-you-type
-            // behavior would need to live in the shell's own core typing
-            // loop, which this excursion resumes into once it breaks out
-            // here). `Editable` gets the real thing, via `run_insert_mode`'s
-            // own `replace: true`.
+            // `R`: over scrollback, a plain insert at the cursor, as in
+            // editor.rs; overtyping would have to live in the prompt's own
+            // loop. A file gets real Replace mode (`run_insert_mode` with
+            // `replace: true`).
             KeyOutcome::EnterReplace => {
                 if matches!(buf, NavBuffer::Editable(_)) {
                     if let Some(tb) = buf.as_writable_mut() {
@@ -7437,12 +6729,9 @@ fn run_normal_mode_navigation(
                     break 'nav (NavExit::Resume(new_chars.into_iter().collect(), new_cursor), nav_buffer_into_edit_state(buf, vk));
                 }
             }
-            // `v`/`V`: arms Visual mode with the buffer's own current
-            // cursor as the anchor (vimkeys.rs can't read that itself --
-            // see `EnterVisual`'s own doc comment). Rendering (the
-            // reverse-video highlight) and what `y`/`Z`/Escape/`d`/`c`/
-            // `p`/`S` do from here on are handled by the guarded arms
-            // above, at the top of this same loop.
+            // `v`/`V` arm Visual mode anchored at the buffer's cursor,
+            // which vimkeys can't read (see `EnterVisual`). The guarded
+            // arms above handle what follows.
             KeyOutcome::EnterVisual(shape) => {
                 vk.begin_visual(shape, buf.cursor());
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
@@ -7462,17 +6751,12 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // `Ctrl-O`/`Ctrl-I`. Cross-file, because vim's are: the
-            // list lives on the pane (see `JumpList`) rather than in
-            // this buffer's `VimKeys`, so a `gd` into another file is
-            // just another entry and stepping back over it goes back to
-            // the file as well as the line.
-            //
-            // A target in *this* buffer moves the cursor and stays; one
-            // in another file leaves this loop with `NavExit::OpenAt`,
-            // which either brings that file's existing frame to the
-            // front or opens it. Nothing is closed either way, which is
-            // what makes `Ctrl-I` able to come back.
+            // `Ctrl-O`/`Ctrl-I`, across files as in vim: the list lives on
+            // the pane (see `JumpList`), so a `gd` into another file is
+            // just another entry. A target in this buffer moves the cursor;
+            // one elsewhere leaves with `NavExit::OpenAt`, which brings
+            // that file's frame forward or opens it. Nothing is closed, so
+            // `Ctrl-I` can come back.
             KeyOutcome::Jump { forward } => {
                 let here = jump_here(&buf);
                 let target = match (here.clone(), buf.as_editable().is_some()) {
@@ -7481,9 +6765,8 @@ fn run_normal_mode_navigation(
                         let jumps = &mut app.windows[app.current_window].pane_mut(pane_id).jumps;
                         if forward { jumps.forward(here) } else { jumps.back(here) }
                     }
-                    // No file behind this view: fall back to the
-                    // position-only list `VimKeys` keeps, which is all
-                    // a prompt or a scrollback ever needed.
+                    // No file behind this view: the position-only list in
+                    // `VimKeys`.
                     _ => {
                         let current = buf.cursor();
                         let target = if forward { vk.jump_forward(current) } else { vk.jump_back(current) };
@@ -7499,10 +6782,9 @@ fn run_normal_mode_navigation(
                         let content_cols = nav_content_cols(&buf, rect);
                         nav_scroll_to_show_cursor(&mut buf, content_cols);
                     } else {
-                        // `Utf32` is bish's own column counting, so the
-                        // buffer coordinates carried here pass through
-                        // `OpenAt`'s server-position conversion
-                        // unchanged. See `lsp::PositionEncoding`.
+                        // `Utf32` is bish's own column counting, so these
+                        // coordinates pass through `OpenAt`'s conversion
+                        // unchanged.
                         break 'nav (
                             NavExit::OpenAt {
                                 path: target.path,
@@ -7517,13 +6799,9 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // `u`/`Ctrl-R`: no-op for `ReadOnly`, same as every other
-            // mutating outcome. Guarded on `!vk.is_visual() &&
-            // buf.selections().is_empty()` -- real vim's Visual mode binds
-            // bare `u`/`U` to lowercase/uppercase the selection, not
-            // implemented in this codebase today (see KeyOutcome::Undo's
-            // own doc comment in vimkeys.rs), so `u` simply does nothing
-            // while a selection is active rather than misfiring as undo.
+            // `u`/`Ctrl-R`, in a writable file only. Not with a selection:
+            // vim's Visual `u`/`U` change case, which isn't implemented
+            // here, so `u` does nothing rather than undo.
             KeyOutcome::Undo(count) => {
                 if !vk.is_visual()
                     && buf.selections().is_empty()
@@ -7550,8 +6828,7 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // `g-`/`g+`: same guard as `u`/`Ctrl-R` just above, for the
-            // same reason.
+            // `g-`/`g+`: guarded like `u`.
             KeyOutcome::UndoSeq { forward, count } => {
                 if !vk.is_visual()
                     && buf.selections().is_empty()
@@ -7565,19 +6842,14 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // Yank works for either buffer kind (`op == Op::Yank` is
-            // checked first, unconditionally) -- copying text out of a
-            // pane's own scrollback/output is exactly what `ReadOnly`'s
-            // view is for, and it's an ordinary read against `Editable`
-            // too. `Delete`/`Change`/case-ops only mutate, so they're
-            // gated to `Editable`; for `ReadOnly` they fall into the same
-            // no-op as before this unification.
+            // Yanking works on either buffer; copying out of scrollback is
+            // what that view is for. The other operators change text, so
+            // they need a writable file.
             KeyOutcome::Operator(op, motion, count, register) => {
                 if op == Op::Yank {
                     editor::yank_motion(&mut buf, &mut app.registers, motion, count, register);
                 } else if op == Op::Fold {
-                    // Before the writable check: a fold changes no text,
-                    // so a read-only buffer folds like any other.
+                    // Before the writable check: a fold changes no text.
                     if let Some(range) = motion::motion_range(&mut buf, motion, count)
                         && let Some(folds) = buf.folds_mut()
                     {
@@ -7663,11 +6935,8 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // `p`/`P`/`x`/`J`/`gJ`/`ys`/`ds`/`cs`/`r`/`~`/`o`/`O`: all
-            // mutate, so all a no-op for `ReadOnly` (same as before this
-            // unification -- a view over already-rendered scrollback,
-            // not an editable buffer), each calling the matching
-            // `fileeditor::` helper for `Editable`.
+            // These all change text: no-ops over scrollback, a `fileeditor::`
+            // helper each in a file.
             KeyOutcome::Put { before, count, register } => {
                 if let Some(tb) = buf.as_writable_mut() {
                     fileeditor::put(tb, &mut app.registers, before, count, register);
@@ -7745,22 +7014,15 @@ fn run_normal_mode_navigation(
                 }
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
-            // dispatch_window_cmd does the actual work (shared with
-            // run_edit_frame's own identical need -- see its own doc
-            // comment); this loop just exits afterward, same as any
-            // other Window outcome -- a focus change, nothing to resume,
-            // handing the buffer/vk back so an `Editable` caller can
-            // re-stash them.
+            // `dispatch_window_cmd` does the work; focus moved, so leave,
+            // handing the buffer back for an `Editable` caller to keep.
             KeyOutcome::Window(cmd, count) => {
                 dispatch_window_cmd(app, cmd, count);
                 return Ok((NavExit::Detached, nav_buffer_into_edit_state(buf, vk)));
             }
-            // Ctrl+T. Picking something changes which pane is focused or
-            // makes a window, so there is nothing here left to resume
-            // and this leaves exactly as a `<C-w>` does. Putting the
-            // opener away without picking anything changed nothing, so
-            // the view comes straight back -- the opener painted over
-            // this pane's rectangle, which is what the redraw is for.
+            // Ctrl+T. Picking something moves focus or makes a window, so
+            // this leaves as `<C-w>` does. Dismissing it changed nothing,
+            // so the view is redrawn over where the opener painted.
             KeyOutcome::Opener => match run_opener(app) {
                 Some((target, destination)) => {
                     act_on_opener_choice(app, target, destination, None);
@@ -7771,31 +7033,25 @@ fn run_normal_mode_navigation(
                     render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
                 }
             },
-            // Rendered on every keystroke, not just a resolved Motion --
-            // the status bar needs to show a pending count/prefix (e.g.
-            // "20g" mid-`20gg`) and a search's in-progress text live, not
-            // just the end result once a motion actually applies.
+            // Rendered on every key, so the status bar shows a pending
+            // count or prefix (`20g` in `20gg`) and a search being typed.
             KeyOutcome::Pending | KeyOutcome::None => {
                 render_nav_frame(&mut buf, &vk, rect, app.term_rows, app.term_cols, color_overrides.as_ref());
             }
         }
     };
 
-    // Whatever is next, it is not this buffer. Reached only on the
-    // paths that actually return here -- see `set_hover_tracking` for
-    // why that is not all of them, and why this is a switch rather than
-    // a guard.
+    // Whatever is next isn't this buffer. Only some paths return here (see
+    // `set_hover_tracking`), hence a switch rather than a guard.
     term::set_hover_tracking(false);
     compositor_redraw(app);
     Ok(result)
 }
 
-// Visual mode's own active (not yet committed via `Z`) selection, if any
-// -- `vk`'s own anchor (see its `visual_anchor`'s own doc comment)
-// ordered against `buf`'s current cursor into a `MotionRange` ready for
-// `extract_text`/rendering. `RegisterShape::Char` maps to
-// `MotionShape::Inclusive` (vim's own visual charwise is inclusive of
-// both ends, unlike most charwise motions), `::Line` to `::Linewise`.
+// Visual mode's active (uncommitted) selection: `vk`'s anchor (see
+// `visual_anchor`) ordered against the cursor. `Char` becomes
+// `Inclusive`, as charwise Visual includes both ends, and `Line`
+// becomes `Linewise`.
 pub(crate) fn active_visual_range(vk: &VimKeys, buf: &dyn BisheditBuffer) -> Option<motion::MotionRange> {
     let (shape, anchor) = vk.visual_anchor()?;
     let cursor = buf.cursor();
@@ -7804,15 +7060,13 @@ pub(crate) fn active_visual_range(vk: &VimKeys, buf: &dyn BisheditBuffer) -> Opt
         RegisterShape::Block => motion::MotionShape::Blockwise,
         RegisterShape::Char => motion::MotionShape::Inclusive,
     };
-    // Rows always in order; columns kept as the two *corners* rather than
-    // sorted, because a block's corners can be the other way round from
-    // its rows -- dragging up-and-right is an ordinary thing to do. See
-    // `motion::block_columns`, which is where that gets untangled.
+    // Rows in order; columns kept as corners, as a block dragged up and
+    // right has them the other way round (see `motion::block_columns`).
     let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
     let (from, to) =
         if motion_shape == motion::MotionShape::Blockwise { ((from.0.min(to.0), anchor.1), (from.0.max(to.0), cursor.1)) } else { (from, to) };
-    // A selection reaching into a closed fold takes the fold whole, the
-    // same rule an operator's motion follows (see motion::motion_range).
+    // A selection reaching into a closed fold takes it whole, as an
+    // operator's motion does (see `motion::motion_range`).
     let (from, to) = match buf.folds() {
         Some(folds) if motion_shape != motion::MotionShape::Blockwise => {
             let from = folds.closed_at(from.0).map_or(from, |(first, _)| (first, 0));
@@ -7824,20 +7078,10 @@ pub(crate) fn active_visual_range(vk: &VimKeys, buf: &dyn BisheditBuffer) -> Opt
     Some(motion::MotionRange { shape: motion_shape, from, to })
 }
 
-// `y` in Visual mode: every selection in `buf.selections` (already in
-// commit order -- see that field's own doc comment), concatenated with no
-// separator -- a `Linewise` part already ends in `\n` (`extract_text`
-// bakes that in), so it naturally lands on its own line; a charwise part
-// butts directly against its neighbor, matching what selecting exactly
-// that much text and nothing else implies. Shape is `Line` if *any* part
-// was `Linewise`, else `Char` -- the same "at least a full line no matter
-// what gets combined with it" rule `RegisterBackend::write`'s own
-// append-shape already uses for `"A`-style concatenation. A no-op if
-// `selections` is empty (nothing was ever committed or active) -- the
-// caller already gates on that before ever getting here. Generic over
-// `impl BisheditBuffer` (not just `ScreenBuffer`) so `NavBuffer`'s own
-// `ReadOnly` case can call this directly, same as `motion::extract_text`
-// itself already is.
+// `y` in Visual mode: the selections, in commit order, joined with no
+// separator; a linewise part already ends in `\n`. The register is
+// linewise if any part is, as with `"A` appends
+// (`RegisterBackend::write`).
 fn yank_selections(buf: &dyn BisheditBuffer, selections: &[motion::MotionRange], registers: &mut Registers, register: Option<char>) {
     if selections.is_empty() {
         return;
@@ -7846,10 +7090,8 @@ fn yank_selections(buf: &dyn BisheditBuffer, selections: &[motion::MotionRange],
     let mut shape = RegisterShape::Char;
     for range in selections {
         text.push_str(&motion::extract_text(buf, range));
-        // A block stays a block through the register, so putting it back
-        // rebuilds the rectangle rather than splicing its rows end to
-        // end. `Line` still wins over both if anything linewise is mixed
-        // in, per this function's own rule.
+        // A block stays a block in the register, so putting it rebuilds the
+        // rectangle. Linewise still wins if mixed in.
         match range.shape {
             motion::MotionShape::Linewise => shape = RegisterShape::Line,
             motion::MotionShape::Blockwise if shape == RegisterShape::Char => shape = RegisterShape::Block,
@@ -7859,40 +7101,30 @@ fn yank_selections(buf: &dyn BisheditBuffer, selections: &[motion::MotionRange],
     registers.record_yank(register, RegisterValue { text, shape });
 }
 
-// (window_id, is_the_current_window, that window's session's cwd) -- an
-// owned snapshot so drive_pending_fg's redraw callback can build a tab
-// bar without holding a live borrow of `sessions` for its whole poll
-// loop (see that call site's comment for why it can't).
+// For each window: its id, whether it's current, and its label. Owned,
+// so a caller can keep it without borrowing `app`.
 fn tab_bar_snapshot(app: &App) -> Vec<(u32, bool, String)> {
-    // The same path the prompt shows (`$HOME` as `~`) -- read once per
-    // redraw rather than per window, since it only depends on $HOME.
+    // The path as the prompt shows it (`$HOME` as `~`).
     let home = std::env::var("HOME").unwrap_or_default();
-    // A tab's share of the bar, less what `tab_segment_text` spends on
-    // the id and the spaces around it. The path no longer arrives
-    // pre-abbreviated, so this is where a window's label is made to fit
-    // -- and a bar of full paths would otherwise run off the end of the
-    // line instead of ending at it.
+    // A tab's share of the bar, less what `tab_segment_text` spends on the
+    // id and spaces; each label is fitted to it, or a bar of full paths
+    // would run off the line.
     let label_budget = tab_label_budget(app.term_cols, app.windows.len());
     app.windows
         .iter()
         .enumerate()
         .map(|(i, w)| {
-            // A window's name replaces its cwd here: if you have told
-            // bish what a window is *for*, that is more useful than
-            // where it happens to be.
+            // A window's name, if it has one, replaces its cwd.
             let label = match &w.name {
-                // A name is a name: it gets cut at the end like any
-                // other text, there being no structure in it to give up
-                // first.
+                // A name has no structure to give up first, so it's cut at
+                // the end.
                 Some(name) => prompt::ellipsize_end(name, label_budget),
                 None => {
                     let cwd = app.sessions[&w.owning_session()].shell.cwd.to_string_lossy();
                     prompt::fit_path(&prompt::display_path(&cwd, &home), label_budget)
                 }
             };
-            // tmux's own marker for the same thing, and for the same
-            // reason: a zoomed window looks exactly like an unsplit
-            // one, so without this there is nothing on screen to say
+            // A zoomed window looks like an unsplit one; the marker says
             // the other panes are still there.
             let label = if w.zoomed.is_some() { format!("{label} Z") } else { label };
             (w.id, i == app.current_window, label)
@@ -7904,16 +7136,12 @@ fn tab_bar_line(app: &App) -> String {
     render_tab_bar(&tab_bar_snapshot(app))
 }
 
-/// What the real terminal should call itself, given what bish knows
-/// about the focused window.
+/// What the terminal's title should be, given the focused window.
 ///
-/// A program that has said what it is gets passed through untouched:
-/// `vim README.md` is what vim asked its window to be called, and bish
-/// is the window manager here, not the author of that name. With nothing
-/// said, bish names it -- `bish: ` and whatever the tab bar shows for
-/// the focused window, which is its name if it has one and where it is
-/// otherwise. The prefix is there so that a terminal tab running bish is
-/// recognisable among a row of them.
+/// A title a program set is passed through: `vim README.md` named its
+/// window. Otherwise `bish: ` and what the tab bar shows for the window
+/// (its name, or its directory), so a terminal tab running bish is
+/// recognisable.
 fn window_title(pane_title: &str, window_name: Option<&str>, cwd: &str, home: &str) -> String {
     if !pane_title.is_empty() {
         return pane_title.to_string();
@@ -7924,7 +7152,7 @@ fn window_title(pane_title: &str, window_name: Option<&str>, cwd: &str, home: &s
     }
 }
 
-/// What the real terminal should call itself right now.
+/// The terminal's title right now.
 fn terminal_title(app: &App) -> String {
     let window = &app.windows[app.current_window];
     let pane_title = window
@@ -7939,13 +7167,9 @@ fn terminal_title(app: &App) -> String {
     window_title(&pane_title, window.name.as_deref(), &cwd, &home)
 }
 
-/// Everything Ctrl+T offers, in the order the opener keeps its groups in:
-/// the panes that are open, then the files git tracks, then the
-/// directories they are in.
-///
-/// Gathered fresh each time it is asked for. A pane list is only true for
-/// as long as nobody splits anything, and `git ls-files` is one process
-/// -- cheaper than being wrong about what is open.
+/// What Ctrl+T offers, in the opener's group order: open panes, then
+/// files git tracks, then their directories. Gathered fresh each time;
+/// `git ls-files` is one process, cheaper than a stale pane list.
 fn opener_items(app: &App) -> Vec<crate::opener::Item> {
     use crate::opener::{Item, Target};
     let home = std::env::var("HOME").unwrap_or_default();
@@ -7953,16 +7177,14 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
     for window in &app.windows {
         for (at, pane) in window.panes.iter().enumerate() {
             let Some(session) = app.sessions.get(&pane.owning_session()) else { continue };
-            // The window's own `[id]` from the tab bar, with the pane's
-            // place in it only when there is more than one -- a number
-            // that says "pane 1 of 1" is a number to read and discard.
+            // The window's `[id]` from the tab bar, with the pane's place
+            // in it only when there's more than one.
             let id = match window.panes.len() > 1 {
                 true => format!("[{}.{}]", window.id, at + 1),
                 false => format!("[{}]", window.id),
             };
-            // All three of what a pane can be known by, so any of them
-            // finds it: what somebody called the window, what the program
-            // in it calls itself, and where it is.
+            // Everything a pane is known by, so any finds it: the window's
+            // name, the program's title, and its directory.
             let title = session.screen.borrow().title().to_string();
             let cwd = prompt::display_path(&session.shell.cwd.to_string_lossy(), &home);
             let text = match (&window.name, title.is_empty()) {
@@ -7974,12 +7196,10 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
             items.push(Item { target: Target::Pane { window: window.id, pane: pane.id }, text });
         }
     }
-    // Outside a repository there is nothing to add, which is not an error
-    // -- the panes are still the answer to most of what Ctrl+T is for.
+    // Outside a repository there are no files to add; the panes remain.
     let cwd = app.sessions.get(&app.windows[app.current_window].owning_session()).map(|s| s.shell.cwd.clone()).unwrap_or_default();
     let Ok(files) = crate::git::tracked_files(&cwd) else { return items };
-    // The trailing slash the file browser uses, so a directory reads as
-    // one next to the files above it.
+    // With the trailing slash the file browser uses.
     let directories: Vec<Item> = crate::git::tracked_directories(&files)
         .into_iter()
         .map(|d| Item { target: Target::Directory(PathBuf::from(&d)), text: format!("{d}/") })
@@ -7989,20 +7209,13 @@ fn opener_items(app: &App) -> Vec<crate::opener::Item> {
     items
 }
 
-/// The destinations Ctrl+T will offer, and the one it starts on.
+/// The destinations Ctrl+T offers, and the one it starts on.
 ///
-/// `opener_targets` is a glob over their names, exactly as `tabular` is
-/// a glob over language names -- so `*` is all four, `*split` is the two
-/// that make a pane, and `tab` pins it to one and takes the key out of
-/// service (the cycle wraps onto itself).
-///
-/// Neither option can be set to nothing useful. A glob that matches no
-/// name at all falls back to the whole set rather than leaving the
-/// dialog unable to open anything, and a `opener_target` that names
-/// nothing -- or names something the glob excluded -- starts on the
-/// first destination that survived. Both are visible in the dialog's own
-/// border the first time the key is pressed, which is a better
-/// diagnosis than a message at startup.
+/// `opener_targets` is a glob over their names, as `tabular` is over
+/// languages: `*` is all four, `*split` the two making a pane, and `tab`
+/// pins it to one. A glob matching nothing falls back to all, and an
+/// `opener_target` naming nothing left starts on the first remaining
+/// destination; both are visible in the dialog's border.
 fn opener_destinations(shell: &exec::Shell) -> (Vec<crate::opener::Destination>, crate::opener::Destination) {
     use crate::opener::Destination;
     let glob = shell.bishopt_str("opener_targets");
@@ -8015,36 +7228,21 @@ fn opener_destinations(shell: &exec::Shell) -> (Vec<crate::opener::Destination>,
     (enabled, start)
 }
 
-/// Where the opener's dialog goes: the middle of the terminal, sized to
-/// what it has to show.
+/// Where the opener's dialog goes: centred over the content area, sized
+/// to what it shows. Not in a pane, as where to go next belongs to no
+/// window.
 ///
-/// Centred on the whole screen rather than placed in a pane, because
-/// going to another pane is not something the pane you are in is doing --
-/// the question "where do you want to be" belongs to no window, and a
-/// dialog that opened inside one read as that pane's own view of the
-/// world.
+/// Three quarters of the width, up to 100 columns. The height is the
+/// four rows of border, query and keys plus a row per item, fixed when
+/// it opens (counting all items, not matches) so it doesn't resize as
+/// you type.
 ///
-/// Three quarters of the width, up to a hundred columns, which is enough
-/// for the longest path in a repository of any size without becoming a
-/// wall. The height is what the list needs -- the four rows the frame
-/// spends on its border, the query and the keys, plus a row per item --
-/// and is fixed once when it opens, counting every item rather than the
-/// matching ones, so the dialog does not resize under the hand with
-/// every character typed.
+/// The content area, not the terminal: below it are the global status
+/// row, which `compositor_redraw` doesn't repaint, and the tab bar. A
+/// dialog reaching the status row left its border behind on close.
+/// Inside the content area, closing needs no cleanup.
 ///
-/// Centred in the *content area* rather than on the terminal, and that
-/// is not a nicety. Two rows below it belong to somebody else: the
-/// global status row that normal mode and command mode write their mode
-/// line to, and the pinned tab bar. `compositor_redraw` repaints the
-/// content area and the tab bar and leaves the status row alone --
-/// nothing owns it between excursions -- so a dialog that reached onto
-/// it left its own bottom border behind when it closed, with nothing
-/// that would ever paint over it. Staying inside what the compositor
-/// repaints means putting the dialog away needs no cleanup at all.
-///
-/// Two further rows of margin where the screen has them, so the box
-/// reads as floating over the panes rather than replacing them -- the
-/// same reason it is inset horizontally.
+/// Two rows of margin where there's room, so it floats over the panes.
 fn opener_dialog_rect(items: usize, term_rows: usize, term_cols: usize) -> Rect {
     let content = content_rows(term_rows);
     let cols = (term_cols * 3 / 4).clamp(24, 100).min(term_cols);
@@ -8052,9 +7250,8 @@ fn opener_dialog_rect(items: usize, term_rows: usize, term_cols: usize) -> Rect 
     Rect { row: (content - rows) / 2, col: (term_cols - cols) / 2, rows, cols }
 }
 
-/// Ctrl+T's loop: the opener, until it is given something to do or put
-/// away. Returns what to do, which is the caller's to carry out -- this
-/// only owns the terminal while the dialog is on screen.
+/// Ctrl+T's loop: the opener, until something is picked or it's put
+/// away. Returns what to do, for the caller to carry out.
 fn run_opener(app: &mut App) -> Option<(crate::opener::Target, crate::opener::Destination)> {
     use crate::opener::Outcome;
     let items = opener_items(app);
@@ -8065,14 +7262,12 @@ fn run_opener(app: &mut App) -> Option<(crate::opener::Target, crate::opener::De
     };
     let chosen = {
         let Ok(_guard) = term::RawGuard::enable_with_mouse(0) else { return None };
-        // What capture reports while this is open -- see `OVERLAYS`.
+        // What capture reports while this is open; see `OVERLAYS`.
         let _overlay = OverlayOpen::new();
         let item_count = items.len();
         let mut rect = opener_dialog_rect(item_count, app.term_rows, app.term_cols);
-        // Everything under the dialog is painted once and then left
-        // alone: the dialog fills every cell of its own rectangle, so
-        // what it covers stays covered, and putting it away is one more
-        // compositor_redraw.
+        // What's under the dialog is painted once: the dialog fills its
+        // rectangle, and closing it is one more `compositor_redraw`.
         compositor_redraw(app);
         let mut view = crate::opener::Opener::new(items, destinations, start, rect.rows, rect.cols);
         let mut last_size = (app.term_rows, app.term_cols);
@@ -8105,21 +7300,15 @@ fn run_opener(app: &mut App) -> Option<(crate::opener::Target, crate::opener::De
     chosen
 }
 
-/// Carries out what the opener was told to do.
+/// Carries out the opener's choice. A pane exists, so going there is a
+/// focus change. A file or directory gets a window of its own, via
+/// `window new` with the command that opens it.
 ///
-/// A pane is somewhere that already exists, so going there is a focus
-/// change and nothing more. A file or a directory is not, so it gets a
-/// window of its own -- `window new` with the command that opens it,
-/// which is the same path `::bish window new -- cmd` already takes.
-///
-/// `typed` is whatever was in a live prompt line when Ctrl+T was pressed,
-/// and `None` when there was no such line (a pane's Normal mode, the hex
-/// view). The difference matters only on the way out of a shell prompt:
-/// read_line draws that line straight to the screen and never through
-/// any grid, so leaving it behind without recording it means the repaint
-/// blanks the row it was echoed on -- the same reason click-to-focus
-/// freezes it. With no line being typed there is nothing to record
-/// beyond the idle prompt every other focus change already freezes.
+/// `typed` is the live prompt line when Ctrl+T was pressed, `None` when
+/// there wasn't one (Normal mode, the hex view). `read_line` draws that
+/// line straight to the screen, never into a grid, so it has to be
+/// recorded before leaving or the repaint blanks its row, as with
+/// click-to-focus.
 fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, destination: crate::opener::Destination, typed: Option<&str>) {
     use crate::opener::{Destination, Target};
     match target {
@@ -8141,29 +7330,20 @@ fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, destinatio
             }
             compositor_redraw(app);
         }
-        // A file opens in the editor and a directory by `cd`, and the
-        // destination decides where that happens. `tab` and the two
-        // splits are the same `window new`/`window split` a person
-        // would have typed, command included, which is why they need no
-        // code of their own here.
+        // A file opens in the editor, a directory by `cd`. `tab` and the
+        // splits are the `window new`/`window split` a person would type.
         //
-        // `here` is the one that differs between the two kinds. A file
-        // goes straight onto the focused pane's own frame stack, so it
-        // opens over whatever that pane is showing -- including another
-        // editor, which is the case queueing a command line could not
-        // serve: the line would have waited for a prompt that is not
-        // coming until you leave. A directory has no frame to be; `cd`
-        // is a thing a shell does, so it is queued for the pane's shell
-        // exactly as if it had been typed there.
+        // `here` differs between the two: a file goes onto the focused
+        // pane's frame stack, opening over whatever it shows, even another
+        // editor, where a queued command line would wait for a prompt that
+        // isn't coming. A directory is queued as `cd` for the pane's shell,
+        // as if typed.
         Target::File(path) => match destination {
             Destination::Here => open_file_frame(app, &path, None),
-            // `--` because a tracked file may be named `-x`, and the
-            // editor's own argument parser refuses an unrecognised
-            // option rather than guessing -- so without this the one
-            // thing the opener could not open was a file whose name
-            // looks like a flag. `shell_quote` already stops a name
-            // from becoming a second command; this stops it becoming an
-            // option of the first.
+            // `--` because a tracked file may be named `-x`, which the
+            // editor's argument parser would refuse as an unknown option.
+            // `shell_quote` stops the name being a second command; this
+            // stops it being an option.
             _ => open_with(app, destination, format!("e -- {}", exec::shell_quote(&path.to_string_lossy()))),
         },
         Target::Directory(path) => {
@@ -8176,21 +7356,16 @@ fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, destinatio
     }
 }
 
-/// Runs `command` in a window or pane of its own, whichever the
-/// destination asked for.
-///
-/// `Here` never reaches this: it is the one destination that makes
-/// nothing, and the two kinds of item answer it differently.
+/// Runs `command` in a new window or pane, as the destination asks.
+/// `Here` never reaches this; it makes nothing.
 fn open_with(app: &mut App, destination: crate::opener::Destination, command: String) {
     use crate::opener::Destination;
     let action = match destination {
         Destination::Tab => WindowAction::New { name: None, command: Some(command) },
-        // `horizontal` names the dividing line, and these two name the
-        // arrangement of the panes -- the opposite pairing, which is
-        // bish's own (see WindowAction::Split). `vsplit` stacks them
-        // vertically, which is what `::bish window vsplit` does, and
-        // the spelling is borrowed from that command so the dialog and
-        // the command cannot come to mean different things.
+        // `horizontal` names the dividing line, the destinations name how
+        // the panes are arranged (see `WindowAction::Split`). `vsplit`
+        // stacks them, as `::bish window vsplit` does, so the two can't
+        // drift apart.
         Destination::VSplit => WindowAction::Split { horizontal: true, command: Some(command) },
         Destination::HSplit => WindowAction::Split { horizontal: false, command: Some(command) },
         Destination::Here => return,
@@ -8198,82 +7373,48 @@ fn open_with(app: &mut App, destination: crate::opener::Destination, command: St
     apply_window_action(app, action);
 }
 
-/// Keeps the real terminal's title in step with what bish is showing.
-///
-/// Called wherever the tab bar is recomputed, since the two answer the
-/// same question about the same window; `term::set_window_title` is what
-/// keeps it from being written on every redraw.
+/// Keeps the terminal's title in step. Called wherever the tab bar is
+/// recomputed, as both describe the same window; `term::set_window_title`
+/// skips writes that change nothing.
 fn sync_terminal_title(app: &App) {
     term::set_window_title(&terminal_title(app));
 }
 
-// Runs whatever `::bish hook` has attached to `event` for this buffer's
-// language, with the file's path appended as the command's first
-// argument.
-//
-// Output is captured and dropped rather than printed: a hook fires while
-// the editor owns the terminal, and anything it echoed would land in the
-// middle of a rendered frame. A hook is for doing something, not for
-// saying something -- and the buffer it is about is still there to be
-// changed, which is the channel that matters.
-//
-// The empty case costs a `Vec` and a string compare, which is what keeps
-// firing an event free on the overwhelmingly common path where nobody is
-// listening.
-// Starts the language server for this buffer's language, if one is
-// registered and isn't already running for its project.
-//
-// Called at exactly the moment `editor:file:open` fires, and for the
-// same reason: the buffer exists and its options are resolved, so its
-// language is knowable. Starting is all that happens here -- the server
-// is not told about the file yet, which is the next piece of work.
-//
-// Every failure is silent apart from what `::bish lsp status` will
-// show. The middle of opening a file is the worst place to interrupt
-// someone with a configuration problem, and a language server is an
-// optional convenience: the editor has to work exactly as well without
-// one. Same tolerance `run_hooks_for` already applies to a hook that
-// doesn't parse.
-// Everything needed to talk to the language server for one buffer,
-// resolved in a single place so the four document events can't disagree
-// about which server a file belongs to or what it is called.
+// Everything for talking to the language server about one buffer,
+// resolved in one place so the document events can't disagree about
+// which server a file belongs to.
 struct ServerTarget {
     id: u64,
     command: Vec<String>,
     display: String,
     root: PathBuf,
-    // The document's own identity as far as the protocol is concerned.
-    // Percent-encoded, because a server matches this string against its
-    // own idea of the same file (see url::from_file_path).
+    // The document's identity to the protocol. Percent-encoded, as the
+    // server matches it against its own URI for the file (see
+    // `url::from_file_path`).
     uri: String,
     language_id: String,
     apply_edits: lspclient::ApplyEdits,
-    // Already nested from the declaration's flat `--setting` pairs, so
-    // the only thing that has to know about dotted keys is the thing
-    // that parsed them.
+    // Already nested from the flat `--setting` pairs, so only the parser
+    // knows about dotted keys.
     settings: crate::json::Value,
 }
 
-// `None` -- meaning "this buffer has nothing to do with any language
-// server" -- for an unnamed buffer, a language nobody registered a
-// server for, `bishopt --unset lsp`, or a file with no project root
-// under it. Each of those is an ordinary state, not a failure.
+// `None` for an unnamed buffer, a language with no server, `bishopt
+// --unset lsp`, or a file with no project root: ordinary states, not
+// failures.
 fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarget> {
     let path = buf.path()?;
     let language = fileeditor::language_of(buf);
     let declared = session.shell.lsp_server_for(&language)?;
-    // Absolute, so walking up for a root marker doesn't depend on where
-    // the shell happens to be, and so the URI names one file however it
-    // was reached.
+    // Absolute, so finding the root doesn't depend on the shell's cwd, and
+    // the URI names one file however it was reached.
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    // A `--root-cmd`'s answer, when one was worked out at open time,
-    // beats the markers -- it is the only thing that can know a Cargo
-    // workspace root, or any other root a build tool alone can compute.
+    // A `--root-cmd`'s answer, when there is one, beats the markers: only a
+    // build tool can know, say, a Cargo workspace root.
     let root = match (&buf.lsp_root, absolute.parent().and_then(|dir| session.lsp_roots.get(dir))) {
-        // Reached by a jump from a buffer that already had a server:
-        // that server knows this file, and asking a second one would
-        // mean starting it and waiting for it to index a project this
-        // file only incidentally sits inside. See `TextBuffer::lsp_root`.
+        // Reached by a jump from a buffer that had a server: that server
+        // knows this file, and a second would start and index a project
+        // this file only sits inside. See `TextBuffer::lsp_root`.
         (Some(inherited), _) => inherited.clone(),
         (None, Some(root)) => root.clone(),
         (None, None) => lspclient::root_for(&absolute, &declared.root_markers)?,
@@ -8290,43 +7431,14 @@ fn server_target(session: &SessionState, buf: &TextBuffer) -> Option<ServerTarge
     })
 }
 
-// Runs a server's `--root-cmd` and takes its first line of output as
-// the project root.
-//
-// Run through **bish's own shell**, not `/bin/sh`. The command is
-// configured in a bishrc by someone writing bish, and the natural
-// spelling of the case this exists for --
-// `cargo metadata --format-version 1 | json -r .workspace_root` --
-// uses `json`, which is a bish *builtin* and so does not exist for
-// `sh`. Discovered exactly that way: the documented example silently
-// fell back to the markers because `sh` could not find `json`.
-//
-// Wrapped in a subshell with a `cd`, so the command sees the file's own
-// directory without the session's cwd moving under the user. Output is
-// captured with the same borrow-and-give-back the hook runner uses (see
-// `run_hooks_for`), and `$?` is put back for the same reason: this is
-// not a command the user ran.
-//
-// `None` on anything unconvincing -- a failure, no output, a relative
-// path, a directory that is not there -- and the caller falls back to
-// the `--root` markers. A root command that half-works must not produce
-// a server pointed at the wrong tree.
+// Runs a server's `--root-cmd` in `dir` and takes its first line of
+// output as the project root.
 fn root_from_command(command: &str, dir: &Path) -> Option<PathBuf> {
-    // Run as `bish -c` in a process of its own, with the file's own
-    // directory as its cwd.
-    //
-    // Not `/bin/sh`: the natural spelling of the case this exists for
-    // uses `json`, which is a bish *builtin* and so does not exist for
-    // sh -- the first version of this documented an example that
-    // silently fell back to the markers for exactly that reason.
-    //
-    // And not the session's own shell either, which was the second
-    // attempt: the command has to run somewhere a `cd` cannot move the
-    // session's cwd, which means a subshell, and neither borrowing the
-    // output sink nor a command substitution into a variable brought
-    // that subshell's output back. A separate process has no such
-    // question -- its stdout is a pipe this reads -- and the cost is one
-    // spawn per directory, memoised (see `SessionState::lsp_roots`).
+    // `bish -c` in a process of its own: `/bin/sh` lacks bish builtins like
+    // `json`, which the usual
+    // `cargo metadata --format-version 1 | json -r .workspace_root` needs,
+    // and running in the session would let a `cd` move its cwd. One spawn
+    // per directory, memoised (see `SessionState::lsp_roots`).
     let exe = std::env::current_exe().ok()?;
     let output = std::process::Command::new(exe).arg("-c").arg(command).current_dir(dir).output().ok()?;
     if !output.status.success() {
@@ -8334,15 +7446,15 @@ fn root_from_command(command: &str, dir: &Path) -> Option<PathBuf> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let root = PathBuf::from(text.lines().next()?.trim());
-    // `None` on anything unconvincing -- no output, a relative path, a
-    // directory that is not there -- so the caller falls back to the
-    // `--root` markers. A root command that half-works must not leave a
-    // server pointed at the wrong tree.
+    // `None` on anything unconvincing (no output, a relative path, a
+    // missing directory), and the caller falls back to the `--root`
+    // markers: a half-working root command mustn't point a server at the
+    // wrong tree.
     (root.is_absolute() && root.is_dir()).then_some(root)
 }
 
-// Works out this file's project root with the declared `--root-cmd`, if
-// there is one and it has not been asked already, and remembers it.
+// Works out this file's project root with the declared `--root-cmd`,
+// if there is one and it hasn't been asked yet, and remembers it.
 fn resolve_root_command(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(path) = buf.path() else { return };
@@ -8364,36 +7476,25 @@ fn resolve_root_command(sessions: &mut HashMap<SessionId, SessionState>, session
 }
 
 // Starts the language server for this buffer's language if one is
-// registered and isn't already running for its project, and tells it
-// about the file.
+// registered and not running for its project, and tells it about the
+// file. Called when `editor:file:open` fires, when the language is
+// known. The handshake isn't waited for: `didOpen` queues until
+// `initialized` goes out.
 //
-// Called at exactly the moment `editor:file:open` fires, and for the
-// same reason: the buffer exists and its options are resolved, so its
-// language is knowable. The server usually isn't ready yet at this
-// point -- the handshake takes as long as it takes -- and that is
-// deliberately not waited for: `didOpen` is held in the server's own
-// queue and goes out the instant `initialized` does.
-//
-// Every failure is silent apart from what `::bish lsp status` will
-// show. The middle of opening a file is the worst place to interrupt
-// someone with a configuration problem, and a language server is an
-// optional convenience: the editor has to work exactly as well without
-// one. Same tolerance `run_hooks_for` already applies to a hook that
-// doesn't parse.
+// Failures are silent apart from `::bish lsp status`: opening a file is
+// the wrong moment for a configuration problem, and the editor must
+// work as well without a server. `run_hooks_for` is as tolerant of a
+// hook that doesn't parse.
 fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
-    // A `--root-cmd` is resolved here and only here: this is the one
-    // moment per file, where paying for a real process is fine, and
-    // every later `server_target` reads the answer back from the memo
-    // (see `SessionState::lsp_roots`) rather than running it again on
-    // each idle tick.
+    // A `--root-cmd` runs only here, once per file; later `server_target`
+    // calls read the memo (`SessionState::lsp_roots`).
     resolve_root_command(sessions, session_id, buf);
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
     let lsp = Rc::clone(&session.lsp);
     let mut table = lsp.borrow_mut();
-    // The error is deliberately dropped: `get_or_start` records it on
-    // the table, which is where `::bish lsp status` shows it, and there
-    // is nowhere sensible to print mid-open.
+    // `get_or_start` records the error on the table for `::bish lsp
+    // status`; there's nowhere to print it mid-open.
     let Ok(server) = table.get_or_start(target.id, &target.command, &target.display, &target.root, target.apply_edits, target.settings.clone())
     else {
         return;
@@ -8402,23 +7503,15 @@ fn open_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
 }
 
 // How long a buffer has to stop changing before the server hears about
-// it. Sending on every keystroke would be a whole-document message per
-// character; waiting for the user to stop typing entirely would mean
-// diagnostics that only ever appear after a pause long enough to
-// notice. This is the usual editor figure, and it is measured from the
-// *first* unsent change rather than the most recent one, so continuous
-// typing still produces updates at a bounded rate rather than none.
+// it. Measured from the first unsent change, not the latest, so steady
+// typing still sends updates at a bounded rate.
 const LSP_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
-// One tick of document synchronization for the buffer being edited.
-//
-// Called from the idle path of the loops that actually drive a buffer,
-// which is the only place with both the live text and a moment to spare
-// -- the same reason those loops already do their own redraws rather
-// than leaving it to `compositor_redraw` (see run_normal_mode_
-// navigation's own idle block). A buffer's text is only ever built when
-// `needs_change` says something actually changed and settled, so the
-// common case -- nothing has been typed -- costs a version comparison.
+// One tick of document sync for the buffer being edited, from the idle
+// path of the loops driving a buffer: the only place with both the
+// live text and time to spare. The text is built only when
+// `needs_change` says a change has settled; otherwise this costs a
+// version comparison.
 fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
@@ -8431,14 +7524,9 @@ fn sync_language_server_document(sessions: &mut HashMap<SessionId, SessionState>
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
 }
 
-// Sends this buffer's text now, debounce or no debounce.
-//
-// For the callers that are about to ask a question whose answer depends
-// on the character just typed. `sync_language_server_document`'s
-// waiting is right for diagnostics -- nobody is looking at them yet --
-// and wrong here, where the whole point is the text as it stands this
-// instant. A no-op when the server is already current, so calling it
-// before a question costs a version comparison.
+// Sends this buffer's text now, skipping the debounce, for callers
+// about to ask something that depends on the character just typed. A
+// version comparison when the server is already current.
 fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &TextBuffer) {
     let Some(session) = sessions.get(&session_id) else { return };
     let Some(target) = server_target(session, buf) else { return };
@@ -8451,23 +7539,13 @@ fn flush_language_server_document(sessions: &mut HashMap<SessionId, SessionState
     server.change_document(&target.uri, buf.version(), &fileeditor::buffer_text(buf));
 }
 
-// One tick of "what is the server doing" upkeep for the buffer being
-// edited, so the status line can say so.
+// Advances a debug adapter session by whatever has arrived, and moves
+// the cursor when the program stops. On the idle tick so the editor
+// stays usable between events. A stop asks for the stack, and the next
+// tick moves the cursor: only the stack says which line, and waiting
+// for it here would block.
 //
-// This is the named risk of the whole feature made visible: a cold
-// server answers nothing, and until now every `K` against one cost a
-// full `lsp_timeout_ms` with no hint that waiting would have helped.
-// Advances a Debug Adapter Protocol session by whatever has arrived,
-// and lands the cursor when the program stops.
-//
-// The whole reason this is an idle-tick job rather than a loop of its
-// own: an adapter sends events when it feels like it, and the editor
-// has to stay usable in between. A stop arrives here, the stack is
-// asked for, and the *next* tick moves the cursor -- two ticks, because
-// only the stack says which line, and waiting for it inline would be
-// the blocking read this design exists to avoid.
-//
-// Returns true when something changed that the screen should show.
+// Returns true when the screen should change.
 fn sync_debug_adapter(app: &mut App, edit_frame_id: EditFrameId, buf: &mut TextBuffer) -> bool {
     if !app.dap_frames.contains_key(&edit_frame_id) {
         return false;
@@ -8490,11 +7568,9 @@ fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Opt
     let events = frame.session.service();
     let mut changed = false;
 
-    // The program's own output goes to the debug-run pane, which is
-    // what that pane is for -- fed to it as terminal bytes, since it is
-    // a terminal grid and the program may well be writing escape
-    // sequences into it. A bare newline becomes a carriage return and
-    // one, because a grid moves down but not back.
+    // The program's output goes to the debug-run pane as terminal bytes,
+    // since it may write escape sequences. A bare newline becomes CR LF:
+    // a grid moves down but not back.
     let output = frame.session.take_output();
     if !output.is_empty() {
         if let Some(screen) = screen {
@@ -8536,8 +7612,7 @@ fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Opt
         }
     }
 
-    // The stack, when it lands: this is what says where the cursor
-    // goes.
+    // The stack, when it arrives, says where the cursor goes.
     if let Some(seq) = frame.awaiting_stack
         && let Some(answer) = frame.session.take_response(seq)
     {
@@ -8548,11 +7623,8 @@ fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Opt
         if frame.landing {
             frame.landing = false;
             let notice = frame.describe_stop();
-            // Only when the stop is in *this* file. A breakpoint inside
-            // a library moves the cursor nowhere, because there is
-            // nothing here to move it to -- and jumping to a line
-            // number that belongs to another file would be worse than
-            // staying put.
+            // Only when the stop is in this file; a line number from
+            // another file would be worse than staying put.
             let here = buf.path().map(|p| p.to_path_buf());
             if let (Some(here), Some(top)) = (here, frame.frames.first())
                 && top.source_path.as_deref().map(std::path::Path::new).is_some_and(|p| same_file(p, &here))
@@ -8565,8 +7637,7 @@ fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Opt
         changed = true;
     }
 
-    // An answer somebody asked for from the command line, once the
-    // adapter has it.
+    // An answer asked for from the command line, once the adapter has it.
     if let Some((seq, label)) = frame.awaiting_answer.clone()
         && let Some(answer) = frame.session.take_response(seq)
     {
@@ -8581,9 +7652,8 @@ fn advance_debug_adapter(frame: &mut DapFrame, buf: &mut TextBuffer, screen: Opt
     changed
 }
 
-/// Whether two paths name the same file, without insisting they were
-/// spelled the same way. An adapter reports the path it was given,
-/// which need not be the one the editor opened.
+/// Whether two paths name the same file, however spelled: an adapter
+/// reports the path it was given, not necessarily the one opened.
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     if a == b {
         return true;
@@ -8594,24 +7664,18 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
-// Keeps a watch on the file behind `buf`, and says so when it changes.
+// Watches the file behind `buf` and says when it changed. The check is
+// a hash of the contents, as `:w`'s E13 does; the watcher only says
+// when to look. A `touch`, a formatter that changed nothing, or our own
+// save all raise events, and warning on those would be crying wolf.
 //
-// The check itself is a hash of the file's contents, exactly as `:w`'s
-// own E13 does -- inotify says *when* to look, not what happened. That
-// matters: a `touch`, a formatter that changed nothing, or this
-// editor's own save all produce an event, and warning about any of them
-// would be crying wolf. What inotify buys is not having to hash the
-// file on a timer to find out.
-//
-// Returns true when the status line changed, the same contract every
-// other `sync_*` on this tick has.
+// Returns true when the status line changed, like every `sync_*` here.
 fn sync_watched_file(watcher: Option<&mut crate::watch::Watcher>, buf: &mut TextBuffer) -> bool {
     let Some(watcher) = watcher else { return false };
     let Some(path) = buf.path().map(|p| p.to_path_buf()) else { return false };
     if !watcher.is_watching(&path) {
-        // A file whose directory has gone is not watchable and not
-        // interesting: whatever it says now, it says because it is
-        // gone, and `:w` will find that out on its own.
+        // A file whose directory is gone can't be watched; `:w` will find
+        // out on its own.
         let _ = watcher.watch(&path);
         return false;
     }
@@ -8619,9 +7683,8 @@ fn sync_watched_file(watcher: Option<&mut crate::watch::Watcher>, buf: &mut Text
     if events.is_empty() {
         return false;
     }
-    // An overflow means the queue dropped events, so what is known is
-    // only that something happened -- which is the same thing this does
-    // with an event about the file itself: look.
+    // An overflow means events were dropped, so all that's known is that
+    // something happened: look, as for an event about the file.
     let overflowed = events.iter().any(|e| e.change == crate::watch::Change::Overflowed);
     if !overflowed && !events.iter().any(|e| e.path == path) {
         return false;
@@ -8629,11 +7692,9 @@ fn sync_watched_file(watcher: Option<&mut crate::watch::Watcher>, buf: &mut Text
     if !buf.changed_on_disk() {
         return false;
     }
-    // Said once per change, not once per tick: `changed_on_disk`
-    // compares against the hash taken when the buffer last read or
-    // wrote the file, so it keeps answering yes until one of those
-    // happens again. Re-echoing it every tick would hold the status
-    // line hostage.
+    // Said once per change: `changed_on_disk` keeps answering yes until the
+    // buffer next reads or writes the file, and re-echoing every tick would
+    // hold the status line.
     let notice = "bish: W11: file changed on disk (`:e!` to reload, `:w!` to overwrite)".to_string();
     if buf.echoed_message.as_deref() == Some(notice.as_str()) {
         return false;
@@ -8642,18 +7703,17 @@ fn sync_watched_file(watcher: Option<&mut crate::watch::Watcher>, buf: &mut Text
     true
 }
 
-// Costs a string comparison on a quiet tick, which is why it can run on
-// every one of them.
+// One tick of upkeep on what the server is doing, for the status line,
+// so a cold server says so instead of each `K` silently costing
+// `lsp_timeout_ms`. A string comparison on a quiet tick.
 //
-// Returns true when the line changed, which is the caller's cue to
-// redraw -- a progress line that only updates on the next keystroke is
-// worse than none, since it is then reliably wrong.
+// Returns true when the line changed, the cue to redraw: a progress line
+// updated only on the next key is reliably wrong.
 fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
-    // Anything the server asked to have *shown* is taken first and
-    // holds the slot until a key clears it (see `TextBuffer::
-    // echoed_message`). Taken on the same tick either way -- leaving it
-    // queued while one is already displayed would mean the second of
-    // two messages arrives long after whatever prompted it.
+    // A message the server asked to show is taken first and holds the slot
+    // until a key clears it (see `TextBuffer::echoed_message`). Taken the
+    // same tick either way, or a second message would show long after its
+    // cause.
     let mut changed = false;
     if let Some(message) = (|| {
         let session = sessions.get(&session_id)?;
@@ -8679,24 +7739,19 @@ fn sync_language_server_progress(sessions: &mut HashMap<SessionId, SessionState>
     true
 }
 
-// One tick of semantic-token upkeep for the buffer being edited.
+// One tick of semantic tokens for the buffer being edited. Never waits:
+// `ask_server`'s bounded wait suits a key press, not a quiet moment.
+// The request's id is parked on the session for a later tick to
+// collect.
 //
-// Asked and collected without ever waiting: `ask_server`'s bounded wait
-// is right when the user pressed a key and is now looking at the screen,
-// and wrong here, where nothing is blocked on the answer and the wait
-// would be paid on every quiet moment. So this sends the request, parks
-// its id on the session, and lets a later tick pick the reply up.
-//
-// Returns true when the painted tokens changed, which is the caller's
-// cue to redraw.
+// Returns true when the tokens changed, the cue to redraw.
 fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     let Some(session) = sessions.get(&session_id) else { return false };
     let Some(target) = server_target(session, buf) else { return false };
     let lsp = Rc::clone(&session.lsp);
     let version = buf.version();
 
-    // Collect first: an answer already sitting there is worth more than
-    // a fresher question.
+    // Collect first: an answer already there beats a fresher question.
     if let Some(&(id, asked_at)) = session.lsp_semantic.get(&target.uri) {
         let mut table = lsp.borrow_mut();
         let Some(server) = table.running(&target.display, &target.root) else {
@@ -8710,9 +7765,8 @@ fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session
             drop(table);
             let session = sessions.get_mut(&session_id).expect("checked");
             session.lsp_semantic.remove(&target.uri);
-            // Answered about a version that has since been typed over:
-            // every offset in it describes text that has moved. Dropped
-            // rather than applied, and the next pass asks again.
+            // About a version since typed over, so its offsets describe moved
+            // text. Dropped, and the next pass asks again.
             if asked_at != version {
                 return false;
             }
@@ -8725,9 +7779,8 @@ fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session
             buf.semantic_spans = spans;
             return true;
         }
-        // Still waiting. Not asking twice about the same document is
-        // what keeps a slow server from accumulating a request per idle
-        // tick.
+        // Still waiting. Asking once per document keeps a slow server from
+        // piling up a request per tick.
         return false;
     }
 
@@ -8739,10 +7792,9 @@ fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session
     if !server.is_ready() || !server.provides("semanticTokensProvider") || server.semantic_legend().is_empty() {
         return false;
     }
-    // The server answers about the text it has been *told* about, so
-    // asking before `didChange` has caught up gets tokens whose offsets
-    // describe a different file. The debounced sync above this in the
-    // same tick is what eventually makes these equal.
+    // The server answers about the text it was told about, so asking
+    // before `didChange` caught up gets offsets into a different file. The
+    // debounced sync earlier in the tick makes these equal eventually.
     if server.known_version(&target.uri) != Some(version) {
         return false;
     }
@@ -8756,17 +7808,12 @@ fn sync_semantic_tokens(sessions: &mut HashMap<SessionId, SessionState>, session
     false
 }
 
-// One tick of `textDocument/documentHighlight` -- "where else in this
-// file is the thing under the cursor".
+// One tick of `textDocument/documentHighlight`: where else in this file
+// the thing under the cursor appears. Keyed on the cursor as well as
+// the version, since moving makes it stale. A still cursor costs a
+// tuple comparison; never waits, like `sync_semantic_tokens`.
 //
-// Keyed on the cursor rather than the version, which is the one way
-// this differs from `sync_semantic_tokens` next to it: the answer goes
-// stale by moving, not by typing. A cursor sitting still costs a tuple
-// comparison; moving costs one request, asked and collected without
-// ever waiting, exactly as the tokens are.
-//
-// Returns true when the marks changed, which is the caller's cue to
-// redraw.
+// Returns true when the marks changed, the cue to redraw.
 fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     let Some(session) = sessions.get(&session_id) else { return false };
     let Some(target) = server_target(session, buf) else { return false };
@@ -8774,8 +7821,7 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
     let version = buf.version();
     let (row, col) = buf.cursor();
 
-    // Collect first: an answer already sitting there is worth more than
-    // a fresher question.
+    // Collect first: an answer already there beats a fresher question.
     if let Some((id, asked_version, asked_row, asked_col)) = session.lsp_highlight {
         let mut table = lsp.borrow_mut();
         let Some(server) = table.running(&target.display, &target.root) else {
@@ -8784,18 +7830,16 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
             return false;
         };
         let Some(result) = server.take_response(id) else {
-            // Still waiting. Not asking twice is what keeps a slow
-            // server from accumulating a request per idle tick.
+            // Still waiting; asking once keeps a slow server from piling up
+            // requests.
             return false;
         };
         let encoding = server.encoding();
         drop(table);
         let session = sessions.get_mut(&session_id).expect("checked");
         session.lsp_highlight = None;
-        // Answered about a cursor position or a revision that has since
-        // been left behind. Dropped rather than drawn -- marks under
-        // the wrong words are worse than none -- and the next pass asks
-        // again from where things now are.
+        // About a position or revision since left. Dropped, as marks under
+        // the wrong words are worse than none, and asked again.
         if (asked_version, asked_row, asked_col) != (version, row, col) {
             return false;
         }
@@ -8803,17 +7847,16 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
         let found = result.map(|result| crate::lsp::highlights(&result)).unwrap_or_default();
         let starts = fileeditor::line_starts_of(buf);
         let underline = vt100::CellAttrs { underline: true, ..vt100::CellAttrs::default() };
-        // A write is where the symbol is *assigned*, which is the one
-        // occurrence people are usually hunting for in a list of reads.
+        // A write is where the symbol is assigned, usually the occurrence
+        // being hunted for.
         let write = vt100::CellAttrs { underline: true, bold: true, ..vt100::CellAttrs::default() };
         let marks: Vec<highlight::StyledSpan> = found
             .iter()
             .filter_map(|h| {
                 let start = fileeditor::diagnostic_offset(buf, &starts, h.start.0, h.start.1, encoding);
                 let end = fileeditor::diagnostic_offset(buf, &starts, h.end.0, h.end.1, encoding);
-                // `fg` is never read for this layer (see
-                // `highlight::compose_attrs`); `Default` is the
-                // no-opinion value to put there.
+                // `fg` isn't read for this layer (see
+                // `highlight::compose_attrs`).
                 (end > start).then_some(highlight::StyledSpan {
                     start,
                     end,
@@ -8837,9 +7880,8 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
     if !server.is_ready() || !server.provides("documentHighlightProvider") {
         return false;
     }
-    // The server answers about the text it has been *told* about, so
-    // asking before `didChange` has caught up marks offsets that
-    // describe a different file.
+    // The server answers about the text it was told about; asking before
+    // `didChange` caught up marks offsets into a different file.
     if server.known_version(&target.uri) != Some(version) {
         return false;
     }
@@ -8861,16 +7903,11 @@ fn sync_document_highlights(sessions: &mut HashMap<SessionId, SessionState>, ses
 }
 
 // One tick of `textDocument/inlayHint` for the visible part of the
-// buffer being edited.
+// buffer. Keyed on version and visible range: typing and scrolling
+// both invalidate, as the request takes a range. Otherwise like
+// `sync_semantic_tokens`.
 //
-// Keyed on (version, visible range): typing invalidates them, and so
-// does scrolling, because the request takes a range and a hint nobody
-// can see costs the same to compute as one they can. Everything else
-// about this is `sync_semantic_tokens` -- asked and collected without
-// ever waiting, dropped if the answer describes a state left behind.
-//
-// Returns true when the hints changed, which is the caller's cue to
-// redraw.
+// Returns true when the hints changed, the cue to redraw.
 fn sync_inlay_hints(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, buf: &mut TextBuffer) -> bool {
     // Off is off: no request, and nothing left drawn from when it was
     // on.
@@ -10234,6 +9271,11 @@ fn close_language_server_document(sessions: &mut HashMap<SessionId, SessionState
     }
 }
 
+// Runs whatever `::bish hook` attached to `event` for this buffer's
+// language, with the file's path as the first argument. Output is
+// captured and dropped: the editor owns the terminal, and an echo would
+// land mid-frame. With nobody listening this costs a `Vec` and a string
+// compare.
 fn run_hooks(sessions: &mut HashMap<SessionId, SessionState>, session_id: SessionId, event: &str, buf: &TextBuffer) {
     let path = buf.path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     run_hooks_for(sessions, session_id, event, &fileeditor::language_of(buf), &path);
