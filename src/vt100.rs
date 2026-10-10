@@ -1,18 +1,11 @@
-// A scoped VT100/ANSI terminal emulator: byte-stream parser + virtual
-// screen grid, fed uniformly by a session's OutputSink bytes (exec.rs)
-// and a job's pty master bytes (pty.rs). Not a full xterm clone -- covers
-// enough of the control-sequence surface for vim/htop/less to render
-// correctly (cursor movement, erase, SGR colors/attrs, line/char editing,
-// scrolling regions, the alternate screen buffer, cursor visibility,
-// line wrap, G0 charset switching for curses box-drawing, and safely
-// skipping OSC/DCS bodies without corrupting the grid). Explicitly out of
-// scope: Sixel/Kitty/iTerm2 images, double-width/height lines, CJK wide
-// characters, real mouse-input forwarding, full G1-G3 charset switching,
-// byte-for-byte xterm terminfo compatibility.
-//
-// Not yet wired into exec.rs/repl.rs: real usage (rendering a window's
-// hidden session/job into its own grid) lands with the M9 compositor,
-// same "land the seam, wire it in later" pattern as pty.rs.
+// A VT100/ANSI terminal emulator: a byte-stream parser and a screen grid,
+// fed a session's output (exec.rs) and a job's pty (pty.rs). Covers what
+// vim, htop and less need: cursor movement, erase, SGR, line and
+// character editing, scroll regions, the alternate screen, cursor
+// visibility, wrapping, wide characters, DEC line drawing, mouse and
+// paste mode requests, and skipping OSC/DCS bodies safely. Not covered:
+// images, double-width or double-height lines, G1-G3 charsets, full
+// xterm compatibility.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -40,18 +33,11 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: CellAttrs,
-    /// The right half of the double-width character in the cell before
-    /// this one. It holds no character of its own: a terminal drawing
-    /// the wide char has already covered this column, so anything
-    /// reading the grid as text skips it and anything writing the grid
-    /// to a terminal emits nothing for it.
-    ///
-    /// A grid where one cell is one column and one character is one
-    /// cell cannot say "this character is two columns wide" any other
-    /// way, and it has to be able to: a pane border drawn at column 40
-    /// is at column 40 whatever is to the left of it, and CJK text that
-    /// counted itself one column per character put the border somewhere
-    /// else.
+    /// The right half of the wide character in the cell before. It holds no
+    /// character: a terminal drawing the wide one covered this column, so
+    /// text readers skip it and terminal writers emit nothing for it. That
+    /// keeps one cell one column, so a pane border at column 40 stays there
+    /// whatever CJK text is left of it.
     pub continuation: bool,
 }
 
@@ -61,12 +47,9 @@ impl Default for Cell {
     }
 }
 
-// The inverse of this module's own SGR parsing: turns a cell's resolved
-// color/attrs back into the ANSI codes that reproduce them, so the real
-// terminal ends up showing the same thing the grid recorded. Shared by
-// repl.rs's render_row (a Screen's own cells) and the syntax-highlighting
-// renderer's render_styled (synthesized StyledSpan-derived cells) -- both
-// need the same run-coalescing "cell style -> SGR escape" step.
+// A cell's colour and attributes back into SGR codes, the inverse of the
+// parser's. Shared by repl.rs's `render_row` and the highlighter's
+// `render_styled`.
 pub fn sgr_codes(fg: Color, bg: Color, attrs: CellAttrs) -> String {
     let mut codes: Vec<String> = vec!["0".to_string()];
     if attrs.bold {
@@ -104,8 +87,8 @@ pub fn sgr_codes(fg: Color, bg: Color, attrs: CellAttrs) -> String {
     format!("\x1b[{}m", codes.join(";"))
 }
 
-// The standard DEC Special Graphics mapping (ESC ( 0), the subset curses
-// actually relies on for box-drawing (ncurses' default `acsc` string).
+// DEC Special Graphics (`ESC ( 0`), the subset curses uses for box
+// drawing (ncurses' default `acsc`).
 fn dec_special_graphics(c: char) -> char {
     match c {
         '`' => '\u{25C6}', // diamond
@@ -143,14 +126,10 @@ pub struct Grid {
     pub rows: usize,
     pub cols: usize,
     cells: Vec<Cell>,
-    // Per-row "this row's content didn't end here on purpose -- it just
-    // ran out of columns and autowrap continued it onto the next row"
-    // flag, set only by print_char's own pending_wrap-consuming branch
-    // (never by an explicit CR/LF, which always clears pending_wrap
-    // first). This is what lets a Buffer built over a Screen (ScreenBuffer
-    // in repl.rs) tell a real line break apart from a column-width
-    // artifact, so yanking/selecting a long wrapped line doesn't garble
-    // it with a newline that was never actually in the source bytes.
+    // Per row: whether its content ran out of columns and autowrap carried
+    // it on, set only by `print_char` consuming a pending wrap (CR and LF
+    // clear it). Lets `ScreenBuffer` (repl.rs) tell a real line break from
+    // a wrapped one, so yanking a long line doesn't add a newline.
     wrapped: Vec<bool>,
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -178,49 +157,27 @@ impl Grid {
         }
     }
 
-    // Whether every cell of `row` is untouched -- what tells a shrink
-    // that a row below the cursor is spare space it can just discard
-    // rather than history it has to preserve.
+    // Whether `row` is untouched, so a shrink can discard it rather than
+    // keep it as history.
     fn row_is_blank(&self, row: usize) -> bool {
         (0..self.cols).all(|c| self.cells[row * self.cols + c] == Cell::default())
     }
 
-    // When shrinking rows, keeps the *bottom* `rows` of the old grid --
-    // the ones most likely to still hold the live cursor/prompt -- not
-    // the top ones: a naive top-anchored copy (this function's own
-    // previous behavior) silently threw away whatever the cursor was
-    // actually sitting on, leaving a resized-down pane showing stale
-    // top-of-screen content with a fresh prompt then written on top of
-    // it at the wrong row entirely (e.g. splitting a window that's
-    // already scrolled full of output). Growing keeps everything,
-    // top-anchored (`src_start_row` is 0 whenever `rows >= self.rows`),
-    // since nothing needs discarding either way -- `Screen::resize` then
-    // hands back a matching number of scrollback rows via
-    // `prepend_rows`, which is what makes a shrink and a later re-grow
-    // cancel out instead of losing what the shrink pushed away. Returns
-    // whatever rows
-    // this dropped off the top (each paired with its own wrapped flag,
-    // same shape as `scroll_up`'s own return) so `Screen::resize` can
-    // push them into scrollback exactly like an ordinary scroll would --
-    // this function doesn't know whether it's the primary or alternate
-    // grid (only `Screen` does), so it can't decide that itself.
+    // Shrinking keeps the bottom rows, which hold the cursor and prompt;
+    // growing keeps everything, top-anchored. Returns the rows dropped off
+    // the top, with their wrapped flags (as `scroll_up` returns them), for
+    // `Screen::resize` to push into scrollback; only `Screen` knows which
+    // grid this is. `prepend_rows` puts them back on regrowth, so a shrink
+    // and regrow cancel out.
     fn resize(&mut self, rows: usize, cols: usize) -> Vec<(Vec<Cell>, bool)> {
         let rows = rows.max(1);
         let cols = cols.max(1);
         let overlap_rows = self.rows.min(rows);
-        // Which end a shrink takes its rows from. Blank rows *below* the
-        // cursor carry nothing, so they go first and are simply
-        // discarded -- only once those run out does anything real get
-        // pushed off the top into scrollback. That's what makes a shrink
-        // and a later re-grow cancel out for a grid that isn't full yet
-        // (a pane holding a couple of prompts and acres of blank space,
-        // which `:diag` expanding and collapsing resizes twice in a row):
-        // top-anchored dropping would push those prompts into scrollback
-        // and clamp the cursor to 0, losing where it really was, and
-        // `prepend_rows` on the way back has no way to work that out
-        // again. A grid that *is* full (the cursor on its last row --
-        // "already scrolled full of output" above) has no spare rows
-        // here, so it drops from the top exactly as before.
+        // Blank rows below the cursor go first, discarded; only then are rows
+        // pushed off the top. So a grid that isn't full (a few prompts and
+        // blank space, resized twice by `:diag`) shrinks and regrows to the
+        // same state; dropping from the top would push the prompts into
+        // scrollback and clamp the cursor. A full grid drops from the top.
         let shrink = self.rows.saturating_sub(rows);
         let mut from_bottom = 0;
         while from_bottom < shrink {
@@ -258,16 +215,10 @@ impl Grid {
         dropped
     }
 
-    // `resize`'s own counterpart for the growing direction: puts
-    // `restored` rows back at the top, shifting what's already here down
-    // by that many rows and carrying the cursor with it. `restored` is
-    // in top-to-bottom order, oldest first.
-    //
-    // Rows come out of a scrollback that may have been captured at a
-    // different width, so each is padded or truncated to this grid's own
-    // columns rather than assumed to fit -- a shrink-then-regrow that
-    // also changed width puts back as much of each line as there's now
-    // room for, instead of indexing past the end of it.
+    // `resize`'s counterpart when growing: puts `restored` rows (oldest
+    // first) back at the top, shifting the rest and the cursor down. Each is
+    // padded or cut to this grid's width, as scrollback may be from another
+    // width.
     fn prepend_rows(&mut self, restored: &[(Vec<Cell>, bool)]) {
         let n = restored.len().min(self.rows);
         if n == 0 {
@@ -292,18 +243,11 @@ impl Grid {
         self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
     }
 
-    // Clamped, not a bounds-checked panic: a caller computing (row, col)
-    // from some other snapshot of this grid's own size (a pane rect
-    // cached before a sibling resize, say -- see repl.rs's TerminalFrame::
-    // capture for a real one that used to crash here) can legitimately
-    // race a real resize elsewhere and hand in a value that's gone stale
-    // by a row or column. Reading/writing the nearest real cell instead
-    // of panicking is what a terminal emulator embedded in an
-    // interactive shell needs here: a transient, self-healing one-frame
-    // rendering glitch from stale input is categorically better than
-    // taking the whole process down over what real callers already try
-    // hard to keep in sync (this is a last-resort safety net, not a
-    // license to skip that effort).
+    // Clamped rather than panicking: a caller computing (row, col) from a
+    // stale size (a pane rect cached before a sibling's resize; see
+    // `TerminalFrame::capture` in repl.rs) can be off by a row or column. A
+    // one-frame glitch beats taking the shell down; callers still keep
+    // in sync.
     fn clamped_index(&self, row: usize, col: usize) -> usize {
         let row = row.min(self.rows.saturating_sub(1));
         let col = col.min(self.cols.saturating_sub(1));
@@ -319,8 +263,7 @@ impl Grid {
         &mut self.cells[idx]
     }
 
-    // Clamped for the same reason clamped_index is -- a stale row from a
-    // caller racing a resize elsewhere shouldn't be able to crash this.
+    // Clamped like `clamped_index`.
     fn is_wrapped(&self, row: usize) -> bool {
         self.wrapped[row.min(self.rows.saturating_sub(1))]
     }
@@ -339,20 +282,17 @@ impl Grid {
         for c in from..=to_inclusive.min(self.cols - 1) {
             *self.cell_mut(row, c) = Cell::default();
         }
-        // Clearing from the start of the row means whatever content used
-        // to be there (including any wrap flag it carried) is gone --
-        // otherwise a row reused for unrelated content (after a scroll,
-        // an erase, ...) could wrongly look "joined" to the row after it.
+        // Clearing from the row's start also clears its wrap flag, or a
+        // reused row could look joined to the next.
         if from == 0 {
             self.wrapped[row] = false;
         }
     }
 
-    // Scrolls the region [scroll_top, scroll_bottom] up by `n` lines,
-    // dropping lines off the top; blank lines fill in at the bottom.
-    // Returns the dropped lines plus each one's own wrapped flag (for
-    // scrollback capture), only meaningful to the caller when the region
-    // spans the whole grid.
+    // Scrolls [scroll_top, scroll_bottom] up by `n`, dropping lines off the
+    // top and filling blanks at the bottom. Returns the dropped lines with
+    // their wrapped flags, for scrollback when the region is the whole
+    // grid.
     fn scroll_up(&mut self, n: usize) -> Vec<(Vec<Cell>, bool)> {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
@@ -465,32 +405,20 @@ pub struct Screen {
     pub alternate: Grid,
     pub using_alternate: bool,
     pub scrollback: VecDeque<Vec<Cell>>,
-    // Parallel to `scrollback`, index-for-index -- whether that scrollback
-    // row was a soft-wrap continuation into the row after it (see Grid's
-    // own `wrapped` field doc comment). Kept as its own deque rather than
-    // folded into `scrollback`'s element type so every existing `Vec<Cell>`
-    // read site (`.len()`, indexing, `.get(col)`, ...) is untouched.
+    // Parallel to `scrollback`: whether each row soft-wrapped into the next
+    // (see `Grid::wrapped`). Separate, so `scrollback` stays `Vec<Cell>`.
     pub scrollback_wrapped: VecDeque<bool>,
     scrollback_limit: usize,
     pub cursor_visible: bool,
     pub autowrap: bool,
     pub mouse_reporting: bool,
     pub bracketed_paste: bool,
-    // DECCKM (CSI ?1h/?1l): whether the program currently expects arrow
-    // keys encoded as SS3 (ESC O A/B/C/D, "application" mode) rather
-    // than the default CSI form (ESC [ A/B/C/D). A curses program (vim,
-    // less, ...) toggles this on startup/exit via smkx/rmkx -- almost
-    // every terminfo entry (xterm, screen, ...) maps its own cursor-key
-    // *input* the same way, so a real terminal switches its own key
-    // encoding to match. bish's own compositor can't just relay a job's
-    // raw output straight to the real terminal (see render_compositor_
-    // frame's doc comment -- it re-renders from grid cell state, which
-    // is what makes multiple simultaneously-visible panes possible at
-    // all), so this DECSET request would otherwise never reach the real
-    // terminal, leaving it stuck sending the *other* encoding than
-    // whatever the job now expects. repl.rs's drive_fg_job reads this
-    // to re-encode a plain CSI arrow key it receives into SS3 before
-    // forwarding, exactly what a real terminal would have done itself.
+    // DECCKM (`CSI ?1h`/`?1l`): whether the program wants arrows as SS3
+    // (`ESC O A`, application mode) rather than CSI (`ESC [ A`). Curses
+    // programs toggle it on start and exit, and a terminal switches its key
+    // encoding to match. bish re-renders panes from the grid, so the
+    // request never reaches the real terminal; `drive_fg_job` reads this and
+    // re-encodes arrows itself.
     pub app_cursor_keys: bool,
 
     cur_fg: Color,
@@ -503,10 +431,9 @@ pub struct Screen {
 
     state: ParserState,
     csi_raw: String,
-    // The OSC string as it arrives, and what the last title-setting one
-    // said. Kept beside the grids rather than in one of them: a title
-    // belongs to the terminal, and switching to the alternate screen
-    // does not change what the window is called.
+    // The OSC string as it arrives, and the last title set. Beside the
+    // grids, not in one: switching to the alternate screen doesn't rename
+    // the window.
     osc_raw: String,
     title: String,
     osc_prev_was_esc: bool,
@@ -548,19 +475,12 @@ impl Screen {
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        // The primary grid's own rows, only -- pushed into scrollback
-        // unconditionally (not gated on `using_alternate` the way
-        // line_feed_no_scroll_check's own scroll-driven push is): this
-        // is capturing *primary*'s own history regardless of which grid
-        // happens to be on screen right now (a resize while an
-        // alternate-screen app like vim is open still shrinks the real
-        // shell underneath it). The alternate grid's own dropped rows
-        // are simply discarded, matching line_feed_no_scroll_check's
-        // "alternate screen buffers don't get a scrollback" rule.
-        // How many rows the primary grid is about to gain, read before
-        // the resize that grants them. Growing and shrinking are mutually
-        // exclusive, so at most one of this and `dropped` below is ever
-        // non-zero.
+        // How many rows the primary grid will gain, read before the resize.
+        // At most one of this and `dropped` is non-zero.
+        //
+        // Only the primary grid's dropped rows go to scrollback, even with
+        // the alternate screen showing (resizing under vim still shrinks
+        // the shell beneath); the alternate grid has no scrollback.
         let grew_by = rows.max(1).saturating_sub(self.primary.rows);
         let dropped = self.primary.resize(rows, cols);
         for (line, wrapped) in dropped {
@@ -571,15 +491,11 @@ impl Screen {
                 self.scrollback_wrapped.pop_front();
             }
         }
-        // The other direction: rows the grid just gained are filled from
-        // the bottom of the scrollback, so a pane that shrinks and grows
-        // back -- `:diag` expanding and collapsing, a split closing, a
-        // window made taller again -- shows exactly what it showed
-        // before, instead of the shrink's rows staying gone with blank
-        // space appearing at the bottom. Real terminals restore on growth
-        // the same way. The whole document (scrollback followed by the
-        // grid) is unchanged by the move either way, which is what keeps
-        // Ctrl+G's own scrollback view consistent across it.
+        // Rows the grid gained are refilled from the bottom of the
+        // scrollback, so a pane that shrinks and grows back (`:diag`
+        // toggling, a split closing) shows what it did before, as real
+        // terminals do. Scrollback plus grid is unchanged by the move,
+        // keeping Ctrl+G's view consistent.
         let restored_count = grew_by.min(self.scrollback.len());
         if restored_count > 0 {
             let mut restored: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(restored_count);
@@ -598,14 +514,10 @@ impl Screen {
         (self.grid().rows, self.grid().cols)
     }
 
-    /// One row of the grid as text, with the second column of every
-    /// double-width character left out.
-    ///
-    /// That column is not a space in the row -- it is the rest of the
-    /// character before it, and putting a space there would make a line
-    /// of CJK text come back with a space between every pair of
-    /// characters. Every reader of the grid that wants *text* wants
-    /// this; a reader that wants columns still walks `cell`.
+    /// One row as text, leaving out every wide character's second column:
+    /// it's the rest of the character, not a space, and a space there would
+    /// put one between every pair of CJK characters. For columns, use
+    /// `cell`.
     pub fn row_text(&self, row: usize) -> String {
         (0..self.grid().cols).filter(|&col| !self.cell(row, col).continuation).map(|col| self.cell(row, col).ch).collect()
     }
@@ -622,28 +534,17 @@ impl Screen {
         self.grid().cell(row, col)
     }
 
-    // Whether the currently-showing grid's `row` is a soft-wrap
-    // continuation into `row + 1` (see Grid's own `wrapped` field doc
-    // comment).
-    /// Every row as text, with a row that only exists because the one
-    /// above it ran out of width rejoined onto it.
-    ///
-    /// A grid is a rectangle and a shell's output is not: a line longer
-    /// than the screen occupies several rows here and one line
-    /// everywhere else. Rejoining by `row_wraps` is what lets what a
-    /// pane shows be compared with what the same script printed down a
-    /// pipe -- see bashdiff's pane corpus, which is the only caller.
-    ///
-    /// Trailing blanks go, on each line and at the end, for the same
-    /// reason: they are the shape of the grid, not of the output.
+    /// Every row as text, rejoining rows that exist only because the one
+    /// above ran out of width. A long line is several rows here and one line
+    /// in a pipe; rejoining lets bashdiff's pane corpus, the only caller,
+    /// compare the two. Trailing blanks go too: they're the grid's shape.
     pub fn text_unwrapped(&self) -> String {
         let (rows, _cols) = self.size();
         let mut lines: Vec<String> = Vec::new();
         for row in 0..rows {
             let text: String = self.row_text(row);
             match lines.last_mut() {
-                // The *previous* row said it ran out of width, so this
-                // row is the rest of that same line.
+                // The previous row wrapped, so this is the rest of its line.
                 Some(previous) if row > 0 && self.row_wraps(row - 1) => previous.push_str(&text),
                 _ => lines.push(text),
             }
@@ -665,6 +566,8 @@ impl Screen {
         }
     }
 
+    // Whether the showing grid's `row` soft-wraps into `row + 1` (see
+    // `Grid::wrapped`).
     pub fn row_wraps(&self, row: usize) -> bool {
         self.grid().is_wrapped(row)
     }
@@ -742,8 +645,8 @@ impl Screen {
                     self.utf8_buf.clear();
                 }
             } else {
-                // Invalid continuation -- abandon and reprocess this byte
-                // as a fresh lead byte instead of corrupting the grid.
+                // An invalid continuation: drop the partial character and
+                // take this byte as a new lead byte.
                 self.utf8_buf.clear();
                 self.utf8_need = 0;
                 self.feed_utf8_byte(b);
@@ -776,17 +679,13 @@ impl Screen {
             self.carriage_return();
             self.grid_mut().pending_wrap = false;
         }
-        // Two columns for a CJK ideograph, a Hangul syllable, a
-        // fullwidth form or most emoji -- the same table the editor
-        // measures its own lines with, so a pane and a buffer showing
-        // the same text agree about how wide it is.
+        // Two columns for a CJK ideograph, Hangul syllable, fullwidth form
+        // or most emoji, by the editor's own width table, so pane and
+        // buffer agree.
         let width = crate::bishedit::unicode_width::char_width(ch).max(1);
-        // A character that is two columns wide is not split across a
-        // line break: with one column left, the whole of it goes to the
-        // next line, which is what every terminal does with one.
-        // Without autowrap there is no next line to put it on, so the
-        // column is left as it was rather than filled with half a
-        // character.
+        // A two-column character isn't split across lines: with one column
+        // left it goes to the next line, as terminals do. Without autowrap
+        // the column is left as it was rather than given half a character.
         let (row, col) = (self.grid().cursor_row, self.grid().cursor_col);
         if width == 2 && col + 2 > cols {
             if !self.autowrap {
@@ -800,10 +699,8 @@ impl Screen {
         let fg = self.cur_fg;
         let bg = self.cur_bg;
         let attrs = self.cur_attrs;
-        // Whatever was here, its other half is now orphaned: a cell
-        // written over by something narrower leaves a wide character
-        // with one column, which draws over its neighbour. Blanking the
-        // other half is how the grid stays a grid.
+        // Overwriting half of a wide character orphans the other half, which
+        // would draw over its neighbour; blank it.
         self.split_wide_at(row, col);
         if width == 2 {
             self.split_wide_at(row, col + 1);
@@ -822,10 +719,8 @@ impl Screen {
         }
     }
 
-    /// Blanks whichever half of a double-width character (row, col) is,
-    /// so what is left of it is never a lone half. Does nothing to an
-    /// ordinary cell, which is every cell in text that has no wide
-    /// characters in it.
+    /// Blanks whichever half of a wide character (row, col) is, so no lone
+    /// half remains. Does nothing to an ordinary cell.
     fn split_wide_at(&mut self, row: usize, col: usize) {
         let cols = self.grid().cols;
         if col >= cols {
@@ -862,8 +757,8 @@ impl Screen {
         g.pending_wrap = false;
     }
 
-    // Line feed that respects the scroll region but does not reset column
-    // (matches real LF semantics; carriage_return is separate).
+    // Line feed within the scroll region, keeping the column, as LF does
+    // (carriage return is separate).
     fn line_feed(&mut self) {
         self.line_feed_no_scroll_check();
     }
@@ -975,28 +870,18 @@ impl Screen {
                 self.state = ParserState::Ground;
             }
             0x20..=0x2F => {
-                // Intermediate bytes (rare in the sequences we support) --
-                // keep them so a final byte still terminates the sequence,
-                // but they don't affect dispatch here.
+                // Intermediate bytes, rare here: kept so a final byte still
+                // ends the sequence, but not used in dispatch.
             }
             _ => {}
         }
     }
 
-    // ECMA-48 reserves '<', '=', '>' and '?' (0x3C-0x3F) as CSI parameter
-    // bytes for private/experimental use -- xterm's own ctlseqs.txt uses
-    // all four this way (DEC private modes lead with '?'; SGR mouse
-    // reports, among others, lead with '<'). Treating only '?' as
-    // "private" used to mean a sequence like an SGR mouse report
-    // ("ESC[<0;5;3M", which this terminal itself only ever *emits*, never
-    // parses as input -- but a job's own stdout can still contain one,
-    // e.g. echoing back raw bytes it read from its stdin) fell through
-    // to dispatch_csi's public-sequence match instead, where 'M' happens
-    // to mean "delete N lines" (DL) -- corrupting the grid instead of
-    // being safely ignored the way an unrecognized private sequence
-    // already is (dispatch_private_mode's own final-byte match no-ops
-    // anything that isn't 'h'/'l'). Recognizing all four leaders as
-    // private closes that off in general, not just for this one case.
+    // ECMA-48 reserves `<`, `=`, `>` and `?` as private parameter leaders
+    // (DEC modes use `?`, SGR mouse reports `<`). Treating all four as
+    // private keeps, say, a mouse report a job echoes back
+    // (`ESC[<0;5;3M`) from reaching the public dispatch, where `M` would
+    // delete lines; unknown private sequences are ignored.
     fn parse_params(&self) -> (bool, Vec<i64>) {
         let private = self.csi_raw.starts_with(['<', '=', '>', '?']);
         let rest = if private { &self.csi_raw[1..] } else { &self.csi_raw[..] };
@@ -1250,18 +1135,16 @@ impl Screen {
         }
     }
 
-    // How much of an OSC string is kept. A title is a handful of
-    // characters; this is room for a long path and then some, and a
-    // bound so that a program emitting an unterminated OSC -- or a
-    // binary file catted into a pane -- cannot grow this without end.
-    // Past it the bytes are still read, so the terminator is still found
-    // and the grid is still safe; they are simply not kept.
+    // How much of an OSC string is kept: room for a long title, bounded so
+    // an unterminated OSC (or a binary catted into a pane) can't grow it
+    // forever. Bytes past it are read, so the terminator is still found,
+    // but not kept.
     const OSC_LIMIT: usize = 1024;
 
     fn feed_osc(&mut self, b: u8) {
         let terminated = b == 0x07 || (self.osc_prev_was_esc && b == b'\\');
         if terminated {
-            // The ESC of an ST is already in the string; the `\` is not.
+            // The ESC of an ST is already in the string; the `\` isn't.
             if self.osc_prev_was_esc {
                 self.osc_raw.pop();
             }
@@ -1277,28 +1160,21 @@ impl Screen {
         }
     }
 
-    /// What a finished OSC string asks for.
-    ///
-    /// Only the title is acted on. `0` sets the icon name and the title
-    /// together and `2` sets the title, which is one thing as far as
-    /// anything here is concerned; `1` sets the icon name alone and is
-    /// deliberately ignored, since nothing in bish shows an icon and a
-    /// program that sets one has not said what the window is called.
-    /// Everything else -- a clipboard write, a colour query, a
-    /// hyperlink -- is skipped exactly as the whole of OSC used to be.
+    /// What a finished OSC string asks for. Only the title is acted on:
+    /// `0` (icon name and title) and `2` (title). `1`, the icon name alone,
+    /// is ignored: nothing shows an icon, and it doesn't name the window.
+    /// Everything else (clipboard, colour queries, hyperlinks) is skipped.
     fn apply_osc(&mut self) {
         let Some((command, text)) = self.osc_raw.split_once(';') else { return };
         if matches!(command, "0" | "2") {
-            // A control character in a title is not a title: it would be
-            // drawn into the tab bar, or into the real terminal's own
-            // title, as an instruction. Same guard, and the same reason,
-            // as the prompt's own `safe_text`.
+            // A control character in a title would be an instruction in the
+            // tab bar or the real terminal's title; `safe_text`, as for the
+            // prompt.
             self.title = crate::term::safe_text(text);
         }
     }
 
-    /// What the program in this screen last called itself, or empty if it
-    /// has not said.
+    /// What the program in this screen last called itself, or empty.
     pub fn title(&self) -> &str {
         &self.title
     }
@@ -1338,14 +1214,13 @@ mod tests {
     #[test]
     fn row_wraps_marks_autowrap_but_not_an_explicit_newline() {
         let mut s = Screen::new(3, 5);
-        // Fills row 0 exactly, then a further printable byte forces autowrap.
+        // Fills row 0, then one more printable byte forces autowrap.
         s.feed(b"helloX");
         assert!(s.row_wraps(0));
         assert!(!s.row_wraps(1));
 
-        // A row filled exactly and then terminated with a real newline
-        // never actually wrapped -- CR clears pending_wrap before it can
-        // fire.
+        // A row filled exactly then ended with a real newline never
+        // wrapped: CR clears the pending wrap first.
         let mut s2 = Screen::new(3, 5);
         s2.feed(b"world\r\nY");
         assert!(!s2.row_wraps(0));
@@ -1355,8 +1230,8 @@ mod tests {
     #[test]
     fn row_wraps_survives_scrolling_into_scrollback() {
         let mut s = Screen::new(2, 5);
-        // Row 0: "aaaaa" autowraps into row 1 ("bb"), then an explicit
-        // newline pushes row 0 off into scrollback.
+        // Row 0's "aaaaa" wraps into row 1 ("bb"), then a newline pushes
+        // row 0 into scrollback.
         s.feed(b"aaaaabb\r\nccc");
         assert_eq!(s.scrollback.len(), 1);
         assert!(s.scrollback_wrapped[0]);
@@ -1418,10 +1293,8 @@ mod tests {
 
     #[test]
     fn shrinking_rows_keeps_the_bottom_of_the_grid_not_the_top() {
-        // Fills every row (no scrolling yet -- exactly "a terminal
-        // that's already full of content"), then shrinks height by one.
-        // A naive top-anchored resize would keep "one"/"two" and drop
-        // "three" -- the row the live cursor is actually sitting on.
+        // Fills every row, then shrinks by one. Top-anchored, it would keep
+        // "one" and "two" and drop "three", the cursor's row.
         let mut s = Screen::new(3, 6);
         s.feed(b"one\r\ntwo\r\nthree");
         s.resize(2, 6);
@@ -1445,9 +1318,8 @@ mod tests {
         s.feed(b"one\r\ntwo\r\nthree");
         assert_eq!(s.cursor(), (2, 5));
         s.resize(2, 6);
-        // The cursor's own row (2, "three") shifted down to row 1 along
-        // with its content -- not clamped to whatever row 1 used to
-        // hold ("two", the old middle row).
+        // The cursor's row ("three") moved to row 1 with its content, not
+        // clamped onto "two".
         assert_eq!(s.cursor(), (1, 5));
     }
 
@@ -1477,10 +1349,8 @@ mod tests {
 
     #[test]
     fn shrinking_spends_spare_blank_rows_below_the_cursor_before_touching_history() {
-        // A pane holding a couple of prompts and acres of blank space --
-        // what a shell pane looks like most of the time, and what `:diag`
-        // resizes twice in a row. Nothing here is history yet, so a
-        // shrink has no business pushing any of it away.
+        // A few prompts and blank space, as `:diag` resizes twice; nothing is
+        // history yet, so a shrink pushes none of it away.
         let mut s = Screen::new(6, 6);
         s.feed(b"one\r\ntwo\r\n");
         assert_eq!(s.cursor(), (2, 0));
@@ -1493,10 +1363,8 @@ mod tests {
 
     #[test]
     fn a_shrink_and_a_regrow_leave_a_partly_filled_grid_exactly_as_it_was() {
-        // The `:diag` round trip, reduced: expanding the pane shrinks
-        // this grid, collapsing it grows it back, and the prompt has to
-        // still be on the row it was on -- otherwise the next one draws
-        // somewhere else and the old one stays behind as a ghost.
+        // The `:diag` round trip: shrink, grow back, and the prompt is on its
+        // old row, or the next draws elsewhere and leaves a ghost.
         let mut s = Screen::new(8, 6);
         s.feed(b"$ e f\r\n");
         let before: Vec<String> = (0..8).map(|r| text_row(&s, r)).collect();
@@ -1509,8 +1377,8 @@ mod tests {
 
     #[test]
     fn a_full_grid_still_round_trips_through_scrollback() {
-        // No spare rows below the cursor at all, so the shrink genuinely
-        // has to spend history -- and the regrow has to hand it back.
+        // No spare rows below the cursor, so the shrink spends history and
+        // the regrow returns it.
         let mut s = Screen::new(3, 6);
         s.feed(b"one\r\ntwo\r\nthree");
         let before: Vec<String> = (0..3).map(|r| text_row(&s, r)).collect();
@@ -1528,11 +1396,9 @@ mod tests {
         s.feed(b"aaa\r\nbbb\r\nccc");
         assert!(s.using_alternate);
         s.resize(2, 6);
-        // Shrinking still drops (empty) primary rows into scrollback --
-        // that's expected and harmless (primary.rows unconditionally
-        // shrinks, see Screen::resize's own doc comment) -- what matters
-        // is that none of the *alternate* screen's own "aaa"/"bbb"/"ccc"
-        // content ever ends up there.
+        // Shrinking still drops empty primary rows into scrollback (see
+        // `Screen::resize`); none of the alternate screen's content may get
+        // there.
         for line in &s.scrollback {
             let text: String = line.iter().map(|c| c.ch).collect();
             assert!(text.trim().is_empty(), "alternate screen content leaked into scrollback: {text:?}");
@@ -1541,13 +1407,9 @@ mod tests {
 
     #[test]
     fn an_echoed_sgr_mouse_report_does_not_delete_a_line() {
-        // A job's own stdout can legitimately contain an SGR mouse report
-        // (e.g. echoing back raw bytes it read from its stdin) even
-        // though this terminal only ever *emits* one, never receives one
-        // as real input -- 'M' is also the public (non-private) final
-        // byte for DL (delete N lines), so this would previously wipe
-        // the second row instead of being safely ignored the way any
-        // other unrecognized private-marked sequence already is.
+        // An SGR mouse report in a job's output (echoed input, say) must be
+        // ignored like any unknown private sequence, not read as `M`, delete
+        // lines.
         let mut s = Screen::new(3, 20);
         s.feed(b"row0\r\nrow1\r\nrow2");
         s.feed(b"\x1b[<0;5;3M");
@@ -1570,11 +1432,8 @@ mod tests {
     }
 
     // -- double-width characters ---------------------------------------
-    //
-    // The grid used to give every character one column, so a line of
-    // CJK text was half as wide here as on the terminal drawing it --
-    // and a pane border, which is at the column it is at, ended up
-    // somewhere else entirely.
+    // A wide character takes two columns, as on the terminal, so a pane
+    // border stays at its column.
     #[test]
     fn a_wide_character_takes_two_columns() {
         let mut s = Screen::new(1, 10);
@@ -1586,9 +1445,8 @@ mod tests {
         assert_eq!(s.cursor(), (0, 4), "two characters, four columns");
     }
 
-    // The text is what was printed, not one space per column: a grid
-    // read back character by character would put a space between every
-    // pair of CJK characters.
+    // The text is what was printed, not a space per column, which would
+    // separate every pair of CJK characters.
     #[test]
     fn a_wide_character_reads_back_as_itself() {
         let mut s = Screen::new(1, 10);
@@ -1608,8 +1466,7 @@ mod tests {
     fn writing_over_half_a_wide_character_takes_the_other_half_with_it() {
         let mut s = Screen::new(1, 10);
         s.feed("漢字".as_bytes());
-        // Back to the second column -- the right half of `漢` -- and
-        // write an ordinary character there.
+        // Back to `漢`'s right half, and write an ordinary character there.
         s.feed(b"\x1b[1;2H");
         s.feed(b"x");
         assert_eq!(text_row(&s, 0), " x字", "what is left of the wide character is a space, not half a glyph");
@@ -1625,10 +1482,9 @@ mod tests {
         assert_eq!(text_row(&s, 0), "x 字");
     }
 
-    // Combining marks are a separate gap and stay one: the grid holds
-    // one `char` per cell, so a mark has nowhere to live but a cell of
-    // its own. Asserted so the day a cell can hold a cluster, this test
-    // is what says so.
+    // Combining marks remain a gap: a cell holds one `char`, so a mark gets
+    // a cell of its own. This test notices when a cell can hold a
+    // cluster.
     #[test]
     fn a_zero_width_mark_still_takes_a_cell_of_its_own() {
         let mut s = Screen::new(1, 10);
@@ -1650,43 +1506,39 @@ mod tests {
         assert_eq!(text_row(&s, 0), "hi");
     }
 
-    // What a program in a pane calls itself -- which is what the tab bar
-    // and the fuzzy opener have to show for it, and what bish passes on
-    // to the real terminal for the pane it is showing.
+    // What a program in a pane calls itself: shown in the tab bar and the
+    // opener, and passed to the real terminal.
     #[test]
     fn a_program_can_say_what_it_is_called() {
         let mut s = Screen::new(1, 10);
         assert_eq!(s.title(), "", "nothing said yet");
 
-        // `0` is icon-and-title, `2` is title: one thing, here.
+        // `0` is icon and title, `2` title: the same here.
         s.feed(b"\x1b]0;vim README.md\x07");
         assert_eq!(s.title(), "vim README.md");
         s.feed(b"\x1b]2;~/bish\x07");
         assert_eq!(s.title(), "~/bish");
 
-        // A string terminator rather than a bell ends it just as well,
-        // and the ESC of the ST is not part of the title.
+        // A string terminator ends it as a bell does, its ESC not in the
+        // title.
         s.feed(b"\x1b]2;cargo test\x1b\\");
         assert_eq!(s.title(), "cargo test");
 
-        // `1` is the icon name alone: nothing here shows an icon, and a
-        // program that sets one has not said what it is called.
+        // `1` is the icon name alone, which names nothing here.
         s.feed(b"\x1b]1;icon only\x07");
         assert_eq!(s.title(), "cargo test");
 
-        // Nor does anything else OSC carries -- a clipboard write is not
-        // a title.
+        // Nor any other OSC: a clipboard write isn't a title.
         s.feed(b"\x1b]52;c;aGk=\x07");
         assert_eq!(s.title(), "cargo test");
 
-        // A title cannot name itself a terminal command: this would
-        // otherwise be drawn into the tab bar, and passed on to the real
-        // terminal, as an instruction.
+        // A title can't carry a terminal command into the tab bar or the real
+        // terminal.
         s.feed(b"\x1b]2;evil\x1b[2Jtitle\x07");
         assert_eq!(s.title(), "evil\u{FFFD}[2Jtitle");
 
-        // One a program never terminates leaves the grid alone and the
-        // last real title standing, however long it is.
+        // One never terminated leaves the grid alone and the last title
+        // standing.
         let mut runaway = Screen::new(1, 10);
         runaway.feed(b"\x1b]2;fine\x07");
         runaway.feed(b"\x1b]2;");
@@ -1724,17 +1576,13 @@ mod tests {
         assert_eq!(s.cell(0, 1).ch, 'é');
     }
 
-    // Regression: cell/cell_mut used to index self.cells[row * cols +
-    // col] with no bounds check at all, which real callers could (and,
-    // in production, did -- see repl.rs's TerminalFrame::capture) hit
-    // with a stale row/col from a size snapshot that raced a real
-    // resize. Reading/writing out of bounds must clamp to the nearest
-    // real cell instead of panicking.
+    // `cell`/`cell_mut` with an out-of-range row or column (a stale size, as
+    // in repl.rs's `TerminalFrame::capture`) clamp to the nearest cell
+    // rather than panic.
     #[test]
     fn cell_out_of_bounds_clamps_instead_of_panicking() {
         let s = Screen::new(2, 3);
-        // Same cell as the last real one (1, 2) -- proves this is a
-        // real clamp, not a fluke default value.
+        // The last real cell (1, 2): a real clamp, not a default.
         assert_eq!(s.cell(50, 50), s.cell(1, 2));
         assert_eq!(s.cell(0, 50).ch, s.cell(0, 2).ch);
         assert_eq!(s.cell(50, 0).ch, s.cell(1, 0).ch);
