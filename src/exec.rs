@@ -12754,44 +12754,23 @@ fn restore_fd012(saved: [i32; 3]) {
     }
 }
 
-// Signal traps (`trap CMD SIGNAL`). A signal handler can only safely do
-// async-signal-safe work -- no allocation, no locks, nothing that could
-// reenter a libc function the interrupted code was mid-call in -- so the
-// handler itself does nothing but flag the signal number in this bitmask;
-// the shell's own run_program loop checks it between top-level statements
-// (see check_pending_signals) and runs the actual trap code there, in a
-// normal, fully-safe context. One consequence: a trap won't fire truly
-// asynchronously mid-syscall (e.g. while a script is blocked in `sleep` or
-// `wait`) -- only at the next between-statements checkpoint. That's a
-// real, deliberate scope boundary (not a bug): true async delivery mid-
-// blocking-call needs EINTR-aware retry logic threaded through every
-// blocking call site in this file, which is a much bigger change for a
-// scripting-focused shell where "runs between statements" already covers
-// the overwhelmingly common trap use (cleanup-on-signal, not low-latency
-// signal response).
-//
-// Sixty-four bits, one per signal, with signal `n` at bit `n - 1`. It
-// was thirty-two, which fits every signal Linux had a name for in 1990
-// and none of the real-time range above 32 -- so a `trap` on one was
-// accepted, the handler was installed, and the signal arrived and was
-// silently dropped on the floor here.
+// Signals caught for `trap`, signal `n` at bit `n - 1`. The handler
+// may only do async-signal-safe work, so it sets a bit, and
+// `check_pending_signals` runs the trap between statements. So a trap
+// doesn't fire while a script is blocked in `sleep` or `wait`; that would
+// take EINTR handling at every blocking call.
 static PENDING_SIGNALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "C" fn record_pending_signal(sig: i32) {
-    // One bit per signal in a u64, so a number past 64 has nowhere to go
-    // -- which no OS bish runs on has, Linux's real-time range topping
-    // out exactly there.
+    // No OS bish runs on has a signal past 64.
     if (1..=64).contains(&sig) {
         PENDING_SIGNALS.fetch_or(1u64 << (sig - 1), std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// What `trap` does to one signal.
-///
-/// Named rather than the three raw handler values, because what the OS
-/// takes for "default" and "ignore" is the layer's business -- and
-/// because `Trapped` is the only one of the three that is a real
-/// function, which is what makes it the only one an `exec` resets.
+/// What `trap` does to one signal. Named because the OS's default and
+/// ignore values are the platform layer's business, and only `Trapped`
+/// is a handler, which `exec` resets.
 enum Disposition {
     Default,
     Ignored,
@@ -12806,51 +12785,26 @@ fn set_disposition(signum: i32, what: Disposition) {
     }
 }
 
-/// The signals that were already ignored when this process started.
-///
-/// POSIX: a signal ignored on entry to the shell cannot be trapped or
-/// reset. The rule exists so that immunity granted from outside survives
-/// -- a script backgrounded from another script has INT and QUIT ignored
-/// precisely so a Ctrl-C aimed at the terminal's process group does not
-/// take it down with everything else, and `nohup`'s promise about HUP
-/// works the same way. A shell that let `trap` override that would hand
-/// back the very thing the caller went out of its way to take away.
-///
-/// This module already reasons about `SIG_IGN` in the other direction --
-/// see `ignore_sigint`'s doc comment in term.rs, and the `pre_exec` reset
-/// below, both of which exist because an ignored disposition survives
-/// `exec` where a handled one does not. This is that same fact seen from
-/// the receiving end.
+/// The signals ignored when this process started. POSIX doesn't let the
+/// shell trap or reset those, so immunity granted from outside survives:
+/// a script backgrounded by another has INT and QUIT ignored so Ctrl-C
+/// at the terminal spares it, and `nohup` relies on the same for HUP.
 static IGNORED_AT_ENTRY: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
 
-/// Reads them, once, before anything has had a chance to change one.
-///
-/// Called from `main` rather than from `Shell::new`: the dispositions
-/// this is about are the *process's*, so they have to be read before the
-/// first shell exists, and a `Shell` built later (a subshell, a test)
-/// must see the same answer rather than whatever is current by then.
+/// Read once, from `main`: these are the process's dispositions, and a
+/// `Shell` built later (a subshell, a test) must see the same answer.
 pub fn record_signals_ignored_at_entry() {
-    // SIGPIPE is never on this list, however it reads right now. Rust's
-    // runtime sets it to SIG_IGN before `main` is entered (the same fact
-    // `PIPE_WRITE_FAILED` below is built on), discarding the disposition
-    // bish was started with -- so by the time anything here can look,
-    // "ignored" says only that bish is a Rust program. Reporting that as
-    // an inherited ignore cost `trap '' PIPE` and `trap 'cmd' PIPE`
-    // outright: both were silently refused, and `trap` listed a
-    // `SIGPIPE` nobody had asked for, where bash lists nothing.
-    //
-    // The price is that a genuine `trap '' PIPE; exec bish` is invisible
-    // here where bash sees it. There is no way to tell the two apart
-    // after the fact: the only process that could have is this one,
-    // before its own runtime started.
+    // Never SIGPIPE: Rust's runtime ignores it before `main`, so "ignored"
+    // here would only say bish is a Rust program, and `trap '' PIPE` would
+    // be refused. The cost is that a real `trap '' PIPE; exec bish` goes
+    // unseen, which nothing after the runtime starts could detect.
     let pipe = signal_number("PIPE");
     let _ = IGNORED_AT_ENTRY
         .set(SIGNAL_NAMES.iter().map(|(_, num)| *num).filter(|num| Some(*num) != pipe && crate::platform::is_signal_ignored(*num)).collect());
 }
 
-/// Whether `trap` has to leave this one alone. False for every signal
-/// when nothing recorded them, which is every unit test -- those build a
-/// `Shell` directly and never go through `main`.
+/// Whether `trap` must leave this one alone. False for all when nothing
+/// recorded them, as in unit tests, which don't go through `main`.
 fn ignored_at_entry(signum: i32) -> bool {
     IGNORED_AT_ENTRY.get().is_some_and(|ignored| ignored.contains(&signum))
 }
@@ -12859,19 +12813,10 @@ fn ignored_at_entry_list() -> &'static [i32] {
     IGNORED_AT_ENTRY.get().map(|v| v.as_slice()).unwrap_or_default()
 }
 
-/// The signal half of what `trap`/`trap -p` prints, by signal number.
-///
-/// The signals ignored at entry belong in it: `trap` reports what this
-/// shell would do with each signal, and for those the answer is "nothing,
-/// and that cannot be changed" -- which is exactly what `trap -- '' SIG`
-/// says. bash lists them, and a script reading its own `trap -p` back is
-/// entitled to the same answer from both shells.
-///
-/// They cannot collide with a real trap: `trap` refuses to record one for
-/// a signal on this list (see `ignored_at_entry`), so the union is never
-/// ambiguous. Sorted by number afterwards rather than appended, because
-/// an inherited ignore is not later news than a trap set here -- bash
-/// interleaves them, so `trap 'x' INT` with HUP ignored prints HUP first.
+/// The signals in `trap -p`'s listing: the traps, and those ignored at
+/// entry, shown as `trap -- '' SIG` as bash does. They can't collide,
+/// since `trap` refuses the ignored ones. Sorted by number, as bash
+/// interleaves them.
 fn trap_signal_listing(traps: &std::collections::HashMap<i32, TrapAction>, ignored: &[i32]) -> Vec<(i32, TrapAction)> {
     let mut entries: Vec<(i32, TrapAction)> = traps.iter().map(|(k, v)| (*k, v.clone())).collect();
     entries.extend(ignored.iter().filter(|n| !traps.contains_key(n)).map(|n| (*n, TrapAction::Ignore)));
@@ -12879,15 +12824,9 @@ fn trap_signal_listing(traps: &std::collections::HashMap<i32, TrapAction>, ignor
     entries
 }
 
-// SIGWINCH (terminal resize) tracking for the M9 compositor. Deliberately
-// a separate flag from PENDING_SIGNALS/traps above, not a `trap`-able
-// signal at all from the user's perspective: PENDING_SIGNALS is consumed
-// wholesale (swapped to 0) by whichever session's run_program happens to
-// call check_pending_signals next, which would silently eat a WINCH
-// notification before repl.rs -- the only thing that actually owns
-// terminal-size-dependent state (every session's Screen, the tab bar) --
-// ever saw it. Same async-signal-safety reasoning as record_pending_signal:
-// the handler only stores a bool.
+// SIGWINCH, tracked apart from `PENDING_SIGNALS`, which whichever
+// session checks next clears: a resize must reach repl.rs, which owns
+// everything sized to the terminal. The handler only stores a bool.
 pub const SIGWINCH: i32 = crate::platform::SIGWINCH;
 static WINCH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -12895,77 +12834,49 @@ extern "C" fn record_winch(_sig: i32) {
     WINCH_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-// Called once, at interactive startup, so the compositor loop in repl.rs
-// can later poll take_winch() to notice terminal resizes.
+// At interactive startup, so repl.rs can poll `take_winch`.
 pub fn install_winch_handler() {
     crate::platform::handle_signal(SIGWINCH, record_winch);
 }
 
-// True at most once per resize -- clears the flag on read. repl.rs polls
-// this once per REPL loop iteration (see the loop's own doc comment for
-// why that's "per input iteration", not truly asynchronous, in M9a).
+// True at most once per resize. repl.rs polls it once per input
+// iteration.
 pub fn take_winch() -> bool {
     WINCH_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
-// Name <-> number for the signals scripts actually trap. KILL (9) and
-// STOP (19) are intentionally absent -- neither can be caught or ignored,
-// matching real bash's own refusal to let `trap` touch them.
-/// How a re-exec'd continuation of a shell learns the `$$` it must
-/// report. Not a variable any script sets or sees: it is removed from
-/// the child's own environment the moment it is read, so
-/// `env | grep BISH` in a background subshell shows nothing and an
-/// exported copy cannot leak on to a grandchild that is a *new* shell.
+/// How a re-exec'd shell learns the `$$` to report. Removed from the
+/// environment as soon as it's read, so scripts never see it and a
+/// grandchild that is a new shell doesn't inherit it.
 const REEXEC_SHELL_PID: &str = "BISH_REEXEC_SHELL_PID";
 
-/// Where a re-exec'd child's script is handed over, instead of in argv.
-///
-/// It used to be `bish -c <script>`, and the script is the shell's whole
-/// state: `functions_preamble` writes out every function and every
-/// *variable*, exported or not, because that is what the child has to
-/// start from. `/proc/<pid>/cmdline` is mode 0444, so for as long as any
-/// backgrounded subshell, coproc or re-exec'd pipeline stage was alive,
-/// every local user could read every variable of the shell that started
-/// it -- measured: a `SECRET=hunter2` that was never exported came back
-/// out of `/proc` verbatim. bash keeps that state in forked memory,
-/// where no other uid has a name for it.
-///
-/// `/proc/<pid>/environ` is mode 0400 -- the owner and root, nobody
-/// else -- which is the whole reason this moved. `main` takes the script
-/// out of the environment and *removes the variable* before building a
-/// shell, so it reaches neither the script nor anything the child goes
-/// on to start.
+/// Where a re-exec'd child's script goes, rather than argv. The script
+/// carries every function and variable, exported or not, and
+/// `/proc/<pid>/cmdline` is readable by every user; `/proc/<pid>/environ`
+/// only by the owner. `main` removes it from the environment before
+/// building a shell.
 pub(crate) const REEXEC_SCRIPT: &str = "BISH_REEXEC_SCRIPT";
 
 /// The `$$` this process was told to report, if it was told one.
 fn inherited_shell_pid() -> Option<u32> {
     let value = std::env::var(REEXEC_SHELL_PID).ok()?;
-    // Taken, not read: see REEXEC_SHELL_PID. Removing it here is what
-    // keeps it out of `export -p`, out of a child's environment, and
-    // out of the way of anything that enumerates variables.
+    // Taken, not read: see `REEXEC_SHELL_PID`.
     unsafe { std::env::remove_var(REEXEC_SHELL_PID) };
     value.parse().ok()
 }
 
-/// The layer's, under the name this file has always used: the numbers
-/// are the OS's and a third of them differ between the two.
+/// The platform layer's: the numbers differ between OSes.
 pub(crate) use crate::platform::SIGNAL_NAMES;
 
-/// The real-time range. Linux numbers it 34..64 and reserves 32 and 33
-/// for the thread library, which is why `kill -l` has a gap there --
-/// bash's own list does the same.
-///
-/// Named rather than listed: there are thirty-one of them, bash names
-/// the lower half from the bottom and the upper half from the top, and
-/// the halves meet in the middle. `kill -l 49` is `RTMIN+15` and
-/// `kill -l 50` is `RTMAX-14`.
-/// Where this OS's real-time range runs from and to, if it has one at
-/// all: macOS does not, and there `realtime_signal_name` and its number
-/// counterpart answer `None` for everything.
+/// This OS's real-time range, if it has one; macOS doesn't.
 fn realtime_range() -> Option<(i32, i32)> {
     crate::platform::REALTIME_SIGNALS
 }
 
+// Linux numbers the real-time range 34 to 64, leaving 32 and 33 to the
+// thread library, hence the gap in `kill -l`. bash names the lower half
+// from the bottom and the upper half from the top: `kill -l 49` is
+// `RTMIN+15`, `kill -l 50` is `RTMAX-14`.
 fn realtime_signal_name(num: i32) -> Option<String> {
     let (first, last) = realtime_range()?;
     if !(first..=last).contains(&num) {
@@ -12993,17 +12904,13 @@ fn realtime_signal_number(bare: &str) -> Option<i32> {
     (first..=last).contains(&num).then_some(num)
 }
 
-// The two `trap` must refuse, kept out of SIGNAL_NAMES precisely so
-// that list can *be* trap's answer to "may I catch this?" -- and put
-// back by everything that is not asking that question. Naming a signal
-// is one such job (`kill -l`, a job's own status line); *sending* one
-// is the other, and is the case this comment used to leave out.
-// `kill -KILL` was refused for as long as it did, which is a strange
-// thing for a shell not to accept -- see `kill_signal_number`.
+// The two signals `trap` must refuse, kept out of `SIGNAL_NAMES` so that
+// list answers "may I catch this?". Added back for naming (`kill -l`, a
+// job's status) and for sending (`kill_signal_number`).
 pub(crate) const UNCATCHABLE_SIGNALS: &[(&str, i32)] = &[("KILL", 9), ("STOP", crate::platform::SIGSTOP)];
 
-/// Every signal by name and number, in numeric order -- the named ones
-/// and the whole real-time range after them.
+/// Every signal by name and number, in numeric order, the real-time
+/// range last.
 pub(crate) fn all_signals() -> Vec<(String, i32)> {
     let mut all: Vec<(String, i32)> = SIGNAL_NAMES.iter().chain(UNCATCHABLE_SIGNALS.iter()).map(|(name, num)| ((*name).to_string(), *num)).collect();
     if let Some((first, last)) = realtime_range() {
@@ -13013,10 +12920,8 @@ pub(crate) fn all_signals() -> Vec<(String, i32)> {
     all
 }
 
-// Accepts "INT", "SIGINT", or a bare number ("2"); "0"/"EXIT" is handled by
-// the caller separately since it isn't a real signal.
-// Everything `${NAME}` may name: an identifier, a positional
-// parameter's digits, or one of the shell's own special parameters.
+// Everything `${NAME}` may name: an identifier, a positional's digits,
+// or a special parameter.
 fn is_parameter_name(name: &str) -> bool {
     if name.len() == 1 && "@*#?-$!_0".contains(name) {
         return true;
@@ -13028,6 +12933,8 @@ fn is_parameter_name(name: &str) -> bool {
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// `INT`, `SIGINT` or a number. `EXIT`/0 isn't a signal; the caller
+// handles it. KILL and STOP aren't here: see `UNCATCHABLE_SIGNALS`.
 pub(crate) fn signal_number(name: &str) -> Option<i32> {
     let bare = name.strip_prefix("SIG").unwrap_or(name);
     if let Some(&(_, n)) = SIGNAL_NAMES.iter().find(|(n, _)| *n == bare) {
@@ -13036,10 +12943,8 @@ pub(crate) fn signal_number(name: &str) -> Option<i32> {
     if let Some(n) = realtime_signal_number(bare) {
         return Some(n);
     }
-    // A number has to be one the kernel could actually deliver: bash
-    // rejects `trap x 99999` rather than recording a trap for a signal
-    // that can never arrive. 64 is Linux's highest (the real-time
-    // range tops out there).
+    // A number must be one the kernel could deliver: bash rejects
+    // `trap x 99999`.
     bare.parse::<i32>().ok().filter(|n| (1..=crate::platform::HIGHEST_SIGNAL).contains(n))
 }
 
@@ -13051,57 +12956,34 @@ pub(crate) fn send_signal(pid: u32, sig: i32) -> bool {
     crate::platform::send_signal(pid as i32, sig)
 }
 
-// kill(2) with a negative pid targets the whole process group (POSIX) --
-// used to SIGCONT/SIGTERM/etc. a real-job-control job (Job::pgid) as a
-// unit, matching how the terminal driver itself would signal it.
+// Signals a whole process group (`Job::pgid`), as the terminal driver
+// would.
 pub(crate) fn send_signal_to_pgrp(pgid: u32, sig: i32) -> bool {
     crate::platform::send_signal_to_group(pgid as i32, sig)
 }
 
-// Real job control: SIGCONT resumes a Stopped job from `fg`/`bg`, and
-// SIGSTOP is what FgJob::send_stop uses instead of SIGTSTP -- see its own
-// doc comment for why the catchable one does not reliably work here. Both
-// from the layer: BSD renumbered them, and they are each other's
-// opposite, so a wrong number would stop a job asked to continue.
-/// This process's own group, under the name `builtins::jobs` asks for.
+/// This process's group, under the name `builtins::jobs` uses.
 pub(crate) use crate::platform::process_group as getpgrp;
+// `fg`/`bg` resume with SIGCONT; `FgJob::send_stop` uses SIGSTOP. BSD
+// numbers them differently, so they come from the platform layer.
 pub(crate) use crate::platform::{SIGCONT, SIGSTOP};
 
-// How a real-job-control wait (waitpid_untraced) ended.
+// How a `waitpid_untraced` wait ended.
 pub(crate) enum JobWaitOutcome {
-    // Exited normally or was killed by a signal -- either way, this is
-    // the process's final status, bash-convention-encoded (128+signum
-    // for the killed case, matching exit_code_from_status elsewhere in
-    // this file).
+    // The final status, 128+signum if killed (as `exit_code_from_status`).
     Exited(i32),
-    // Stopped (Ctrl-Z or an explicit SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU),
-    // not exited -- still alive, resumable via SIGCONT. Carries the stop
-    // signal only for completeness; every caller here treats any stop
-    // the same way bash's default job control does, regardless of which
-    // of the four stop signals caused it.
+    // Stopped, and resumable with SIGCONT. Callers treat the four stop
+    // signals alike.
     Stopped(i32),
 }
 
-// Linux/glibc's raw wait-status bit layout (the same "stable, standard,
-// safe to hardcode" reasoning this file already applies to signal
-// numbers) -- decodes what plain libc's WIFEXITED/WEXITSTATUS/
-// WIFSIGNALED/WTERMSIG/WIFSTOPPED/WSTOPSIG macros would, since Rust's
-// std doesn't expose a way to inspect a raw waitpid status at all (only
-// ExitStatus, built from the exited/signaled cases exec_code_from_status
-// already handles -- a WUNTRACED stop has no ExitStatus representation).
-// Blocking wait for a single process, but (unlike Job::wait/poll, which
-// go through std::process::Child and can never ask for this) able to
-// observe it stopping instead of exiting -- see WUNTRACED. Used only for
-// pids real job control (Job::pgid) has isolated into their own process
-// group; every other job in this shell is still waited on the ordinary
-// way, via Child::wait/try_wait.
+// A blocking wait for one process that also sees it stop
+// (`WUNTRACED`), which `Child::wait` can't. Only for processes job
+// control put in their own group (`Job::pgid`).
 //
-// With a socket to answer on, it polls rather than blocks, so a peer
-// asking about the editor while a command runs at a prompt with no panes
-// is answered in between (`session::service_while_busy`). The naps start
-// at a quarter of a millisecond and double to 20ms: a command that is
-// over at once is waited on about as long as before, and a long one is
-// looked in on fifty times a second.
+// With a socket to answer on it polls instead, so a peer asking about
+// the editor is answered meanwhile (`session::service_while_busy`). The
+// naps start at a quarter millisecond and double up to 20ms.
 pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
     let polling = crate::session::is_listening();
     let mut nap = std::time::Duration::from_micros(250);
@@ -13113,27 +12995,18 @@ pub(crate) fn waitpid_untraced(pid: u32) -> JobWaitOutcome {
                 nap = (nap * 2).min(std::time::Duration::from_millis(20));
             }
             crate::platform::Waited::Stopped(signum) => return JobWaitOutcome::Stopped(signum),
-            // 128 + n is bash's convention for "killed by a signal", not
-            // the OS's, so the shell is where it is applied.
+            // 128 + n is bash's convention, not the OS's.
             crate::platform::Waited::Killed(signum) => return JobWaitOutcome::Exited(128 + signum),
             crate::platform::Waited::Exited(code) => return JobWaitOutcome::Exited(code),
-            // Already gone some other way: nothing meaningful to report,
-            // but this has to answer rather than loop for ever.
+            // Already reaped elsewhere: nothing to report, but it must
+            // answer.
             crate::platform::Waited::Gone => return JobWaitOutcome::Exited(1),
         }
     }
 }
 
-// $HOSTNAME: bash populates this at startup from uname(); Linux exposes
-// the same value via this proc file, which avoids yet another raw
-// syscall. Falls back to the HOSTNAME env var (some environments export
-// it already) and then to empty. pub: prompt.rs reuses this for the
-// "user@host" segment of the default prompt rather than duplicating the
-// lookup.
-// A user's home directory, straight out of /etc/passwd -- field 6 of a
-// colon-separated line whose field 1 is the name. No NSS, so a network
-// directory is not consulted; that is the same limit every other
-// /etc-parsing corner of this shell already has.
+// A user's home directory from /etc/passwd (field 6 where field 1 is
+// the name). No NSS, so network directories aren't consulted.
 fn home_of_user(user: &str) -> Option<String> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
@@ -13142,9 +13015,8 @@ fn home_of_user(user: &str) -> Option<String> {
     })
 }
 
-// How `set -x` shows a value: bare when it can be, single-quoted when
-// it cannot. bash's trace is meant to be re-runnable, and quoting
-// everything makes it noise -- `+ x=1`, not `+ x='1'`.
+// How `set -x` shows a value: bare when it can be, else single-quoted.
+// `+ x=1`, not `+ x='1'`.
 fn xtrace_quote(value: &str) -> String {
     let safe = value.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:=@+,%^".contains(c));
     match safe {
@@ -13153,10 +13025,9 @@ fn xtrace_quote(value: &str) -> String {
     }
 }
 
-// The same rule for a command *word*, where an empty one still has to
-// be quoted or it vanishes from the trace and `echo ""` reads as
-// `+ echo`. bash draws the line exactly here: `''` for an empty
-// argument, a bare `x=` for an empty assignment value.
+// The same for a command word, where an empty one is quoted (`''`) or
+// `echo ""` would trace as `+ echo`. An empty assignment value stays
+// bare, as in bash.
 fn xtrace_quote_word(value: &str) -> String {
     match value.is_empty() {
         true => "''".to_string(),
@@ -13164,9 +13035,8 @@ fn xtrace_quote_word(value: &str) -> String {
     }
 }
 
-// The variables lookup_var answers for without ever storing them.
-// Listed here so name enumeration -- `${!prefix*}`, completion -- can
-// see them too.
+// The variables `lookup_var` computes without storing, so `${!prefix*}`
+// and completion can list them.
 const COMPUTED_VAR_NAMES: &[&str] = &[
     "BASH",
     "BASHPID",
@@ -13184,16 +13054,13 @@ const COMPUTED_VAR_NAMES: &[&str] = &[
     "UID",
 ];
 
+// `$HOSTNAME`, and the default prompt's host: from the OS, else the
+// `HOSTNAME` environment variable.
 pub fn get_hostname() -> String {
-    // Asked of the OS rather than read out of /proc, which is Linux's
-    // alone -- `$HOSTNAME` stays the last resort, as it was.
     crate::platform::hostname().or_else(|| std::env::var("HOSTNAME").ok()).unwrap_or_default()
 }
 
-// `${v@P}`'s own `\u`/`\$` helpers -- deliberately separate from
-// prompt.rs's own username()/geteuid() (same underlying logic, but
-// this transform stays fully self-contained rather than depending on
-// the actual-prompt module, which stays untouched).
+// `${v@P}`'s `\u`.
 fn prompt_username() -> String {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_else(|_| "user".to_string())
 }
@@ -13202,58 +13069,26 @@ fn is_effective_root() -> bool {
     crate::platform::effective_user() == 0
 }
 
-// `\l`: basename of the controlling terminal's device name (bash reads
-// this from the tty itself). Best-effort -- an unresolvable tty (not a
-// real terminal, ttyname_r failing, ...) just gives an empty string,
-// same spirit as bash showing nothing useful there either in that case.
+// `\l`: the basename of the terminal's device name, empty without one.
 fn tty_basename() -> String {
     let Some(name) = crate::platform::terminal_name(0) else { return String::new() };
     name.rsplit('/').next().unwrap_or("").to_string()
 }
 
-// `read -p`'s prompt only displays when input is coming from a terminal
-// (bash-documented behavior), and `read -t`'s timeout is only meaningfully
-// pollable against a real fd (stdin), not a shell-internal here-doc/file
-// Cursor -- both need to know if fd 0 is an actual tty/pollable descriptor.
+// Whether fd 0 is a terminal: `read -p` prompts only then, and
+// `read -t` can only poll a real fd.
 fn stdin_is_tty() -> bool {
     crate::platform::is_terminal(0)
 }
 
-// Polls fd 0 for readability, waiting up to `timeout_ms` (0 = check without
-// waiting). Used by `read -t` to implement its timeout without needing a
-// second thread or signal handling.
+// Waits up to `timeout_ms` for fd 0 to be readable (0 doesn't wait),
+// for `read -t`.
 fn stdin_ready(timeout_ms: i32) -> bool {
     crate::poll::poll_one(0, timeout_ms)
 }
 
-// Single pre_exec hook covering both dup_stderr_to_stdout and any
-// numbered-fd redirects -- CommandExt::pre_exec isn't documented as safe to
-// call more than once per Command, so every fd-dup need for a given spawn
-// funnels through this one closure instead of stacking separate calls.
-// Real bug, found by tracing a "3>file works for every fd except 3" report
-// down to its root cause: `dup2(oldfd, newfd)` is a no-op per POSIX when
-// oldfd == newfd -- it does *not* clear FD_CLOEXEC on that descriptor. Rust
-// opens files (and pipes, e.g. for coproc) with O_CLOEXEC by default, so
-// whenever the file/pipe's own already-assigned fd number happens to
-// coincide with the redirect's target fd (a real possibility: both are
-// small numbers chosen by "next available", so collisions aren't rare),
-// dup2 silently no-ops and the fd -- despite looking open right up to the
-// exec() call -- gets closed by the kernel as part of exec's own cloexec
-// handling, instead of surviving into the child like every other target
-// fd does. Explicitly clearing FD_CLOEXEC after every dup2 (redundant for
-// the normal src != dst case, since dup2 already clears it there) makes
-// this correct regardless of whether the dup2 was a genuine duplicate or
-// this same-fd no-op.
-// Applies numbered-fd redirects (dup2/close) directly to *this* process,
-// for `exec`'s redirect-only form (`exec 3>file`, `exec 3>&1`, `exec
-// 3>&-`) -- unlike every other spawn site in this file, there's no pre_exec
-// hook here since nothing is being forked; this just runs the same dup2/
-// close logic inline, before continuing (bare exec) or before calling
-// CommandExt::exec (exec CMD). Scoped to the numbered-fd forms specifically
-// (extra_fds/dup_stderr_to_stdout) -- plain `exec > file` (implicit fd
-// 0/1/2) goes through a completely different Option<Stdio>-based resolution
-// path elsewhere in this file that isn't wired up to apply to the current
-// process, a separate, narrower remaining gap.
+// The redirect actions applied to this process, for `exec`: alone, or
+// before replacing the process. `apply_fd_redirects` does it in a child.
 fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
     for ef in actions {
         match ef {
@@ -13263,19 +13098,9 @@ fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
                 clear_cloexec(fd);
-                // Unlike apply_fd_redirects' pre_exec path (where the
-                // process image gets replaced by execve right after,
-                // bypassing Rust-level Drop entirely, .exec() failure
-                // notwithstanding -- and even then via _exit, not normal
-                // unwinding), this function returns normally and lets its
-                // locals drop like any other Rust code. If `file`'s own fd
-                // happened to already equal the target (a real
-                // possibility, same as the pre_exec case), dropping it
-                // here would close the very fd this function exists to
-                // keep open -- forget it instead so it isn't closed out
-                // from under the persisted redirect. When source != target
-                // there's no such risk, and letting `file` drop normally
-                // correctly closes the now-redundant source descriptor.
+                // When the file already sits on the target, dropping it
+                // would close the redirect, so it's forgotten. Otherwise
+                // dropping closes the spare.
                 if srcfd == fd {
                     std::mem::forget(file);
                 }
@@ -13286,45 +13111,22 @@ fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
                 }
                 clear_cloexec(fd);
             }
-            // Closing a descriptor nothing opened is a no-op, not an
-            // error: `{ echo a; } 3>&-` is legal in bash whether or not
-            // anything ever opened fd 3, and a script that closes
-            // defensively should not have to check first.
+            // Closing an unopened descriptor is fine: `{ echo a; } 3>&-` is
+            // legal in bash.
             FdAction::Close(fd) => crate::platform::close_fd(fd),
         }
     }
     Ok(())
 }
 
-/// The platform layer's, under the name this file has always used.
+/// Cleared after every dup2: `dup2(fd, fd)` is a no-op that leaves
+/// `FD_CLOEXEC` as it was, and Rust opens files close-on-exec, so a file
+/// already on its target fd would be closed by the exec.
 use crate::platform::clear_cloexec;
 
-/// What to say and what to exit with when a command could not be
-/// spawned -- bash's three answers and its two statuses.
-///
-/// A bare name nothing in PATH matched is "command not found"; a path
-/// that is not there says so; and a path that *is* there but cannot be
-/// run is 126, not 127 -- the distinction a script checks to tell "no
-/// such tool" from "found it, could not run it".
-///
-/// Shared because there are two spawn sites. A promoted session goes
-/// out through a pty instead of the ordinary spawn, and that path used
-/// to answer every failure with the raw OS error and a flat 127: in a
-/// split window `nosuchcmd` said "No such file or directory (os error
-/// 2)" and a directory said "Permission denied" with the wrong status.
-/// One shell, one answer, whichever way the command happened to be
-/// started.
-/// What a status *is*: the low byte of what was asked for.
-///
-/// `exit` and `return` take an int and the kernel keeps eight bits of
-/// it, so `exit -1` is 255 and `exit 300` is 44. bish handed the number
-/// back whole, which made `$?` a value no real wait status can hold --
-/// and `(exit 256); echo $?` said 256 where every other shell says 0.
-/// `for x in a b` / `select x in a b`, written the way it was written.
-///
-/// A missing list is the positional parameters, and bash prints the
-/// list it stands for rather than the shorthand -- the same choice its
-/// `declare -f` makes.
+/// `for x in a b` / `select x in a b` as written. A missing list is the
+/// positional parameters, printed as the list it stands for, as bash's
+/// `declare -f` does.
 fn loop_header(keyword: &str, var: &str, words: Option<&[Word]>) -> String {
     let items = match words {
         Some(words) => words.iter().map(crate::serialize::serialize_word).collect::<Vec<_>>().join(" "),
@@ -13333,30 +13135,29 @@ fn loop_header(keyword: &str, var: &str, words: Option<&[Word]>) -> String {
     format!("{} {} in {}", keyword, var, items)
 }
 
-/// Whether opening this redirect target for reading would do more than
-/// find out that it can be opened.
-///
-/// A process substitution is a pipe with a producer already writing
-/// into it, so a second reader takes data the command was about to
-/// get. `/dev/tcp` and `/dev/udp` are not files at all -- opening one
-/// makes a connection. Neither can be probed, so neither is.
+/// Whether opening this target for reading would do more than test it:
+/// a process substitution's pipe would lose data to a second reader, and
+/// `/dev/tcp` and `/dev/udp` would connect.
 fn opening_would_consume_it(path: &str) -> bool {
     path.starts_with("/dev/fd/") || path.starts_with("/proc/self/fd/") || path.starts_with("/dev/tcp/") || path.starts_with("/dev/udp/")
 }
 
+// A status is the low byte of what was asked for, as the kernel keeps
+// it: `exit -1` is 255, `exit 300` is 44.
 fn exit_status_byte(code: i32) -> i32 {
     code & 0xff
 }
 
+// The message and status for a command that couldn't be spawned, as
+// bash answers: "command not found" for a bare name, a missing path
+// says so, and a path that exists but can't run is 126, not 127. Shared
+// by the ordinary spawn and a promoted session's pty spawn.
 fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
-    // A name that is nearly a builtin is worth saying so about. Only
-    // for NotFound: an EACCES on a real file is a different problem and
-    // a suggestion there would be noise on top of it.
+    // A near builtin name is worth suggesting, but only for NotFound.
     let not_found = e.kind() == std::io::ErrorKind::NotFound;
     let hint = match not_found {
-        // A bash builtin this shell deliberately answers differently
-        // gets pointed at its equivalent; every other unknown name gets
-        // the nearest builtin.
+        // A bash builtin bish answers differently points at its equivalent;
+        // other unknown names get the nearest builtin.
         true => match crate::suggest::instead_of(name) {
             advice if !advice.is_empty() => advice,
             _ => crate::suggest::did_you_mean(name, KNOWN_BUILTINS.iter().copied()),
@@ -13366,31 +13167,26 @@ fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
     let (text, status) = match (not_found, name.contains('/')) {
         (true, false) => ("command not found".to_string(), 127),
         (true, true) => (os_message(e), 127),
-        // execve on a directory reports EACCES on Linux, which is true
-        // and unhelpful; bash stats it and says what it actually is.
+        // execve on a directory fails with EACCES; bash says what it is.
         (false, _) if std::path::Path::new(name).is_dir() => ("Is a directory".to_string(), 126),
         (false, _) => (os_message(e), 126),
     };
     (format!("bish: {name}: {text}{hint}"), status)
 }
 
+// Arranges the redirect actions in the child, in one `pre_exec` hook:
+// calling `pre_exec` twice on a `Command` isn't documented as safe.
 fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
-    // A child's descriptors are arranged in a `pre_exec` hook, which only
-    // a platform that forks has. Where none does, the spawn this prepares
-    // fails on its own, so there is nothing to arrange.
+    // Descriptors are arranged in `pre_exec`, which only a forking platform
+    // has. Elsewhere the spawn fails anyway.
     #[cfg(not(unix))]
     let _ = (command, actions);
     #[cfg(unix)]
     unsafe {
         command.pre_exec(move || {
-            // bish ignores SIGINT for itself (term::ignore_sigint, called
-            // once at interactive startup) so Ctrl-C from its own
-            // controlling terminal doesn't kill the shell -- but that
-            // disposition is inherited across fork, and POSIX only resets
-            // *handled* signals back to SIG_DFL across exec; an ignored
-            // (SIG_IGN) disposition is explicitly left unchanged. Without
-            // this reset, every external child would silently inherit
-            // "ignore SIGINT" too and never respond to Ctrl-C.
+            // bish ignores SIGINT for itself (`term::ignore_sigint`), and
+            // an ignored disposition survives exec, so every child would
+            // ignore Ctrl-C without this.
             crate::platform::default_signal(crate::platform::SIGINT);
             for ef in &actions {
                 match ef {
