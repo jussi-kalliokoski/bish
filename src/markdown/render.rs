@@ -1,38 +1,28 @@
-// Rendering a parsed markdown document to a terminal: what `:help` shows,
-// what `:preview` shows, and the only part of this feature that has an
-// opinion about how things should *look*.
+// Renders a parsed markdown document to a terminal, for `:help` and
+// `:preview`. Output is one styled line per `String`, the unit both
+// callers scroll by. Wrapping goes by display width
+// (bishedit::unicode_width), so CJK and emoji wrap correctly.
 //
-// Output is a `Vec<String>`, one styled line each, rather than one big
-// string -- both callers scroll, and a line is the unit they scroll by.
-// Wrapping is by display width (bishedit::unicode_width), not by
-// character count, so a line of CJK or emoji stops in the right place.
-//
-// HTML is where this feature's whole point shows up. A markdown document
-// may contain arbitrary markup; crate::html parses it properly, and this
-// then renders the handful of elements that mean something in a terminal
-// (emphasis, code, links, line breaks, list items) and quietly drops the
-// rest. That is "most of it ignored" by choice rather than by inability:
-// the tree is right there, so `<b>x</b>` can be bold instead of literal
-// angle brackets, and a `<script>` can be dropped whole instead of
-// having its source printed.
+// HTML in a document is parsed by crate::html, and the elements that mean
+// something in a terminal (emphasis, code, links, line breaks, list
+// items) are rendered: `<b>x</b>` is bold, a `<script>` vanishes; the
+// rest contributes its text.
 
 use crate::bishedit::unicode_width::{char_width, str_width};
 use crate::html::{self, NodeData};
 
 use super::{Align, Block, Document, Inline, List, Table};
 
-// SGR sequences, matching the palette the rest of the editor already
-// uses (bishedit::highlight::default_style's indexed colours) rather
-// than inventing a second one.
+// SGR sequences from the editor's palette
+// (`bishedit::highlight::default_style`'s indexed colours).
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
 const STRIKE: &str = "\x1b[9m";
-// The four this renderer picks by *meaning* rather than by weight, and
-// so the four a theme can set (see theme.rs). The rest of the constants
-// above are plain attributes -- bold is bold whatever colour you like.
+// The four chosen by meaning rather than weight, which a theme can set
+// (theme.rs); the constants above are plain attributes.
 fn heading(opts: &Options) -> String {
     crate::theme::sgr(crate::theme::Ui::Heading, opts.colors.as_ref())
 }
@@ -52,26 +42,20 @@ fn quote_bar(opts: &Options) -> String {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub width: usize,
-    // Whether a fenced code block's own language gets syntax
-    // highlighted. Off for a plain-text render (a test, a pipe).
+    // Whether a fenced code block is highlighted in its language; off for
+    // plain text (tests, pipes).
     pub highlight_code: bool,
-    // Whether a link's own text is emitted as a real OSC 8 terminal
-    // hyperlink. Off for a plain-text render, and off when the
-    // `hyperlinks` bishopt is.
+    // Whether link text is an OSC 8 hyperlink; off for plain text and with
+    // the `hyperlinks` bishopt off.
     pub hyperlinks: bool,
-    // What a *relative* link destination is relative to -- the directory
-    // of the document being rendered. `None` for a document that has no
-    // file behind it (`:help`), where a relative target has nothing to
-    // resolve against and simply gets no hyperlink.
+    // What a relative link is relative to: the document's directory. `None`
+    // without a file (`:help`), when relative links get no hyperlink.
     pub base_dir: Option<std::path::PathBuf>,
-    // This session's resolved `ui_col_*` colours. `None` renders the
-    // defaults, which is what a plain-text render wants anyway.
+    // The session's `ui_col_*` colours; `None` renders the defaults.
     pub colors: Option<crate::theme::UiColors>,
     // The `table_wrap` bishopt: whether a table too wide for `width` is
-    // fitted to it by narrowing its columns and wrapping the cells
-    // inside them, or keeps the width its cells want and runs off the
-    // side for the view to scroll. Only tables -- prose wraps either
-    // way, since a paragraph has no columns to keep.
+    // fitted by narrowing columns and wrapping cells, or keeps its width
+    // and runs off the side for the view to scroll. Prose wraps either way.
     pub wrap_tables: bool,
 }
 
@@ -90,7 +74,7 @@ pub fn to_lines(doc: &Document, opts: &Options) -> Vec<String> {
     out
 }
 
-// The same thing as one string, for a caller that just wants to print it.
+// The same as one string, for printing.
 pub fn to_string(doc: &Document, opts: &Options) -> String {
     let mut out = to_lines(doc, opts).join("\n");
     out.push('\n');
@@ -108,8 +92,8 @@ fn render_blocks(blocks: &[Block], opts: &Options, indent: usize, out: &mut Vec<
 
 fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<String>) {
     let pad = " ".repeat(indent);
-    // A floor, so a deeply indented block in a narrow pane still has
-    // somewhere to put its text rather than wrapping every word.
+    // A floor, so a deeply indented block in a narrow pane has room for
+    // more than a word per line.
     let width = opts.width.saturating_sub(indent).max(8);
     match block {
         Block::Paragraph { content, .. } => {
@@ -118,16 +102,16 @@ fn render_block(block: &Block, opts: &Options, indent: usize, out: &mut Vec<Stri
             }
         }
         Block::Heading { level, content, .. } => {
-            // A heading's own level is shown by its prefix rather than
-            // by size, since a terminal has only one of those.
+            // A heading's level shows by its prefix, since a terminal has
+            // one size.
             let prefix = match level {
                 1 => String::new(),
                 _ => "  ".repeat((*level as usize).saturating_sub(2)),
             };
             let text: String = inline_runs(content, opts).iter().map(|r| r.styled()).collect();
             out.push(format!("{pad}{}{prefix}{text}{RESET}", heading(opts)));
-            // A top-level heading is underlined, which is what makes a
-            // long help page scannable.
+            // A top-level heading is underlined, which makes long help pages
+            // scannable.
             if *level == 1 {
                 let plain: String = content.iter().map(|i| i.text_content()).collect();
                 let rule = "\u{2500}".repeat(str_width(&plain).min(width));
@@ -171,8 +155,8 @@ fn render_list(list: &List, opts: &Options, indent: usize, out: &mut Vec<String>
         if i > 0 && !list.tight {
             out.push(String::new());
         }
-        // The marker's own width is what the item's content indents by,
-        // so wrapped lines line up under the first one.
+        // The marker's width is the item's content indent, so wrapped lines
+        // line up.
         let marker = match (list.ordered, item.task) {
             (_, Some(done)) => format!("{} ", if done { "[\u{2713}]" } else { "[ ]" }),
             (true, None) => format!("{}. ", list.start + i as u64),
@@ -204,19 +188,12 @@ fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<Stri
             *width = (*width).max(natural(&cell(row, i)));
         }
     }
-    // Every column is as wide as its widest cell -- until the table as a
-    // whole does not fit the pane, and something has to give. Each
-    // column keeps a floor and gives up a share of what is left in
-    // proportion to what it asked for, so the prose column is the one
-    // that yields and a column of numbers is not squeezed to nothing.
-    // Sized to fit exactly: the floors plus every share can only add up
-    // to what was available, so the frame lands where the rule does.
-    //
-    // Unless `table_wrap` is off, which is the other answer to the same
-    // question: keep every column the width its cells want, let the
-    // table run off the side, and leave reading the rest to the view
-    // that scrolls. Either way the rows and the rules agree on a width,
-    // which is the part that is not negotiable.
+    // Each column is as wide as its widest cell, until the table doesn't
+    // fit: then each keeps a floor and yields a share of the rest in
+    // proportion to what it wanted, so prose yields and numbers aren't
+    // squeezed. The floors and shares add up to exactly what's available.
+    // With `table_wrap` off, columns keep their width and the table runs
+    // off the side. Either way rows and rules agree on a width.
     let available = opts.width.saturating_sub(indent + 3 * columns + 1);
     let total: usize = widths.iter().sum();
     if opts.wrap_tables && total > available {
@@ -237,12 +214,8 @@ fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<Stri
         s.push_str(RESET);
         s
     };
-    // A row is as tall as its tallest cell. What does not fit a column
-    // wraps within it rather than running past the frame -- which is
-    // what it used to do, and one long cell taking every row after it
-    // out of alignment is a worse answer than a two-line row. With the
-    // columns left at their natural width there is nothing to wrap, so
-    // this is one line a row and the `true` below never fires.
+    // A row is as tall as its tallest cell; what doesn't fit wraps within
+    // its column. With natural widths nothing wraps, one line per row.
     let row_lines = |cells: &[Vec<Inline>]| -> Vec<String> {
         let wrapped: Vec<Vec<(String, usize)>> = widths.iter().enumerate().map(|(i, w)| wrap_runs(&cell(cells, i), *w, true)).collect();
         let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
@@ -272,8 +245,8 @@ fn render_table(table: &Table, opts: &Options, indent: usize, out: &mut Vec<Stri
     out.push(rule("\u{2514}", "\u{2534}", "\u{2518}"));
 }
 
-// One piece of text plus how to draw it. Wrapping works on these so a
-// line break never lands inside a styled run's escape sequence.
+// One piece of text and how to draw it. Wrapping works on these so a
+// break never lands inside an escape sequence.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Style {
     bold: bool,
@@ -281,26 +254,19 @@ struct Style {
     dim: bool,
     underline: bool,
     strike: bool,
-    // A whole SGR sequence rather than a `&'static str`: with the four
-    // meaningful ones themeable (see theme.rs) the colour is resolved
-    // per render, not baked in at compile time.
+    // A whole SGR sequence: the four meaningful colours are themeable
+    // (theme.rs), so resolved per render.
     color: Option<String>,
-    // The OSC 8 target for this run, when it has one. Carried on the
-    // style rather than beside it because wrapping splits a run into
-    // words by cloning exactly this -- so a link that wraps stays a link
-    // on both rows without the wrapper knowing anything about links.
+    // The run's OSC 8 target, if any. On the style because wrapping splits a
+    // run into words by cloning it, so a wrapped link stays a link on both
+    // rows.
     link: Option<Link>,
 }
 
-// A hyperlink target, and the id that ties its pieces together.
-//
-// The id matters because of that same word-splitting: `[the site](...)`
-// becomes two runs and so two OSC 8 sequences, and a terminal treats two
-// adjacent hyperlinks with no id as two separate targets -- hovering
-// would underline only the word under the pointer. Giving both pieces
-// the same id is what makes the whole phrase one link, and is exactly
-// what the id parameter is for. The link's own source offset serves as
-// the id, since no two links in a document start at the same place.
+// A hyperlink target and the id tying its pieces together: wrapping
+// splits `[the site](...)` into runs with separate OSC 8 sequences, and
+// a terminal treats adjacent links without an id as separate. The
+// link's source offset is the id, unique within a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
     id: usize,
@@ -322,8 +288,8 @@ impl Run {
             return self.text.clone();
         }
         let mut out = String::new();
-        // Outside the SGR codes, so the reset that ends them doesn't
-        // land between the hyperlink's open and its text.
+        // Outside the SGR codes, so their reset doesn't land between the
+        // hyperlink's open and its text.
         let link = s.link.as_ref().filter(|l| crate::url::is_safe(&l.url));
         if let Some(link) = link {
             out.push_str(&format!("\x1b]8;id={};{}\x1b\\", link.id, link.url));
@@ -362,16 +328,11 @@ fn inline_runs(inlines: &[Inline], opts: &Options) -> Vec<Run> {
 }
 
 fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Options) {
-    // Inline HTML arrives as *separate* nodes -- `<b>`, the text, then
-    // `</b>` -- because in markdown the text between two tags is
-    // markdown, not HTML. So making `<b>bold</b>` actually bold means
-    // tracking which tags are open across the sequence, rather than
-    // parsing each tag alone (which would find an empty element and
-    // nothing to style). This is the stack of what's open, innermost
-    // last, each entry the style that applies inside it.
+    // Inline HTML arrives as separate nodes (`<b>`, the text, `</b>`), since
+    // text between tags is markdown. So which tags are open is tracked
+    // across them: this stack, innermost last, each with its style.
     let mut open: Vec<(String, Style)> = Vec::new();
-    // How many `<script>`/`<style>` elements are open: their content is
-    // not text and contributes nothing.
+    // How many `<script>`/`<style>` are open: their content isn't text.
     let mut suppress = 0usize;
     for inline in inlines {
         let style = open.last().map(|(_, s)| s.clone()).unwrap_or_else(|| base.clone());
@@ -398,11 +359,9 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
                 s.link =
                     opts.hyperlinks.then(|| crate::url::absolute(dest, opts.base_dir.as_deref())).flatten().map(|url| Link { id: span.start, url });
                 push_inlines(content, s, out, opts);
-                // The destination is shown after the text, dimmed. Still
-                // shown even now that the text itself can be a real
-                // hyperlink: not every terminal can click one, and
-                // seeing where a link goes without hovering is worth a
-                // few dim columns.
+                // The destination follows the text, dimmed: not every
+                // terminal can click a link, and seeing where it goes is
+                // worth a few columns.
                 let text: String = content.iter().map(|i| i.text_content()).collect();
                 if !dest.is_empty() && *dest != text && format!("mailto:{text}") != *dest {
                     out.push(Run { text: format!(" ({dest})"), style: Style { dim: true, ..Style::default() }, break_after: false });
@@ -424,17 +383,13 @@ fn push_inlines(inlines: &[Inline], base: Style, out: &mut Vec<Run>, opts: &Opti
     }
 }
 
-// A parsed HTML subtree, rendered as far as a terminal can render it.
-// The elements below are the ones that mean something here; everything
-// else contributes only its text, and the three that mean "not text at
-// all" contribute nothing.
+// A parsed HTML subtree, rendered as far as a terminal can: the
+// elements below mean something here, the rest give their text, and
+// three mean "not text at all".
 fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut Vec<Run>, opts: &Options, depth: usize) {
-    // The HTML tree is an arena, so building it is iterative and its
-    // depth is whatever the document says -- `<div>` fifty thousand
-    // times over is a legal fragment. This walk is the recursive part,
-    // so it is where the floor has to be: past the limit the subtree
-    // contributes nothing, which is the same thing a terminal renderer
-    // does with any structure it cannot show.
+    // The HTML tree is an arena built iteratively, so its depth is the
+    // document's (fifty thousand `<div>`s is legal). This walk recurses, so
+    // the floor is here: past it, a subtree contributes nothing.
     const MAX_DEPTH: usize = 128;
     if depth == MAX_DEPTH {
         return;
@@ -449,9 +404,8 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
         }
         NodeData::Element { name, attrs, .. } => {
             let child_style = match name.as_str() {
-                // Whatever the document says these mean, they are not
-                // text -- printing their source is the one thing a
-                // reader definitely doesn't want.
+                // Whatever the document says, these aren't text, and
+                // printing their source is what a reader doesn't want.
                 "script" | "style" | "head" | "template" => return,
                 "b" | "strong" => Style { bold: true, ..style },
                 "i" | "em" | "cite" | "var" => Style { italic: true, ..style },
@@ -472,9 +426,8 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
                     out.push(Run { text: "\u{2022} ".to_string(), style: style.clone(), break_after: false });
                     style
                 }
-                // A block element inside inline content still ends the
-                // line it was on, which is the one structural thing a
-                // terminal can honour.
+                // A block element in inline content still ends its line,
+                // the one structure a terminal can honour.
                 "p" | "div" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     if !out.is_empty() {
                         out.push(Run { text: String::new(), style: style.clone(), break_after: true });
@@ -499,22 +452,16 @@ fn html_runs(doc: &html::Document, node: html::NodeId, style: Style, out: &mut V
     }
 }
 
-// Greedy wrapping on whitespace, measuring display width rather than
-// characters so a wide glyph counts for what it draws.
+// Greedy wrapping on whitespace by display width, so a wide glyph
+// counts for what it draws.
 fn wrap(runs: &[Run], width: usize) -> Vec<String> {
     wrap_runs(runs, width, false).into_iter().map(|(line, _)| line).collect()
 }
 
-// The same, and how wide each line came out. Prose has no use for that
-// -- it is drawn flush left and ends where it ends -- but a table cell
-// is padded to its column, and the styled string it gets back has
-// escape sequences in it, so measuring it afterwards is not something
-// the caller can do.
-//
-// `break_words` is the other thing a cell needs and prose does not. A
-// word longer than the whole width is normally left to overflow, since
-// a URL or an identifier is more useful whole; in a column, overflowing
-// is the very thing being avoided, so there it breaks.
+// The same, with each line's width: a table cell is padded to its
+// column, and its styled string can't be measured afterwards.
+// `break_words` breaks a word wider than the column; in prose such a
+// word (a URL) overflows whole.
 fn wrap_runs(runs: &[Run], width: usize, break_words: bool) -> Vec<(String, usize)> {
     let mut lines: Vec<(String, usize)> = Vec::new();
     let mut line = String::new();
@@ -561,10 +508,8 @@ fn wrap_runs(runs: &[Run], width: usize, break_words: bool) -> Vec<(String, usiz
     lines
 }
 
-// One word in pieces no wider than `width` -- the word itself, unless
-// the caller asked for it to be broken and it does not fit. By display
-// width, so a run of wide glyphs breaks where it draws rather than
-// where it counts.
+// One word in pieces no wider than `width`: the word itself unless
+// breaking was asked for and it doesn't fit. By display width.
 fn split_to_width(word: &str, width: usize, break_words: bool) -> Vec<String> {
     if !break_words || width == 0 || str_width(word) <= width {
         return vec![word.to_string()];
@@ -587,9 +532,8 @@ fn split_to_width(word: &str, width: usize, break_words: bool) -> Vec<String> {
     out
 }
 
-// A code block's own line, run through whichever highlighter its info
-// string names -- the same highlighters the editor uses, so a bash
-// example in `:help` is coloured exactly as it would be in a buffer.
+// A code block line through the highlighter its info string names, the
+// editor's, so a bash example in `:help` looks as in a buffer.
 fn highlight_line(line: &str, lang: &str) -> String {
     use crate::bishedit::highlight::{self, BashHighlighter, HighlightContext, Highlighter, JsonHighlighter};
     let spans = match lang {
@@ -608,9 +552,9 @@ fn highlight_line(line: &str, lang: &str) -> String {
     highlight::render_styled(&highlight::compose(&chars, &[&styled]))
 }
 
-// One inline HTML tag's effect on the style stack. Read with the real
-// tokenizer rather than by looking for `<` and `>`, so an attribute
-// containing either (`<a title="a > b">`) can't confuse it.
+// One inline tag's effect on the style stack, read with the real
+// tokenizer, so an attribute containing `>` (`<a title="a > b">`)
+// can't confuse it.
 fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, suppress: &mut usize, out: &mut Vec<Run>, opts: &Options) {
     use crate::html::tokenizer::{Token, Tokenizer};
     let token = Tokenizer::new(raw).next();
@@ -629,8 +573,8 @@ fn apply_inline_tag(raw: &str, style: &Style, open: &mut Vec<(String, Style)>, s
                 _ => {}
             }
             let inner = inline_tag_style(&tag.name, style, opts);
-            // A void element styles nothing, and a self-closing one has
-            // already closed.
+            // A void element styles nothing, and a self-closing one already
+            // closed.
             if !tag.self_closing && !is_void(&tag.name) {
                 open.push((tag.name, inner));
             }
@@ -669,9 +613,8 @@ mod tests {
     use super::*;
     use crate::markdown::parse;
 
-    // Rendered without styling, so a test reads as the text a reader
-    // sees rather than as escape sequences. The escapes themselves are
-    // checked separately, below.
+    // Without styling, so a test reads as the text; escapes are checked
+    // separately.
     fn plain(input: &str, width: usize) -> String {
         let doc = parse(input);
         let lines = to_lines(&doc, &Options { width, highlight_code: false, ..Options::default() });
@@ -769,10 +712,8 @@ to need wrapping at this width",
         );
     }
 
-    // A table wider than the pane used to draw its rules at one width
-    // and its rows at another, because the columns were narrowed and
-    // the cells written into them at full length anyway. Every line of
-    // a table is the same width as its own frame, or it is not a table.
+    // Every line of a table is its frame's width: the narrowed columns'
+    // cells wrap rather than overflow.
     #[test]
     fn a_table_too_wide_for_the_pane_wraps_inside_its_columns() {
         let src =
@@ -781,18 +722,15 @@ to need wrapping at this width",
         let widths: Vec<usize> = lines.lines().map(str_width).collect();
         assert!(widths.iter().all(|w| *w == widths[0]), "every line squares up with the frame: {widths:?}");
         assert!(widths[0] <= 40, "and fits the pane: {}", widths[0]);
-        // Nothing is dropped to get there -- the cell wraps, and both
-        // halves are still on the page.
+        // Nothing is dropped: the cell wraps, both halves on the page.
         let text: String = lines.lines().collect::<Vec<_>>().join(" ");
         for word in ["penalty", "bracket", "test", "slower", "margin"] {
             assert!(text.contains(word), "{word} survived the wrap:\n{lines}");
         }
     }
 
-    // `table_wrap` off: the columns keep the width their cells want and
-    // the table runs off the side, for the view to scroll to. Still a
-    // table, though -- every line agrees on a width, which is the part
-    // the old overflow bug got wrong.
+    // `table_wrap` off: natural column widths, running off the side, every
+    // line still the same width.
     #[test]
     fn a_wide_table_keeps_its_columns_when_table_wrap_is_off() {
         let src =
@@ -803,14 +741,13 @@ to need wrapping at this width",
         let widths: Vec<usize> = lines.iter().map(|l| str_width(l)).collect();
         assert!(widths.iter().all(|w| *w == widths[0]), "the rows and the rules still agree: {widths:?}");
         assert!(widths[0] > 40, "and the table is wider than the pane, to be scrolled to: {}", widths[0]);
-        // Each cell on one line, whole, as it was written.
+        // Each cell whole on one line.
         assert!(lines.iter().any(|l| l.contains("penalty for a bracket test")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("slower than bash by a good margin")), "{lines:?}");
     }
 
-    // A word with nowhere to wrap is left whole in prose, where running
-    // long costs nothing, and broken in a column, where running long is
-    // the whole problem.
+    // A word with nowhere to wrap stays whole in prose and breaks in a
+    // column.
     #[test]
     fn a_word_wider_than_its_column_breaks_in_a_table_and_not_in_prose() {
         let table = plain("| a |\n|---|\n| supercalifragilistic |\n", 20);
@@ -823,7 +760,7 @@ to need wrapping at this width",
     #[test]
     fn a_link_shows_its_text_and_its_destination() {
         assert_render("[docs](https://example.com)\n", 60, "docs (https://example.com)");
-        // ...except an autolink, where the two are the same thing.
+        // Except an autolink, where the two are the same.
         assert_render("<https://example.com>\n", 60, "https://example.com");
     }
 
@@ -832,8 +769,7 @@ to need wrapping at this width",
         assert_render("one  \ntwo\n", 60, "one\ntwo");
     }
 
-    // The point of parsing the HTML rather than printing it: `<b>` is
-    // bold text, not four literal characters.
+    // `<b>` is bold text, not four literal characters.
     #[test]
     fn inline_html_is_rendered_as_what_it_means() {
         assert_render("a <b>bold</b> and <code>code</code> word\n", 60, "a bold and code word");
@@ -843,8 +779,8 @@ to need wrapping at this width",
 
     #[test]
     fn a_script_element_contributes_nothing_at_all() {
-        // The script contributes nothing -- and the text on either
-        // side of it is still one line, because it was one `<div>`.
+        // The script contributes nothing, and the text either side is one
+        // line, being one `<div>`.
         assert_render("<div>keep<script>var x = 1;</script>this</div>\n", 60, "keepthis");
     }
 
@@ -863,13 +799,12 @@ to need wrapping at this width",
         assert!(line.contains("\x1b[9mgone"), "strikethrough: {line:?}");
     }
 
-    // Wrapping measures what a glyph draws, not how many chars it is.
+    // Wrapping measures what a glyph draws, not chars.
     #[test]
     fn wrapping_measures_display_width() {
-        // 3 + a space + 6 is 10, which fits in 12; adding " bbb" makes
-        // 14, which does not. Counting *characters* instead would make
-        // the whole line 11 and fit it, so this really does pin the
-        // measurement rather than the wrapping.
+        // 3, a space and 6 is 10, fitting 12; " bbb" makes 14, which doesn't.
+        // Counting chars would make the line 11 and fit it, so this pins the
+        // measurement.
         assert_render("aaa 日本語 bbb\n", 12, "aaa 日本語\nbbb");
     }
 
@@ -914,9 +849,8 @@ to need wrapping at this width",
         assert_eq!(targets, vec!["https://example.com/x", "file:///tmp/somewhere/plan.md"]);
     }
 
-    // Each word of a link's text is its own run after wrapping, so each
-    // gets its own sequence -- all sharing one id, which is what makes a
-    // terminal treat the whole phrase as a single hyperlink.
+    // Each word of a link becomes its own run and sequence, sharing one id,
+    // so the terminal sees one hyperlink.
     #[test]
     fn the_pieces_of_one_link_share_an_id() {
         let doc = crate::markdown::parse("[the site here](https://example.com/x)");
@@ -934,9 +868,8 @@ to need wrapping at this width",
         assert!(osc8_targets(&to_lines(&doc, &opts).join("\n")).is_empty());
     }
 
-    // Without a directory to resolve against, a relative destination
-    // gets no link rather than a guessed one -- the absolute one beside
-    // it still does.
+    // With no directory, a relative destination gets no link; the absolute
+    // one beside it does.
     #[test]
     fn a_relative_destination_needs_a_base_directory() {
         let doc = crate::markdown::parse("[a](https://example.com/x) [b](plan.md)");
