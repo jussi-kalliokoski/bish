@@ -1,7 +1,5 @@
-// Small recursive-descent integer arithmetic evaluator for $((...)),
-// ((...)), and `let`. Standalone from the shell's own lexer/parser --
-// arithmetic has a completely different token set (numbers, C-like
-// operators) so reusing the shell tokenizer would just add indirection.
+// Integer arithmetic for `$((...))`, `((...))` and `let`. It has its own
+// tokenizer: the token set has nothing in common with the shell's.
 
 pub trait VarContext {
     fn get(&mut self, name: &str) -> i64;
@@ -33,15 +31,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
         }
         if c.is_ascii_digit() {
             let start = i;
-            // A numeric literal runs to the end of the run of digit-set
-            // characters, and the base is checked *afterwards*. Stopping
-            // at the first character that did not fit the base instead
-            // read `12a` as 12, `1e2` as 1 and `0b101` as 0, each with
-            // something left over that quietly went nowhere. bash reads
-            // the whole token and then rejects it.
+            // The whole run of digit-set characters is one literal, checked
+            // against the base afterwards, so `12a` and `0b101` are errors
+            // as in bash.
             let digit_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '@';
-            // base#digits (e.g. 16#FF, 2#101) -- the base is the plain
-            // decimal run in front of the `#`.
+            // `base#digits`, e.g. `16#FF`.
             let mut scan = i;
             while scan < chars.len() && chars[scan].is_ascii_digit() {
                 scan += 1;
@@ -66,8 +60,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 }
                 let digits: String = chars[hstart..i].iter().collect();
                 let token: String = chars[start..i].iter().collect();
-                // `0x` with nothing after it is zero, where `64#` with
-                // nothing after it is an error -- bash's own asymmetry.
+                // `0x` alone is 0, but `64#` alone is an error, as in bash.
                 let n = if digits.is_empty() { 0 } else { base_number(16, &digits, &token)? };
                 toks.push(Tok::Num(n));
                 continue;
@@ -76,8 +69,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             let digits: String = chars[start..i].iter().collect();
-            // Leading-zero octal (bash: 010 is 8, not 10); a bare "0" (or
-            // "00") still just parses as 0 either way.
+            // A leading zero means octal: 010 is 8.
             let base = if digits.len() > 1 && digits.starts_with('0') { 8 } else { 10 };
             let n = base_number(base, &digits, &digits)?;
             toks.push(Tok::Num(n));
@@ -88,10 +80,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            // `a[1]`, `a[i+1]`, `m[key]`: the subscript belongs to the
-            // name, brackets and all -- `$((a[1]))` is an ordinary way
-            // to read an element, and the VarContext is what knows how
-            // to resolve one. Nesting is counted so `a[b[0]]` works.
+            // A subscript is part of the name (`a[i+1]`, `m[key]`), for the
+            // VarContext to resolve. Nesting is counted so `a[b[0]]` works.
             if i < chars.len() && chars[i] == '[' {
                 let mut depth = 0;
                 while i < chars.len() {
@@ -236,13 +226,8 @@ impl<'a> Parser<'a> {
         t
     }
 
-    /// The token the parser had just consumed when something went
-    /// wrong, which is the one bash names in `(error token is "...")`.
-    ///
-    /// Measured against bash rather than reasoned about: `1/0` names
-    /// `0`, `1+` names `+`, `1**-1` names `1` and `1?2` names `2`. In
-    /// every one of them that is the last token taken, because the
-    /// parser only discovers the problem once it has the operand.
+    /// The token last consumed when parsing failed: the one bash names in
+    /// `(error token is "...")`. `1/0` names `0`, `1+` names `+`.
     fn error_token(&self) -> String {
         self.toks.get(self.pos.saturating_sub(1)).map(Tok::text).unwrap_or_default()
     }
@@ -259,18 +244,11 @@ impl<'a> Parser<'a> {
         self.parse_comma()
     }
 
-    // The comma operator (`a=1, b=2, a+b`): evaluates every comma-
-    // separated subexpression left to right for its side effects,
-    // keeping only the last one's value -- bash's own semantics, valid
-    // both at the top level of ((...))/$((...)) and inside a
-    // parenthesized grouping (see parse_primary's Tok::LParen arm,
-    // which calls this same level rather than parse_assign directly).
+    // The comma operator: every subexpression for its side effects, the
+    // last one for the value.
     fn parse_comma(&mut self) -> Result<i64, String> {
-        // Every level of `( )` comes back through here, so this is the
-        // one place the nesting has to be bounded. `$(( ((((1)))) ))`
-        // 2000 deep is a thing bash evaluates without complaint and
-        // this used to abort on -- parsing and evaluating happen in the
-        // same descent, so one check covers both.
+        // Every `( )` comes back through here, so this one check bounds
+        // the nesting for parsing and evaluation alike.
         if crate::stackguard::deeply_exhausted() {
             return Err("expression nested too deeply".to_string());
         }
@@ -500,9 +478,8 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
-    // `**` binds tighter than `* / %` but looser than unary +/-/!/~, and is
-    // right-associative (2**3**2 is 2**(3**2) = 512, not (2**3)**2 = 64) --
-    // matching bash's precedence and associativity exactly.
+    // Binds tighter than `* / %` and looser than unary operators, and is
+    // right-associative: 2**3**2 is 512.
     fn parse_pow(&mut self) -> Result<i64, String> {
         let base = self.parse_unary()?;
         if self.peek_op("**") {
@@ -544,9 +521,8 @@ impl<'a> Parser<'a> {
                 self.ctx.set(&name, v);
                 return Ok(v);
             }
-            // Nothing to increment, so this was never an increment:
-            // bash reads `++5` as `+(+5)` and answers 5. Only a name
-            // makes `++` an operator of its own.
+            // bash reads `++5` as `+(+5)`; `++` is only an operator before
+            // a name.
             return self.parse_unary();
         }
         if self.peek_op("--") {
@@ -594,9 +570,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-// Wrapping integer exponentiation (matches how +/-/* already wrap here
-// rather than panicking on overflow, since bash's arithmetic is
-// fixed-width and just wraps).
+// Wraps on overflow, like the other operators here and like bash.
 fn ipow(base: i64, mut exp: u64) -> i64 {
     let mut result: i64 = 1;
     let mut b = base;
@@ -610,16 +584,9 @@ fn ipow(base: i64, mut exp: u64) -> i64 {
     result
 }
 
-// `base#digits`, with bash's own digit set rather than Rust's.
-//
-// `from_str_radix` accepts bases 2 to 36 and *panics* outside that
-// range, which `$((64#zZ))` -- a base bash supports -- walked straight
-// into: the shell died on an arithmetic expression.
-//
-// bash goes up to 64. Digits are 0-9, then a-z for 10-35, then A-Z for
-// 36-61, then `@` for 62 and `_` for 63. Below base 37 there is no room
-// for two letter ranges, and bash folds case there instead, which is
-// what makes `16#FF` and `16#ff` both 255 while `64#zZ` is 35*64+61.
+// bash's digit set, up to base 64: 0-9, a-z, A-Z, `@`, `_`. Up to base
+// 36 the letters fold case, so `16#FF` and `16#ff` are both 255. Not
+// `from_str_radix`, which panics above base 36.
 fn base_number(base: u32, digits: &str, token: &str) -> Result<i64, String> {
     if base == 0 {
         return Err(format!("{}: invalid number", token));
@@ -634,8 +601,6 @@ fn base_number(base: u32, digits: &str, token: &str) -> Result<i64, String> {
     for c in digits.chars() {
         let d = match c {
             '0'..='9' => c as u32 - '0' as u32,
-            // Case folds together only where the two ranges would
-            // otherwise overlap the base.
             'a'..='z' => c as u32 - 'a' as u32 + 10,
             'A'..='Z' if base <= 36 => c as u32 - 'A' as u32 + 10,
             'A'..='Z' => c as u32 - 'A' as u32 + 36,
@@ -655,12 +620,8 @@ pub fn eval(src: &str, ctx: &mut dyn VarContext) -> Result<i64, String> {
     let toks = tokenize(src)?;
     let mut p = Parser { toks, pos: 0, ctx };
     let value = p.parse_expr()?;
-    // Having *an* expression is not the same as having consumed the
-    // input. Without this the parser stopped at the first token it
-    // could not use and returned what it had: `$((1 2))` was 1,
-    // `$((3 4))` was 3, and `$((sqrt 3))` was 0 -- an undefined name
-    // followed by a number nobody looked at. Silently answering half
-    // an expression is worse than refusing it, and bash refuses.
+    // Leftover tokens are an error, as in bash, rather than a silently
+    // half-read expression: `$((1 2))` isn't 1.
     if !matches!(p.peek(), Tok::Eof) {
         return Err(format!("arithmetic syntax error in expression (error token is \"{}\")", p.peek().text()));
     }
