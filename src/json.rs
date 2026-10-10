@@ -1,19 +1,10 @@
-// Hand-rolled JSON parser plus a small pretty-printer and `jq`-lite
-// dotted-path query -- no external crate, same spirit as glob.rs/
-// regex.rs/csscolor.rs. Backs the `json` builtin (exec.rs). Only ever
-// needs to *parse* and *extract*, never re-serialize an arbitrary Rust
-// value into JSON (nothing in this codebase produces JSON output other
-// than by re-printing a `Value` this same parser already built), so
-// there's no separate "serialize any type" API -- just Value's own
-// pretty_print.
+// A JSON parser, a pretty-printer, and a dotted-path query, for the
+// `json` builtin. Only parsing and extraction: nothing serializes Rust
+// values, so output is a `Value` printed back.
 //
-// The path query is a small, fixed grammar (`.foo.bar[2]`, `.["key
-// with spaces"]`, `.`) -- not a full jq filter/expression language (no
-// pipes, `map`/`select`/`length`, arithmetic, ...). Scoped to the
-// overwhelmingly common "pull one value out of some JSON" a shell
-// script actually needs, see bish-before-deps.md's own note on why
-// this stops here rather than growing into a second parser for jq's
-// own filter language.
+// The query is a small fixed grammar (`.foo.bar[2]`, `.["key with
+// spaces"]`, `.`), not jq's filter language: no pipes, `map`, `select`
+// or arithmetic. Pulling one value out is what scripts need.
 
 use std::fmt::Write as _;
 use std::iter::Peekable;
@@ -27,41 +18,28 @@ pub enum Value {
     Number(f64),
     Str(String),
     Array(Vec<Value>),
-    // `Vec<(String, Value)>`, not a HashMap/BTreeMap -- preserves the
-    // source's own field order (what a human expects from a pretty-
-    // printer, and what real `jq` does too), at the cost of O(n) field
-    // lookup instead of O(1). Never a concern at the sizes this is
-    // actually used for (shell config/API-response-sized JSON, not a
-    // database export) -- not worth a HashMap-with-a-side-order-Vec
-    // just to shave lookup cost nothing here is sensitive to.
+    // A `Vec`, not a map, to keep the source's field order, as a person and
+    // jq expect; lookup is linear, which doesn't matter at config and
+    // API-response sizes.
     Object(Vec<(String, Value)>),
 }
 
 const NULL: Value = Value::Null;
 
-// One lexical piece of JSON, with where it sits in the input -- `start`
-// and `end` are *char* offsets (not bytes), because the one consumer that
-// cares about position is syntax highlighting, whose spans index a
-// `&[char]` (see bishedit::highlight::compose).
-//
-// The tokenizer exists so there is exactly one JSON scanner in this
-// repo: `parse` below is built on it, and so is bishedit::highlight's
-// JsonHighlighter. A highlighter needs positions and must survive
-// nonsense (a buffer mid-keystroke is nearly always invalid JSON),
-// neither of which a value parser wants to carry -- so those two needs
-// meet here, at the token, instead of in two scanners that would
-// disagree about what a string is the first time one of them grew an
-// escape rule the other didn't.
+// One lexical piece of JSON and its position: `start` and `end` are
+// char offsets, since highlighting indexes a `&[char]`
+// (`bishedit::highlight::compose`). The one JSON scanner here: `parse`
+// and the highlighter's `JsonHighlighter` both use it, so they can't
+// disagree about what a string is. Tokenizing survives nonsense, since a
+// buffer mid-keystroke is rarely valid JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
     pub start: usize,
     pub end: usize,
-    // A `Str` token's own escape sequences (`\n`, `\uXXXX`, ...) as char
-    // spans into the whole input -- what lets a highlighter mark them
-    // inside the string the way printf's `%s` is marked inside its own
-    // argument. Empty for every other kind, and ignored by `parse`,
-    // which only wants the decoded value.
+    // A string's escape sequences (`\n`, `\uXXXX`) as char spans into the
+    // input, so a highlighter can mark them. Empty for other kinds; `parse`
+    // ignores them.
     pub escapes: Vec<Range<usize>>,
 }
 
@@ -73,39 +51,30 @@ pub enum TokenKind {
     CloseBracket,
     Comma,
     Colon,
-    // Already unescaped -- the raw source text is `start..end` if a
-    // caller wants it back.
+    // Unescaped; the source text is `start..end`.
     Str(String),
     Number(f64),
     Bool(bool),
     Null,
-    // `//` to end of line, or `/* ... */`. Only ever emitted by
-    // `tokens_with_comments` -- strict JSON has no comments, and
-    // `parse`, which reads the strict stream, therefore never sees one.
+    // `//` to end of line, or `/* ... */`, only from `tokens_with_comments`:
+    // strict JSON has none, so `parse` never sees one.
     Comment,
-    // Whatever couldn't be read as any of the above, carrying the reason
-    // for `parse` to report. Tokenizing never fails: it emits one of
-    // these and keeps going, so a half-typed buffer still tokenizes into
-    // something a highlighter can colour up to (and past) the mistake.
+    // Whatever couldn't be read, with the reason, for `parse` to report.
+    // Tokenizing never fails: it emits this and goes on, so a highlighter
+    // can colour past a mistake.
     Invalid(String),
 }
 
-// Every token in `input`, whitespace dropped. Never fails -- see
-// TokenKind::Invalid.
+// Every token in `input`, whitespace dropped. Never fails; see
+// `TokenKind::Invalid`.
 pub fn tokens(input: &str) -> Vec<Token> {
     lex(input, false)
 }
 
-// The same, for JSONC -- JSON as `tsconfig.json` and every `.vscode`
-// file actually write it, with `//` and `/* */` comments. Comments come
-// back as real `TokenKind::Comment` tokens rather than being skipped,
-// since the one consumer that wants this stream is a highlighter and a
-// comment it can't see is a comment it can't colour.
-//
-// The other thing JSONC permits, a trailing comma before `}`/`]`, needs
-// nothing here: a comma is the same token wherever it sits, and whether
-// one is allowed in that position is a question for a parser, which is
-// not what this stream is for.
+// The same for JSONC, as `tsconfig.json` and `.vscode` files write it:
+// `//` and `/* */` comments come back as `TokenKind::Comment` for the
+// highlighter. JSONC's trailing commas need nothing here: whether a
+// comma is allowed is a parser's question.
 pub fn tokens_with_comments(input: &str) -> Vec<Token> {
     lex(input, true)
 }
@@ -144,20 +113,17 @@ impl Lexer<'_> {
         false
     }
 
-    // JSON itself allows only space/tab/CR/LF between tokens; this
-    // accepts anything char::is_whitespace does, which is what the
-    // hand-rolled parser this replaced already did -- kept deliberately,
-    // since narrowing it would start rejecting input the `json` builtin
-    // has always accepted.
+    // JSON allows only space, tab, CR and LF between tokens; this takes
+    // anything `char::is_whitespace` does, as the `json` builtin always
+    // has.
     fn skip_ws(&mut self) {
         while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
             self.advance();
         }
     }
 
-    // `// ...` to the end of the line, or `/* ... */` -- unterminated,
-    // it runs to the end of the input, which is what a comment being
-    // typed looks like.
+    // `// ...` to end of line, or `/* ... */`; unterminated, to the end of
+    // the input, as a comment being typed looks.
     fn comment(&mut self) -> Token {
         let start = self.pos;
         self.advance();
@@ -216,11 +182,9 @@ impl Lexer<'_> {
         Some(Token { kind, start, end: self.pos, escapes })
     }
 
-    // An unterminated string stops at the end of its line rather than
-    // swallowing the rest of the input: a raw newline inside a string is
-    // invalid JSON anyway, so this loses nothing -- and it means typing
-    // an opening quote in the editor doesn't briefly restyle every line
-    // below it.
+    // An unterminated string stops at the end of its line: a raw newline
+    // is invalid in a string anyway, and an opening quote typed in the
+    // editor doesn't restyle every line below.
     fn lex_string(&mut self, escapes: &mut Vec<Range<usize>>) -> TokenKind {
         self.advance();
         let mut s = String::new();
@@ -260,11 +224,9 @@ impl Lexer<'_> {
             Some('t') => Ok('\t'),
             Some('u') => {
                 let hi = self.hex4()?;
-                // A surrogate pair (\uD800-\uDBFF followed by
-                // \uDC00-\uDFFF) encodes one codepoint outside the BMP
-                // (most commonly an emoji) -- combined here rather than
-                // left as two lone surrogates, which char::from_u32
-                // would reject outright.
+                // A surrogate pair (\uD800-\uDBFF then \uDC00-\uDFFF) is
+                // one codepoint outside the BMP, often an emoji, combined
+                // here since `char::from_u32` rejects a lone surrogate.
                 if (0xD800..=0xDBFF).contains(&hi) {
                     if !self.eat('\\') || !self.eat('u') {
                         return Err("expected a low surrogate after a high surrogate".to_string());
@@ -294,13 +256,9 @@ impl Lexer<'_> {
         Ok(v)
     }
 
-    // Deliberately more permissive than JSON's own number grammar (which
-    // rejects a leading zero, a bare `-`, and `.5`): this scans the
-    // characters a number is made of and lets f64's own parse be the
-    // judge, which is what the parser this replaced did too. Tightening
-    // it would start rejecting input the `json` builtin has accepted all
-    // along, for no benefit to anything that reads JSON rather than
-    // certifying it.
+    // Looser than JSON's number grammar (which rejects a leading zero, a
+    // bare `-` and `.5`): scans number characters and lets `f64`'s parse
+    // decide, as the `json` builtin always has.
     fn lex_number(&mut self) -> TokenKind {
         let mut raw = String::new();
         if self.chars.peek() == Some(&'-') {
@@ -329,11 +287,9 @@ impl Lexer<'_> {
         }
     }
 
-    // A bare alphabetic run: one of the three JSON literals, or a word
-    // that only looks like one. Taken whole (rather than character by
-    // character against each literal in turn) so `tru` reports itself as
-    // one wrong word instead of decaying into a pile of stray-character
-    // errors -- and so a highlighter has one span to leave alone.
+    // A run of letters: one of the three literals, or a word that only
+    // looks like one. Taken whole, so `tru` is one wrong word rather than
+    // stray characters, and one span for a highlighter.
     fn lex_word(&mut self) -> TokenKind {
         let mut word = String::new();
         while matches!(self.chars.peek(), Some(c) if c.is_ascii_alphabetic()) {
@@ -348,13 +304,11 @@ impl Lexer<'_> {
     }
 }
 
-// Deep enough for anything a real document does -- an LSP payload, a
-// package manifest, a config -- and shallow enough that the recursion
-// here (and the equally recursive `Drop` of the `Value` it builds)
-// cannot run the stack out. Without it, 64 MiB of `[` is 33 million
-// levels and a SIGSEGV; the size cap on an LSP body bounds the bytes
-// but says nothing about their shape. Same idea as roff/interp.rs's
-// own MAX_DEPTH.
+// Deep enough for real documents (LSP payloads, manifests, configs) and
+// shallow enough that this recursion, and the recursive `Drop` of the
+// result, can't overflow the stack: 64 MiB of `[` would be 33 million
+// levels. An LSP body's size cap bounds bytes, not shape. Like
+// roff/interp.rs's `MAX_DEPTH`.
 const MAX_DEPTH: usize = 128;
 
 pub fn parse(input: &str) -> Result<Value, String> {
@@ -391,9 +345,8 @@ impl Parser {
         }
     }
 
-    // One level down, for the two token kinds that open a container.
-    // The counter lives here rather than in the two parsers so there is
-    // exactly one place that can forget to decrement it.
+    // One level down for the two container tokens; the counter lives here
+    // so only one place can forget to decrement it.
     fn nested(&mut self, at: usize, parse: fn(&mut Self) -> Result<Value, String>) -> Result<Value, String> {
         if self.depth == MAX_DEPTH {
             return Err(format!("JSON nested deeper than {MAX_DEPTH} levels (position {at})"));
@@ -452,10 +405,8 @@ impl Parser {
     }
 }
 
-// How a token reads inside a parse error -- the source spelling for
-// punctuation, a word for anything with a value in it, since printing an
-// entire nested string or number back at the reader says less about what
-// went wrong than "a string" does.
+// How a token reads in a parse error: punctuation as spelled, a word
+// for anything with a value, which says more than echoing the value.
 fn describe(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::OpenBrace => "'{'",
@@ -468,9 +419,8 @@ fn describe(kind: &TokenKind) -> &'static str {
         TokenKind::Number(_) => "a number",
         TokenKind::Bool(_) => "a boolean",
         TokenKind::Null => "null",
-        // Unreachable through `parse`, which reads the strict stream --
-        // named rather than lumped in with Invalid so that if a JSONC
-        // stream is ever handed to a parser, it says what it saw.
+        // Unreachable through `parse`, which reads the strict stream; named
+        // so a JSONC stream given to a parser says what it saw.
         TokenKind::Comment => "a comment",
         TokenKind::Invalid(_) => "invalid input",
     }
@@ -527,21 +477,10 @@ fn write_pretty(out: &mut String, v: &Value, indent: usize) {
     }
 }
 
-// JSON numbers have no int/float distinction of their own; printed
-// without a trailing ".0" when the value is a whole number that fits
-// exactly (matching how every JSON value this shape actually came from
-// -- an integer field in the source -- would have looked to begin
-// with), the ordinary float rendering otherwise.
-/// `pretty_print`'s sibling: the same value with no whitespace at all
-/// between tokens. Shares `write_json_string`/`write_number` with it, so
-/// the two can only ever disagree about layout, never about escaping or
-/// how a whole number renders.
-///
-/// Exists for JSON that is a *message* rather than something a person
-/// reads -- a JSON-RPC body on a language server's stdin, where the
-/// framing header is a byte count of exactly this string and the
-/// indentation would be pure overhead on every keystroke's worth of
-/// document sync.
+/// `pretty_print` without whitespace, sharing `write_json_string` and
+/// `write_number`, so the two differ only in layout. For JSON that's a
+/// message, such as a JSON-RPC body whose framing header counts its
+/// bytes.
 pub fn compact_print(v: &Value) -> String {
     let mut out = String::new();
     write_compact(&mut out, v);
@@ -579,6 +518,8 @@ fn write_compact(out: &mut String, v: &Value) {
     }
 }
 
+// JSON has one number type: a whole number that fits exactly prints
+// without `.0`, as the integer field it came from would have.
 fn write_number(out: &mut String, n: f64) {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         let _ = write!(out, "{}", n as i64);
@@ -605,19 +546,11 @@ fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-// `.foo.bar[2]`/`["key with spaces"]`/`.` -- a missing field or an
-// out-of-range index resolves to `Null` rather than an error (matching
-// real `jq`'s own "absent means null" convention), so a script can
-// write `json .maybe_missing file.json` and get a clean "null" instead
-// of a parse-time-shaped failure for something that's a perfectly
-// ordinary runtime outcome. A malformed *path expression* itself (bad
-// syntax, not a bad lookup) is still a real Err.
-//
-// A bare `.name` runs to the next `.` or `[`, so it covers hyphens and
-// anything else a JSON key may contain -- `.rust-analyzer.check` works.
-// The bracket form is for the two characters a bare name cannot hold:
-// `["a.b"]` for a key with a dot, and `["x"]` at the very start, since
-// a leading `.` there would be looking for a field called nothing.
+// `.foo.bar[2]`, `["key with spaces"]`, `.`. A missing field or an
+// out-of-range index is `Null`, as in jq, so `json .maybe_missing
+// file.json` prints "null"; a malformed path is an `Err`. A bare `.name`
+// runs to the next `.` or `[`, so `.rust-analyzer.check` works; brackets
+// are for a key with a dot (`["a.b"]`) and a key at the very start.
 pub fn query<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
     let path = path.trim();
     if path.is_empty() || path == "." {
@@ -631,13 +564,8 @@ pub fn query<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
             '.' => {
                 i += 1;
                 let start = i;
-                // Everything up to the next `.` or `[` is the name. It
-                // used to be alphanumerics and `_` only, which quietly
-                // stopped at the hyphen in `.rust-analyzer` -- the most
-                // common LSP settings key there is -- and answered for
-                // `rust` instead. A JSON key can contain anything at
-                // all, so the only characters that can end one here are
-                // the two that begin the next step.
+                // The name runs to the next `.` or `[`: a JSON key may
+                // contain anything else, hyphens included.
                 while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
                     i += 1;
                 }
@@ -696,10 +624,9 @@ fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
 
 #[cfg(test)]
 mod tests {
-    // A server can send a legal 64 MiB body that is 33 million `[` deep;
-    // parsing it recursively -- and then *dropping* the result, which
-    // recurses too -- is a SIGSEGV, not an error. The size cap on an LSP
-    // body bounds the bytes and says nothing about their shape.
+    // A legal 64 MiB body 33 million `[` deep would overflow the stack in
+    // parsing and in dropping the result. The size cap bounds bytes, not
+    // shape.
     #[test]
     fn nesting_past_the_limit_is_an_error_rather_than_a_crash() {
         let ok = format!("{}1{}", "[".repeat(super::MAX_DEPTH), "]".repeat(super::MAX_DEPTH));
@@ -709,13 +636,12 @@ mod tests {
         let err = super::parse(&one_deeper).unwrap_err();
         assert!(err.contains("nested deeper"), "{err}");
 
-        // Unterminated is the shape a bomb actually arrives in -- there
-        // is no reason for it to bother closing its brackets.
+        // Unterminated, as a bomb would arrive.
         assert!(super::parse(&"[".repeat(100_000)).unwrap_err().contains("nested deeper"));
         assert!(super::parse(&"{\"a\":".repeat(100_000)).unwrap_err().contains("nested deeper"));
 
-        // The counter comes back down, so a wide document of shallow
-        // values is not slowly starved of depth.
+        // The counter comes back down, so a wide document of shallow values
+        // isn't starved of depth.
         let wide = format!("[{}]", vec!["[[1]]"; 500].join(","));
         assert!(super::parse(&wide).is_ok());
     }
@@ -727,18 +653,16 @@ mod tests {
         let src = r#"{"a":[1,2.5,null,true],"b":{"c":"x"},"d":{},"e":[]}"#;
         let value = parse(src).unwrap();
         let out = compact_print(&value);
-        // Field order is preserved (Value::Object is a Vec), so a
-        // round trip through a compact write is byte-identical to a
-        // source that already had no whitespace.
+        // Field order is kept, so a compact round trip of whitespace-free
+        // source is byte-identical.
         assert_eq!(out, src);
         assert_eq!(parse(&out).unwrap(), value);
     }
 
     #[test]
     fn compact_print_escapes_exactly_as_pretty_print_does() {
-        // The one property that actually matters for a wire format:
-        // whatever is in a string survives, and the two writers cannot
-        // disagree about it because they share the same escaper.
+        // Whatever is in a string survives, and the two writers share the
+        // escaper.
         let nasty = Value::Object(vec![("k\u{1}\"\\\n".to_string(), Value::Str("tab\there\u{7f}\u{1f600}".to_string()))]);
         let compact = compact_print(&nasty);
         assert_eq!(parse(&compact).unwrap(), nasty);
@@ -750,9 +674,7 @@ mod tests {
         tokens(input).into_iter().map(|t| t.kind).collect()
     }
 
-    // Char offsets, not bytes -- the é is two bytes and one column, and
-    // a highlighter that got this wrong would paint everything after it
-    // one position off.
+    // Char offsets: `é` is two bytes and one column.
     #[test]
     fn token_spans_are_char_offsets_covering_each_token_exactly() {
         let toks = tokens(r#"{"é": 12}"#);
@@ -780,9 +702,8 @@ mod tests {
         );
     }
 
-    // The property the highlighter depends on and the parser doesn't:
-    // tokenizing never gives up, so everything after a mistake is still
-    // read as itself rather than lost.
+    // Tokenizing never gives up, so everything after a mistake is read as
+    // itself.
     #[test]
     fn tokenizing_recovers_after_invalid_input_instead_of_stopping() {
         let toks = kinds("[tru, 1]");
@@ -791,10 +712,8 @@ mod tests {
         assert_eq!(toks[2..], [TokenKind::Comma, TokenKind::Number(1.0), TokenKind::CloseBracket]);
     }
 
-    // An open quote must not swallow the rest of the buffer: a raw
-    // newline can't appear in a JSON string anyway, so ending the bad
-    // token at the line break costs nothing and keeps every line below
-    // it highlighted as itself while it's being typed.
+    // An open quote doesn't swallow the buffer: ending the bad token at the
+    // line break keeps every line below highlighted while it's typed.
     #[test]
     fn an_unterminated_string_ends_at_its_own_line() {
         let toks = tokens("{\"a\n\"b\": 1}");
@@ -830,7 +749,7 @@ mod tests {
     fn parses_string_escapes_including_unicode_and_surrogate_pairs() {
         assert_eq!(parse(r#""a\nb\t\"c""#).unwrap(), Value::Str("a\nb\t\"c".to_string()));
         assert_eq!(parse(r#""é""#).unwrap(), Value::Str("é".to_string()));
-        // U+1F600 GRINNING FACE, encoded as a UTF-16 surrogate pair.
+        // U+1F600, encoded as a UTF-16 surrogate pair.
         assert_eq!(parse(r#""😀""#).unwrap(), Value::Str("😀".to_string()));
     }
 
@@ -873,19 +792,15 @@ mod tests {
 
     #[test]
     fn a_bare_field_name_may_hold_anything_but_a_dot_or_a_bracket() {
-        // The bug: a bare name used to stop at the first non-alphanumeric,
-        // so `.rust-analyzer` silently looked up `rust` -- and that is the
-        // most common LSP settings key there is. lspclient.rs had to walk
-        // its sections by hand because of it.
+        // A bare name runs past `-`: `.rust-analyzer` is the most common LSP
+        // settings key.
         let v = parse(r#"{"rust-analyzer":{"check":{"command":"clippy"}},"a.b":1,"with space":2}"#).unwrap();
         assert_eq!(query(&v, ".rust-analyzer.check.command").unwrap(), &Value::Str("clippy".to_string()));
         assert_eq!(query(&v, r#".["with space"]"#).unwrap_or(&Value::Null), &Value::Null, "a leading dot still wants a name");
-        // The bracket form covers the two a bare name cannot: a key
-        // containing a dot, and a key at the very start.
+        // Brackets cover a key with a dot, and a key at the very start.
         assert_eq!(query(&v, r#"["a.b"]"#).unwrap(), &Value::Number(1.0));
         assert_eq!(query(&v, r#"["with space"]"#).unwrap(), &Value::Number(2.0));
-        // ...and a name that is genuinely absent still resolves to null
-        // rather than to a shorter prefix of itself.
+        // An absent name resolves to null, not to a shorter prefix.
         assert_eq!(query(&v, ".rust-analyser").unwrap(), &Value::Null);
     }
 
