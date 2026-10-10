@@ -203,7 +203,11 @@ pub fn blame(path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
     let mut blame = command(dir);
     blame.arg("blame").arg("--line-porcelain");
     if let Some(rev) = rev {
-        blame.arg(rev);
+        // `--end-of-options` before it, the way `log` and `show`
+        // already do: a revision is a word somebody typed at `:blame`,
+        // and one beginning with a dash would otherwise be read as an
+        // option by `git blame` rather than refused as a bad revision.
+        blame.arg("--end-of-options").arg(rev);
     }
     // `--` before the path, always: without it a revision and a filename
     // are told apart by guesswork, and a branch and a file can share a

@@ -9333,7 +9333,14 @@ fn act_on_opener_choice(app: &mut App, target: crate::opener::Target, destinatio
         // exactly as if it had been typed there.
         Target::File(path) => match destination {
             Destination::Here => open_file_frame(app, &path, None),
-            _ => open_with(app, destination, format!("e {}", exec::shell_quote(&path.to_string_lossy()))),
+            // `--` because a tracked file may be named `-x`, and the
+            // editor's own argument parser refuses an unrecognised
+            // option rather than guessing -- so without this the one
+            // thing the opener could not open was a file whose name
+            // looks like a flag. `shell_quote` already stops a name
+            // from becoming a second command; this stops it becoming an
+            // option of the first.
+            _ => open_with(app, destination, format!("e -- {}", exec::shell_quote(&path.to_string_lossy()))),
         },
         Target::Directory(path) => {
             let command = format!("cd {}", exec::shell_quote(&path.to_string_lossy()));
