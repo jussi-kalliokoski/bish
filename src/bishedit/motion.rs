@@ -25,8 +25,7 @@ pub enum Motion {
     WordEndBackward,    // ge
     WordEndBackwardBig, // gE
     FindChar {
-        // f F t T. Repeat via ';'/',' is vimkeys' job (stage 4): it remembers
-        // the last FindChar and re-issues it (flipping `forward` for ',').
+        // `f F t T`. vimkeys repeats them with `;` and `,`.
         ch: char,
         till: bool,
         forward: bool,
@@ -53,20 +52,15 @@ pub enum Motion {
     SetMark(char),      // m{a-z}
     GotoMark(char),     // `{mark}
     GotoMarkLine(char), // '{mark}
-    // Repeat via 'n'/'N' is vimkeys' job (stage 4), same as ';'/',' for
-    // FindChar: it remembers the last search (the literal string it parsed
-    // for '/'/'?', or simply that '*'/'#' was used) and re-issues the same
-    // motion, flipping direction for 'N'. For '*'/'#' this works out neatly
-    // because the word under the cursor after landing on a match is, by
-    // construction, textually identical to the word that was searched for.
+    // vimkeys repeats searches with `n` and `N`, re-issuing the last one
+    // (flipping direction for `N`). For `*` and `#` that works because the
+    // word under the cursor after a match is the word that was searched for.
     SearchForward(String),  // /pattern<Enter>
     SearchBackward(String), // ?pattern<Enter>
     SearchWordForward,      // *
     SearchWordBackward,     // #
-    // `g*`/`g#` -- same "search for the word under the cursor" idea as
-    // `*`/`#`, but a plain substring search: no `\<`/`\>` word-boundary
-    // requirement, so "foobar" also matches when the word under the
-    // cursor is "foo".
+    // `g*`/`g#`: like `*`/`#` without the word-boundary requirement, so
+    // `foobar` matches when the word under the cursor is `foo`.
     SearchWordForwardUnbounded,
     SearchWordBackwardUnbounded,
     UnmatchedOpenParen,  // [(
@@ -77,14 +71,11 @@ pub enum Motion {
     SectionForwardEnd,   // ][ (next line starting with '}')
     SectionBackward,     // [[ (previous line starting with '{')
     SectionBackwardEnd,  // [] (previous line starting with '}')
-    // `iw`/`aw`/`i(`/`a(`/`i"`/`a"`/... -- vim's text objects, valid only as
-    // an operator's target (`vimkeys.rs` only ever produces this while an
-    // operator is armed -- see its own doc comment on `i`/`a`'s gating).
-    // Unlike every other `Motion`, the cursor usually sits *inside* the
-    // target range rather than at one of its ends, so `motion_range` can't
-    // use its usual "apply the motion, diff the cursor before/after" trick
-    // -- it special-cases this variant to call `text_object_range` directly
-    // instead. `bool` is `around` (`a{obj}`) vs inner (`i{obj}`).
+    // `iw`, `aw`, `i(`, `a"` and the rest: text objects, only ever an
+    // operator's target. The cursor usually sits inside the range, so
+    // `motion_range` can't diff the cursor before and after, and calls
+    // `text_object_range` directly. The `bool` is `around` (`a`) vs inner
+    // (`i`).
     TextObject(TextObjectKind, bool),
     /// `zj`: down to where the next fold starts.
     FoldNextStart,
@@ -96,10 +87,8 @@ pub enum Motion {
     FoldEnd,
 }
 
-/// The object an `i`/`a` text object names. `b`/`B` are vim's own aliases for
-/// `(`/`{` respectively (both map to `Paren`/`Brace`); tag objects (`it`/
-/// `at`) are out of scope for this pass -- rare outside markup, and this is
-/// a shell editor, not a web one.
+/// The object an `i`/`a` text object names. `b` and `B` are vim's aliases
+/// for `(` and `{`. No tag objects (`it`/`at`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextObjectKind {
     Word,
@@ -122,16 +111,14 @@ enum Class {
     Punct,
 }
 
-// Whether `c` is part of a word, given the buffer's own `iskeyword`
-// answer -- see `Buffer::word_chars`. Letters and digits always are, in
-// any script; `extra` says which punctuation joins them.
+// Whether `c` is part of a word, given the buffer's `iskeyword` (see
+// `Buffer::word_chars`). Letters and digits always are.
 fn is_word_char(c: char, extra: &str) -> bool {
     c.is_alphanumeric() || extra.contains(c)
 }
 
-/// `~`/`gu`/`gU`/`g~`'s own shared notion of "which way to change case" --
-/// a non-alphabetic character is always left untouched by every variant
-/// (vim's own rule: only letters have a case to change).
+/// Which way `~`, `gu`, `gU` and `g~` change case. Non-letters are left
+/// alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseKind {
     Lower,
@@ -139,13 +126,10 @@ pub enum CaseKind {
     Toggle,
 }
 
-/// The single-character transform every case command (`~`'s own direct
-/// per-character toggle, and `gu{motion}`/`gU{motion}`/`g~{motion}`'s
-/// operator versions) is built from. ASCII-only, matching `r`'s own
-/// scope -- a full Unicode case fold can expand one character into
-/// several (`ß` -> `SS`), which wouldn't fit this "one char in, one char
-/// out" shape any of these commands assume; non-ASCII letters simply
-/// pass through unchanged.
+/// One character's case change, which every case command is built from.
+/// ASCII only, like `r`: a full Unicode case mapping can turn one character
+/// into several (`ß` to `SS`), which these commands can't take. Non-ASCII
+/// letters pass through.
 pub fn case_transform(c: char, kind: CaseKind) -> char {
     match kind {
         CaseKind::Lower => c.to_ascii_lowercase(),
@@ -176,17 +160,10 @@ fn classify(buf: &dyn Buffer, line: usize, col: usize, big: bool) -> Class {
     }
 }
 
-// The rightmost column a Normal-mode cursor can ever sit at on `line`
-// -- the shared clamp point almost every motion in this file uses
-// (Left/Right, Up/Down's own column preservation, GotoLine, page
-// scrolling, ...), so fixing it here is what actually makes "the
-// cursor never lands mid-grapheme-cluster" hold everywhere at once,
-// not just for the motions that call `grapheme::next_boundary`/
-// `prev_boundary` directly. If the line's last char is part of a
-// multi-char cluster (a trailing ZWJ emoji sequence, say), the cursor's
-// own last valid position is that cluster's *start*, not its last raw
-// char index -- landing on any char index past the start would put the
-// cursor visually inside the glyph.
+// The rightmost column a Normal-mode cursor can sit at on `line`, the
+// clamp nearly every motion uses. If the last char belongs to a
+// multi-char cluster (a ZWJ emoji sequence), that's the cluster's start,
+// so the cursor never lands inside a glyph.
 fn last_col(buf: &dyn Buffer, line: usize) -> usize {
     let len = buf.line_len(line);
     if len == 0 {
@@ -218,10 +195,8 @@ fn last_non_blank(buf: &dyn Buffer, line: usize) -> usize {
     0
 }
 
-/// `$`'s own target row: walks forward past every `line_wraps` row so it
-/// always lands on the true end of the logical line, not wherever a
-/// column-width autowrap happened to cut it -- for every ordinary buffer
-/// (`line_wraps` always false) this is just `line` itself, unchanged.
+/// `$`'s target row: past every `line_wraps` row to the end of the
+/// logical line. For an ordinary buffer, just `line`.
 fn logical_line_end(buf: &dyn Buffer, line: usize) -> usize {
     let mut l = line;
     while buf.line_wraps(l) && l + 1 < buf.line_count() {
@@ -230,10 +205,9 @@ fn logical_line_end(buf: &dyn Buffer, line: usize) -> usize {
     l
 }
 
-/// Steps one character forward. Never lands on the virtual "just past the
-/// last character" slot of a line -- that slot is skipped straight through
-/// to column 0 of the next line, since it isn't a real character and vim's
-/// word motions treat the line break itself as the boundary.
+/// One character forward, skipping the slot past a line's last character
+/// straight to the next line's column 0: vim's word motions treat the line
+/// break itself as the boundary.
 fn step_forward(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     let len = buf.line_len(line);
@@ -246,9 +220,8 @@ fn step_forward(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)>
     }
 }
 
-/// Mirror of `step_forward`: stepping back from column 0 lands on the last
-/// real character of the previous line (or column 0 if that line is empty),
-/// never on a virtual past-the-end slot.
+/// The mirror of `step_forward`: back from column 0 to the previous line's
+/// last character (or column 0 if it's empty).
 fn step_backward(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     if col > 0 {
@@ -370,11 +343,8 @@ fn word_end_forward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (u
     }
 }
 
-/// `ge`/`gE`: end of the word before the cursor. Unlike `w`/`b`/`e`, if there
-/// is no previous word to find (the cursor is already within the buffer's
-/// first word), this leaves the cursor unmoved rather than clamping to the
-/// farthest reachable position -- matching vim, which simply fails the
-/// motion in that case.
+/// `ge`/`gE`: end of the previous word. With none (the cursor is in the
+/// buffer's first word) the cursor stays, as vim fails the motion.
 fn word_end_backward_once(buf: &dyn Buffer, pos: (usize, usize), big: bool) -> (usize, usize) {
     let (oline, ocol) = pos;
     let orig_is_word = buf.line_len(oline) > 0 && classify(buf, oline, ocol, big) != Class::Blank;
@@ -413,13 +383,10 @@ fn find_char_backward_once(buf: &dyn Buffer, line: usize, from_col: usize, ch: c
     (0..from_col).rev().find(|&c| buf.char_at(line, c) == Some(ch))
 }
 
-/// Where `f`/`F`/`t`/`T` would put the cursor, or `None` if there is no
-/// `n`th `ch` to find in that direction.
-///
-/// Separate from `apply_motion` because `motion_range` has to know
-/// whether the find *succeeded*, which is not the same question as
-/// whether the cursor ended up somewhere new -- see its own note on
-/// `dt,`.
+/// Where `f`/`F`/`t`/`T` would land, or `None` with no `n`th `ch` that
+/// way. Separate from `apply_motion` because `motion_range` needs to know
+/// whether the find succeeded, which isn't whether the cursor moved (see
+/// `dt,` there).
 fn find_char_landing(buf: &dyn Buffer, line: usize, col: usize, ch: char, till: bool, forward: bool, n: usize) -> Option<usize> {
     let mut c = col;
     for _ in 0..n {
@@ -440,11 +407,10 @@ fn is_blank_line(buf: &dyn Buffer, line: usize) -> bool {
     buf.line_len(line) == 0
 }
 
-/// `pos` must hold a sentence-ending punctuation character. Returns the
-/// position right after it (and any immediately following closing
-/// quotes/brackets, same line only) if that position is whitespace,
-/// end-of-line, or end-of-buffer -- i.e. if `pos` really does end a sentence
-/// -- or `None` if it doesn't (e.g. "3.14", where '.' isn't a sentence end).
+/// `pos` holds sentence-ending punctuation. Returns the position after it
+/// (and any closing quotes or brackets on the same line) if that's
+/// whitespace, end of line or end of buffer, i.e. `pos` ends a sentence;
+/// `None` otherwise (`3.14`).
 fn sentence_boundary_after(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let mut cur = pos;
     loop {
@@ -517,12 +483,9 @@ fn sentence_forward_once(buf: &dyn Buffer, pos: (usize, usize)) -> (usize, usize
     }
 }
 
-/// Sentence-start positions, in document order, computed by repeatedly
-/// applying `sentence_forward_once` from the first sentence. `(`
-/// (sentence-backward) is defined in terms of this list rather than as an
-/// independent backward scan -- much easier to keep correct than
-/// hand-rolling a mirrored version of the forward algorithm's boundary
-/// detection.
+/// Sentence starts in document order, from repeated
+/// `sentence_forward_once`. `(` uses this list rather than a mirrored
+/// backward scan, which would be harder to keep correct.
 fn sentence_starts(buf: &dyn Buffer) -> Vec<(usize, usize)> {
     let first = if buf.line_len(0) == 0 { (0, 0) } else { (0, first_non_blank(buf, 0)) };
     let mut starts = vec![first];
@@ -597,8 +560,7 @@ fn viewport_bottom(buf: &dyn Buffer) -> usize {
     (buf.viewport_top() + buf.viewport_height().saturating_sub(1)).min(buf.line_count() - 1)
 }
 
-/// For a bracket character, returns (the character that closes/opens the
-/// pair, whether `c` itself is the opening bracket).
+/// For a bracket: its partner, and whether `c` is the opening one.
 fn bracket_partner(c: char) -> Option<(char, bool)> {
     match c {
         '(' => Some((')', true)),
@@ -611,9 +573,8 @@ fn bracket_partner(c: char) -> Option<(char, bool)> {
     }
 }
 
-/// `%`: if the cursor isn't on a bracket, scans forward on the current line
-/// only (matching vim) for the first one, then walks forward or backward
-/// through the buffer tracking nesting depth to find its partner.
+/// `%`: off a bracket, finds the first one on the line (as vim does), then
+/// walks the buffer tracking depth to its partner.
 fn match_pair_once(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usize)> {
     let (line, col) = pos;
     let len = buf.line_len(line);
@@ -629,16 +590,13 @@ fn match_pair_once(buf: &dyn Buffer, pos: (usize, usize)) -> Option<(usize, usiz
     partner_of(buf, start?, None)
 }
 
-// How far `bracket_pair_at` looks before giving up. `%` itself has no
-// budget -- it is typed once, and taking a moment to answer beats not
-// answering -- while the mark is worked out on every redraw, where an
-// unmatched bracket in a long file would otherwise be chased from end to
-// end between one keystroke and the next.
+// How far `bracket_pair_at` looks. `%` has no budget, since it's typed
+// once, but the mark is computed on every redraw, where an unmatched
+// bracket would otherwise be chased through the whole file.
 const MATCH_LIMIT: usize = 20_000;
 
 // The bracket that closes the one at `start`, or opens it for a closing
-// one. `None` when nothing does -- and, given a `budget`, when nothing
-// does within that many characters.
+// one. `None` when there's none, or none within `budget` characters.
 fn partner_of(buf: &dyn Buffer, start: (usize, usize), budget: Option<usize>) -> Option<(usize, usize)> {
     let ch0 = buf.char_at(start.0, start.1)?;
     let (partner_char, is_opening) = bracket_partner(ch0)?;
@@ -664,29 +622,18 @@ fn partner_of(buf: &dyn Buffer, start: (usize, usize), budget: Option<usize>) ->
     }
 }
 
-/// The bracket the cursor is *on* and the one it pairs with, for a caller
-/// that shows both at once -- which is what vim does, and what says where
-/// `%` would land before it is pressed.
-///
-/// Deliberately not `%`'s own rule: `%` scans forward to the first
-/// bracket on the line and jumps from there, where vim marks nothing at
-/// all unless the cursor is on a bracket itself. `None` for an unmatched
-/// bracket, and for one whose partner is further off than `MATCH_LIMIT`.
+/// The bracket under the cursor and its partner, for showing both, as vim
+/// does. Not `%`'s rule: vim marks nothing unless the cursor is on a
+/// bracket. `None` when unmatched or past `MATCH_LIMIT`.
 pub fn bracket_pair_at(buf: &dyn Buffer, pos: (usize, usize)) -> Option<((usize, usize), (usize, usize))> {
     bracket_partner(buf.char_at(pos.0, pos.1)?)?;
     Some((pos, partner_of(buf, pos, Some(MATCH_LIMIT))?))
 }
 
-/// The word (contiguous run of word chars) at or after `pos`. If `pos`
-/// isn't on a word char, advances to the next word first, matching `*`/`#`'s
-/// vim behavior of searching from the nearest word forward.
-///
-/// Public so a caller rendering search-match highlighting can recover the
-/// pattern a `*`/`#` search actually used: `SearchWordForward`/
-/// `SearchWordBackward`'s own doc comment already notes that the word
-/// under the cursor *after* landing on a match is, by construction,
-/// textually identical to the word that was searched for -- so there's no
-/// need for `vimkeys.rs` to separately track and expose that text itself.
+/// The word at or after `pos`, advancing to the next word if `pos` isn't
+/// on one, as `*` and `#` search from the nearest word forward. Public so
+/// search highlighting can recover a `*` search's pattern: the word under
+/// the cursor after a match is the word searched for.
 pub fn word_under_cursor(buf: &dyn Buffer, pos: (usize, usize)) -> Option<String> {
     let mut p = pos;
     if buf.line_len(p.0) == 0 || !matches!(buf.char_at(p.0, p.1), Some(c) if is_word_char(c, buf.word_chars())) {
@@ -714,11 +661,9 @@ pub fn word_under_cursor(buf: &dyn Buffer, pos: (usize, usize)) -> Option<String
     Some((start_col..=end_col).filter_map(|c| buf.char_at(line, c)).collect())
 }
 
-/// The chunk (contiguous run of the same `Class`) at `col` on `line`,
-/// extended `count - 1` further chunks forward -- the shared core of
-/// `iw`/`aw`/`iW`/`aW`: vim defines `[count]iw` as "the word (or
-/// punctuation-run, or blank-run -- whichever the cursor sits on) plus the
-/// next `count - 1` chunks of *any* class immediately following it".
+/// The chunk (run of one `Class`) at `col`, extended `count - 1` chunks
+/// forward: vim's `[count]iw` is the word, punctuation run or blank run
+/// under the cursor plus the next `count - 1` chunks of any class.
 fn word_object_range(buf: &dyn Buffer, pos: (usize, usize), big: bool, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let (line, col) = pos;
     if buf.line_len(line) == 0 {
@@ -761,11 +706,8 @@ fn word_object_range(buf: &dyn Buffer, pos: (usize, usize), big: bool, around: b
     Some(MotionRange { shape: MotionShape::Inclusive, from: (line, start), to: (line, end) })
 }
 
-/// The raw positions of the two `quote` characters `quote_object_range`
-/// (below) would resolve around/inside -- factored out so `ds"`/`cs"` (see
-/// `surround_pair_positions`) can act on exactly the delimiter characters
-/// themselves, with none of `quote_object_range`'s own around-whitespace
-/// swallowing or inner-content trimming.
+/// The two `quote` characters `quote_object_range` works around, for
+/// `ds"`/`cs"`, which act on the delimiters alone.
 fn quote_pair_positions(buf: &dyn Buffer, pos: (usize, usize), quote: char) -> Option<((usize, usize), (usize, usize))> {
     let (line, col) = pos;
     let len = buf.line_len(line);
@@ -781,12 +723,10 @@ fn quote_pair_positions(buf: &dyn Buffer, pos: (usize, usize), quote: char) -> O
     None
 }
 
-/// `i"`/`a"`/`i'`/`a'`/`` i` ``/`` a` `` -- same-line only, matching vim
-/// (string text objects never cross a line break). Pairs up every
-/// occurrence of `quote` on the line left to right (1st+2nd, 3rd+4th, ...)
-/// and picks the first pair the cursor is at-or-before the close of --
-/// vim's own rule: inside a pair selects that pair, before all pairs
-/// selects the first, in the gap between two pairs selects the next one.
+/// `i"`, `a'`, `` i` `` and the rest, on one line only, as in vim. The
+/// line's quotes pair up left to right (1st and 2nd, 3rd and 4th, ...), and
+/// the first pair the cursor is at or before the close of is chosen: inside
+/// a pair selects it, before all pairs the first, between two the next.
 fn quote_object_range(buf: &dyn Buffer, pos: (usize, usize), quote: char, around: bool) -> Option<MotionRange> {
     let (line, _) = pos;
     let len = buf.line_len(line);
@@ -808,14 +748,13 @@ fn quote_object_range(buf: &dyn Buffer, pos: (usize, usize), quote: char, around
     } else if b > a + 1 {
         Some(MotionRange { shape: MotionShape::Inclusive, from: (line, a + 1), to: (line, b - 1) })
     } else {
-        // Adjacent quotes ("") have nothing between them -- matches vim's
-        // own `di"` no-op on an empty string.
+        // `""` has nothing between: `di"` does nothing, as in vim.
         None
     }
 }
 
-/// Walks forward from just after `open_pos` (already known to hold `open`),
-/// tracking nesting depth, to `open_pos`'s matching `close`.
+/// Forward from just after `open_pos` (which holds `open`), tracking
+/// depth, to its matching `close`.
 fn scan_matching_forward(buf: &dyn Buffer, open_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 1;
     let mut cur = open_pos;
@@ -834,8 +773,7 @@ fn scan_matching_forward(buf: &dyn Buffer, open_pos: (usize, usize), open: char,
     }
 }
 
-/// Mirror of `scan_matching_forward`: walks backward from just before
-/// `close_pos` to its matching `open`.
+/// Backward from just before `close_pos` to its matching `open`.
 fn scan_matching_backward(buf: &dyn Buffer, close_pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 1;
     let mut cur = close_pos;
@@ -854,9 +792,8 @@ fn scan_matching_backward(buf: &dyn Buffer, close_pos: (usize, usize), open: cha
     }
 }
 
-/// Walks backward from `pos` (not itself on `open`/`close`) for the nearest
-/// `open` that isn't already balanced by a `close` seen along the way --
-/// i.e. the bracket that innermost-encloses `pos`.
+/// Backward from `pos` (not itself a bracket) to the nearest `open` not
+/// balanced by a `close` on the way: the innermost enclosing bracket.
 fn scan_unmatched_open_backward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 0;
     let mut cur = pos;
@@ -875,9 +812,8 @@ fn scan_unmatched_open_backward(buf: &dyn Buffer, pos: (usize, usize), open: cha
     }
 }
 
-/// The bracket pair that innermost-encloses `pos` -- `pos` sitting exactly
-/// on `open` or `close` counts as enclosed by that pair (matching vim: `%`
-/// on either paren already works the same way).
+/// The innermost bracket pair enclosing `pos`; sitting on either bracket
+/// counts, as for `%`.
 fn find_enclosing_pair(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<((usize, usize), (usize, usize))> {
     if let Some(c) = buf.char_at(pos.0, pos.1) {
         if c == open {
@@ -892,9 +828,7 @@ fn find_enclosing_pair(buf: &dyn Buffer, pos: (usize, usize), open: char, close:
     Some((open_pos, close_pos))
 }
 
-/// Mirror of `scan_unmatched_open_backward`: walks forward from `pos` for
-/// the nearest `close` that isn't already balanced by an `open` seen along
-/// the way -- `[(`/`[{`'s own forward-facing sibling, `])`/`]}`.
+/// Forward from `pos` to the nearest unbalanced `close`, for `])`/`]}`.
 fn scan_unmatched_close_forward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char) -> Option<(usize, usize)> {
     let mut depth = 0;
     let mut cur = pos;
@@ -913,10 +847,9 @@ fn scan_unmatched_close_forward(buf: &dyn Buffer, pos: (usize, usize), open: cha
     }
 }
 
-/// `[(`/`[{`: `count` unmatched opening brackets backward from the cursor.
-/// Each repeat starts strictly before the previous find (`scan_unmatched_
-/// open_backward` never looks at `pos` itself, so re-feeding the same
-/// position back in naturally continues past it).
+/// `[(`/`[{`: `count` unmatched opening brackets back from the cursor.
+/// Each repeat starts before the last find, since the scan never looks at
+/// `pos` itself.
 fn unmatched_backward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char, count: usize) -> Option<(usize, usize)> {
     let mut cur = pos;
     let mut found = None;
@@ -938,17 +871,14 @@ fn unmatched_forward(buf: &dyn Buffer, pos: (usize, usize), open: char, close: c
     found
 }
 
-/// A line whose very first character is `ch` -- vim's own (language-
-/// agnostic) definition of a section boundary: `{` starts one, `}` ends
-/// one. No 'sections' option, no form-feed handling -- just the plain-text
-/// default.
+/// A line starting with `ch`: vim's default section boundary, `{` opening
+/// one and `}` closing one. No 'sections' option or form feeds.
 fn line_starts_with(buf: &dyn Buffer, line: usize, ch: char) -> bool {
     buf.line_len(line) > 0 && buf.char_at(line, 0) == Some(ch)
 }
 
-/// `]]`/`][`: the next line (after the cursor's own) starting with `boundary`,
-/// clamped to the buffer's last line if there isn't one -- same clamp-at-
-/// the-edge convention `paragraph_forward_once` already uses.
+/// `]]`/`][`: the next line starting with `boundary`, or the last line
+/// when there's none, like `paragraph_forward_once`.
 fn section_forward_once(buf: &dyn Buffer, line: usize, boundary: char) -> usize {
     let last = buf.line_count() - 1;
     let mut l = line;
@@ -973,10 +903,8 @@ fn section_backward_once(buf: &dyn Buffer, line: usize, boundary: char) -> usize
     0
 }
 
-/// `i(`/`a(`/`ib`/`ab`/`i{`/`a{`/... -- spans lines (unlike word/quote
-/// objects), tracking nesting via `find_enclosing_pair`. `count` widens
-/// outward one enclosing level per extra count, same as vim's `2i(` inside
-/// nested parens.
+/// `i(`, `a{`, `ib` and the rest: across lines, via `find_enclosing_pair`.
+/// Each extra count widens one enclosing level, as `2i(` does in vim.
 fn pair_object_range(buf: &dyn Buffer, pos: (usize, usize), open: char, close: char, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let n = count.unwrap_or(1).max(1);
     let mut cur_pos = pos;
@@ -995,8 +923,7 @@ fn pair_object_range(buf: &dyn Buffer, pos: (usize, usize), open: char, close: c
         let inner_start = step_forward(buf, open_pos)?;
         let inner_end = step_backward(buf, close_pos)?;
         if pos_lt(inner_end, inner_start) {
-            // Adjacent brackets ("()") have nothing between them -- matches
-            // vim's own `di(` no-op there, same as the empty-quote case.
+            // `()` has nothing between: `di(` does nothing, as in vim.
             None
         } else {
             Some(MotionRange { shape: MotionShape::Inclusive, from: inner_start, to: inner_end })
@@ -1004,12 +931,10 @@ fn pair_object_range(buf: &dyn Buffer, pos: (usize, usize), open: char, close: c
     }
 }
 
-/// `ip`/`ap` -- the run of contiguous lines with the same "blank or not" as
-/// the cursor's own line, `count - 1` more such runs extended forward.
-/// `around` additionally swallows one trailing blank-line run (or, only if
-/// there's none to swallow -- e.g. the buffer's last paragraph -- a leading
-/// one instead), matching vim's own "prefer trailing, fall back to
-/// leading" rule (same shape as `word_object_range`'s own `around` logic).
+/// `ip`/`ap`: the run of lines that are blank or not like the cursor's,
+/// plus `count - 1` more runs. `around` takes one trailing blank run, or a
+/// leading one when there's none after (the buffer's last paragraph), as
+/// vim does.
 fn paragraph_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
     let (line, _) = pos;
     let last = buf.line_count() - 1;
@@ -1048,11 +973,9 @@ fn paragraph_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, c
     Some(MotionRange { shape: MotionShape::Linewise, from: (start, 0), to: (end, 0) })
 }
 
-/// `is`/`as` -- the sentence (per `sentence_starts`'s own boundary rules)
-/// containing the cursor, `count - 1` more sentences extended forward.
-/// `around` includes the whitespace run up to the next sentence's start (or
-/// to the end of the buffer, for the last sentence); inner trims that back
-/// off, stopping at the last non-blank character.
+/// `is`/`as`: the sentence containing the cursor, plus `count - 1` more.
+/// `around` runs through the whitespace to the next sentence's start (or
+/// the buffer's end); inner stops at the last non-blank.
 fn sentence_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, count: Option<usize>) -> Option<MotionRange> {
     let starts = sentence_starts(buf);
     let mut idx = 0;
@@ -1069,14 +992,9 @@ fn sentence_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, co
         (last_line, last_col(buf, last_line))
     };
     let end_idx = (idx + count.unwrap_or(1).max(1) - 1).min(starts.len() - 1);
-    // `sentence_starts` can end with a phantom "start" sitting exactly on
-    // the buffer's very last character -- `sentence_forward_once` clamps
-    // there (see its own test's "clamped on the last '.'" case) rather
-    // than reporting "no more sentences" the way it does mid-buffer, so
-    // that clamp lands in the starts list looking like a genuine next
-    // sentence. It never is one (a sentence can't both end and begin on
-    // the same single character), so it's treated as "no next sentence"
-    // here rather than truncating this object's own last sentence short.
+    // `sentence_starts` can end with a start on the buffer's last character,
+    // where `sentence_forward_once` clamps. A sentence can't end and begin on
+    // one character, so that's no next sentence.
     let next_start = starts.get(end_idx + 1).copied().filter(|&s| s != buf_end);
     let around_end = next_start.and_then(|ns| step_backward(buf, ns)).unwrap_or(buf_end);
     if pos_lt(around_end, start) {
@@ -1095,11 +1013,8 @@ fn sentence_object_range(buf: &dyn Buffer, pos: (usize, usize), around: bool, co
     Some(MotionRange { shape: MotionShape::Inclusive, from: start, to: end })
 }
 
-/// Resolves a text object (`iw`/`aw`/`i(`/`a(`/...) against the cursor's
-/// current position -- unlike `motion_range`'s usual motions, this doesn't
-/// move anything itself; see `Motion::TextObject`'s own doc comment for why
-/// `motion_range` special-cases this variant instead of going through
-/// `apply_motion`.
+/// Resolves a text object against the cursor without moving it; see
+/// `Motion::TextObject` for why `motion_range` calls this directly.
 pub fn text_object_range(buf: &dyn Buffer, kind: TextObjectKind, around: bool, count: Option<usize>) -> Option<MotionRange> {
     let pos = buf.cursor();
     match kind {
@@ -1117,13 +1032,10 @@ pub fn text_object_range(buf: &dyn Buffer, kind: TextObjectKind, around: bool, c
     }
 }
 
-/// vim-surround's own `ds`/`cs` target character -- which pair-shaped
-/// `TextObjectKind` it names, restricted to the kinds that actually have a
-/// pair of single-character delimiters to search for (`w`/`s`/`p` aren't
-/// valid `ds`/`cs` targets in the real plugin either). `b`/`B`/`r` are its
-/// own mnemonic aliases for `(`/`{`/`[` respectively; either half of a pair
-/// (`(` or `)`) names the same kind, matching how `find_enclosing_pair`
-/// itself doesn't care which side of a pair `pos` is searched from.
+/// vim-surround's `ds`/`cs` target: which pair kind a character names.
+/// Only kinds with single-character delimiters (`w`, `s`, `p` aren't
+/// targets in the plugin either). `b`, `B` and `r` alias `(`, `{` and `[`,
+/// and either half of a pair names it.
 pub fn surround_target_kind(ch: char) -> Option<TextObjectKind> {
     Some(match ch {
         '(' | ')' | 'b' => TextObjectKind::Paren,
@@ -1137,19 +1049,13 @@ pub fn surround_target_kind(ch: char) -> Option<TextObjectKind> {
     })
 }
 
-/// The two delimiter strings vim-surround inserts for a given trigger
-/// character -- `ys`/`cs`'s own "which character did you press" half.
-/// Pressing an *opening* bracket (`(`/`{`/`[`/`<`, or their `b`/`B`/`r`
-/// mnemonics) pads its inner side with a space (`ysiw(` -> `( word )`);
-/// its own closing counterpart inserts tight (`ysiw)` -> `(word)`), and
-/// quotes/backtick never pad either way. Any other printable, non-
-/// alphanumeric character (`*`, `_`, `=`, ...) is its own literal,
-/// unpadded pair -- vim-surround's own generic fallback for a delimiter
-/// with no dedicated meaning. Letters beyond `b`/`B`/`r` are deliberately
-/// excluded from that fallback: unlike real vim-surround (which allows
-/// any single character), reserving them avoids a typo in an unsupported
-/// tag/function-call surround (`t`, `f`, ...) silently succeeding as a
-/// literal-letter wrap instead of being rejected.
+/// The delimiters vim-surround inserts for a character. An opening
+/// bracket (`(`, `{`, `[`, `<`, or `b`/`B`/`r`) pads with spaces
+/// (`ysiw(` gives `( word )`), its closing one doesn't, and quotes never
+/// do. Any other printable non-alphanumeric character is its own unpadded
+/// pair. Other letters are rejected, unlike in vim-surround, so a typo for
+/// an unsupported tag or function surround (`t`, `f`) fails instead of
+/// wrapping in letters.
 pub fn surround_delims(ch: char) -> Option<(String, String)> {
     Some(match ch {
         '(' | 'b' => ("( ".to_string(), " )".to_string()),
@@ -1168,15 +1074,10 @@ pub fn surround_delims(ch: char) -> Option<(String, String)> {
     })
 }
 
-/// The raw `(open_pos, close_pos)` of the delimiter pair `ds`/`cs` should
-/// act on for a given target kind, found relative to the buffer's own
-/// current cursor -- `find_enclosing_pair` for the four bracket kinds
-/// (already nesting-aware and multi-line), `quote_pair_positions` for the
-/// three quote kinds (same-line only, matching vim). `Word`/`WordBig`/
-/// `Sentence`/`Paragraph` never reach here (see `surround_target_kind`'s
-/// own doc comment on why those characters never resolve to a kind at
-/// all), but are listed explicitly rather than via a wildcard so this
-/// stays exhaustive if `TextObjectKind` ever grows a new pair-like kind.
+/// The delimiter pair `ds`/`cs` acts on: `find_enclosing_pair` for
+/// brackets, `quote_pair_positions` for quotes (one line only, as in vim).
+/// Word, sentence and paragraph never get here (see `surround_target_kind`)
+/// but are listed, so a new pair kind can't slip past.
 pub fn surround_pair_positions(buf: &dyn Buffer, kind: TextObjectKind) -> Option<((usize, usize), (usize, usize))> {
     let pos = buf.cursor();
     match kind {
@@ -1191,17 +1092,11 @@ pub fn surround_pair_positions(buf: &dyn Buffer, kind: TextObjectKind) -> Option
     }
 }
 
-/// `ds{ch}`'s own deletion span for each side of a found pair -- just the
-/// delimiter character itself, except for a bracket kind (`(`/`{`/`[`/`<`),
-/// where vim-surround also strips one immediately-adjacent space on each
-/// side (its own "probably padding `ys` added" convention -- quotes never
-/// pad, so this never extends for them). Returns `(open_range, close_range)`
-/// as two single-position `MotionRange`s, ready for two `delete_range`
-/// calls -- close side first, so removing it can never shift the open
-/// side's own position. The one-char-of-content-is-just-a-shared-pad-space
-/// case (`( )`) is guarded so both sides don't independently claim the
-/// same position: the close side wins it, the open side falls back to
-/// just its own bracket.
+/// What `ds` deletes on each side of a pair: the delimiter, plus one
+/// adjacent space inside a bracket kind, as vim-surround strips the padding
+/// `ys` adds. Returned as (open, close); delete the close side first so
+/// the open side doesn't shift. In `( )` the single space goes to the
+/// close side.
 pub fn surround_delete_spans(
     buf: &dyn Buffer,
     kind: TextObjectKind,
@@ -1234,14 +1129,10 @@ pub fn surround_delete_spans(
     )
 }
 
-/// Where `ys`/`yss`/Visual-`S` (`surround_delims`) inserts each half of a
-/// new surround pair around `range` -- the close delimiter's own position
-/// first (inserting there can never shift `from`, so callers are free to
-/// apply both insertions close-then-open with no further adjustment,
-/// regardless of shape). `Linewise` follows `yss`'s own definition (see
-/// `KeyOutcome::AddSurround`'s doc comment): first non-blank of the first
-/// line through the true end of the last line, ignoring leading
-/// indentation the way vim-surround's own linewise wrap does.
+/// Where `ys`, `yss` and Visual `S` insert each half of a new pair around
+/// `range`, close first, so inserting there never shifts `from`. `Linewise`
+/// is `yss`'s: from the first non-blank of the first line to the end of the
+/// last, ignoring indentation as vim-surround does.
 pub fn surround_insert_points(buf: &dyn Buffer, range: &MotionRange) -> ((usize, usize), (usize, usize)) {
     match range.shape {
         MotionShape::Linewise => {
@@ -1249,24 +1140,17 @@ pub fn surround_insert_points(buf: &dyn Buffer, range: &MotionRange) -> ((usize,
             let close_at = (range.to.0, buf.line_len(range.to.0));
             (open_at, close_at)
         }
-        // A block has no surround of its own in vim either; treated as
-        // the inclusive span between its corners, which is what a
-        // one-row block already is.
+        // A block has no surround in vim either; taken as the span between
+        // its corners.
         MotionShape::Inclusive | MotionShape::Blockwise => (range.from, (range.to.0, range.to.1 + 1)),
         MotionShape::Exclusive => (range.from, range.to),
     }
 }
 
-/// `Ctrl-A`/`Ctrl-X`'s own target: a decimal number found at or after the
-/// cursor on the current line -- `from` includes a leading `-` sign if
-/// present (`to` is always the last digit, inclusive), `value` is the
-/// parsed number, `width` is how many digit characters it has (not
-/// counting the sign). `apply_number_delta`'s own zero-padding only
-/// kicks in when `leading_zero` is set (the original text itself started
-/// with `0`, e.g. `007`) -- `width` alone isn't enough: an ordinary
-/// number like `42` also has a width (2), but vim never pads `42 - 42`
-/// back out to `00`, only a number that was genuinely zero-padded to
-/// begin with keeps that padding.
+/// `Ctrl-A`/`Ctrl-X`'s target: a decimal number at or after the cursor.
+/// `from` includes a leading `-`, `to` is the last digit, `width` counts
+/// digits. Padding back to `width` happens only with `leading_zero` (`007`):
+/// vim doesn't pad `42 - 42` to `00`.
 pub struct NumberMatch {
     pub from: (usize, usize),
     pub to: (usize, usize),
@@ -1275,16 +1159,10 @@ pub struct NumberMatch {
     pub leading_zero: bool,
 }
 
-/// Scans forward from `pos` along its own line for the first digit
-/// (`pos` itself counts, so a cursor already inside a number finds that
-/// same number rather than skipping to the next one), then expands both
-/// directions to the number's full extent -- vim's own `Ctrl-A`/`Ctrl-X`
-/// targeting rule. Decimal only (no hex/octal `nrformats` support) --
-/// deliberately simplified scope, matching `r`'s/`case_transform`'s own
-/// ASCII-only precedent elsewhere in this file. `None` if there's no
-/// digit anywhere at or after `pos` on this line, or if the number
-/// somehow doesn't fit in an `i64` (astronomically unlikely for anything
-/// actually typed).
+/// From `pos` along the line to the first digit (`pos` counts, so a
+/// cursor inside a number finds it), then out to the number's extent: vim's
+/// `Ctrl-A` rule. Decimal only, no `nrformats`. `None` with no digit ahead,
+/// or a number that doesn't fit an `i64`.
 pub fn find_number(buf: &dyn Buffer, pos: (usize, usize)) -> Option<NumberMatch> {
     let (line, col) = pos;
     let len = buf.line_len(line);
@@ -1306,10 +1184,8 @@ pub fn find_number(buf: &dyn Buffer, pos: (usize, usize)) -> Option<NumberMatch>
     Some(NumberMatch { from: (line, sign_col), to: (line, end), value, width, leading_zero })
 }
 
-/// The replacement text for `m` after adding `delta` to its value --
-/// zero-padded back up to `m`'s own original digit width if it was
-/// genuinely zero-padded to begin with (`m.leading_zero`) and the result
-/// needs fewer digits than that, and re-signed if it crossed zero.
+/// `m`'s replacement after adding `delta`: zero-padded to its width when it
+/// was zero-padded, and re-signed if it crossed zero.
 pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
     let new_value = m.value.saturating_add(delta);
     let digits = new_value.unsigned_abs().to_string();
@@ -1317,22 +1193,17 @@ pub fn apply_number_delta(m: &NumberMatch, delta: i64) -> String {
     if new_value < 0 { format!("-{padded}") } else { padded }
 }
 
-/// ERE search (via `crate::regex`) for `/`/`?` -- and, via an
-/// escaped-literal pattern (see `search_forward_once`'s other callers),
-/// for the plain-text word searches (`*`/`#`/`g*`/`g#`) too, so there's
-/// only one matching engine for "search" in normal mode. Matches never
-/// span line breaks.
+/// Regex search (`crate::regex`) for `/` and `?`, and with an escaped
+/// literal for `*`, `#`, `g*` and `g#`, so normal mode has one search
+/// engine. Matches never span lines.
 fn line_find(buf: &dyn Buffer, line: usize, lower_bound: usize, re: &Regex) -> Option<usize> {
     let chars = buf.line_chars(line);
     re.find_at(&chars, lower_bound).map(|(start, _end)| start)
 }
 
-/// Every non-overlapping occurrence of `pattern` on `line`, left to right --
-/// the same convention vim's own `hlsearch` uses (a match's own end is
-/// where the search for the next one starts, so "aa" against "aaaa" finds
-/// cols 0 and 2, not 0/1/2). For search-match *highlighting* -- unrelated
-/// to, and doesn't share any state with, a live search's own cursor
-/// position via search_forward_once/search_backward_once above.
+/// Every non-overlapping match of `pattern` on `line`, left to right, as
+/// vim's `hlsearch` finds them (`aa` in `aaaa` at 0 and 2), for match
+/// highlighting.
 pub fn find_matches_in_line(buf: &dyn Buffer, line: usize, pattern: &str) -> Vec<(usize, usize)> {
     if pattern.is_empty() {
         return Vec::new();
@@ -1354,9 +1225,8 @@ fn line_rfind(buf: &dyn Buffer, line: usize, upper_bound: usize, re: &Regex) -> 
     (0..upper).rev().find(|&start| re.match_at(&chars, start).is_some())
 }
 
-/// Wrapping forward search (matches vim's default 'wrapscan'): tries the
-/// rest of the current line, then every subsequent line, then wraps back
-/// around to the start of the original line.
+/// Wrapping forward search, vim's default `wrapscan`: the rest of the line,
+/// the lines after, then back round to the start of this one.
 fn search_forward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex) -> Option<(usize, usize)> {
     let total = buf.line_count();
     if let Some(c) = line_find(buf, pos.0, pos.1 + 1, re) {
@@ -1389,11 +1259,8 @@ fn is_word_boundary_at(buf: &dyn Buffer, line: usize, col: usize) -> bool {
     !matches!(buf.char_at(line, col), Some(c) if is_word_char(c, buf.word_chars()))
 }
 
-/// `*`/`#`'s own word-boundary-respecting wrapper around `search_forward_
-/// once`/`search_backward_once` -- `re` is always compiled from an
-/// *escaped* literal word (see the `Motion::SearchWordForward` arm below),
-/// so `word_len` (its char count) doubles as the matched text's length for
-/// the boundary check on either side.
+/// `*`/`#` with word boundaries. `re` is an escaped literal word, so
+/// `word_len` is the match length for the boundary checks.
 fn search_word_forward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex, word_len: usize) -> Option<(usize, usize)> {
     let first = search_forward_once(buf, pos, re)?;
     let mut candidate = first;
@@ -1430,8 +1297,8 @@ fn search_word_backward_once(buf: &dyn Buffer, pos: (usize, usize), re: &Regex, 
     }
 }
 
-/// The line `n` rows below `line`, a closed fold counting as one row --
-/// and never past the last line.
+/// The line `n` rows below `line`, a closed fold counting as one row,
+/// never past the last line.
 pub fn rows_down(buf: &dyn Buffer, line: usize, n: usize) -> usize {
     let last = buf.line_count().saturating_sub(1);
     let mut at = line;
@@ -1473,10 +1340,10 @@ pub fn line_span(buf: &dyn Buffer, count: usize) -> (usize, usize) {
     (first, last)
 }
 
-/// Whether landing inside a closed fold opens it -- vim's default
-/// `foldopen`. What moves by rows (`j`, `G`, a page, `zj`) stops *on* a
-/// closed fold and leaves it be; a search, a mark, `%`, `l` and the rest
-/// were looking for something in particular, and it is in there.
+/// Whether landing in a closed fold opens it: vim's default `foldopen`.
+/// Moving by rows (`j`, `G`, a page, `zj`) stops on a closed fold; a
+/// search, a mark, `%`, `l` and the rest were looking for something inside
+/// it.
 fn opens_folds(m: &Motion) -> bool {
     !matches!(
         m,
@@ -1507,22 +1374,20 @@ fn opens_folds(m: &Motion) -> bool {
     )
 }
 
-/// Applies a single motion to `buf`'s cursor. `count` is the raw count typed
-/// before the motion (`None` if the user typed no digits) -- most motions
-/// treat it as a repeat count defaulting to 1, but `GotoFirstLine`/
-/// `GotoLastLine`/`GotoColumn` treat it as an explicit target, so `None` and
-/// `Some(1)` are not interchangeable for those.
+/// Applies one motion to the cursor. `count` is as typed (`None` without
+/// digits): most motions repeat, defaulting to 1, but `GotoFirstLine`,
+/// `GotoLastLine` and `GotoColumn` take it as a target, so `None` and
+/// `Some(1)` differ there.
 ///
-/// A cursor that ends up inside a closed fold either opens it or goes to
-/// the row that stands for it (see `opens_folds`). An operator's motion
-/// does neither -- `motion_range` takes a closed fold whole instead -- so
-/// it moves through `move_cursor` directly.
+/// Ending inside a closed fold either opens it or moves to its row (see
+/// `opens_folds`). An operator's motion does neither, since `motion_range`
+/// takes a closed fold whole, so it uses `move_cursor`.
 pub fn apply_motion(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
     let opens = opens_folds(&motion);
     move_cursor(buf, motion, count);
     let (line, col) = buf.cursor();
-    // `closed_at` rather than `fold_span`: a closed fold one line long
-    // spans only itself, and `l` still opens it.
+    // `closed_at` rather than `fold_span`: a one-line closed fold spans only
+    // itself, and `l` still opens it.
     let Some((start, _)) = buf.folds().and_then(|folds| folds.closed_at(line)) else {
         return;
     };
@@ -1539,15 +1404,9 @@ pub fn apply_motion(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) 
 fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
     let n = count.unwrap_or(1).max(1);
     match motion {
-        // Steps by whole grapheme cluster, `n` times, rather than raw
-        // char index -- a multi-codepoint cluster (a ZWJ emoji
-        // sequence, a base char plus combining marks) is one glyph on
-        // screen, and `h`/`l` should cross it in a single press each
-        // way, never stopping mid-cluster. `prev_boundary`/
-        // `next_boundary` are themselves already idempotent at the
-        // line's own start/end (they clamp, don't panic or wrap), so
-        // repeating them `n` times naturally saturates there too, same
-        // as the old `saturating_sub`/`.min(max_col)` did.
+        // By whole grapheme cluster, `n` times: `h` and `l` cross a ZWJ
+        // sequence or a char with combining marks in one press. The
+        // boundary functions clamp at the line's ends.
         Motion::Left => {
             let (line, col) = buf.cursor();
             let chars = buf.line_chars(line);
@@ -1615,9 +1474,8 @@ fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
             let col = first_non_blank(buf, target);
             buf.set_cursor(target, col);
         }
-        // `{count}%` -- only ever emitted with a count (see vimkeys.rs's
-        // own `%` handler); `count.unwrap_or(0)` below just keeps this
-        // total rather than mattering in practice. Vim's own formula:
+        // `{count}%`, only emitted with a count (see vimkeys.rs); the
+        // `unwrap_or(0)` just keeps this total. vim's formula:
         // `([count] * lines + 99) / 100`, 1-indexed.
         Motion::GotoPercent => {
             let total = buf.line_count();
@@ -1902,10 +1760,8 @@ fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
                 }
             }
         }
-        // `g*`/`g#`: identical shape to `SearchWordForward`/`SearchWordBackward`
-        // above, just via the plain (boundary-free) `search_forward_once`/
-        // `search_backward_once` instead of their word-boundary-checked
-        // siblings.
+        // `g*`/`g#`: like `SearchWordForward`/`SearchWordBackward` without
+        // the word-boundary check.
         Motion::SearchWordForwardUnbounded => {
             let pos = buf.cursor();
             if let Some(word) = word_under_cursor(buf, pos) {
@@ -1994,12 +1850,9 @@ fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
             }
             buf.set_cursor(line, 0);
         }
-        // Not reached by any wiring in this crate today -- `vimkeys.rs`
-        // only ever produces this while an operator is armed, which
-        // `motion_range` (below) intercepts before `apply_motion` would be
-        // called. Implemented anyway (moves to the object's start, same as
-        // `motion_range`'s own contract) so this stays correct rather than
-        // silently wrong if a future caller ever does invoke it standalone.
+        // Unreachable: vimkeys produces this only with an operator armed, and
+        // `motion_range` intercepts it. Moves to the object's start, as
+        // `motion_range` does, in case a caller ever uses it.
         Motion::TextObject(kind, around) => {
             if let Some(range) = text_object_range(buf, kind, around, count) {
                 buf.set_cursor(range.from.0, range.from.1);
@@ -2008,47 +1861,36 @@ fn move_cursor(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) {
     }
 }
 
-/// How an operator (today: yank; later: delete/change) treats a motion's
-/// resulting range -- vim's own classification (`:help exclusive`), which
-/// this mirrors motion-for-motion. `Inclusive`/`Exclusive` differ only in
-/// whether the character the cursor lands *on* is part of the range;
-/// `Linewise` ignores columns entirely and takes whole lines.
+/// How an operator treats a motion's range, per vim's `:help exclusive`.
+/// `Inclusive` and `Exclusive` differ in whether the character the cursor
+/// lands on is included; `Linewise` takes whole lines.
 ///
-/// Known simplification: real vim also has an adjustment where an
-/// exclusive motion that ends in column 1, having started at or before the
-/// first non-blank, becomes linewise (`:help exclusive-linewise` --
-/// prevents e.g. `dw` at the last word of a line from swallowing the
-/// newline into the next line's indent). Not implemented here; it would
-/// only show up as a subtly-too-long yank in that specific situation.
+/// Not implemented: vim's `exclusive-linewise` adjustment, where an
+/// exclusive motion ending in column 1 after starting at or before the
+/// first non-blank becomes linewise. Without it, that one case yanks
+/// slightly too much.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionShape {
     Exclusive,
     Inclusive,
     Linewise,
-    /// A rectangle between two corners: rows `from.0..=to.0`, and on each
-    /// of them the columns between `from.1` and `to.1` inclusive.
-    ///
-    /// Unlike the other three, `from`/`to` here are *corners* rather than
-    /// a start and an end in reading order -- either may hold the smaller
-    /// column. `block_columns` is the one place that is untangled.
+    /// A rectangle: rows `from.0..=to.0`, and on each the columns between
+    /// `from.1` and `to.1` inclusive. `from` and `to` are corners, not start
+    /// and end, so either may hold the smaller column; `block_columns` sorts
+    /// that out.
     Blockwise,
 }
 
-/// The inclusive column range a blockwise motion covers, lowest first.
-/// `None` for any other shape, which has no such thing.
+/// The inclusive columns a blockwise range covers, lowest first; `None` for
+/// other shapes.
 pub fn block_columns(range: &MotionRange) -> Option<(usize, usize)> {
     (range.shape == MotionShape::Blockwise).then(|| (range.from.1.min(range.to.1), range.from.1.max(range.to.1)))
 }
 
-/// Whether `m` is one of vim's own `:help jump-motions` -- the ones that
-/// record where the cursor was *before* they ran, so `Ctrl-O`/`Ctrl-I` (see
-/// `vimkeys::VimKeys::push_jump`'s own doc comment) can step back through
-/// them. Deliberately excludes the small, local motions (`h`/`j`/`k`/`l`,
-/// word motions, `f`/`t`, scrolling, sentence text-object-adjacent detail)
-/// even though several of them (e.g. `f`) can technically move the cursor
-/// a long way on a long line -- matching vim's own distinction between
-/// "a motion" and "a jump" by which commands are on this specific list,
-/// not by how far any given use of one happens to move the cursor.
+/// Whether `m` is one of vim's `:help jump-motions`, which record the
+/// position before they run so `Ctrl-O`/`Ctrl-I` can step back (see
+/// `vimkeys::VimKeys::push_jump`). Membership is vim's list, not distance:
+/// `f` can move far and still isn't one.
 pub fn is_jump(m: &Motion) -> bool {
     matches!(
         m,
@@ -2078,11 +1920,9 @@ pub fn is_jump(m: &Motion) -> bool {
     )
 }
 
-/// `None` means `m` isn't a valid operator target at all -- either it's not
-/// really a motion (`SetMark` just records a position, it doesn't move
-/// anything), or it's one of the viewport/scroll commands (Ctrl-D/U/F/B,
-/// Ctrl-E/Y, zz/zt/zb) that real vim documents separately from motions and
-/// doesn't accept as operator targets either.
+/// `None` when `m` isn't an operator target: `SetMark` doesn't move, and
+/// vim doesn't accept the scroll commands (Ctrl-D/U/F/B, Ctrl-E/Y,
+/// zz/zt/zb) either.
 fn motion_shape(m: &Motion) -> Option<MotionShape> {
     use MotionShape::*;
     Some(match m {
@@ -2122,27 +1962,21 @@ fn motion_shape(m: &Motion) -> Option<MotionShape> {
         Motion::SearchWordForward | Motion::SearchWordBackward => Exclusive,
         Motion::SearchWordForwardUnbounded | Motion::SearchWordBackwardUnbounded => Exclusive,
         Motion::UnmatchedOpenParen | Motion::UnmatchedCloseParen | Motion::UnmatchedOpenBrace | Motion::UnmatchedCloseBrace => Exclusive,
-        // Same classification `ParagraphForward`/`ParagraphBackward` already
-        // use above -- vim's own section motions are their sibling, moving
-        // to a boundary line's own start rather than tracking columns.
+        // Like the paragraph motions: to a boundary line's start, columns not
+        // tracked.
         Motion::SectionForward | Motion::SectionForwardEnd | Motion::SectionBackward | Motion::SectionBackwardEnd => Exclusive,
-        // Never actually consulted -- `motion_range` special-cases
-        // `TextObject` before this function is called at all (see
-        // `Motion::TextObject`'s own doc comment). Kept correct anyway,
-        // matching `text_object_range`'s own per-kind shape, for whatever
-        // future caller might reasonably expect `motion_shape` to be total.
+        // Not consulted (`motion_range` handles text objects first), but kept
+        // consistent with `text_object_range`.
         Motion::TextObject(TextObjectKind::Paragraph, _) => Linewise,
         Motion::TextObject(..) => Inclusive,
-        // vim's own classification: `dzj` takes whole lines, `d]z` does
-        // not.
+        // vim's classification: `dzj` takes whole lines, `d]z` doesn't.
         Motion::FoldNextStart | Motion::FoldPreviousEnd => Linewise,
         Motion::FoldStart | Motion::FoldEnd => Exclusive,
     })
 }
 
-/// A resolved operator target: `from`/`to` are already ordered (`from <=
-/// to`, regardless of which direction the motion actually moved the
-/// cursor).
+/// A resolved operator target, ordered `from <= to` whichever way the
+/// motion moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MotionRange {
     pub shape: MotionShape,
@@ -2150,25 +1984,17 @@ pub struct MotionRange {
     pub to: (usize, usize),
 }
 
-/// Resolves `motion` against `buf` the same way any other motion would
-/// (via the existing `apply_motion`, unchanged -- this adds zero regression
-/// risk to plain navigation), then reports the range it covered instead of
-/// just leaving the cursor at the destination. Per vim's own rule, the
-/// cursor is left at `from` (the earlier of the two endpoints) rather than
-/// wherever `apply_motion` put it -- the one exception, `yy`/`Y`, isn't a
-/// `Motion` at all and is handled by `whole_lines` instead, which leaves
-/// the cursor untouched.
+/// Applies `motion` with `apply_motion` and reports the range it covered.
+/// The cursor is left at `from`, as vim does. `yy`/`Y` isn't a `Motion`;
+/// see `whole_lines`.
 ///
-/// Returns `None` if `m` isn't a valid operator target (see `motion_shape`)
-/// or if it didn't actually move the cursor (a failed find/search, or a
-/// motion that's already at its clamped boundary) -- either way, there's
-/// nothing to yank and the cursor is restored to where it started.
+/// `None` if `m` isn't an operator target (see `motion_shape`) or didn't
+/// move the cursor (a failed find, or a motion already at its limit); the
+/// cursor is then restored.
 pub fn motion_range(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) -> Option<MotionRange> {
-    // Text objects don't fit the "apply the motion, diff the cursor
-    // before/after" trick below -- the cursor usually sits *inside* the
-    // target range, not at one of its ends -- so they're resolved directly
-    // via `text_object_range` instead, then the cursor is parked at
-    // `range.from` to match every other motion's own contract here.
+    // The cursor usually sits inside a text object's range, so diffing the
+    // cursor doesn't work; resolve it directly and park the cursor at
+    // `range.from`.
     if let Motion::TextObject(kind, around) = motion {
         let range = text_object_range(buf, kind, around, count)?;
         buf.set_cursor(range.from.0, range.from.1);
@@ -2178,14 +2004,11 @@ pub fn motion_range(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) 
     // Checked before the move, since `apply_motion` consumes it.
     let cannot_fail = match motion {
         Motion::LineEnd | Motion::LineLastNonBlank => true,
-        // `dt,` with the comma sitting immediately ahead of the cursor.
-        // `t` lands *before* its target, which here is the character
-        // the cursor is already on, so nothing moves -- but the find
-        // succeeded, and being inclusive it still covers that one
-        // character, which is what vim deletes. Telling that apart from
-        // a find with no target left on the line is exactly why this
-        // asks where the motion would land rather than reading it off
-        // the cursor afterwards.
+        // `dt,` with the comma right ahead: `t` lands before its target,
+        // which is where the cursor already is, so nothing moves. But the
+        // find succeeded, and being inclusive it covers that character,
+        // which vim deletes. So this asks where the motion would land
+        // instead of reading the cursor.
         Motion::FindChar { ch, till, forward } => {
             let (line, col) = buf.cursor();
             find_char_landing(buf, line, col, ch, till, forward, count.unwrap_or(1).max(1)) == Some(col)
@@ -2196,42 +2019,32 @@ pub fn motion_range(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) 
     move_cursor(buf, motion, count);
     let end = buf.cursor();
     if start == end {
-        // A motion that did not move usually covers nothing, and an
-        // operator on it must do nothing -- `dfx` with no `x` ahead is
-        // not "delete one character", it is a find that failed.
-        //
-        // The line-end motions are the exception, because they cannot
-        // fail: `$` with the cursor already on the last character has
-        // *succeeded*, and being inclusive it still covers that
-        // character. Without this, `D`, `d$` and `y$` all silently did
-        // nothing at the one position where they are most often used
-        // -- reached by `$` itself, which is how you get there.
-        //
-        // Guarded on the line having any characters at all, so `d$` on
-        // an empty line still deletes nothing rather than inventing a
-        // character to remove.
+        // A motion that didn't move usually covers nothing: `dfx` with no
+        // `x` ahead is a failed find, not one deleted character. The
+        // line-end motions can't fail: `$` already on the last character
+        // succeeded and, being inclusive, covers it, so `D`, `d$` and `y$`
+        // work there. Not on an empty line, which has no character to
+        // cover.
         if cannot_fail && shape == MotionShape::Inclusive && buf.line_len(start.0) > 0 {
             return Some(MotionRange { shape, from: start, to: start });
         }
         return None;
     }
     let (mut from, mut to) = if pos_lt(start, end) { (start, end) } else { (end, start) };
-    // A closed fold at either end is taken whole: vim's rule, which is
-    // what makes `dj` on a fold delete the fold and the line after it,
-    // and `dl` on one empty every line in it rather than one character.
-    // The far end only counts if the motion reaches into that line at
-    // all -- an exclusive motion stopping at column 0 of it does not.
+    // A closed fold at either end is taken whole, as in vim: `dj` on a fold
+    // deletes it and the line after, and `dl` on one empties every line in
+    // it. The far end counts only if the motion reaches into that line; an
+    // exclusive motion stopping at its column 0 doesn't.
     if let Some(folds) = buf.folds() {
         let head = folds.closed_at(from.0);
         let tail = folds.closed_at(to.0).filter(|_| shape != MotionShape::Exclusive || to.1 > 0);
         if let Some((first, _)) = head {
             from = (first, 0);
         }
-        // The end has to be a position `extract_text` can step onto, or
-        // it walks straight past it: an exclusive range ends where the
-        // next line starts, which also takes the line break and so every
-        // line of the fold -- vim's `dl` on one -- and an inclusive one
-        // ends on the fold's last character.
+        // The end has to be a position `extract_text` can step onto. An
+        // exclusive range ends where the next line starts, taking the line
+        // break and so every line of the fold (vim's `dl` on one); an
+        // inclusive one ends on the fold's last character.
         if let Some((_, last)) = tail {
             to = match shape {
                 MotionShape::Exclusive if last + 1 < buf.line_count() => (last + 1, 0),
@@ -2244,19 +2057,14 @@ pub fn motion_range(buf: &mut dyn Buffer, motion: Motion, count: Option<usize>) 
     Some(MotionRange { shape, from, to })
 }
 
-/// The literal text a `MotionRange` covers. `Linewise` joins whole lines
-/// with `\n`, including a trailing one (so the result is always a sequence
-/// of complete lines, ready to be spliced back in as-is by a linewise
-/// put) -- except across a `line_wraps` boundary, where no line actually
-/// ended there, so no `\n` is inserted either. `Inclusive`/`Exclusive`
-/// walk character-by-character via the same `step_forward` plain motions
-/// use, inserting `\n` exactly when a step crosses a real line boundary
-/// (again, not a `line_wraps` one) -- `Exclusive` stops one character
-/// short of `to`, `Inclusive` includes it.
+/// The text a range covers. `Linewise` joins whole lines with `\n`,
+/// including a trailing one, ready for a linewise put. The others walk with
+/// `step_forward`, adding `\n` at each real line break; `Exclusive` stops
+/// before `to`, `Inclusive` includes it. No `\n` is added across a
+/// `line_wraps` boundary, where no line really ended.
 pub fn extract_text(buf: &dyn Buffer, range: &MotionRange) -> String {
-    // A block yanks as one line per row, each cut to the block's own
-    // columns -- a short line contributing whatever of it falls inside,
-    // which may be nothing at all.
+    // A block yanks one line per row, each cut to the block's columns; a
+    // short line gives what falls inside, possibly nothing.
     if let Some((left, right)) = block_columns(range) {
         let rows: Vec<String> = (range.from.0..=range.to.0)
             .map(|line| {
@@ -2301,27 +2109,17 @@ pub fn extract_text(buf: &dyn Buffer, range: &MotionRange) -> String {
     s
 }
 
-/// `yy`/`Y`: the current line plus `count - 1` more, linewise -- vim's
-/// double-tap-the-operator shorthand, defined operationally as "this
-/// operator, this line" rather than as a real cursor motion (there's no
-/// `Motion` variant for it, and unlike every other yank the cursor doesn't
-/// move at all, so this takes `&dyn Buffer` rather than `&mut impl
-/// Buffer`). "This line" always means the *whole* line: if the cursor
-/// happens to sit on a `line_wraps` continuation row, the range is
-/// widened back to that run's first row first, so `yy` never yanks just a
-/// column-width fragment of whatever wrapped there.
+/// `yy`/`Y`: this line plus `count - 1` more, linewise. Not a motion, and
+/// the cursor doesn't move. A whole line even on a `line_wraps`
+/// continuation row: the range is widened back to the run's first row.
 pub fn whole_lines(buf: &dyn Buffer, count: usize) -> String {
     let (cursor_line, _) = buf.cursor();
     let mut line = buf.fold_span(cursor_line).0;
     while line > 0 && buf.line_wraps(line - 1) {
         line -= 1;
     }
-    // `count` logical lines, not physical rows -- each iteration widens
-    // `last` out to the end of whichever logical line it currently sits
-    // at the start of, then (unless this was the last one wanted) steps
-    // onto the first row of the next logical line. A closed fold is one
-    // of them, however many lines it holds: `yy` on one yanks it whole,
-    // exactly as `dd` deletes it (see `line_span`).
+    // `count` logical lines, not rows. A closed fold counts as one, so `yy`
+    // on it yanks it whole, as `dd` deletes it (see `line_span`).
     let count = count.max(1);
     let mut last = line;
     for i in 0..count {
@@ -2346,14 +2144,10 @@ pub fn whole_lines(buf: &dyn Buffer, count: usize) -> String {
     s
 }
 
-/// The canonical name of a motion, as `::bish map` prints it.
-///
-/// Kebab-case of the variant, deliberately mechanical rather than
-/// invented: a vocabulary someone has to memorize is worse than one
-/// they can predict, and a derived name cannot fall out of step with
-/// the variant it describes the way a hand-chosen synonym can. The
-/// parameterized ones append what they carry, since `find-char` without
-/// the character would not say which mapping you were looking at.
+/// A motion's canonical name, as `::bish map` prints it: the variant in
+/// kebab-case, so it's predictable and can't drift from the variant.
+/// Parameterized motions append what they carry (`find-char` needs the
+/// character).
 pub fn describe_motion(motion: &Motion) -> String {
     use Motion::*;
     let plain = match motion {
@@ -2412,7 +2206,6 @@ pub fn describe_motion(motion: &Motion) -> String {
         FoldPreviousEnd => "fold-previous-end",
         FoldStart => "fold-start",
         FoldEnd => "fold-end",
-        // The rest carry something, and say so.
         FindChar { ch, till, forward } => {
             let verb = if *till { "till-char" } else { "find-char" };
             let dir = if *forward { "" } else { "-backward" };
@@ -2431,7 +2224,7 @@ pub fn describe_motion(motion: &Motion) -> String {
     plain.to_string()
 }
 
-/// The object half of a text-object motion's name -- see describe_motion.
+/// The object half of a text-object motion's name; see `describe_motion`.
 pub fn describe_text_object(kind: &TextObjectKind) -> &'static str {
     use TextObjectKind::*;
     match kind {
@@ -2459,12 +2252,10 @@ mod tests {
         vtop: usize,
         vheight: usize,
         marks: std::collections::HashMap<char, (usize, usize)>,
-        // Simulates a ScreenBuffer's `line_wraps` -- which lines were "cut"
-        // by column-width autowrap rather than a real line break, for
-        // tests exercising that (empty for every other test here).
+        // Rows cut by autowrap rather than a real line break, as in a
+        // ScreenBuffer. Empty for most tests.
         wraps: std::collections::HashSet<usize>,
-        // What `Buffer::search_ignore_case` answers, so a search test can
-        // exercise folding without a Shell or a bishopt anywhere in sight.
+        // What `Buffer::search_ignore_case` answers.
         icase: bool,
     }
 
@@ -2482,10 +2273,8 @@ mod tests {
             }
         }
 
-        // Builds a buffer from "logical lines" that autowrap: each `&str`
-        // is one real line's full text, pre-split into `width`-wide
-        // storage rows exactly like a terminal grid would, with every row
-        // but the last of each logical line marked as wrapped.
+        // Each `&str` is one logical line, split into `width`-wide rows
+        // like a terminal grid, every row but the last marked as wrapped.
         fn new_wrapped(logical_lines: &[&str], width: usize) -> Self {
             let mut lines = Vec::new();
             let mut wraps = std::collections::HashSet::new();
@@ -2577,7 +2366,7 @@ mod tests {
 
     #[test]
     fn right_crosses_a_whole_grapheme_cluster_in_one_press() {
-        // 'a' + MAN+ZWJ+WOMAN (a 3-char cluster) + 'b'
+        // `a`, MAN+ZWJ+WOMAN (a 3-char cluster), `b`.
         let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}b");
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::Right, None), (0, 1), "lands on the cluster's own start, not its second codepoint");
@@ -2596,16 +2385,15 @@ mod tests {
     fn right_never_lands_mid_cluster_even_with_a_count() {
         let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}b");
         buf.set_cursor(0, 0);
-        // A count of 2 should land exactly on the cluster start then on
-        // 'b' -- never at index 2 or 3, which sit mid-cluster.
+        // A count of 2 lands on the cluster's start, then `b`: never 2 or 3,
+        // inside the cluster.
         assert_eq!(go(&mut buf, Motion::Right, Some(2)), (0, 4));
     }
 
     #[test]
     fn last_col_clamps_to_a_trailing_clusters_own_start() {
-        // A line ending in a 3-char cluster: the last valid Normal-mode
-        // column is where that cluster *starts* (index 1), not its last
-        // raw char index (3).
+        // A line ending in a 3-char cluster: the last valid column is the
+        // cluster's start (1), not its last char (3).
         let mut buf = TestBuffer::new("a\u{1F468}\u{200D}\u{1F469}");
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::Right, Some(99)), (0, 1));
@@ -2613,8 +2401,7 @@ mod tests {
 
     #[test]
     fn ordinary_ascii_left_right_is_unaffected() {
-        // Every char here is its own single-char cluster -- must behave
-        // exactly like the old raw-char-index arithmetic.
+        // Single-char clusters only: plain char arithmetic.
         let mut buf = TestBuffer::new("hello");
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::Right, Some(3)), (0, 3));
@@ -2777,13 +2564,12 @@ mod tests {
         let f = Motion::FindChar { ch: 'X', till: false, forward: true };
         assert_eq!(go(&mut buf, f.clone(), None), (0, 3));
         assert_eq!(go(&mut buf, f.clone(), None), (0, 7));
-        // no third X: motion fails, cursor stays put
+        // No third X: the motion fails and the cursor stays.
         assert_eq!(go(&mut buf, f, None), (0, 7));
     }
 
-    // `dt,` with the comma sitting immediately ahead: the find
-    // succeeds and lands on the column the cursor is already on, which
-    // is not the same thing as a find that had nowhere to go.
+    // `dt,` with the comma right ahead: the find succeeds and lands where the
+    // cursor is, which differs from a find with nowhere to go.
     #[test]
     fn a_till_motion_onto_the_cursors_own_column_still_covers_that_character() {
         let mut buf = TestBuffer::new("a,b,c");
@@ -2791,13 +2577,12 @@ mod tests {
         let range = motion_range(&mut buf, t, None).expect("the find succeeded, so there is a range");
         assert_eq!((range.shape, range.from, range.to), (MotionShape::Inclusive, (0, 0), (0, 0)));
 
-        // ... and a find with no target left still covers nothing.
+        // ...and a find with no target covers nothing.
         let mut buf = TestBuffer::new("abc");
         assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: true, forward: true }, None), None);
         assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: false, forward: true }, None), None);
-        // Backward `T` is exclusive, so landing on the cursor's own
-        // column really does cover nothing -- vim deletes nothing there
-        // either.
+        // Backward `T` is exclusive, so landing on the cursor's column covers
+        // nothing, and vim deletes nothing.
         let mut buf = TestBuffer::new("a,b");
         buf.set_cursor(0, 2);
         assert_eq!(motion_range(&mut buf, Motion::FindChar { ch: ',', till: true, forward: false }, None), None);
@@ -2903,8 +2688,8 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::ScreenBottom, Some(2)), (3, 0));
     }
 
-    // A block's corners are corners, not a start and an end in reading
-    // order: dragging up-and-right is an ordinary thing to do.
+    // A block's corners aren't a start and an end: dragging up and right is
+    // ordinary.
     #[test]
     fn block_columns_sorts_the_corners_and_only_for_a_block() {
         let block = |a: (usize, usize), b: (usize, usize)| MotionRange { shape: MotionShape::Blockwise, from: a, to: b };
@@ -2920,14 +2705,14 @@ mod tests {
         let range = MotionRange { shape: MotionShape::Blockwise, from: (0, 1), to: (2, 3) };
         assert_eq!(extract_text(&buf, &range), "aa1\nbb2\ncc3");
 
-        // A row shorter than the block contributes whatever of it falls
-        // inside -- which can be nothing at all.
+        // A row shorter than the block gives what falls inside, possibly
+        // nothing.
         let buf = TestBuffer::new("aaa111\nb\nccc333");
         let range = MotionRange { shape: MotionShape::Blockwise, from: (0, 3), to: (2, 5) };
         assert_eq!(extract_text(&buf, &range), "111\n\n333");
     }
 
-    // The engine folds; this is the wiring that decides whether it does.
+    // This checks the wiring that decides whether the engine folds case.
     #[test]
     fn a_search_folds_case_only_when_the_buffer_says_so() {
         let lines = "alpha\nbeta\nBETA\ngamma";
@@ -2941,7 +2726,7 @@ mod tests {
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::SearchForward("BETA".to_string()), None), (1, 0), "folded, so `beta` on line 1 comes first");
 
-        // Backwards, and the highlight pass, go through the same answer.
+        // Backward search and the highlight pass use the same answer.
         let mut buf = TestBuffer::new(lines);
         buf.icase = true;
         buf.set_cursor(3, 0);
@@ -2952,8 +2737,7 @@ mod tests {
         assert!(find_matches_in_line(&buf, 1, "BETA").is_empty(), "and case-sensitively it does not match at all");
     }
 
-    // `*` searches for the word under the cursor, and vim folds it the
-    // same way it folds a typed pattern.
+    // `*` folds case as vim does for a typed pattern.
     #[test]
     fn the_word_under_the_cursor_folds_too() {
         let lines = "beta\ngamma\nBETA";
@@ -2994,11 +2778,9 @@ mod tests {
         assert_eq!(buf.viewport_top(), 0);
     }
 
-    // A wheel event moves the cursor one line, and the viewport follows
-    // only when it must -- the motion the terminal itself used to send
-    // for a wheel (kitty's mouse.c fake_scroll, an arrow key per cell
-    // of travel). See `fileeditor::MOUSE_WHEEL_LINES` for the
-    // measurement; this pins the two halves of it that are pure.
+    // A wheel event moves the cursor one line, and the viewport follows only
+    // when it must, like the arrow key per cell the terminal itself sends for
+    // a wheel. See `fileeditor::MOUSE_WHEEL_LINES`.
     #[test]
     fn a_wheel_event_moves_the_cursor_and_the_view_only_follows() {
         let notch = Some(crate::fileeditor::MOUSE_WHEEL_LINES);
@@ -3006,22 +2788,17 @@ mod tests {
         buf.vheight = 10;
         buf.set_cursor(0, 0);
 
-        // Nine events with a ten-row view: the cursor walks down, the
-        // view stays where it is. This is the half that was lost -- as
-        // a viewport scroll these nine moved the view nine lines.
+        // Nine events with a ten-row view: the cursor walks down and the view
+        // stays.
         for _ in 0..9 {
             go(&mut buf, Motion::Down, notch);
         }
         assert_eq!(buf.cursor().0, 9, "the cursor moved one line per event");
         assert_eq!(buf.viewport_top(), 0, "and the view did not move at all");
 
-        // Dragging the view along once the cursor leaves it is the
-        // caller's job, not the motion's -- `scroll_to_show_cursor`,
-        // whose own tests cover it, run after every motion by the
-        // editor and by normal mode alike. What matters here is that
-        // the wheel no longer moves the viewport itself: as a scroll
-        // these nine events moved it nine lines whatever the cursor was
-        // doing.
+        // Dragging the view along is `scroll_to_show_cursor`'s job, run after
+        // every motion. What matters here is that the wheel doesn't move the
+        // viewport itself.
         for _ in 0..9 {
             go(&mut buf, Motion::Up, notch);
         }
@@ -3059,8 +2836,8 @@ mod tests {
     #[test]
     fn a_bracket_pair_is_found_from_a_bracket_the_cursor_is_on_and_from_nothing_else() {
         let mut buf = TestBuffer::new("foo(bar[baz]qux)end");
-        // `%` from here scans forward to the `(`; the mark says nothing,
-        // because vim's says nothing until the cursor is on one.
+        // `%` from here would scan forward to the `(`, but nothing is
+        // marked until the cursor is on a bracket, as in vim.
         buf.set_cursor(0, 0);
         assert_eq!(bracket_pair_at(&buf, buf.cursor()), None);
         buf.set_cursor(0, 3);
@@ -3070,7 +2847,7 @@ mod tests {
         buf.set_cursor(0, 7);
         assert_eq!(bracket_pair_at(&buf, buf.cursor()), Some(((0, 7), (0, 11))));
 
-        // Nothing closes it, so there is nothing to mark.
+        // Nothing closes it, so nothing is marked.
         let mut open = TestBuffer::new("foo(bar");
         open.set_cursor(0, 3);
         assert_eq!(bracket_pair_at(&open, open.cursor()), None);
@@ -3126,8 +2903,7 @@ mod tests {
         buf.set_cursor(5, 0);
         assert_eq!(go(&mut buf, Motion::SectionBackward, None), (1, 0));
         buf.set_cursor(4, 0);
-        // searches strictly backward from the current line, same as vim --
-        // sitting on a '}' line itself doesn't count as "already there".
+        // Searches strictly before the current line, as vim does.
         assert_eq!(go(&mut buf, Motion::SectionBackwardEnd, None), (0, 0));
     }
 
@@ -3149,7 +2925,7 @@ mod tests {
         assert_eq!(go(&mut buf, Motion::GotoMark('a'), None), (1, 1));
         buf.set_cursor(2, 2);
         assert_eq!(go(&mut buf, Motion::GotoMarkLine('a'), None), (1, 0));
-        // an unset mark is a no-op
+        // An unset mark is a no-op.
         assert_eq!(go(&mut buf, Motion::GotoMark('z'), None), (1, 0));
     }
 
@@ -3185,9 +2961,8 @@ mod tests {
 
     #[test]
     fn search_forward_and_backward_are_full_ere_regex() {
-        // `/`/`?` now run through crate::regex, so a class/quantifier
-        // pattern like this finds "foo1"/"foo22"/"foo333" as whole matches,
-        // not just a literal substring.
+        // `/` takes a regex: `foo[0-9]+` matches `foo1`, `foo22` and `foo333`
+        // whole.
         let mut buf = TestBuffer::new("foo1 foo22 foo333");
         buf.set_cursor(0, 0);
         let fwd = Motion::SearchForward("foo[0-9]+".to_string());
@@ -3203,8 +2978,7 @@ mod tests {
     fn search_forward_honors_anchors_per_line() {
         let mut buf = TestBuffer::new("xfoo\nfoo\nfooo");
         buf.set_cursor(0, 0);
-        // ^foo only matches a line that *starts* with "foo" -- skips the
-        // first line's "foo" (it's at column 1, not 0) for the second's.
+        // `^foo` skips the first line's `foo` at column 1 for the second's.
         assert_eq!(go(&mut buf, Motion::SearchForward("^foo".to_string()), None), (1, 0));
     }
 
@@ -3216,8 +2990,7 @@ mod tests {
 
     #[test]
     fn search_word_forward_and_backward_respect_word_boundaries() {
-        // "category" contains "cat" as a substring but not as a whole word --
-        // * must skip it and land on the next real "cat".
+        // `category` contains `cat` but not as a word, so `*` skips it.
         let mut buf = TestBuffer::new("cat dog category cat");
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::SearchWordForward, None), (0, 17));
@@ -3226,9 +2999,7 @@ mod tests {
 
     #[test]
     fn g_star_and_g_hash_ignore_word_boundaries() {
-        // Same buffer as the bounded test above, but g*/g# should land on
-        // "category"'s embedded "cat" (starting at column 8) instead of
-        // skipping past it to the next whole-word match.
+        // `g*` lands on the `cat` inside `category`, at column 8.
         let mut buf = TestBuffer::new("cat dog category cat");
         buf.set_cursor(0, 0);
         assert_eq!(go(&mut buf, Motion::SearchWordForwardUnbounded, None), (0, 8));
@@ -3340,8 +3111,6 @@ mod tests {
 
     #[test]
     fn word_chars_decide_where_a_word_ends() {
-        // `iskeyword`: letters and digits are always word characters,
-        // and the buffer says which punctuation joins them.
         struct Kw(TestBuffer, &'static str);
         impl Buffer for Kw {
             fn line_count(&self) -> usize {
@@ -3392,9 +3161,8 @@ mod tests {
 
     #[test]
     fn a_line_end_motion_that_is_already_there_still_covers_that_character() {
-        // `D`, `d$` and `y$` are most often used from exactly where `$`
-        // leaves you, and did nothing there: the cursor had not moved,
-        // so the range came back empty.
+        // `D`, `d$` and `y$` from where `$` leaves the cursor: it hasn't
+        // moved, but the range isn't empty.
         let mut buf = TestBuffer::new("abxcd");
         buf.set_cursor(0, 4);
         let r = motion_range(&mut buf, Motion::LineEnd, None).unwrap();
@@ -3412,14 +3180,13 @@ mod tests {
 
     #[test]
     fn a_motion_that_failed_still_covers_nothing() {
-        // The distinction the fix turns on: `$` not moving means it is
-        // already there, while `f` not moving means no match was found.
-        // An operator must do nothing for the second.
+        // `$` not moving means it's already there; `f` not moving means no
+        // match, and an operator must do nothing.
         let mut buf = TestBuffer::new("abxcd");
         buf.set_cursor(0, 4);
         assert!(motion_range(&mut buf, Motion::FindChar { ch: 'z', till: false, forward: true }, None).is_none());
         assert!(motion_range(&mut buf, Motion::MatchPair, None).is_none());
-        // ...and an exclusive motion with nowhere to go, likewise.
+        // ...and likewise an exclusive motion with nowhere to go.
         buf.set_cursor(0, 0);
         assert!(motion_range(&mut buf, Motion::LineStart, None).is_none());
     }
@@ -3524,19 +3291,17 @@ mod tests {
 
     #[test]
     fn whole_lines_yy_joins_a_wrapped_line_without_a_newline() {
-        // A single long logical line, "helloworldXYZ", autowrapped into
-        // three 5-wide storage rows: "hello", "world", "XYZ".
+        // One logical line, `helloworldXYZ`, wrapped into three 5-wide rows.
         let mut buf = TestBuffer::new_wrapped(&["helloworldXYZ", "next"], 5);
         buf.set_cursor(0, 0);
         assert_eq!(whole_lines(&buf, 1), "helloworldXYZ\n");
 
-        // Same, but starting from the *middle* row of the wrapped run --
-        // yy still yanks the whole logical line, not just that fragment.
+        // From the middle row, `yy` still yanks the whole logical line.
         buf.set_cursor(1, 0);
         assert_eq!(whole_lines(&buf, 1), "helloworldXYZ\n");
 
-        // count > 1 from the run's start also picks up the real next
-        // line whole, with a real newline separating the two.
+        // A count past the run picks up the next real line, after a real
+        // newline.
         buf.set_cursor(0, 0);
         assert_eq!(whole_lines(&buf, 2), "helloworldXYZ\nnext\n");
     }
@@ -3553,8 +3318,8 @@ mod tests {
     fn line_end_reaches_the_true_end_of_a_wrapped_line() {
         let mut buf = TestBuffer::new_wrapped(&["helloworldXYZ"], 5);
         buf.set_cursor(0, 0);
-        // "$" from the first storage row lands on the run's last row, at
-        // its own last real character -- not at column 4 of row 0.
+        // `$` from the first row lands on the run's last row at its last real
+        // character, not at column 4 of row 0.
         assert_eq!(go(&mut buf, Motion::LineEnd, None), (2, 2));
     }
 
@@ -3562,8 +3327,8 @@ mod tests {
     fn extract_text_charwise_crosses_an_empty_line() {
         let mut buf = TestBuffer::new("a\n\nb");
         buf.set_cursor(0, 0);
-        // "a" -> the empty line (its own word) -> "b": exclusive, lands on
-        // 'b' without including it.
+        // `a`, then the empty line (a word of its own), then `b`:
+        // exclusive, so `b` isn't included.
         let r = motion_range(&mut buf, Motion::WordForward, Some(2)).unwrap();
         assert_eq!(r.shape, MotionShape::Exclusive);
         assert_eq!(r.to, (2, 0));
@@ -3617,8 +3382,7 @@ mod tests {
         let mut buf = TestBuffer::new("foo bar baz");
         assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, false, None), Some("foo".to_string()));
         assert_eq!(object_text(&mut buf, (0, 1), TextObjectKind::Word, true, None), Some("foo ".to_string()));
-        // no trailing whitespace at buffer end -- `aw` falls back to
-        // leading whitespace instead.
+        // No trailing whitespace at the end, so `aw` takes the leading.
         assert_eq!(object_text(&mut buf, (0, 9), TextObjectKind::Word, true, None), Some(" baz".to_string()));
     }
 
@@ -3648,7 +3412,7 @@ mod tests {
         let mut buf = TestBuffer::new(r#"say "hello world" now"#);
         assert_eq!(object_text(&mut buf, (0, 7), TextObjectKind::DoubleQuote, false, None), Some("hello world".to_string()));
         assert_eq!(object_text(&mut buf, (0, 7), TextObjectKind::DoubleQuote, true, None), Some(r#""hello world" "#.to_string()));
-        // cursor before the quotes still finds them
+        // A cursor before the quotes still finds them.
         assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::DoubleQuote, false, None), Some("hello world".to_string()));
     }
 
@@ -3656,9 +3420,8 @@ mod tests {
     fn quote_object_empty_pair_has_no_inner_but_has_around() {
         let mut buf = TestBuffer::new(r#"x = "";"#);
         assert_eq!(object_text(&mut buf, (0, 5), TextObjectKind::DoubleQuote, false, None), None);
-        // No whitespace trails the closing quote (`;` isn't blank), so `a"`
-        // falls back to the leading whitespace before the opening quote --
-        // same "prefer trailing, fall back to leading" rule as `aw`.
+        // No whitespace after the closing quote (`;` isn't blank), so `a"`
+        // takes the leading whitespace, as `aw` does.
         assert_eq!(object_text(&mut buf, (0, 5), TextObjectKind::DoubleQuote, true, None), Some(r#" """#.to_string()));
     }
 
@@ -3698,11 +3461,8 @@ mod tests {
 
     #[test]
     fn paren_object_spans_multiple_lines() {
-        // The open/close brackets themselves sit at the very end of line 0
-        // and the very start of line 2 -- `step_forward`/`step_backward`
-        // never land on the (virtual) newline between them, so the inner
-        // range is exactly line 1's own content, same convention every
-        // other line-crossing motion in this module already follows.
+        // The brackets end line 0 and start line 2. The steps never land on
+        // the newline between, so the inner range is exactly line 1.
         let mut buf = TestBuffer::new("foo(\nbar\n)baz");
         assert_eq!(object_text(&mut buf, (1, 1), TextObjectKind::Paren, false, None), Some("bar".to_string()));
     }
@@ -3721,8 +3481,8 @@ mod tests {
         assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::Paragraph, false, None), Some("one\ntwo\n".to_string()));
         assert_eq!(object_text(&mut buf, (0, 0), TextObjectKind::Paragraph, true, None), Some("one\ntwo\n\n".to_string()));
         assert_eq!(object_text(&mut buf, (3, 0), TextObjectKind::Paragraph, false, None), Some("three\nfour\n".to_string()));
-        // last paragraph has no trailing blank run -- `ap` falls back to
-        // the leading one instead.
+        // The last paragraph has no trailing blank run, so `ap` takes the
+        // leading one.
         assert_eq!(object_text(&mut buf, (6, 0), TextObjectKind::Paragraph, true, None), Some("\nfive\n".to_string()));
     }
 
@@ -3737,11 +3497,8 @@ mod tests {
 
     #[test]
     fn word_object_line_gets_left_untouched_by_text_object_variant_in_motion_shape() {
-        // `TextObject` is never dispatched through `apply_motion`'s normal
-        // callers in this crate (see the variant's own doc comment), but it
-        // must still be handled correctly for `motion_shape`/`apply_motion`
-        // to stay total -- exercised here directly rather than left
-        // entirely to the "never reached" claim.
+        // `TextObject` never reaches `apply_motion` from vimkeys, but is
+        // handled there; tested directly.
         let mut buf = TestBuffer::new("foo bar");
         buf.set_cursor(0, 5);
         apply_motion(&mut buf, Motion::TextObject(TextObjectKind::Word, false), None);
@@ -3809,8 +3566,8 @@ mod tests {
         let m = NumberMatch { from: (0, 0), to: (0, 1), value: 42, width: 2, leading_zero: false };
         assert_eq!(apply_number_delta(&m, 1), "43");
         assert_eq!(apply_number_delta(&m, -1), "41");
-        // An ordinary (non-zero-padded) number never gets padded back
-        // out, even once it shrinks below its own original width.
+        // A number that wasn't zero-padded is never padded, even when it
+        // shrinks.
         assert_eq!(apply_number_delta(&m, -42), "0");
         assert_eq!(apply_number_delta(&m, -50), "-8");
     }
@@ -3819,7 +3576,7 @@ mod tests {
     fn apply_number_delta_preserves_leading_zero_width() {
         let m = NumberMatch { from: (0, 0), to: (0, 2), value: 7, width: 3, leading_zero: true };
         assert_eq!(apply_number_delta(&m, 1), "008");
-        // growing past the original width drops the padding, matching vim.
+        // Growing past the original width drops the padding, as in vim.
         let m = NumberMatch { from: (0, 0), to: (0, 2), value: 999, width: 3, leading_zero: true };
         assert_eq!(apply_number_delta(&m, 1), "1000");
     }
@@ -3840,8 +3597,7 @@ mod tests {
         assert_eq!(surround_target_kind('"'), Some(TextObjectKind::DoubleQuote));
         assert_eq!(surround_target_kind('\''), Some(TextObjectKind::SingleQuote));
         assert_eq!(surround_target_kind('`'), Some(TextObjectKind::Backtick));
-        // `w`/`s`/`p` name text objects but never a surround target --
-        // ds/cs only ever act on pair-shaped delimiters.
+        // `w`, `s` and `p` are text objects but never surround targets.
         assert_eq!(surround_target_kind('w'), None);
         assert_eq!(surround_target_kind('s'), None);
         assert_eq!(surround_target_kind('p'), None);
@@ -3871,10 +3627,8 @@ mod tests {
 
     #[test]
     fn surround_delims_rejects_letters_and_whitespace() {
-        // Only `b`/`B`/`r` are recognized letter aliases -- anything else
-        // (a typo, or vim-surround's own unsupported tag/function-call
-        // triggers) is rejected rather than silently becoming a literal
-        // letter wrap.
+        // Only `b`, `B` and `r` are letter aliases; other letters are
+        // rejected rather than wrapping in a literal letter.
         assert_eq!(surround_delims('t'), None);
         assert_eq!(surround_delims('x'), None);
         assert_eq!(surround_delims(' '), None);
@@ -3930,8 +3684,8 @@ mod tests {
 
     #[test]
     fn surround_delete_spans_a_single_shared_pad_space_is_claimed_only_once() {
-        // "( )" -- the lone character between the brackets would
-        // otherwise be claimed as padding by both sides at once.
+        // `( )`: the lone space would otherwise be claimed as padding by both
+        // sides.
         let buf = TestBuffer::new("( )");
         let (open, close) = surround_delete_spans(&buf, TextObjectKind::Paren, (0, 0), (0, 2));
         assert_eq!(open, MotionRange { shape: MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
