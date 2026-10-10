@@ -487,6 +487,23 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> Result<Command, String> {
+        // Every nesting level of a compound command -- an `if` body, a
+        // loop body, a `{ }` group, a function -- comes back through
+        // here, so this is the one place to notice the stack running
+        // out. Without it a script nested a few thousand deep (~15KB of
+        // `if true; then ... fi`) overflowed the stack and aborted the
+        // whole process; bash parses the same input and runs it. The
+        // guard bites at two-thirds of the stack (stackguard's budget),
+        // which leaves room both for the error to unwind and for the
+        // partially built tree to drop -- drop frames are smaller than
+        // these parse frames, so what the parser could build, it can
+        // also tear back down. `( )` and `$(( ))` do not recurse here:
+        // the lexer captures their interior raw (see the `Subshell`/
+        // `Arith` arms below), so their depth is an execution-time
+        // concern, guarded where they are re-entered.
+        if crate::stackguard::nearly_exhausted() {
+            return Err("too deeply nested".to_string());
+        }
         match self.peek() {
             Some(Tok::KwIf) => self.parse_if(),
             Some(Tok::KwWhile) => self.parse_while(false),
@@ -1663,5 +1680,51 @@ mod line_tracking_tests {
         for leak in ["Subshell", "Tok::", "Some(", "chunks", "{ raw"] {
             assert!(!e.contains(leak), "{leak:?} leaked into a user-facing message: {e}");
         }
+    }
+
+    // Deeply nested input must come back as an error, not overflow the
+    // stack and abort the process. This test is itself the proof: with
+    // no depth guard in `parse_command` the overflow is a `SIGABRT`,
+    // which takes the whole test binary down -- so if this test runs to
+    // its assertion at all, the guard fired. ~5000 levels of `if` is
+    // well past where the stack would have gone, and ~15KB of source,
+    // the size of a hostile paste rather than anything a person writes.
+    //
+    // `note_base` so the stack budget is measured from somewhere,
+    // rather than the zero a test binary starts with (which would make
+    // `nearly_exhausted` either always or never true); harmless to call
+    // more than once, since it only records an address.
+    #[test]
+    fn deeply_nested_input_errors_instead_of_overflowing_the_stack() {
+        // On a thread whose stack matches what `stackguard` assumes (it
+        // reads the main thread's `ulimit -s`, ~8 MiB; a default test
+        // thread gets 2 MiB, less than the budget, so the guard could
+        // not bite before that smaller stack overflowed). In bish the
+        // parser only ever runs on the main thread, so this is the
+        // production shape, reproduced.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                crate::stackguard::note_base();
+                // ~5000 levels of `if`: well past where the stack would
+                // have gone, ~15 KiB of source -- a hostile paste, not
+                // anything a person writes. If the guard did not fire
+                // this would abort the whole test binary, so reaching
+                // the assertion at all is the proof.
+                let deep = format!("{}echo hi{}", "if true; then ".repeat(5000), " ;fi".repeat(5000));
+                let toks = crate::lexer::Lexer::new(&deep).tokenize().expect("the lexer is iterative");
+                let err = Parser::new(toks).parse_program().expect_err("too deep to parse");
+                assert!(err.contains("too deeply nested"), "{err}");
+
+                // ...and real code, which never nests anywhere near this
+                // far, still parses -- the guard protects against a
+                // paste without rejecting a program.
+                let ok = format!("{}echo hi{}", "if true; then ".repeat(50), " ;fi".repeat(50));
+                let toks = crate::lexer::Lexer::new(&ok).tokenize().expect("lexes");
+                assert!(Parser::new(toks).parse_program().is_ok(), "50-deep is well within budget");
+            })
+            .expect("spawn")
+            .join()
+            .expect("the guard fired rather than the stack overflowing");
     }
 }
