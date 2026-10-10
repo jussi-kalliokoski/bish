@@ -833,7 +833,6 @@ impl Browser {
     }
 }
 
-
 // Where a browse starts: the argument, if any (relative to the session's
 // cwd, not the process's: each pane has its own), otherwise that cwd.
 // `~` and `~/...` expand here too, for callers with a raw path.
