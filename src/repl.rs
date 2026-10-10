@@ -9326,7 +9326,7 @@ struct TranscriptEntry {
 }
 
 // `:help`'s content, in markdown rendered by `crate::markdown` (see
-// `render_help`).
+// `render_markdown_document`).
 const EDITOR_HELP_MARKDOWN: &str = r#"# bish editor
 
 ## Moving around
