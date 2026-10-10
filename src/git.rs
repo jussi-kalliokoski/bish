@@ -37,6 +37,31 @@ use std::process::{Command, Stdio};
 // What is *not* overridden is the rest: an alias, an `includeIf`, a
 // `safe.directory`, a mailmap are all the repository's own business and
 // bish asks git the same questions a terminal would.
+//
+// Except for the config keys whose values are *commands*. bish runs git
+// by itself -- on every prompt, when Ctrl+T opens, when a buffer wants a
+// blame gutter -- so a repository's own config becomes code execution on
+// nothing more than `cd`, which is the bug fish shipped as
+// CVE-2022-20001 and powerlevel10k shipped twice. Demonstrated here
+// before this list existed: `core.fsmonitor = "touch /tmp/x; false"` in
+// a repository's `.git/config` ran on entering the directory, and again
+// from the opener, and again from the blame gutter.
+//
+// `safe.directory` is git's own answer and does not cover this: it
+// refuses a repository owned by *another* user, and the way this arrives
+// is an archive you extracted yourself. A person typing `git status`
+// chose to run git there; a prompt did not.
+//
+// So every key below is one git would hand to a shell, and `-c` beats
+// the repository's config file. What this cannot reach is a driver the
+// repository *names* itself -- `filter.<whatever>.clean` selected by a
+// tracked `.gitattributes`, and `diff.<whatever>.textconv` the same way.
+// Config subsections do not glob, so there is no `-c` to write in
+// advance, and the one blunt instrument that works -- pointing
+// `GIT_ATTR_SOURCE` at an empty tree, which was measured to stop it --
+// also throws away `text=auto` and every other eol rule, so a clean
+// repository would start reporting itself dirty. That half is still
+// open and is written down here rather than left to be rediscovered.
 fn command(dir: &Path) -> Command {
     let mut git = Command::new("git");
     git.current_dir(dir)
@@ -58,6 +83,25 @@ fn command(dir: &Path) -> Command {
             "log.date=default",
             "-c",
             "core.quotepath=false",
+            // Every one of these is a command git would run. None of
+            // them is wanted by anything bish asks for: it reads, it
+            // never fetches, and it never pages.
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "core.alternateRefsCommand=",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.sshCommand=",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "core.gitProxy=",
+            "-c",
+            "uploadpack.packObjectsHook=",
         ]);
     git
 }
@@ -592,6 +636,44 @@ mod tests {
         let entry = &log(&dir, None, None).unwrap()[0];
         assert_eq!((entry.hash.len(), entry.author.as_str()), (40, "Test User"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The prompt runs git in whatever directory you entered, so a
+    // repository's own config must not be able to run a command. This is
+    // the vector fish shipped as CVE-2022-20001; it was live here until
+    // `command` started overriding the keys whose values git executes.
+    #[test]
+    fn a_repositorys_own_config_cannot_run_a_command_when_bish_asks_about_it() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-fsmonitor-{}", std::process::id()));
+        let marker = dir.join("EXECUTED");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+        // `false` afterwards so git falls back to its ordinary scan: the
+        // point is whether the command ran at all, not what it answered.
+        run(&["config", "core.fsmonitor", &format!("touch {}; false", marker.display())]);
+
+        // Every automatic query, not just the prompt's: the opener asks
+        // for the file list and a buffer asks for blame.
+        let status = head_status(&dir);
+        let files = tracked_files(&dir);
+        let blamed = blame(&dir.join("a.txt"), None);
+
+        let ran = marker.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!ran, "a repository's `core.fsmonitor` was executed by bish asking about it");
+        // ...and the answers still arrived, which is the half that makes
+        // this a fix rather than a removal.
+        assert_eq!(status.map(|s| s.branch), Some("main".to_string()));
+        assert_eq!(files.unwrap(), ["a.txt"]);
+        assert_eq!(blamed.unwrap().len(), 1);
     }
 
     #[test]
