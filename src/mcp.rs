@@ -1,75 +1,41 @@
-// `bish tool mcp-server` -- the Model Context Protocol, spoken over
-// stdio, so an agent can ask bish what it is looking at.
+// `bish tool mcp-server`: the Model Context Protocol over stdio, so an
+// agent can ask bish what it's looking at (the open file, the cursor,
+// the language server's findings, the selection) rather than scrape the
+// screen.
 //
-// bish knows things nothing outside it can recover: which file is open,
-// where the cursor is, what the language server found, what is
-// selected. An agent running in a pane can only scrape the screen. This
-// module is the door.
+// MCP is JSON-RPC 2.0, which `lsp::Message` already handles; MCP over
+// stdio is newline-delimited, not `Content-Length`, so a smaller reader
+// lives here instead of `framing.rs`.
 //
-// MCP is JSON-RPC 2.0, which `lsp.rs` already is -- `lsp::Message`
-// carries no notion of which protocol it is for, only which of the three
-// shapes a message has, so it needed nothing added for this. The one
-// real difference from `lspserver.rs` is the framing: MCP over stdio is
-// **newline-delimited JSON**, not `Content-Length`, so `framing.rs`
-// stays where it is and a much smaller reader lives here instead.
-//
-// **This is the only file that knows MCP.** That is the whole point of
-// where the seam is. The protocol will move -- it is younger than LSP
-// and its capability negotiation is still settling -- and when it does,
-// this file changes and nothing else does. Everything underneath it is
-// bish's own: the session socket carries opaque bytes, and the answers
-// come from the same `TextBuffer` and `lint::Diagnostic` the editor
-// draws from.
-//
-// And **nothing about a particular client is in here either**. The
-// transport a given agent wants this year -- a WebSocket, a lockfile in
-// a well-known directory, a token in an HTTP header -- is somebody
-// else's process, bridging that to this one's stdin and stdout. None of
-// it is durable and none of it belongs in bish.
+// This is the only file that knows MCP, a younger protocol still
+// settling, so when it moves only this changes; underneath, the session
+// socket carries opaque bytes and answers come from the `TextBuffer` and
+// `lint::Diagnostic` the editor uses. Nothing about any particular
+// client is here either: a client's transport (WebSocket, lockfile,
+// HTTP token) is another process's job, bridging to this one's stdio.
 #![allow(dead_code)]
 
 use crate::json::{self, Value};
 use crate::lsp::{Id, Message, ResponseError};
 use std::io::{Read, Write};
 
-/// Which revision of *this surface* a peer is talking to, and the answer
-/// to every `initialize` regardless of what was asked for.
-///
-/// It says "unstable" because it is: these tools, their payloads and
-/// this whole entry point can change or be withdrawn, and `bish tool
-/// mcp-server` is unlisted for the same reason. Anything connecting has
-/// been told so in the one field every client is guaranteed to read.
-///
-/// bish's own, and deliberately not a specification date. Those dates
-/// belong to the specification and say nothing about bish -- the ones
-/// that exist all predate this file, and quoting one would be claiming
-/// to have implemented a document rather than describing what is
-/// actually here. What is actually here is a set of tools and
-/// notifications that bish decides, so what it announces is a version of
-/// that set.
-///
-/// Which means it is **not what a client expects to see**, and it is not
-/// meant to be: reconciling this with whatever a given client demands is
-/// the job of whatever is bridging bish to that client. Putting the
-/// client's answer here instead would be moving that job into the one
-/// file that is supposed to know nothing about any client.
-///
-/// It moves when this surface changes -- a tool removed, a payload
-/// reshaped -- and not when bish is released. `serverInfo.version`
-/// already says which bish this is; this says what it serves.
+/// The answer to every `initialize`, whatever was asked: which revision
+/// of this surface a peer is talking to. "unstable" because these tools
+/// and payloads may change or go, and the subcommand is unlisted for the
+/// same reason. bish's own version, not a specification date, which
+/// would claim to implement a document; reconciling with what a client
+/// expects is the bridge's job. It changes when this surface does, not
+/// with bish releases (`serverInfo.version` says which bish).
 const PROTOCOL_VERSION: &str = "bish/unstable";
 
-/// What a peer is told this server is. The name is bish's own rather
-/// than an imitation of any editor's: a client that branches on it is
-/// entitled to know what it is actually talking to.
+/// What a peer is told this is: bish, not an imitation of an editor, so
+/// a client branching on it knows what it's talking to.
 const SERVER_NAME: &str = "bish";
 
-/// JSON-RPC's own code for a method that does not exist.
+/// JSON-RPC's code for a method that doesn't exist.
 const METHOD_NOT_FOUND: i64 = -32601;
 
-/// One JSON object, written out longhand. `json.rs` has no builder and
-/// deliberately so; every caller that needs one writes this same three
-/// lines, so this module writes it once.
+/// One JSON object written out; `json.rs` has no builder.
 fn object(fields: Vec<(&str, Value)>) -> Value {
     Value::Object(fields.into_iter().map(|(name, value)| (name.to_string(), value)).collect())
 }
@@ -78,37 +44,23 @@ fn string(s: &str) -> Value {
     Value::Str(s.to_string())
 }
 
-/// A tool result: the `{content: [...]}` envelope every `tools/call`
-/// answers with.
-///
-/// `is_error` is the part worth knowing about. A tool that *fails* still
-/// returns a successful JSON-RPC response, with the failure described
-/// inside the result -- a JSON-RPC error means "this call was
-/// malformed", not "the thing you asked for did not work". Getting that
-/// backwards makes a client treat a routine "no such file" as a broken
-/// server.
+/// A tool result, the `{content: [...]}` envelope `tools/call` answers
+/// with. A tool that fails still returns a successful JSON-RPC response,
+/// with `is_error` set: a JSON-RPC error means the call was malformed,
+/// and using it for "no such file" makes a client think the server is
+/// broken.
 fn tool_result(text: &str, is_error: bool) -> Value {
     object(vec![("content", Value::Array(vec![object(vec![("type", string("text")), ("text", string(text))])])), ("isError", Value::Bool(is_error))])
 }
 
-// ---------------------------------------------------------------------
-// What bish says about itself, in bish's own terms
-// ---------------------------------------------------------------------
-//
-// Everything below this line is *not* MCP. It is the little protocol
-// `bish tool mcp-server` speaks to a running session over its socket,
-// and it is deliberately shaped like bish rather than like any client:
-// plain paths, 0-based line and character positions, severities spelled
-// the way `lint::Severity` spells them. The conversion into whatever a
-// client wants happens above, in one place, which is what makes this
-// half safe to leave alone when the protocol above it moves.
-//
-// It also never leaves the machine, so it needs no version negotiation
-// and can change whenever both halves ship together -- which they do,
-// being the same binary.
+// Below is not MCP but the small protocol `bish tool mcp-server` speaks
+// to a running session over its socket, shaped like bish: plain paths,
+// 0-based line and character, `lint::Severity`'s spellings. Conversion
+// for clients happens above, in one place. It never leaves the machine
+// and both halves are one binary, so it needs no version negotiation.
 
-/// One finding, wherever it came from -- bish's own linter or a
-/// language server, which the editor already merges into one list.
+/// One finding, from bish's linter or a language server, which the
+/// editor merges into one list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diag {
     pub message: String,
@@ -135,11 +87,9 @@ pub struct FileState {
     pub diagnostics: Vec<Diag>,
 }
 
-/// Everything bish is willing to say right now.
-///
-/// One question and one answer, rather than a question per tool: the
-/// whole thing is small, a round trip over a unix socket costs more than
-/// the extra fields, and one shape is one shape to test.
+/// Everything bish will say right now. One question, one answer, rather
+/// than one per tool: it's small, a socket round trip costs more than
+/// the extra fields, and one shape is one thing to test.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EditorState {
     pub files: Vec<FileState>,
@@ -241,8 +191,7 @@ impl Diag {
     }
 }
 
-/// bish's own spelling, not any client's -- see `mcp_severity` for the
-/// place that translates.
+/// bish's spelling; `mcp_severity` translates.
 fn severity_name(severity: crate::bishedit::lint::Severity) -> &'static str {
     use crate::bishedit::lint::Severity;
     match severity {
@@ -277,54 +226,42 @@ fn number_at(value: &Value, path: &str) -> usize {
     }
 }
 
-/// The question a peer asks, and the answer a session gives.
-///
-/// Called from `repl.rs`'s own idle tick with the state it alone can
-/// assemble. `None` means "nothing to send back", which is what a
-/// question nobody recognizes gets: this is a private protocol between
-/// two halves of one binary, so an unknown question is a bug on the
-/// asking side, not something to negotiate about.
+/// The question a peer asks and the answer a session gives, called from
+/// repl.rs's idle tick with the state only it can assemble. `None` means
+/// nothing to send, including for an unknown question, which in a private
+/// protocol between halves of one binary is the asker's bug.
 pub fn answer(state: &EditorState, question: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(question).ok()?;
     let value = json::parse(text).ok()?;
     match string_at(&value, ".q")?.as_str() {
         "state" => Some(json::compact_print(&state.to_value()).into_bytes()),
-        // Announcing itself. Deliberately answered with nothing: the
-        // point is the side effect -- the session now knows somebody is
-        // listening, and starts keeping current the things it only
-        // bothers to track when somebody is. A reply here would also sit
-        // in the socket waiting to be mistaken for the answer to the
-        // first real question.
+        // Announcing itself, answered with nothing: the session now knows
+        // someone listens and keeps current what it only tracks then. A reply
+        // would sit in the socket to be mistaken for the first real answer.
         "hello" => None,
         _ => None,
     }
 }
 
-/// `answer`, for the one question a stored copy of the state can answer
-/// by itself -- what a peer is told while a command holds the loop that
-/// would otherwise build the state fresh (see `session::service_while_busy`).
-/// Every other question is `None`, and waits to be asked of `answer`.
+/// `answer` for the one question a stored copy of the state can answer,
+/// while a command holds the loop that would build it fresh
+/// (`session::service_while_busy`). Others are `None` until `answer` can.
 pub fn answer_from_state(state: &EditorState, question: &[u8]) -> Option<Vec<u8>> {
     let value = json::parse(std::str::from_utf8(question).ok()?).ok()?;
     (string_at(&value, ".q")? == "state").then(|| answer(state, question)).flatten()
 }
 
-/// The focus notification, in the private protocol: what the editor is
-/// showing now, or that it is showing nothing.
-///
-/// Sent unasked, which is the whole reason the socket carries replies
-/// and notifications on one message kind -- see `session::Message`.
+/// The focus notification in the private protocol: what the editor
+/// shows, or nothing. Sent unasked, which is why replies and
+/// notifications share one message kind (`session::Message`).
 pub fn selection_notification(focus: Option<&FileState>) -> Option<Vec<u8>> {
     let payload = object(vec![("n", string("focus")), ("file", focus.map(FileState::to_value).unwrap_or(Value::Null))]);
     Some(json::compact_print(&payload).into_bytes())
 }
 
-/// A proposed new version of a file, for somebody to go through change
-/// by change -- `openDiff`, in bish's own terms.
-///
-/// The one question in this protocol whose answer cannot come from the
-/// tick that received it: it waits on a person. So it carries an `id`,
-/// and the answer names it, rather than being whatever reply comes next.
+/// A proposed new version of a file to review change by change,
+/// `openDiff` in bish's terms. Its answer waits on a person, not the
+/// tick that received it, so it carries an `id` that the answer names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewRequest {
     pub id: u64,
@@ -360,7 +297,7 @@ impl ReviewRequest {
 }
 
 /// How a review ended: with the file as it now stands, written, or with
-/// nothing done to it.
+/// nothing done.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReviewOutcome {
     Saved(String),
@@ -392,7 +329,7 @@ fn review_outcome(payload: &[u8], id: u64) -> Option<ReviewOutcome> {
     }
 }
 
-/// The other end of it.
+/// The other end of `answer`.
 fn ask_state(peer: &mut crate::session::Peer) -> Result<EditorState, String> {
     let reply = peer.ask(br#"{"q":"state"}"#, std::time::Duration::from_millis(2000)).map_err(|e| e.to_string())?;
     let text = String::from_utf8(reply).map_err(|e| e.to_string())?;
@@ -400,19 +337,17 @@ fn ask_state(peer: &mut crate::session::Peer) -> Result<EditorState, String> {
 }
 
 pub struct Server {
-    /// Set by `initialize`, so a peer that skips the handshake and asks
-    /// for something is told what it did rather than quietly served.
+    /// Set by `initialize`, so a peer skipping the handshake is told so
+    /// rather than served.
     initialized: bool,
-    /// The session being reported on, if any. `None` is a perfectly
-    /// good server that has nothing to say: it completes the handshake
-    /// and offers no tools, which a client discovers and works around.
-    /// That is the shape that makes starting small safe.
+    /// The session reported on, if any. `None` is a valid server with
+    /// nothing to say: it completes the handshake and offers no tools, which
+    /// a client discovers.
     session: Option<crate::session::Peer>,
     /// The last review asked for, so each answer can name its question.
     next_review: u64,
-    /// What the session said while a review was being waited on and
-    /// that was not its answer -- held for `forward_notifications`,
-    /// since a wait is no reason to drop a notification.
+    /// What the session said during a review's wait that wasn't its answer,
+    /// held for `forward_notifications`.
     held: Vec<Vec<u8>>,
 }
 
@@ -422,20 +357,15 @@ impl Default for Server {
     }
 }
 
-/// `bish tool mcp-server [--session NAME]`.
+/// `bish tool mcp-server [--session NAME]`. Without `--session`, the bish
+/// it runs inside, through the `BISH_SOCKET` every interactive bish gives
+/// its panes (`session::listen_here`); run elsewhere, it reports on
+/// nothing.
 ///
-/// Without `--session`, the bish it is running inside, found through the
-/// `BISH_SOCKET` every interactive bish gives its panes (see
-/// `session::listen_here`). Run from anywhere else, it reports on nothing,
-/// as it always did.
-///
-/// Unlisted, and with no `--help` of its own: `tool.rs` leaves it out of
-/// the subcommand table, so it is not offered, not suggested after a
-/// typo, and not described anywhere a reader would find it by looking.
-/// That is the point rather than an omission -- this surface has not
-/// settled, and anything documented is something somebody is entitled to
-/// keep. This module's own doc comment is the documentation until that
-/// changes, and `PROTOCOL_VERSION` tells anything connecting the same.
+/// Unlisted, with no `--help`: `tool.rs` leaves it out of the subcommand
+/// table, so it's not offered, suggested or documented, because the
+/// surface hasn't settled and documented things get relied on. This
+/// module's doc and `PROTOCOL_VERSION` are its documentation.
 pub fn run(args: &[String]) -> i32 {
     if !cfg!(feature = "mcp") {
         eprintln!("bish tool mcp-server: the MCP server is not part of this build");
@@ -443,8 +373,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let mut session = None;
     let mut rest = args;
-    // `--session NAME` and `--session=NAME`, and nothing else. There is
-    // no `--help` here, deliberately -- see this function's own comment.
+    // `--session NAME` and `--session=NAME`, nothing else, no `--help`.
     while let Some(arg) = rest.first() {
         let named = arg
             .strip_prefix("--session=")
@@ -466,12 +395,9 @@ pub fn run(args: &[String]) -> i32 {
     let peer = match connected {
         Some(connected) => match connected {
             Ok(mut peer) => {
-                // Before the client has asked anything. What the editor
-                // publishes for us to read is only kept current while a
-                // peer exists, so a peer that first announces itself
-                // when it asks would find the answer to its own first
-                // question not ready yet -- which it did, and this is
-                // the fix for it.
+                // Before the client asks anything: the editor keeps what we
+                // read current only while a peer exists, so announcing at
+                // the first question would find its answer not ready.
                 if let Err(e) = peer.tell(br#"{"q":"hello"}"#) {
                     eprintln!("bish tool mcp-server: {e}");
                     return 1;
@@ -495,28 +421,24 @@ impl Server {
         Server { initialized: false, next_review: 0, held: Vec::new(), session: None }
     }
 
-    /// The loop, over any reader and writer rather than stdin and stdout
-    /// specifically -- which is what lets the tests drive a whole
-    /// session by handing it bytes, the same shape `lspserver.rs` uses.
+    /// The loop, over any reader and writer, so tests drive a session with
+    /// bytes, as for `lspserver.rs`.
     pub fn serve(&mut self, input: &mut impl Read, output: &mut impl Write) -> i32 {
         let mut lines = Lines::default();
         let mut buf = [0u8; 8192];
         loop {
-            // Everything already complete is answered before another
-            // read: one read can carry several messages, and a client
-            // that sent `initialize` and `tools/list` together is
-            // entitled to both answers.
+            // Everything complete is answered before reading again: one
+            // read can carry several messages.
             while let Some(line) = lines.take_line() {
                 if let Some(message) = self.decode(&line, output) {
                     self.handle(message, output);
                 }
             }
-            // Anything the session has said unasked, before waiting on
-            // the client again -- a notification nobody is waiting for
-            // is one that has to be noticed rather than replied to.
+            // What the session said unasked, before waiting on the client
+            // again.
             self.forward_notifications(output);
             match input.read(&mut buf) {
-                // The peer is gone; there is nobody left to answer.
+                // The peer is gone.
                 Ok(0) => return 0,
                 Ok(n) => lines.feed(&buf[..n]),
                 Err(e) => {
@@ -527,14 +449,12 @@ impl Server {
         }
     }
 
-    /// Passes on whatever the session has said on its own, translated.
-    ///
-    /// A notice this side does not recognize is dropped rather than
-    /// forwarded: the two halves ship together, so a shape neither
-    /// understands is a bug rather than something to relay blindly.
+    /// Passes on, translated, what the session said on its own. An
+    /// unrecognized notice is dropped: the halves ship together, so it's a
+    /// bug, not something to relay blindly.
     fn forward_notifications(&mut self, output: &mut impl Write) {
         let Some(peer) = self.session.as_mut() else { return };
-        // What arrived during a review's wait first, since it came first.
+        // What arrived during a review's wait first.
         let mut payloads = std::mem::take(&mut self.held);
         if let Ok(fresh) = peer.poll() {
             payloads.extend(fresh);
@@ -546,18 +466,14 @@ impl Server {
         }
     }
 
-    /// One line to a message, or `None` after reporting why not.
-    ///
-    /// Unlike a `Content-Length` stream, a newline-delimited one stays
-    /// synchronised through a bad message: the next newline is still the
-    /// next message. So a line that will not parse is answered and the
-    /// loop carries on, where `lspserver.rs` has to give up.
+    /// One line to a message, or `None` after reporting why. A newline-
+    /// delimited stream stays synchronized through a bad message, so the loop
+    /// carries on, where `lspserver.rs` must stop.
     fn decode(&self, line: &str, output: &mut impl Write) -> Option<Message> {
         let value = match json::parse(line) {
             Ok(value) => value,
             Err(e) => {
-                // No id to answer against -- a message we cannot read is
-                // a message whose id we do not know either.
+                // No id to answer: an unreadable message's id is unknown too.
                 eprintln!("bish tool mcp-server: {e}");
                 return None;
             }
@@ -584,16 +500,14 @@ impl Server {
                 self.send(output, Message::Response { id, result });
             }
             Message::Notification { method, params } => self.notification(&method, &params),
-            // This server asks its peer for nothing, so anything
-            // arriving as a response answers a question never put.
+            // This server asks nothing, so a response answers nothing.
             Message::Response { .. } => {}
         }
     }
 
     fn send(&self, output: &mut impl Write, message: Message) {
-        // One message, one line. A write that fails means the peer is
-        // gone, which the next read discovers; there is no useful
-        // recovery here and nowhere to report it that the peer sees.
+        // One message, one line. A failed write means the peer is gone, which
+        // the next read finds.
         let _ = writeln!(output, "{}", json::compact_print(&message.to_value()));
         let _ = output.flush();
     }
@@ -601,8 +515,7 @@ impl Server {
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, ResponseError> {
         match method {
             "initialize" => Ok(self.initialize(params)),
-            // Liveness, and nothing else: an empty result is the whole
-            // of the answer the specification asks for.
+            // Liveness only: an empty result is all the spec asks.
             "ping" => Ok(object(vec![])),
             "tools/list" => Ok(object(vec![("tools", Value::Array(self.tools()))])),
             "tools/call" => Ok(self.call(params)),
@@ -610,37 +523,27 @@ impl Server {
         }
     }
 
-    /// Notifications have no answer by definition, so an unrecognized
-    /// one is not an error -- there is nowhere to report it and nothing
-    /// the peer would do about it. `notifications/initialized` and a
-    /// client's own connection notices all land here.
+    /// Notifications have no answer, so an unrecognized one isn't an error:
+    /// `notifications/initialized` and clients' connection notices land
+    /// here.
     fn notification(&mut self, _method: &str, _params: &Value) {}
 
     fn initialize(&mut self, _params: &Value) -> Value {
         self.initialized = true;
         object(vec![
-            // What bish speaks, whatever was asked for. A client that
-            // wants a different revision is a client something in front
-            // of bish has to reconcile -- see `PROTOCOL_VERSION`.
+            // What bish speaks, whatever was asked; a client wanting another
+            // revision is for something in front of bish to reconcile.
             ("protocolVersion", string(PROTOCOL_VERSION)),
-            // Only `tools`. No resources, no prompts, no logging --
-            // declaring a capability is promising to serve it, and a
-            // client is entitled to skip asking about anything not
-            // declared here.
+            // Only `tools`: declaring a capability promises to serve it.
             ("capabilities", object(vec![("tools", object(vec![("listChanged", Value::Bool(true))]))])),
             ("serverInfo", object(vec![("name", string(SERVER_NAME)), ("version", string(env!("CARGO_PKG_VERSION")))])),
         ])
     }
 
-    /// Every tool this server has, as `tools/list` reports them.
-    ///
-    /// Deliberately short. A client discovers what is here rather than
-    /// assuming, so an absent tool costs whatever that one tool did and
-    /// nothing else -- which is what makes starting small safe.
+    /// Every tool this server has, for `tools/list`. Short: clients discover
+    /// rather than assume, so an absent tool costs only itself.
     fn tools(&self) -> Vec<Value> {
-        // Nothing to report on, so nothing to offer. A client reads this
-        // list rather than assuming one, so an empty one costs exactly
-        // the tools that are not in it.
+        // Nothing to report on, so no tools.
         if self.session.is_none() {
             return Vec::new();
         }
@@ -674,24 +577,19 @@ impl Server {
         match name.as_str() {
             "getDiagnostics" => self.get_diagnostics(&arguments),
             "openDiff" => self.open_diff(&arguments),
-            // A review closes itself the moment it is decided, which is
-            // before `openDiff` answers -- so by the time a client asks
-            // for one to be closed, there is never one open. Answered
-            // rather than refused because a client calls both of these
-            // unprompted, and an error there is noise about nothing.
+            // A review closes when decided, before `openDiff` answers, so
+            // there's never one open to close. Answered rather than
+            // refused, since clients call this unprompted.
             "close_tab" => tool_result("TAB_CLOSED", false),
             "closeAllDiffTabs" => tool_result("CLOSED_0_DIFF_TABS", false),
             other => tool_result(&format!("bish has no tool called {other}"), true),
         }
     }
 
-    /// Puts a proposed version of a file in front of whoever is at the
-    /// session, and answers once they have been through it: the file as
-    /// it now stands, written, or word that nothing was taken.
-    ///
-    /// Blocks this server until then, deliberately. The client asking is
-    /// itself waiting on exactly this answer, and has nothing else it
-    /// could usefully be told meanwhile.
+    /// Shows a proposed version of a file to whoever is at the session, and
+    /// answers once they've been through it: the file as written, or that
+    /// nothing was taken. Blocks until then: the client is waiting on exactly
+    /// this.
     fn open_diff(&mut self, arguments: &Value) -> Value {
         let Some(proposed) = string_at(arguments, ".new_file_contents") else {
             return tool_result("openDiff needs new_file_contents", true);
@@ -713,8 +611,8 @@ impl Server {
                 self.held.extend(others);
                 let block = |text: &str| object(vec![("type", string("text")), ("text", string(text))]);
                 match review_outcome(&answer, id) {
-                    // Two blocks, the second the file as written: what a
-                    // client reads a saved review as.
+                    // Two blocks, the second the file as written, how
+                    // clients read a saved review.
                     Some(ReviewOutcome::Saved(text)) => {
                         object(vec![("content", Value::Array(vec![block("FILE_SAVED"), block(&text)])), ("isError", Value::Bool(false))])
                     }
@@ -733,11 +631,9 @@ impl Server {
             Ok(state) => state,
             Err(e) => return tool_result(&format!("could not ask the session: {e}"), true),
         };
-        // A `file://` URI back to the path it names, percent-decoded, so
-        // `file:///tmp/my%20notes.sh` is the file with a space in its
-        // name. Anything else -- a bare path, a scheme bish does not
-        // serve -- matches nothing, which is the honest answer rather
-        // than an error.
+        // A `file://` URI back to its path, percent-decoded
+        // (`file:///tmp/my%20notes.sh` has a space). Anything else matches
+        // nothing, rather than erroring.
         let wanted = string_at(arguments, ".uri").map(|uri| crate::url::to_file_path(&uri));
         let files: Vec<Value> = state
             .files
@@ -752,8 +648,8 @@ impl Server {
     }
 }
 
-/// One tool as `tools/list` describes it, with a flat object schema --
-/// which is every schema here, and all MCP's own tools use.
+/// One tool for `tools/list`, with a flat object schema, as all of
+/// these have.
 fn tool(name: &str, description: &str, params: Vec<(&str, &str, &str)>) -> Value {
     let properties: Vec<(String, Value)> = params
         .iter()
@@ -762,18 +658,14 @@ fn tool(name: &str, description: &str, params: Vec<(&str, &str, &str)>) -> Value
     object(vec![
         ("name", string(name)),
         ("description", string(description)),
-        // No `required`: every parameter here is optional, and saying so
-        // by omission is what the schema means.
+        // No `required`: every parameter is optional.
         ("inputSchema", object(vec![("type", string("object")), ("properties", Value::Object(properties))])),
     ])
 }
 
-/// One file's diagnostics, in the shape a client reads them in.
-///
-/// Three details here are not negotiable, and each one silently discards
-/// the answer if it is wrong: the URI has to carry a `file://` scheme,
-/// positions are 0-based, and the severity is a *name* rather than a
-/// number.
+/// One file's diagnostics as a client reads them. Each detail silently
+/// loses the answer if wrong: the URI has a `file://` scheme, positions
+/// are 0-based, and severity is a name, not a number.
 fn file_diagnostics(file: &FileState) -> Value {
     let findings: Vec<Value> = file
         .diagnostics
@@ -795,13 +687,9 @@ fn file_diagnostics(file: &FileState) -> Value {
     ])
 }
 
-/// The session's own focus notice, turned into what a client listens
-/// for. `None` when there is nothing worth saying -- an unnamed buffer,
-/// or a pane that is not showing a file at all.
-///
-/// Named for the client's vocabulary rather than bish's, and that is the
-/// point of it being here: everything below this file says "focus", and
-/// only this line knows what a particular client calls it.
+/// The session's focus notice as what a client listens for; `None` for
+/// an unnamed buffer or a pane not showing a file. Below this file it's
+/// "focus"; only here knows what a client calls it.
 fn selection_changed(payload: &[u8]) -> Option<Message> {
     let text = std::str::from_utf8(payload).ok()?;
     let value = json::parse(text).ok()?;
@@ -811,8 +699,8 @@ fn selection_changed(payload: &[u8]) -> Option<Message> {
     let file = FileState::from_value(json::query(&value, ".file").ok()?)?;
     let (start, end) = match file.selection {
         Some((a, b, c, d)) => ((a, b), (c, d)),
-        // No selection is still worth sending: it is how a client learns
-        // the last one is over, and which file is in front now.
+        // No selection is still sent: it tells a client the last one ended
+        // and which file is in front.
         None => ((0, 0), (0, 0)),
     };
     let uri = crate::url::from_file_path(&file.path);
@@ -831,9 +719,8 @@ fn position((line, character): (usize, usize)) -> Value {
     object(vec![("line", Value::Number(line as f64)), ("character", Value::Number(character as f64))])
 }
 
-/// bish's four severities under the names a client expects. `Info` is
-/// the one that is spelled differently at each end, which is exactly the
-/// kind of thing this seam exists to absorb.
+/// bish's four severities as clients name them; `Info` is spelled
+/// differently at each end.
 fn mcp_severity(severity: crate::bishedit::lint::Severity) -> &'static str {
     use crate::bishedit::lint::Severity;
     match severity {
@@ -844,8 +731,8 @@ fn mcp_severity(severity: crate::bishedit::lint::Severity) -> &'static str {
     }
 }
 
-/// The other half of a JSON-RPC id, for the one place a message failed
-/// to parse but its id survived.
+/// A JSON-RPC id, for a message that failed to parse but whose id
+/// survived.
 fn id_of(value: &Value) -> Option<Id> {
     match value {
         Value::Number(n) => Some(Id::Number(*n as i64)),
@@ -854,25 +741,19 @@ fn id_of(value: &Value) -> Option<Id> {
     }
 }
 
-/// Newline-delimited JSON, which is what MCP over stdio is framed as.
-///
-/// Smaller than `framing.rs` because it has less to do: there is no
-/// header to parse, no length to disbelieve, and a message that will not
-/// read leaves the stream in a known place rather than an unknown one.
-/// The one thing it does have to do is not grow without bound on a peer
-/// that never sends a newline.
+/// Newline-delimited JSON, MCP's stdio framing. Simpler than
+/// `framing.rs`: no header or length, and a bad message leaves the stream
+/// in a known place. It mustn't grow without bound on a peer that never
+/// sends a newline.
 #[derive(Default)]
 struct Lines {
     buf: Vec<u8>,
-    /// Set once a single line has run past `MAX_LINE`, so the rest of
-    /// that line is dropped instead of buffered -- and dropped up to and
-    /// including its newline, so the *next* line still parses.
+    /// Set once a line has run past `MAX_LINE`: the rest of it, through its
+    /// newline, is dropped, so the next line parses.
     overrun: bool,
 }
 
-/// As much of one message as this will hold. Generous: a tool result
-/// carrying a whole file's diagnostics is the big case and is nowhere
-/// near this.
+/// One message's limit: a whole file's diagnostics is nowhere near it.
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
 impl Lines {
@@ -880,15 +761,14 @@ impl Lines {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// The next complete line, without its newline, or `None` when there
-    /// is not one yet. A `\r\n` line ending is accepted too: nothing in
-    /// the specification promises which a peer writes.
+    /// The next complete line without its newline, or `None`. `\r\n` is
+    /// accepted too; the spec doesn't say which a peer writes.
     fn take_line(&mut self) -> Option<String> {
         loop {
             let Some(at) = self.buf.iter().position(|b| *b == b'\n') else {
                 if self.buf.len() > MAX_LINE {
-                    // Keep nothing; the line is already lost, and the
-                    // point of noticing is to stop holding it.
+                    // Keep nothing: the line is lost, and this stops
+                    // holding it.
                     self.overrun = true;
                     self.buf.clear();
                 }
@@ -901,7 +781,7 @@ impl Lines {
             }
             let line = &line[..at];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            // A blank line between messages is not a message.
+            // A blank line between messages isn't one.
             if line.is_empty() {
                 continue;
             }
@@ -914,10 +794,7 @@ impl Lines {
 mod tests {
     use super::*;
 
-    /// A whole session, driven the way `lspserver.rs`'s own tests drive
-    /// theirs: bytes in, bytes out, no process and no pipes. `serve`
-    /// takes a reader and a writer rather than stdin and stdout for
-    /// exactly this.
+    /// A whole session as bytes in and out, as `lspserver.rs`'s tests do.
     fn session(messages: &[Value]) -> (i32, Vec<Message>) {
         let mut input = String::new();
         for m in messages {
@@ -927,8 +804,8 @@ mod tests {
         raw_session(&input)
     }
 
-    /// The same, over bytes written out by hand -- for the cases about
-    /// the framing itself, which a well-formed session cannot reach.
+    /// The same over hand-written bytes, for framing cases a well-formed
+    /// session can't reach.
     fn raw_session(input: &str) -> (i32, Vec<Message>) {
         let mut output: Vec<u8> = Vec::new();
         let code = Server::new().serve(&mut input.as_bytes(), &mut output);
@@ -949,10 +826,9 @@ mod tests {
         object(vec![("jsonrpc", string("2.0")), ("method", string(method)), ("params", params)])
     }
 
-    /// The handshake a test has to get past before it can ask for
-    /// anything. What it asks for does not matter -- bish answers with
-    /// its own either way -- so the common case says nothing, and only
-    /// the test that is *about* the asking spells one out.
+    /// The handshake a test must get past. What it asks for doesn't matter,
+    /// since bish answers with its own, so only the test about it spells one
+    /// out.
     fn initialize() -> Value {
         request(0.0, "initialize", object(vec![]))
     }
@@ -961,8 +837,7 @@ mod tests {
         request(0.0, "initialize", object(vec![("protocolVersion", string(version))]))
     }
 
-    /// The result for one id. Panics rather than returning an option:
-    /// every test here knows which answers it asked for.
+    /// The result for one id; panics, since every test knows its answers.
     fn result(messages: &[Message], id: f64) -> Value {
         for m in messages {
             if let Message::Response { id: Id::Number(n), result } = m
@@ -985,45 +860,37 @@ mod tests {
         panic!("no error for id {id} in {messages:?}");
     }
 
-    // The whole of "connected", as far as a client is concerned: a
-    // protocol version it recognizes and a `serverInfo`. Those two are
-    // the only things a client is entitled to refuse the connection
-    // over, so they are the two this pins.
+    // A recognized protocol version and a `serverInfo`: the only things a
+    // client may refuse a connection over.
     #[test]
     fn the_handshake_says_who_this_is_and_what_it_speaks() {
         let (_, out) = session(&[initialize()]);
         let answer = result(&out, 0.0);
         assert_eq!(json::query(&answer, ".serverInfo.name"), Ok(&string("bish")));
         assert_eq!(json::query(&answer, ".serverInfo.version"), Ok(&string(env!("CARGO_PKG_VERSION"))));
-        // bish's own, not a specification date, and saying out loud that
-        // it is not to be relied on -- see PROTOCOL_VERSION.
+        // bish's own, and marked unreliable; see `PROTOCOL_VERSION`.
         assert_eq!(json::query(&answer, ".protocolVersion"), Ok(&string("bish/unstable")));
-        // Only what this server will actually serve. Declaring a
-        // capability is promising to answer for it.
+        // Only what this server serves.
         assert_eq!(json::query(&answer, ".capabilities.tools.listChanged"), Ok(&Value::Bool(true)));
         assert_eq!(json::query(&answer, ".capabilities.resources"), Ok(&Value::Null));
         assert_eq!(json::query(&answer, ".capabilities.prompts"), Ok(&Value::Null));
     }
 
-    // bish answers with its own surface version, whatever was asked for,
-    // and it is not a specification date -- see `PROTOCOL_VERSION`. What
-    // a particular client will accept is that client's business, and
-    // reconciling the two is the bridge's.
+    // bish answers with its own surface version whatever was asked;
+    // reconciling with a client is the bridge's job.
     #[test]
     fn the_protocol_version_is_bishs_own_whatever_was_asked_for() {
         for asked in [PROTOCOL_VERSION, "2024-01-01", "1999-01-01", "", "whatever-a-client-wants"] {
             let (_, out) = session(&[initialize_asking(asked)]);
             assert_eq!(json::query(&result(&out, 0.0), ".protocolVersion"), Ok(&string(PROTOCOL_VERSION)), "{asked}");
         }
-        // Including when the client says nothing about it at all.
+        // Including when the client says nothing.
         let (_, out) = session(&[request(0.0, "initialize", object(vec![]))]);
         assert_eq!(json::query(&result(&out, 0.0), ".protocolVersion"), Ok(&string(PROTOCOL_VERSION)));
     }
 
-    // A notification has no answer by definition, so an unrecognized one
-    // is silence rather than an error -- including the ones a client
-    // sends about its own state, which this server has nothing to say
-    // about and must not choke on.
+    // An unrecognized notification is silence, including a client's notes
+    // about its own state.
     #[test]
     fn notifications_are_accepted_and_answered_with_nothing() {
         let (code, out) = session(&[
@@ -1034,7 +901,7 @@ mod tests {
             request(1.0, "ping", Value::Null),
         ]);
         assert_eq!(code, 0);
-        // Two answers for two requests, and not one more.
+        // Two answers for two requests.
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(result(&out, 1.0), object(vec![]));
     }
@@ -1047,9 +914,8 @@ mod tests {
         assert!(e.message.contains("resources/list"), "{}", e.message);
     }
 
-    // A tool that fails is a *successful* JSON-RPC response describing a
-    // failure. Getting this backwards makes a client treat a routine "no
-    // such thing" as a broken server.
+    // A failing tool is a successful JSON-RPC response describing the
+    // failure.
     #[test]
     fn a_tool_failure_is_content_and_not_a_json_rpc_error() {
         let (_, out) = session(&[initialize(), request(1.0, "tools/call", object(vec![("name", string("nosuchtool"))]))]);
@@ -1060,9 +926,8 @@ mod tests {
         assert!(text.contains("nosuchtool"), "{text}");
     }
 
-    // Newline framing, and the reason it was worth writing instead of
-    // reusing `framing.rs`: a message that will not read leaves the
-    // stream in a known place, so the next one still works.
+    // A bad message leaves newline framing in a known place, so the next
+    // works.
     #[test]
     fn a_line_that_will_not_parse_does_not_lose_the_stream() {
         let (code, out) = raw_session("not json at all\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
@@ -1070,8 +935,8 @@ mod tests {
         assert_eq!(result(&out, 1.0), object(vec![]));
     }
 
-    // Whitespace between messages is not a message, and neither ending
-    // is promised by the specification.
+    // Whitespace between messages isn't a message, and neither line ending
+    // is promised.
     #[test]
     fn blank_lines_and_carriage_returns_are_tolerated() {
         let (_, out) = raw_session("\r\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n\n");
@@ -1079,9 +944,8 @@ mod tests {
         assert_eq!(result(&out, 1.0), object(vec![]));
     }
 
-    // A peer that never sends a newline must not be able to make this
-    // process grow without bound, and the line *after* the one that was
-    // dropped still has to parse.
+    // A peer that never sends a newline can't make this grow without
+    // bound, and the line after the dropped one parses.
     #[test]
     fn an_endless_line_is_dropped_rather_than_buffered() {
         let mut lines = Lines::default();
@@ -1111,8 +975,8 @@ mod tests {
         }
     }
 
-    // The private half: the two ends of one binary agreeing about a
-    // shape neither a client nor the specification has any say over.
+    // The private half: both ends of one binary agree on a shape no client
+    // has a say over.
     #[test]
     fn the_editor_state_survives_the_socket() {
         let state = EditorState { files: vec![a_file(), FileState { focused: false, ..a_file() }] };
@@ -1120,20 +984,18 @@ mod tests {
         let back = EditorState::from_value(&json::parse(std::str::from_utf8(&answered).unwrap()).unwrap());
         assert_eq!(back, state);
 
-        // A question this side does not know is silence, not an error:
-        // both halves ship together, so an unknown one is a bug on the
-        // asking side rather than something to negotiate.
+        // An unknown question is silence: the halves ship together, so it's
+        // the asker's bug.
         assert_eq!(answer(&state, br#"{"q":"whatever"}"#), None);
         assert_eq!(answer(&state, b"not json"), None);
     }
 
-    /// A `Server` wired to a fake session over a socketpair: the daemon
-    /// itself needs a controlling terminal, and this exercises every
-    /// byte of the protocol without one.
+    /// A `Server` wired to a fake session over a socketpair: the daemon needs
+    /// a controlling terminal, and this exercises the protocol without one.
     fn with_session(state: EditorState, messages: &[Value]) -> Vec<Message> {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        // The far end plays the daemon: read one question, answer it,
-        // exactly as `answer_rpc_requests` does from the idle tick.
+        // The far end plays the daemon: read a question and answer it, as
+        // `answer_rpc_requests` does.
         let daemon = std::thread::spawn(move || {
             use crate::session::{Decoder, Message as Wire};
             use std::io::{Read, Write};
@@ -1147,11 +1009,10 @@ mod tests {
                 decoder.feed(&buf[..n]);
                 while let Ok(Some(message)) = decoder.next_message() {
                     let Wire::Rpc(question) = message else { continue };
-                    // A review is decided on the spot, the way someone at
-                    // the session would decide it: kept, unless the
+                    // A review decided on the spot: kept, unless the
                     // proposal asks to be refused. The focus notice sent
-                    // ahead of the answer is what a wait has to hold on
-                    // to rather than drop.
+                    // before the answer is what the wait must hold rather
+                    // than drop.
                     if let Some(review) = ReviewRequest::from_question(&question) {
                         if let Some(focus) = state.focused().or(state.files.first())
                             && let Some(notice) = selection_notification(Some(focus))
@@ -1186,11 +1047,9 @@ mod tests {
             .collect()
     }
 
-    // The whole of `openDiff` as a client sees it: a proposal goes in,
-    // and the answer comes back only once somebody has decided -- in the
-    // shape a client reads, two text blocks for a saved file and one for
-    // a refused one. The focus notice the session sent while the review
-    // was open is not lost to the wait.
+    // `openDiff` as a client sees it: the answer comes only once decided,
+    // as two text blocks for a saved file and one for a refusal, and a
+    // focus notice sent meanwhile isn't lost.
     #[test]
     fn open_diff_answers_once_the_review_is_decided_and_keeps_what_arrived_meanwhile() {
         let file = FileState {
@@ -1239,9 +1098,7 @@ mod tests {
         assert_eq!(review_outcome(br#"{"n":"focus","file":null}"#, 7), None, "a notification is not an answer");
     }
 
-    // What a client is told exists. Short on purpose -- a client reads
-    // this rather than assuming, so an absent tool costs that tool and
-    // nothing else.
+    // What a client is told exists.
     #[test]
     fn the_tool_list_is_what_bish_can_actually_answer() {
         let out = with_session(EditorState::default(), &[initialize(), request(1.0, "tools/list", Value::Null)]);
@@ -1252,15 +1109,13 @@ mod tests {
         assert_eq!(json::query(&tools[0], ".inputSchema.type"), Ok(&string("object")));
         assert_eq!(json::query(&tools[0], ".inputSchema.properties.uri.type"), Ok(&string("string")));
 
-        // With nothing to report on there is nothing to offer, and
-        // saying so is a working server, not a broken one.
+        // With nothing to report on, no tools, which is a working server.
         let (_, out) = session(&[initialize(), request(1.0, "tools/list", Value::Null)]);
         assert_eq!(json::query(&result(&out, 1.0), ".tools"), Ok(&Value::Array(vec![])));
     }
 
-    // Three details a client silently discards the answer over: the
-    // scheme, the base of the line numbers, and the spelling of the
-    // severity. Each was read off a real client rather than guessed.
+    // The scheme, the line base and the severity spelling, each read off a
+    // real client, which silently discards a wrong answer.
     #[test]
     fn diagnostics_come_out_in_the_shape_a_client_reads() {
         let state = EditorState { files: vec![a_file()] };
@@ -1272,15 +1127,13 @@ mod tests {
 
         assert_eq!(json::query(&files, "[0].uri"), Ok(&string("file:///tmp/bad.sh")), "the scheme is not optional");
         assert_eq!(json::query(&files, "[0].linesInFile"), Ok(&Value::Number(5.0)));
-        // 0-based, and carried through unchanged from what the editor
-        // published.
+        // 0-based, unchanged from what the editor published.
         assert_eq!(json::query(&files, "[0].diagnostics[0].range.start.line"), Ok(&Value::Number(2.0)));
         assert_eq!(json::query(&files, "[0].diagnostics[0].range.start.character"), Ok(&Value::Number(5.0)));
-        // A name, not a number -- and `Info` is spelled differently at
-        // each end, which is the case that catches a missing conversion.
+        // A name, not a number; `Info` differs between the ends.
         assert_eq!(json::query(&files, "[0].diagnostics[0].severity"), Ok(&string("Warning")));
         assert_eq!(json::query(&files, "[0].diagnostics[1].severity"), Ok(&string("Information")));
-        // A finding with no server behind it is bish's own.
+        // A finding without a server is bish's.
         assert_eq!(json::query(&files, "[0].diagnostics[0].source"), Ok(&string("bish")));
     }
 
@@ -1295,8 +1148,7 @@ mod tests {
         assert_eq!(json::query(&files, "[0].uri"), Ok(&string("file:///tmp/other.sh")));
         assert_eq!(json::query(&files, "[1]"), Ok(&Value::Null), "only the one asked for");
 
-        // A file bish does not have is an empty answer, not an error:
-        // "I have nothing to say about that" is true and useful.
+        // A file bish doesn't have gets an empty answer, not an error.
         let out = with_session(state, &[initialize(), request(1.0, "tools/call", call("file:///nowhere"))]);
         let answer = result(&out, 1.0);
         assert_eq!(json::query(&answer, ".isError"), Ok(&Value::Bool(false)));
@@ -1304,10 +1156,9 @@ mod tests {
         assert_eq!(json::parse(text).unwrap(), Value::Array(vec![]));
     }
 
-    // A path is not a URI. One with a space, a `#` or anything outside
-    // ASCII has to go out encoded -- `#` would otherwise start a fragment
-    // -- and come back in decoded, or the file a client asks about is
-    // never the file bish has.
+    // A path isn't a URI: a space, a `#` (which would start a fragment) or
+    // non-ASCII goes out encoded and comes back decoded, or the file asked
+    // about isn't bish's.
     #[test]
     fn a_path_that_needs_encoding_goes_out_encoded_and_is_found_by_it() {
         let odd = std::path::PathBuf::from("/tmp/my notes/#1 caf\u{e9}.sh");
@@ -1329,23 +1180,21 @@ mod tests {
         let files = files_for(encoded);
         assert_eq!(json::query(&files, "[0].uri"), Ok(&string(encoded)), "encoded going out");
         assert_eq!(json::query(&files, "[1]"), Ok(&Value::Null), "and only that file, found by it");
-        // Not a URI at all, and not one naming a file: nothing, rather
-        // than a guess at what was meant.
+        // Not a URI, or not a file one: nothing, not a guess.
         assert_eq!(files_for("/tmp/other.sh"), Value::Array(vec![]));
         assert_eq!(files_for("https://example.com/tmp/other.sh"), Value::Array(vec![]));
     }
 
-    // Registration is a side effect and nothing else. A reply here
-    // would sit in the socket waiting to be mistaken for the answer to
-    // the first real question, which is why `answer` gives none -- and
-    // why the next question still gets its own answer and not this one.
+    // Registration is a side effect only: a reply would wait in the socket
+    // to be mistaken for the next answer, so `answer` gives none, and the
+    // next question gets its own.
     #[test]
     fn announcing_yourself_registers_without_answering() {
         let state = EditorState { files: vec![a_file()] };
         assert_eq!(answer(&state, br#"{"q":"hello"}"#), None);
 
-        // And the session is still able to answer normally afterwards,
-        // through the same connection the announcement went down.
+        // And the session answers normally afterwards, on the same
+        // connection.
         let out = with_session(state, &[initialize(), request(1.0, "tools/call", object(vec![("name", string("getDiagnostics"))]))]);
         let answered = result(&out, 1.0);
         let Ok(Value::Str(text)) = json::query(&answered, ".content[0].text") else { panic!() };
@@ -1371,9 +1220,8 @@ mod tests {
         assert_eq!(answer_from_state(&state, b"not a question"), None);
     }
 
-    // The one place a client's own vocabulary is spoken. Everything
-    // below this file calls it "focus"; only the translation knows what
-    // a listener calls it, or that its positions are 0-based.
+    // The one place a client's vocabulary appears: below this file it's
+    // "focus".
     #[test]
     fn a_focus_notice_becomes_the_notification_a_client_listens_for() {
         let notice = selection_notification(Some(&a_file())).expect("a notice");
@@ -1386,28 +1234,27 @@ mod tests {
         assert_eq!(json::query(&params, ".selection.end.character"), Ok(&Value::Number(4.0)));
         assert_eq!(json::query(&params, ".selection.isEmpty"), Ok(&Value::Bool(false)));
 
-        // No selection still says something: it is how a listener learns
-        // the last one is over, and which file is in front now.
+        // No selection still says something: the last one ended, and which
+        // file is in front.
         let notice = selection_notification(Some(&FileState { selection: None, selected_text: String::new(), ..a_file() })).unwrap();
         let Some(Message::Notification { params, .. }) = selection_changed(&notice) else { panic!() };
         assert_eq!(json::query(&params, ".selection.isEmpty"), Ok(&Value::Bool(true)));
 
-        // The path as it is, the URL encoded -- the same file either way.
+        // The path as is, the URL encoded: the same file.
         let odd = FileState { path: std::path::PathBuf::from("/tmp/my notes/#1 caf\u{e9}.sh"), ..a_file() };
         let notice = selection_notification(Some(&odd)).unwrap();
         let Some(Message::Notification { params, .. }) = selection_changed(&notice) else { panic!() };
         assert_eq!(json::query(&params, ".filePath"), Ok(&string("/tmp/my notes/#1 caf\u{e9}.sh")));
         assert_eq!(json::query(&params, ".fileUrl"), Ok(&string("file:///tmp/my%20notes/%231%20caf%C3%A9.sh")));
 
-        // Nothing in front of the user is nothing to say.
+        // Nothing in front of the user: nothing to say.
         let notice = selection_notification(None).unwrap();
         assert!(selection_changed(&notice).is_none());
-        // And a notice of a kind this side does not know is dropped
-        // rather than relayed as something it is not.
+        // An unknown notice is dropped, not relayed as something else.
         assert!(selection_changed(br#"{"n":"something-else"}"#).is_none());
     }
 
-    // Half a message, then the rest -- what a pipe actually delivers.
+    // Half a message, then the rest, as a pipe delivers.
     #[test]
     fn a_message_split_across_reads_is_answered_once_it_is_whole() {
         let mut lines = Lines::default();
