@@ -1,8 +1,6 @@
-// Hand-rolled fuzzy matcher for tab-completion candidates (see plan.md).
-// Zero crates, consistent with the rest of this codebase. Subsequence match
-// (candidate must contain query's characters in order, not necessarily
-// contiguous) with fzf-style greedy-first-match scoring -- not a globally
-// optimal alignment, just cheap and good enough to rank completion lists.
+// Fuzzy matching for completion candidates: the candidate must contain the
+// query's characters in order. Scored on the greedy first match rather than
+// the best alignment, which is cheap and good enough for ranking.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuzzyMatch {
@@ -25,8 +23,8 @@ fn is_boundary_start(cand_chars: &[char], pos: usize) -> bool {
     prev.is_lowercase() && cand_chars[pos].is_uppercase()
 }
 
-/// Empty query matches everything with score 0 -- this is what lets Tab on
-/// a bare `git ` show every subcommand unranked-but-present.
+/// An empty query matches everything with score 0, so Tab after `git `
+/// shows every subcommand.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
     if query.is_empty() {
         return Some(FuzzyMatch { score: 0, positions: Vec::new() });
@@ -64,14 +62,10 @@ pub fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
                 score += 15;
             }
         }
-        // A small tiebreak nudge, not a real ranking factor: without it,
-        // a case-insensitive match against candidates differing only by
-        // case (e.g. "-l" vs "-L") ties on every other term above and
-        // falls back to alphabetical order, where a bare uppercase
-        // letter sorts before its lowercase counterpart in plain ASCII
-        // -- surprising when the query's own case exactly matched one of
-        // them. +1 is deliberately smaller than any other scoring term
-        // here, so it only ever breaks an otherwise-exact tie.
+        // A tiebreak only: candidates differing just in case (`-l`, `-L`)
+        // would otherwise tie and fall back to ASCII order, putting the
+        // uppercase one first even when the query's case matched the other.
+        // Smaller than any other term, so it only breaks an exact tie.
         if cand_chars[pos] == query_chars[i] {
             score += 1;
         }
@@ -103,7 +97,7 @@ mod tests {
     #[test]
     fn basic_subsequence_matches_with_positions() {
         let m = fuzzy_match("gco", "git-checkout").unwrap();
-        // g=0, c=4 ("git-c..."), then the next 'o' after index 4 is at index 9.
+        // g=0, c=4 (`git-c...`), and the next `o` after 4 is at 9.
         assert_eq!(m.positions, vec![0, 4, 9]);
     }
 
@@ -115,11 +109,6 @@ mod tests {
         assert_eq!(b.positions, vec![0, 4]);
     }
 
-    // Found via interactive verification: `ls -l` + Tab was completing to
-    // "-L" instead of "-l" -- both matched the case-insensitive query
-    // equally well on every other scoring term, so it fell back to plain
-    // alphabetical order, where "-L" (uppercase) sorts first. An exact-
-    // case match should win a tie like this.
     #[test]
     fn exact_case_match_breaks_a_tie_with_a_differently_cased_candidate() {
         let lower = fuzzy_match("-l", "-l").unwrap();
@@ -131,13 +120,13 @@ mod tests {
     fn contiguous_match_scores_higher() {
         let commit = fuzzy_match("co", "commit").unwrap();
         let checkout = fuzzy_match("co", "checkout").unwrap();
-        // commit: c=0,o=1 contiguous; checkout: c=0,o=5 not contiguous.
+        // commit: c=0, o=1, contiguous; checkout: c=0, o=5.
         assert!(commit.score > checkout.score, "{:?} vs {:?}", commit, checkout);
     }
 
     #[test]
     fn word_boundary_start_bonus() {
-        // "co" in "count-objects" -> boundary at 0; in "xxco" -> not a boundary.
+        // `co` in `count-objects` is at a boundary; in `xxco` it isn't.
         let boundary = fuzzy_match("co", "count-objects").unwrap();
         let no_boundary = fuzzy_match("co", "xxco").unwrap();
         assert!(boundary.score > no_boundary.score);
@@ -159,8 +148,6 @@ mod tests {
 
     #[test]
     fn git_co_ranks_subcommands_as_expected() {
-        // The plan's own worked example: commit/config/count-objects should
-        // all rank above checkout for the query "co".
         let candidates = ["commit", "config", "count-objects", "checkout"];
         let mut scored: Vec<(&str, i32)> = candidates.iter().filter_map(|c| fuzzy_match("co", c).map(|m| (*c, m.score))).collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
