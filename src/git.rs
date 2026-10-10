@@ -203,11 +203,22 @@ pub fn blame(path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
     let mut blame = command(dir);
     blame.arg("blame").arg("--line-porcelain");
     if let Some(rev) = rev {
-        // `--end-of-options` before it, the way `log` and `show`
-        // already do: a revision is a word somebody typed at `:blame`,
-        // and one beginning with a dash would otherwise be read as an
-        // option by `git blame` rather than refused as a bad revision.
-        blame.arg("--end-of-options").arg(rev);
+        // Refused here rather than fenced off with
+        // `--end-of-options`, which is how `log` and `show` do it and
+        // does not work for this command: `git blame
+        // --end-of-options <rev> -- <path>` stops treating the `--` as
+        // the revision/path separator, so the path is read as a second
+        // revision and the whole call fails with "bad revision". Tried,
+        // measured, and the separator is the more important of the two
+        // -- a branch and a file can share a name, which is what the
+        // comment below is about.
+        //
+        // A revision is a word somebody typed at `:blame`, so the only
+        // thing that needed closing is one shaped like an option.
+        if rev.starts_with('-') {
+            return Err(format!("bad revision '{rev}'"));
+        }
+        blame.arg(rev);
     }
     // `--` before the path, always: without it a revision and a filename
     // are told apart by guesswork, and a branch and a file can share a
@@ -678,6 +689,35 @@ mod tests {
         assert_eq!(status.map(|s| s.branch), Some("main".to_string()));
         assert_eq!(files.unwrap(), ["a.txt"]);
         assert_eq!(blamed.unwrap().len(), 1);
+    }
+
+    // `:blame <rev>` passes a typed word to `git blame`, where one
+    // beginning with a dash would be an option rather than a revision.
+    // `--end-of-options` is how the other commands here fence that off
+    // and cannot be used for this one: it makes `blame` stop treating
+    // `--` as the revision/path separator, so the path becomes a second
+    // revision and the call fails outright.
+    #[test]
+    fn blame_refuses_a_revision_shaped_like_an_option() {
+        if !available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bish-git-blame-dash-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| crate::gittest::run(&dir, args);
+        crate::gittest::init(&dir);
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "initial"]);
+
+        assert_eq!(blame(&file, Some("-L1,1")).unwrap_err(), "bad revision '-L1,1'");
+        // And the ordinary pair still work, which is what the refusal
+        // must not cost: a named revision, and none at all.
+        assert_eq!(blame(&file, Some("HEAD")).unwrap().len(), 1);
+        assert_eq!(blame(&file, None).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
