@@ -606,9 +606,6 @@ b
         case("both-sides-bounded-but-uneven", r#"seq 1 10000 | { read v; echo "got=$v"; }"#),
         case("subshell-scope", r#"x=1; (x=2); echo $x"#),
         case("subshell-exit", r#"(exit 4); echo $?"#),
-        // In-process constructs share the real environment, so what a
-        // foreground subshell exports has to be undone by hand (the env
-        // journal in exec.rs).
         case("subshell-export-does-not-escape", r#"(export E=inner); echo "[${E-unset}]""#),
         case("subshell-export-restores-the-old-value", r#"export E=outer; (export E=inner); echo "$E""#),
         case("subshell-unset-does-not-escape", r#"export E=outer; (unset E); echo "$E""#),
