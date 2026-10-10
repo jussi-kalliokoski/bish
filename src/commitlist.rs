@@ -1,9 +1,6 @@
-// `:git log`'s list of commits: one to a row, newest first, and one of
-// them picked out to open in the diff view.
-//
-// Keys in, a frame out, and nothing about terminals or git in between --
-// the same arrangement as review.rs and pager.rs, so every rule here is
-// a unit test.
+// `:git log`'s commit list: one per row, newest first, with one picked out
+// to open in the diff view. Keys in, a frame out, nothing about terminals
+// or git, as in review.rs and pager.rs, so every rule is unit-tested.
 
 use crate::editor::Key;
 use crate::git::LogEntry;
@@ -52,8 +49,8 @@ impl CommitList {
         }
     }
 
-    // Moves the pick, stopping at either end rather than wrapping: the
-    // newest commit and the oldest are the two a reader goes looking for.
+    // Stops at either end rather than wrapping: the newest and oldest commits
+    // are the two a reader looks for.
     fn move_by(&mut self, delta: isize) {
         let last = self.entries.len().saturating_sub(1) as isize;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
@@ -81,8 +78,8 @@ impl CommitList {
         out.push_str(&at(0));
         let count = format!("{} commit{}", self.entries.len(), if self.entries.len() == 1 { "" } else { "s" });
         out.push_str(&format!("\x1b[1;7m{}\x1b[0m", fit(&format!("{}  {count}", self.title), self.cols)));
-        // Authors to one width, so the subjects start in one column; a
-        // long name is cut rather than pushing every subject off screen.
+        // Authors at one width so subjects start in one column; a long name
+        // is cut.
         let author_width = self.entries.iter().map(|e| e.author.chars().count()).max().unwrap_or(0).min(20);
         for row in 0..self.height {
             out.push_str(&at(row + 1));
