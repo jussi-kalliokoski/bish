@@ -1,9 +1,6 @@
-// Tab-completion (see plan.md). Foundation stage: the candidate/provider
-// types every source will implement against, plus the cursor-targeted
-// word-role walker (`find_word_start` / `classify_word_role`) that decides
-// *what kind* of completion applies to the word under the cursor --
-// command name, flag, subcommand, or file. The actual shell-backed
-// candidate sources are a later stage in this same file.
+// Tab completion: the candidate and provider types, the walker that decides
+// what kind of word is under the cursor (command name, flag, subcommand or
+// file), and the shell-backed candidate sources.
 #![allow(dead_code)]
 
 use crate::bishedit::fuzzy;
@@ -22,47 +19,38 @@ pub struct CompletionCandidate {
 
 pub struct CompletionRequest<'a> {
     pub line: &'a str,
-    // Char index (not byte offset) into `line`'s chars() sequence --
-    // matches LineEditor's own cursor semantics, since that's this
-    // request's real origin.
+    // A char index, as the line editor's cursor is.
     pub cursor: usize,
 }
 
 pub struct CompletionResult {
-    // Char index. `word_start..cursor` is always the replaced range -- v1
-    // never touches text after the cursor within the same word.
+    // Char index. `word_start..cursor` is the replaced range; text after
+    // the cursor is never touched.
     pub word_start: usize,
     pub candidates: Vec<CompletionCandidate>,
 }
 
-/// One candidate the *editor*'s completion popup can show and insert.
+/// One candidate the editor's completion popup can show and insert. Unlike
+/// `CompletionCandidate` (the shell prompt's, with fuzzy-match positions),
+/// this carries what a language server answers with: a label, a detail, the
+/// text to insert (often not the label), and the range to replace.
 ///
-/// Deliberately not `CompletionCandidate` above: that one is the shell
-/// prompt's, and carries fuzzy-match positions for highlighting. This
-/// one carries what a language server actually answers with -- a label
-/// to show, an elaboration beside it, the text to insert (which is
-/// often not the label), and the exact range to replace when the server
-/// named one.
-///
-/// The replace range is in **buffer coordinates** already: whoever
-/// builds these owns the position encoding, and resolving it there
-/// keeps the editor free of anything protocol-shaped.
+/// The range is already in buffer coordinates: whoever builds these owns
+/// the position encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorCompletion {
     pub label: String,
-    /// Shown dimmed beside the label -- a kind, a signature, a type.
+    /// Shown dimmed beside the label: a kind, a signature, a type.
     pub detail: String,
     pub insert: String,
     /// `(row, start_col, end_col)`, or `None` to replace the word being
-    /// typed. A server that names a range is completing something the
-    /// editor would not have recognised as one word -- a dotted path,
-    /// an import -- so its answer wins where it gave one.
+    /// typed. A server that names a range is completing something that
+    /// isn't one word to the editor (a dotted path, an import), so its
+    /// range wins.
     pub replace: Option<(usize, usize, usize)>,
-    /// True when `insert` is a snippet (see `bishedit::snippet`) rather
-    /// than finished text: it goes in tentatively, with a caret in its
-    /// first tabstop and Tab moving between them, exactly as an `abbr`
-    /// expansion does. Only a language server ever sets this -- the
-    /// shell's own completions are plain words.
+    /// `insert` is a snippet (see `bishedit::snippet`): it goes in
+    /// tentatively, caret in the first tabstop, Tab moving between them, as
+    /// an `abbr` expansion does. Only a language server sets this.
     pub snippet: bool,
 }
 
@@ -70,19 +58,15 @@ pub trait CompletionProvider {
     fn complete(&self, req: CompletionRequest) -> CompletionResult;
 }
 
-// Whitespace and `| & ; ( ) < >` are word boundaries; quotes/`$`/backslash
-// are deliberately NOT -- a documented v1 gap (this scans plain characters,
-// it doesn't understand quoting), matching the same "no crash, just a
-// plausible-not-guaranteed answer" tolerance the rest of this feature
-// leans on for anything quote/substitution-shaped.
+// Whitespace and `| & ; ( ) < >` are boundaries. Quotes, `$` and backslash
+// aren't: this scans characters and doesn't understand quoting.
 fn is_word_char(c: char) -> bool {
     !(c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')' | '<' | '>'))
 }
 
-// Scans backward from `cursor` over word characters to the enclosing
-// boundary. Always lands exactly on a boundary (or 0), which is what lets
-// `classify_word_role` treat `chars[0..word_start]` as a clean,
-// fully-terminated prefix safe to re-tokenize on its own.
+// Scans back from `cursor` to the enclosing boundary (or 0), so
+// `chars[0..word_start]` is a complete prefix `classify_word_role` can
+// re-tokenize on its own.
 pub(crate) fn find_word_start(chars: &[char], cursor: usize) -> usize {
     let mut i = cursor.min(chars.len());
     while i > 0 && is_word_char(chars[i - 1]) {
@@ -93,28 +77,19 @@ pub(crate) fn find_word_start(chars: &[char], cursor: usize) -> usize {
 
 /// Where the alternative under the cursor starts inside a word with an
 /// unclosed `{`, and how much of the word before it every alternative
-/// inherits.
+/// inherits. In `mv somedir/{old,ne`, `ne` means `somedir/ne`: the
+/// inherited text decides what to look for, and only the alternative may be
+/// replaced.
 ///
-/// `mv somedir/{old,ne` is completing `ne`, and what `ne` *means* is
-/// `somedir/ne`: the text in front of the brace belongs to every
-/// alternative in the list, which is the whole point of writing it that
-/// way. So completion there has two halves -- the inherited text, which
-/// decides what to look for, and the alternative, which is the only part
-/// a candidate may replace.
+/// Returns `(end of the inherited text, start of this alternative)` as char
+/// indices into `word`, or `None` outside a brace list, including one that
+/// closed again (`{old,new}ex`).
 ///
-/// Returns `(end of the inherited text, start of this alternative)` as
-/// char indices into `word`, or `None` when the cursor is not inside a
-/// brace list at all -- including when one opened and closed again
-/// (`{old,new}ex`), where the whole word is being completed as usual.
-///
-/// Two things it deliberately does not understand, both documented
-/// rather than handled: a `${...}` inside a brace list (its closing brace
-/// is counted as the list's), and quoting, which this module does not
-/// model anywhere -- see `is_word_char`.
+/// Not understood: a `${...}` inside a brace list (its `}` is counted as
+/// the list's), and quoting (see `is_word_char`).
 fn brace_alternative(word: &[char]) -> Option<(usize, usize)> {
-    // One entry per brace still open, holding where its current
-    // alternative starts -- so a nested list's alternative is the one
-    // being typed, and closing it hands the enclosing one back.
+    // Per open brace, where its current alternative starts, so closing a
+    // nested list hands the enclosing one back.
     let mut open: Vec<usize> = Vec::new();
     let mut inherited = 0;
     let mut i = 0;
@@ -145,22 +120,17 @@ fn brace_alternative(word: &[char]) -> Option<(usize, usize)> {
     open.last().map(|alternative| (inherited, *alternative))
 }
 
-/// Re-roots candidates built for the inherited-plus-alternative text
-/// onto the alternative alone, which is all the editor will replace.
-///
-/// `somedir/new.txt` becomes `new.txt`, and the fuzzy-match positions
-/// come down with it: the ones inside the inherited text have nothing
-/// left to point at, and the rest have moved.
+/// Re-roots candidates built for the inherited text plus the alternative
+/// onto the alternative alone, fuzzy-match positions included.
 fn strip_inherited(candidates: Vec<CompletionCandidate>, inherited: &str) -> Vec<CompletionCandidate> {
     let skipped = inherited.chars().count();
     candidates
         .into_iter()
         .filter_map(|c| {
             let display: String = c.display.chars().skip(skipped).collect();
-            // A candidate that does not start with the inherited text is
-            // not an answer to this alternative -- `file_candidates`
-            // builds every one of its own from that text, so this only
-            // ever drops something a registered spec invented.
+            // `file_candidates` builds every candidate from the inherited
+            // text, so this only drops something a registered spec
+            // invented.
             c.display.starts_with(inherited).then(|| CompletionCandidate {
                 display,
                 matched_positions: c.matched_positions.iter().filter(|p| **p >= skipped).map(|p| p - skipped).collect(),
@@ -180,22 +150,15 @@ enum CmdPosLite {
     InCommand { name: Option<String>, arg_index: usize },
 }
 
-// Re-tokenizes `prefix_text` (always a clean prefix ending right at a word
-// boundary, per find_word_start) and walks it with the same
-// ExpectCommand/InCommand shape highlight.rs's own CmdPos state machine
-// uses -- reusing its now-pub(crate) `resets_command_position` /
-// `is_assignment_prefix_word` primitives rather than sharing that
-// module's actual stateful walker, which is built for a different job
-// (emitting spans across a whole line, not answering "what's the role of
-// the word starting right after this text"). The *terminal* state after
-// walking every token in `prefix_text` is the role of the word being
-// completed.
+// Re-tokenizes `prefix_text` (a complete prefix, per `find_word_start`) and
+// walks it with the same ExpectCommand/InCommand states as highlight.rs's
+// walker, using its `resets_command_position` and
+// `is_assignment_prefix_word`. The state after the last token is the role
+// of the word being completed.
 //
-// Tolerates anything tokenize_spanned tolerates: an unclosed `$(...)` etc.
-// degrades to whatever partial token stream the lexer managed to collect
-// before erroring (see SpannedResult::error's own doc comment) -- never a
-// panic, just a role that may not be the "real" one a full parse would
-// give.
+// An unclosed `$(...)` and the like degrade to whatever tokens the lexer
+// collected (see `SpannedResult::error`): a role that may be wrong, never a
+// panic.
 pub(crate) fn classify_word_role(prefix_text: &str) -> CmdRole {
     let res = lexer::tokenize_spanned(prefix_text);
     let mut cmd_pos = CmdPosLite::ExpectCommand;
@@ -221,11 +184,8 @@ pub(crate) fn classify_word_role(prefix_text: &str) -> CmdRole {
     }
 }
 
-// Fuzzy-scores and ranks `names` against `prefix`, dropping non-matches
-// (fuzzy::fuzzy_match already handles "does this even qualify"). Ties
-// break alphabetically for a stable, predictable order rather than
-// insertion order, which would otherwise vary source to source (HashSet
-// iteration for command names, read_dir order for files).
+// Fuzzy-scores and ranks `names` against `prefix`, dropping non-matches.
+// Ties break alphabetically so the order is stable across sources.
 fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
     let mut scored: Vec<(i32, bool, CompletionCandidate)> = names
         .into_iter()
@@ -234,49 +194,31 @@ fn rank(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
             fuzzy::fuzzy_match(prefix, &name).map(|m| (m.score, hidden, CompletionCandidate { display: name, matched_positions: m.positions }))
         })
         .collect();
-    // Hidden *first*, ahead of the score, not as a tiebreak after it.
-    // A dotfile is unlikely however well it happens to fuzzy-match, and
-    // as a tiebreak this did nothing the moment two candidates scored
-    // differently -- which for any non-empty prefix is almost always,
-    // since the score largely tracks name length. `.env` came second
-    // for `./` on no better grounds than being short.
+    // Hidden names sort first, ahead of the score: a dotfile is unlikely
+    // however well it matches, and the score mostly tracks name length.
     crate::sort::sort_by(&mut scored, |a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)).then_with(|| a.2.display.cmp(&b.2.display)));
     scored.into_iter().map(|(_, _, c)| c).collect()
 }
 
-/// Whether the *last* path segment of a candidate starts with a dot.
-///
-/// The segment, not the whole string: `src/.gitignore` is hidden and
-/// `./main.rs` is not, and a test on the first character would get both
-/// backwards.
+/// Whether the last path segment starts with a dot: `src/.gitignore` is
+/// hidden and `./main.rs` isn't.
 fn hidden_name(name: &str) -> bool {
     let bare = name.strip_suffix('/').unwrap_or(name);
     bare.rsplit('/').next().is_some_and(|seg| seg.starts_with('.'))
 }
 
-/// Whether the word being completed is reaching for a hidden name --
-/// in which case they stop being unlikely and sort like anything else.
-///
-/// `.`, `..` and `./` are the exception inside the exception: they are
-/// how anyone writes an ordinary relative path, and reading them as
-/// "show me the dotfiles" would put `.git/` in front of the file they
-/// are actually typing.
+/// Whether the word is reaching for a hidden name, in which case they sort
+/// like anything else. `.`, `..` and `./` start ordinary relative paths and
+/// don't count.
 fn asking_for_hidden(prefix: &str) -> bool {
     let last = prefix.rsplit('/').next().unwrap_or(prefix);
     last.starts_with('.') && !matches!(last, "." | "..")
 }
 
-// A registered completion spec's own candidates are shown exactly as it
-// produced them, in its own order, unfiltered -- never re-run through
-// `rank`'s own fuzzy_match/drop-non-matches step, since a -F/-C source's
-// entries are deliberately not required to start with (or otherwise
-// contain, in fuzzy-subsequence order) `prefix` at all (see compgen.rs's
-// own doc comment on why -F/-C are trusted to have already applied their
-// own logic) -- fuzzy-filtering them here could silently make a real,
-// intentional COMPREPLY entry disappear from the popup. Still highlights
-// the matched prefix span when a candidate happens to actually start with
-// it (the common case for -W/-A/-G-sourced entries), for the same visual
-// bolding every other source gets.
+// A registered completion spec's candidates, unfiltered and in its own
+// order: `-F`/`-C` sources are trusted to have applied their own logic (see
+// compgen.rs), and fuzzy filtering could drop a real COMPREPLY entry. The
+// prefix is still highlighted where a candidate starts with it.
 fn as_unranked_candidates(prefix: &str, names: Vec<String>) -> Vec<CompletionCandidate> {
     let prefix_len = prefix.chars().count();
     names
@@ -288,10 +230,8 @@ fn as_unranked_candidates(prefix: &str, names: Vec<String>) -> Vec<CompletionCan
         .collect()
 }
 
-// Thin wrapper: resolves `command`'s man-page data if ready (None
-// otherwise -- Pending/Missing both mean "nothing to offer yet"), mirroring
-// highlight.rs's own classify_plain_argument's identical resolve-then-
-// delegate shape.
+// The command's man-page data if ready; `Pending` and `Missing` both mean
+// nothing to offer yet.
 fn ready_man_data(command: &str) -> Option<std::sync::Arc<manpages::ManPageData>> {
     match manpages::query(command) {
         manpages::ManStatus::Ready(data) => Some(data),
@@ -299,18 +239,14 @@ fn ready_man_data(command: &str) -> Option<std::sync::Arc<manpages::ManPageData>
     }
 }
 
-// Takes the man data directly rather than going through the real
-// cache/thread -- the seam this module's own tests use to stay
-// deterministic without spawning `man`, matching
-// classify_plain_argument_core's own precedent in highlight.rs.
+// Takes the man data directly, so tests needn't spawn `man`.
 fn flag_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str) -> Vec<CompletionCandidate> {
     let Some(man) = man else { return Vec::new() };
     rank(prefix, man.flags.clone())
 }
 
-// None means "no usable subcommand data" -- the caller's cue to fall
-// through to file candidates instead, per this feature's "arg 0 without
-// subcommand data completes as a file" rule.
+// `None` means no usable subcommand data, and the caller falls through to
+// files.
 fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str) -> Option<Vec<CompletionCandidate>> {
     let man = man?;
     if man.subcommands.is_empty() {
@@ -319,32 +255,14 @@ fn subcommand_candidates_core(man: Option<&manpages::ManPageData>, prefix: &str)
     Some(rank(prefix, man.subcommands.clone()))
 }
 
-// The shell's own built-in completion source, built entirely on
-// infrastructure the highlighting feature already established:
-// KNOWN_BUILTINS/known_functions/enumerate_path_matches for command names,
-// manpages::query for subcommands and flags (same cache the highlighter
-// itself populates, so a command that's already been typed once tends to
-// have `Ready` data by the time its own completion is requested), and a
-// single-level `read_dir` for files. `cwd`/`known_functions` are the same
-// owned-snapshot pattern HighlightContext already uses -- borrowed here,
-// not re-snapshotted, since the caller already did that work.
-// Argument completion for a builtin whose arguments are bish's own to
-// define, rather than a command's on `$PATH` with a man page. `None`
-// means "not one of those, carry on"; `Some` -- even empty -- means this
-// command owns its completion outright, the same rule a registered
-// `complete` spec follows, so `bishopt --set wrap <Tab>` offers nothing
-// rather than falling through and offering files.
+// Arguments for a builtin whose arguments bish defines (`bishopt`,
+// `::bish`). `None` means not one of those; `Some`, even empty, means this
+// command owns its completion, as with a registered `complete` spec, so
+// `bishopt --set wrap <Tab>` offers nothing rather than files.
 //
-// `bishopt` and `::bish`, for the same reason: both are registries
-// nobody can be expected to remember, and both already print their own
-// contents when asked -- this puts that same list under the key people
-// actually press.
-//
-// `hl` is the currently-set `::bish hl` colour names, for the one place
-// a fixed list cannot answer: that namespace is open, so what exists is
-// whatever has been set. Empty for a caller with no shell to read it
-// from (the editor's colon line), which falls back to the names bish
-// itself produces.
+// `hl` is the currently set `::bish hl` names, since that namespace is
+// open. Empty for a caller with no shell (the editor's colon line), which
+// falls back to the names bish produces.
 pub(crate) fn builtin_argument_candidates(role: &CmdRole, prefix_text: &str, prefix: &str, hl: &[String]) -> Option<Vec<CompletionCandidate>> {
     let CmdRole::Argument { command, arg_index } = role else { return None };
     match command.as_deref()? {
@@ -354,12 +272,10 @@ pub(crate) fn builtin_argument_candidates(role: &CmdRole, prefix_text: &str, pre
     }
 }
 
-// `::bish <sub> ...`. `None` means "this position is an ordinary
-// command or a free-text value" -- an event's handler, a language
-// server's own command line, a CSS colour -- and the generic fallbacks
-// should have it instead. `Some(vec![])` would claim the position and
-// offer nothing, which is right for `bishopt --set wrap` and wrong
-// here.
+// `::bish <sub> ...`. `None` means the position is a command or free text
+// (an event handler, a server command line, a CSS colour) and the generic
+// fallbacks should have it. `Some(vec![])` would claim it and offer
+// nothing.
 pub(crate) fn bish_candidates(args: &[String], prefix: &str, hl: &[String]) -> Option<Vec<CompletionCandidate>> {
     let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
     let subs = |sub: &str| strings(crate::exec::bish_sub_subcommands(sub));
@@ -374,13 +290,12 @@ pub(crate) fn bish_candidates(args: &[String], prefix: &str, hl: &[String]) -> O
         "theme" | "window" | "win" => match rest {
             [] => Some(rank(prefix, subs(sub))),
             // `window rename NAME` and `window select NAME` take a name
-            // this cannot know; everything else is already complete.
+            // this can't know.
             _ => Some(Vec::new()),
         },
-        // Only the flag forms are completed from the table; a directory
-        // or a capability is the user's to name, and the plain
-        // `::bish trust` with no flag takes a path, which the ordinary
-        // filename completion already offers.
+        // Only the flags are completed. A directory or capability is the
+        // user's to name, and plain `::bish trust` takes a path, which file
+        // completion offers.
         "trust" => match rest {
             [] => Some(rank(prefix, subs(sub))),
             _ => Some(Vec::new()),
@@ -389,13 +304,10 @@ pub(crate) fn bish_candidates(args: &[String], prefix: &str, hl: &[String]) -> O
     }
 }
 
-// `::bish hl [NAME | --set NAME COLOUR | --unset NAME]`.
-//
-// The namespace is open -- a language server's own semantic token type
-// names are settable before any version of bish has heard of them (see
-// repl::semantic_spans) -- so a completion list here can only ever be a
-// starting point, never the set of legal answers. It offers what bish
-// itself draws, plus whatever is already set.
+// `::bish hl [NAME | --set NAME COLOUR | --unset NAME]`. The namespace is
+// open (a server's semantic token types are settable; see
+// `repl::semantic_spans`), so this offers what bish draws plus whatever is
+// set.
 fn hl_candidates(args: &[String], prefix: &str, hl: &[String]) -> Vec<CompletionCandidate> {
     let known = || {
         let mut names: Vec<String> = crate::bishedit::highlight::HL_NAMES.iter().map(|(_, name)| name.to_string()).collect();
@@ -408,16 +320,11 @@ fn hl_candidates(args: &[String], prefix: &str, hl: &[String]) -> Vec<Completion
     };
     match args {
         [] if prefix.starts_with('-') => rank(prefix, vec!["--set".to_string(), "--unset".to_string()]),
-        // Reading one: anything is a legal question, but the ones that
-        // will actually answer are the ones that are set.
         [] => rank(prefix, known()),
         [flag] if flag == "--set" || flag == "-s" => rank(prefix, known()),
-        // Unsetting: only what is set can be unset, and saying so is
-        // more useful than listing names that would just error.
+        // Only what is set can be unset.
         [flag] if flag == "--unset" || flag == "-u" => rank(prefix, hl.to_vec()),
-        // The colour itself. Free text -- a CSS colour, or a
-        // comma-separated list of fallbacks -- so there is nothing to
-        // offer, but nor should a file name be offered.
+        // The colour is free text, so nothing is offered, files included.
         _ => Vec::new(),
     }
 }
@@ -428,28 +335,23 @@ fn lsp_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandida
     match args.split_first() {
         None => Some(rank(prefix, strings(crate::exec::bish_sub_subcommands("lsp")))),
         Some((sub, rest)) if sub == "add" => {
-            // `--apply-edits scoped` -- the separated spelling, where
-            // the value is its own word.
+            // `--apply-edits scoped`, the value as its own word.
             if rest.last().is_some_and(|w| w == "--apply-edits") {
                 return Some(rank(prefix, strings(crate::exec::lsp_apply_edits_values())));
             }
             if prefix.starts_with('-') {
                 let mut flags = strings(crate::exec::lsp_add_flags());
-                // `--apply-edits=` is the one with a fixed set of
-                // values, so the whole `--apply-edits=always` is worth
-                // offering rather than just the flag.
+                // `--apply-edits=` has a fixed set of values, so the whole
+                // `--apply-edits=always` is offered.
                 if prefix.starts_with("--apply-edits=") {
                     flags.extend(crate::exec::lsp_apply_edits_values().iter().map(|v| format!("--apply-edits={v}")));
                 }
                 return Some(rank(prefix, flags));
             }
-            // Past the flags this is the server's own command line,
-            // which is an ordinary command and then its ordinary
-            // arguments.
+            // Past the flags, the server's own command line.
             None
         }
-        // `rm`/`log`/`restart` take an id, which is whatever
-        // `::bish lsp ls` last printed -- a number, not a name.
+        // `rm`, `log` and `restart` take an id from `::bish lsp ls`.
         Some(_) => Some(Vec::new()),
     }
 }
@@ -464,9 +366,8 @@ fn hook_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandid
             if prefix.starts_with('-') {
                 return Some(rank(prefix, vec!["--lang=".to_string()]));
             }
-            // Everything before the event is `--lang=GLOB` or
-            // `--lang GLOB`; the first word that is neither is the
-            // event, and anything after it is the handler command.
+            // Before the event come `--lang=GLOB` or `--lang GLOB`; the
+            // first other word is the event, and the rest is the handler.
             let mut after_flags = rest.iter().peekable();
             let mut positional = 0;
             while let Some(word) = after_flags.next() {
@@ -481,7 +382,6 @@ fn hook_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandid
             }
             match (sub.as_str(), positional) {
                 ("add", 0) => Some(rank(prefix, strings(crate::exec::HOOK_EVENTS))),
-                // The handler: an ordinary command line.
                 ("add", _) => None,
                 _ => Some(Vec::new()),
             }
@@ -490,10 +390,8 @@ fn hook_candidates(args: &[String], prefix: &str) -> Option<Vec<CompletionCandid
     }
 }
 
-// The `arg_index` words already typed between the command name and the
-// word being completed. Whitespace-split rather than lexed, matching the
-// same "plain characters, no quoting" tolerance `find_word_start` is
-// documented with -- an option name has never needed quoting.
+// The `arg_index` words between the command name and the word being
+// completed, split on whitespace (see `find_word_start`).
 fn preceding_args(prefix_text: &str, arg_index: usize) -> Vec<String> {
     let words: Vec<&str> = prefix_text.split_whitespace().collect();
     words[words.len().saturating_sub(arg_index)..].iter().map(|w| w.to_string()).collect()
@@ -504,39 +402,28 @@ pub(crate) fn bishopt_candidates(args: &[String], prefix: &str) -> Vec<Completio
     let names = || crate::exec::bishopt_names().into_iter().map(|n| n.to_string()).collect::<Vec<_>>();
     let strings = |vs: &[&str]| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>();
     match args {
-        // The long spellings only: `-s`/`-u`/`-q` work and are
-        // understood above, but a completion list is a menu, and a menu
-        // should show the name that says what it does.
+        // The long spellings only: a menu should show the name that says
+        // what it does.
         [] if prefix.starts_with('-') => rank(prefix, strings(&["--set", "--unset", "--quiet"])),
-        // `bishopt <Tab>`, and `bishopt --set <Tab>`: an option name.
         [] => rank(prefix, names()),
         [flag] if takes_a_name(flag) => rank(prefix, names()),
-        // `bishopt --set wrap <Tab>`: the value, when there is a fixed
-        // set of them to offer.
+        // `bishopt --set wrap <Tab>`: the value, when there's a fixed set.
         [flag, name] if flag == "--set" || flag == "-s" => rank(prefix, strings(crate::exec::bishopt_values(name))),
-        // A bare `bishopt NAME` reads it and takes nothing more, and
-        // `--unset NAME` is already complete.
+        // `bishopt NAME` takes nothing more, and `--unset NAME` is
+        // complete.
         _ => Vec::new(),
     }
 }
 
-// What the editor's own colon line gets. A full `ShellCompletionProvider`
-// has nothing to be built from there (no single current session, and
-// command mode types window-management subcommands rather than shell
-// command lines -- see run_command_mode's own doc comment), but the
-// builtins whose arguments bish defines need no shell context at all, so
-// they can be offered anywhere a line is being typed.
+// What the editor's colon line gets. There's no shell context there for a
+// full `ShellCompletionProvider`, but the builtins whose arguments bish
+// defines need none.
 pub struct BuiltinCompletionProvider {
-    /// The same `::bish hl` snapshot `ShellCompletionProvider` takes.
-    /// The colon line has no shell *completion* context -- no cwd, no
-    /// PATH, no registered specs -- but it does have a session behind
-    /// it, and changing a colour is something you do while looking at
-    /// the buffer it changes, so this one snapshot is worth carrying.
+    /// The same `::bish hl` snapshot `ShellCompletionProvider` takes: a
+    /// colour is changed while looking at the buffer it changes.
     pub hl_names: Vec<String>,
-    /// The command names this line has of its own -- the editor's colon
-    /// commands (`repl::COLON_COMMANDS`), which no PATH scan would ever
-    /// turn up because they are the editor's, not the system's. Empty
-    /// for a caller whose line has no vocabulary beyond the shell's.
+    /// The line's own command names (`repl::COLON_COMMANDS`), which no PATH
+    /// scan finds. Empty when the line has none beyond the shell's.
     pub commands: &'static [&'static str],
 }
 
@@ -556,50 +443,29 @@ impl CompletionProvider for BuiltinCompletionProvider {
     }
 }
 
-/// The commands whose argument is a *directory* rather than any file,
-/// and where.
+/// Commands whose arguments are directories rather than any file. Written
+/// down because there's no general way to know: man-page data is fetched in
+/// the background and still `Pending` on the first Tab, which is the one
+/// that needs it. Anything else is `complete -d -c name`, which this
+/// doesn't override.
 ///
-/// The same shape as `host_position` just below, and the same honest
-/// answer to "how does a shell know this": it is written down. There is
-/// no general way to derive it. A man page's SYNOPSIS does often name
-/// the operand (`mkdir ... DIRECTORY`, `cat ... FILE`), and bish
-/// already parses man pages -- but that data is fetched in a background
-/// thread and is `Pending` on the first lookup, so the first Tab after
-/// a fresh shell would not have it, which is precisely the Tab that
-/// needs it. fish, which is where this idea comes from, hard-codes the
-/// same knowledge in its own per-command completion files; its
-/// man-page scraper extracts *options*, not operand types.
-///
-/// So: a short list of the commands where offering a plain file is
-/// always wrong, and nothing beyond it. Anything else a user wants is
-/// `complete -d -c name`, which already works and which this
-/// deliberately does not override.
-///
-/// `cd -` and `cd ~-` are not paths at all, but they are two
-/// characters to type and nothing here needs to know about them.
-///
-/// Every argument, not a position: unlike `ssh`, none of these takes a
-/// remote command or anything else afterwards, so there is no index at
-/// which the answer changes.
+/// Every argument, not a position: none of these takes anything else
+/// afterwards.
 fn directory_position(command: Option<&str>) -> bool {
     matches!(
         command,
-        // The whole point of them.
         Some("cd" | "pushd" | "chdir" | "rmdir")
-        // `mkdir a/b` names a directory that does not exist yet, and
-        // the parent it goes in is still completed as one.
+        // `mkdir a/b` names a directory that doesn't exist yet; its parent
+        // is still completed as one.
         | Some("mkdir")
     )
 }
 
-// The commands whose arguments are hosts, and where.
-//
-// `ssh`, `sftp`, `mosh` and `ssh-copy-id` take exactly one host and then
-// (for ssh) a *remote command*, which nothing here can know anything
-// about -- so only the first argument is a host position. `scp` and
-// `rsync` take `[user@]host:path` in any argument position, and either
-// side of the copy can be local, so those positions offer hosts *and*
-// files together rather than replacing one with the other.
+// Commands whose arguments are hosts, and where. `ssh`, `sftp`, `mosh` and
+// `ssh-copy-id` take one host, then (for ssh) a remote command, so only the
+// first argument is a host. `scp` and `rsync` take `[user@]host:path`
+// anywhere and either side can be local, so those offer hosts and files
+// together.
 fn host_position(command: Option<&str>, arg_index: usize) -> bool {
     match command {
         Some("ssh" | "sftp" | "mosh" | "ssh-copy-id") => arg_index == 0,
@@ -608,13 +474,11 @@ fn host_position(command: Option<&str>, arg_index: usize) -> bool {
     }
 }
 
-// A host argument's own shape: `[user@]host[:path]`. Completion applies
-// to the host part alone, with whatever came before it kept -- typing
-// `ssh deploy@we<Tab>` should finish the host, not offer to replace the
-// user with one.
+// `[user@]host[:path]`: only the host part is completed, so
+// `ssh deploy@we<Tab>` keeps the user.
 fn host_word(prefix: &str) -> Option<(&str, &str)> {
-    // A `:` means the host is already complete and a path has started;
-    // remote paths are not something this can enumerate.
+    // A `:` means the host is done and a remote path, which can't be
+    // listed, has started.
     if prefix.contains(':') {
         return None;
     }
@@ -627,42 +491,27 @@ fn host_word(prefix: &str) -> Option<(&str, &str)> {
 pub struct ShellCompletionProvider<'a> {
     pub cwd: Option<&'a Path>,
     pub known_functions: Option<&'a HashSet<String>>,
-    // `complete NAME`-registered specs (a per-prompt snapshot of
-    // Shell::completions/default_completion -- see repl.rs's own
-    // construction site) and the contextual data (aliases, PATH commands,
-    // jobs, ...) compgen::resolve_spec needs to actually evaluate one, plus
-    // a snapshot of the caller's own functions/vars (Shell::
-    // functions_preamble's output) for -F/-C specs, which run via
-    // subprocess -- see compgen.rs's own doc comment on why this needs no
-    // live, mutably-borrowable Shell at all. `None` (rather than an empty
-    // map) is what a caller with no completions concept at all -- e.g. this
-    // module's own tests -- passes, distinct from "no specs registered
-    // yet" (an empty map still consults `default_completion` if any).
+    // Registered `complete` specs (a per-prompt snapshot of
+    // `Shell::completions` and `default_completion`) and what
+    // `compgen::resolve_spec` needs to evaluate one, including a snapshot
+    // of the caller's functions and variables for `-F`/`-C` specs, which
+    // run in a subprocess. `None` is a caller with no completion specs at
+    // all; an empty map still consults `default_completion`.
     pub completions: Option<&'a HashMap<String, compgen::CompgenSpec>>,
     pub default_completion: Option<&'a compgen::CompgenSpec>,
     pub action_ctx: Option<&'a compgen::ActionContext>,
     pub functions_preamble: Option<&'a str>,
-    /// The `gitignore` bishopt. `false` for a caller with no shell to
-    /// read it from, which offers everything -- the behaviour before
-    /// this existed.
+    /// The `gitignore` bishopt. `false` for a caller with no shell, which
+    /// offers everything.
     pub honor_gitignore: bool,
-    /// `FIGNORE`, split on `:` -- filename *suffixes* completion leaves
-    /// out (`.o`, `~`). Empty when the variable is unset, which is the
-    /// usual case.
+    /// `FIGNORE`, split on `:`: filename suffixes to leave out (`.o`, `~`).
     pub fignore: Vec<String>,
-    /// The `force_fignore` shopt, on by default as in bash. Off means
-    /// the suffixes are only honoured while doing so still leaves
-    /// something to offer -- so a directory of nothing but `.o` files
-    /// still completes rather than appearing empty.
+    /// The `force_fignore` shopt, on by default as in bash. Off, the
+    /// suffixes are dropped only while something else is left to offer.
     pub force_fignore: bool,
-    /// The `::bish hl` colour names currently set (a per-prompt
-    /// snapshot of `Shell::hl_colors`'s keys), for completing
-    /// `::bish hl --unset <Tab>`.
-    ///
-    /// Needed as a snapshot rather than a fixed list because that
-    /// namespace is open: what exists is whatever has been set, which
-    /// for a language server's semantic token types is a set no version
-    /// of bish knows in advance. Empty for a caller with no shell.
+    /// The `::bish hl` names currently set, for `::bish hl --unset <Tab>`.
+    /// A snapshot because the namespace is open. Empty for a caller with no
+    /// shell.
     pub hl_names: Vec<String>,
 }
 
@@ -674,15 +523,13 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         let word = &chars[word_start..cursor];
         let prefix_text: String = chars[..word_start].iter().collect();
 
-        // The role is the *word's*, decided from the text in front of the
-        // whole word -- a brace list does not make `mv somedir/{a,b` the
-        // second argument of `mv`.
+        // The role is the whole word's, so a brace list doesn't make
+        // `mv somedir/{a,b` the second argument.
         let role = classify_word_role(&prefix_text);
 
-        // Inside an unclosed brace, only the alternative under the cursor
-        // is being completed, and it inherits whatever stands in front of
-        // the brace. Everything below then works on the two joined, which
-        // is the text the shell will expand this to.
+        // Inside an unclosed brace only the alternative is completed, and
+        // it inherits the text before the brace. Below works on the two
+        // joined: what the shell will expand.
         let (replacing_from, prefix, inherited) = match brace_alternative(word) {
             Some((inherited_end, alternative)) => {
                 let inherited: String = word[..inherited_end].iter().collect();
@@ -697,10 +544,9 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         {
             return CompletionResult { word_start, candidates: strip_inherited(candidates, &inherited) };
         }
-        // After a user's own `complete` spec (which owns a command
-        // outright, per real bash) but before the generic flag/
-        // subcommand/file fallbacks, since those know nothing about a
-        // builtin whose arguments bish itself defines.
+        // After a user's `complete` spec, which owns a command outright,
+        // but before the generic fallbacks, which know nothing of bish's
+        // builtins.
         if let Some(candidates) = builtin_argument_candidates(&role, &prefix_text, &prefix, &self.hl_names) {
             return CompletionResult { word_start, candidates: strip_inherited(candidates, &inherited) };
         }
@@ -708,15 +554,11 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
         let candidates = match role {
             CmdRole::Command => self.command_name_candidates(&prefix),
             CmdRole::Argument { command, .. } if prefix.starts_with('-') => self.flag_candidates(command.as_deref(), &prefix),
-            // Before the subcommand/file fallbacks: `ssh web` is not a
-            // path and never will be, and a man page has nothing to say
-            // about which hosts *this machine* knows.
+            // Before the subcommand and file fallbacks: `ssh web` isn't a
+            // path, and a man page doesn't know this machine's hosts.
             CmdRole::Argument { command, arg_index } if host_position(command.as_deref(), arg_index) => {
                 self.host_candidates(command.as_deref(), &prefix)
             }
-            // A command whose argument can only be a directory is
-            // offered only directories -- a file there is not a
-            // near-miss, it is an answer that cannot work.
             CmdRole::Argument { command, .. } if directory_position(command.as_deref()) => self.directory_candidates(&prefix),
             CmdRole::Argument { command, arg_index: 0 } => self.subcommand_or_file_candidates(command.as_deref(), &prefix),
             CmdRole::Argument { .. } => self.file_candidates(&prefix),
@@ -727,17 +569,10 @@ impl<'a> CompletionProvider for ShellCompletionProvider<'a> {
 }
 
 impl<'a> ShellCompletionProvider<'a> {
-    // `None` means "no registered spec applies here -- fall through to the
-    // built-in flag/subcommand/file logic below"; `Some(candidates)` (even
-    // if empty) means a spec *did* match and fully owns this completion,
-    // matching real bash's own model: once a command has a registered
-    // `complete`, every one of its argument completions goes through that
-    // spec -- flags included, never blended with the built-in fallback.
-    // `command`'s own registered spec wins if one exists; the `-D` default
-    // spec (see Shell::default_completion) is the fallback for every other
-    // command, including one bish doesn't otherwise recognize at all, and
-    // even when `command` itself couldn't be resolved to a literal name
-    // (e.g. it's behind a variable).
+    // `None` means no registered spec applies; `Some`, even empty, means
+    // one matched and owns this completion, flags included, as in bash. The
+    // command's own spec wins, and the `-D` default spec covers every other
+    // command, including one behind a variable.
     fn registered_spec_candidates(&self, command: Option<&str>, prefix: &str) -> Option<Vec<CompletionCandidate>> {
         let completions = self.completions?;
         let spec = command.and_then(|c| completions.get(c)).or(self.default_completion)?;
@@ -746,45 +581,26 @@ impl<'a> ShellCompletionProvider<'a> {
         let cwd = self.cwd.unwrap_or_else(|| Path::new("."));
         let preamble = self.functions_preamble.unwrap_or("");
         let mut names = compgen::resolve_spec(spec, prefix, ctx, cwd, preamble);
-        // Alphabetical unless the spec says otherwise, which is bash's
-        // rule read from the other side: `-o nosort` is documented as
-        // "tell readline not to sort the list of possible completions
-        // alphabetically", so sorting is what happens without it. bish
-        // took `nosort` as a valid name and then sorted nothing, which
-        // is the same as having it always on -- a spec's candidates came
-        // out in whatever order it produced them, so `abc` offered
-        // `abcdef` ahead of `abcd` whenever the wordlist happened to be
-        // written that way, and a `-F` function's COMPREPLY came out in
-        // its own build order.
-        //
-        // Sorting only. The entries themselves are still left exactly as
-        // the spec produced them -- see as_unranked_candidates for why
-        // filtering them here would be wrong.
+        // Sorted alphabetically unless the spec says `-o nosort`, as in
+        // bash. Only sorted: the entries are left as the spec produced them
+        // (see `as_unranked_candidates`).
         if !spec.opts.iter().any(|o| o == "nosort") {
             crate::sort::sort(&mut names);
         }
         Some(as_unranked_candidates(prefix, names))
     }
 
-    // KNOWN_BUILTINS union known_functions union PATH -- deliberately
-    // excludes aliases; see HighlightContext::known_functions's own doc
-    // comment for why an alias name isn't safe to offer as "this will
-    // run" here (this shell's `alias` builtin never expands them at
-    // command-run time).
+    // Builtins, functions and PATH commands. Aliases are left out; see
+    // `HighlightContext::known_functions` for why.
     fn command_name_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
         let mut names: HashSet<String> = KNOWN_BUILTINS.iter().map(|s| s.to_string()).collect();
         if let Some(functions) = self.known_functions {
             names.extend(functions.iter().cloned());
         }
-        // The caller's own PATH scan (`Shell::action_context`, one per
-        // prompt, which is also what `compgen -c` answers from) rather
-        // than a second one here: it walked the *session's* PATH, which
-        // is the only one a typed command actually resolves against --
-        // see highlight.rs's HighlightContext::path. Scanning again here
-        // would be both a second read_dir per PATH directory per
-        // keystroke and the wrong PATH. Nothing but this module's own
-        // tests passes no context at all; those still get the real
-        // environment's.
+        // The caller's PATH scan (`Shell::action_context`, once per prompt,
+        // also behind `compgen -c`), which used the session's PATH: the one
+        // a typed command resolves against. Only this module's tests pass
+        // no context; they get the real environment's.
         match self.action_ctx {
             Some(ctx) => names.extend(ctx.path_commands.iter().filter(|n| n.starts_with(prefix)).cloned()),
             None => names.extend(highlight::enumerate_path_matches(prefix, None)),
@@ -792,20 +608,18 @@ impl<'a> ShellCompletionProvider<'a> {
         rank(prefix, names.into_iter().collect())
     }
 
-    // The hosts this machine knows about (`hosts::known` -- ssh config,
-    // known_hosts, /etc/hosts), plus, for the commands where an argument
-    // can be either end of a copy, the local files beside them.
+    // Hosts this machine knows (`hosts::known`), plus local files for the
+    // commands where an argument can be either end of a copy.
     fn host_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
         let also_files = matches!(command, Some("scp" | "rsync"));
         let Some((keep, _)) = host_word(prefix) else {
-            // Past the `:`, so this is a remote path -- nothing here can
-            // enumerate one, and offering local files for it would be
-            // offering the wrong machine's.
+            // Past the `:`, a remote path: local files would be the wrong
+            // machine's.
             return Vec::new();
         };
         let mut names: Vec<String> = crate::hosts::known().into_iter().map(|h| format!("{keep}{h}")).collect();
-        // `scp host:` wants the colon, since the path follows it on the
-        // same word; `ssh host` is finished as it stands.
+        // `scp host:` wants the colon, since the path follows on the same
+        // word; `ssh host` is finished as it is.
         if also_files {
             names = names.into_iter().map(|n| format!("{n}:")).collect();
             names.extend(self.file_candidates(prefix).into_iter().map(|c| c.display));
@@ -813,20 +627,16 @@ impl<'a> ShellCompletionProvider<'a> {
         rank(prefix, names)
     }
 
-    // Flags only, never falling through to subcommands/files even on a
-    // miss -- exact parity with classify_plain_argument_core's own
-    // flag-never-falls-through rule in highlight.rs. No command name, or
-    // no ready man-page data yet, just yields nothing (not files: a
-    // `-`-shaped word is never meaningfully a file path either).
+    // Flags only, never falling through on a miss, as in highlight.rs's
+    // `classify_plain_argument_core`. A `-` word is never a file path
+    // either.
     fn flag_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
         let Some(cmd) = command else { return Vec::new() };
         flag_candidates_core(ready_man_data(cmd).as_deref(), prefix)
     }
 
-    // arg_index == 0, non-flag: subcommands if the man page actually has
-    // subcommand data, else falls through to files -- this is the `git
-    // co` case (manpages::query("git") is likely already `Ready` from
-    // highlighting the same line).
+    // First argument and not a flag: subcommands if the man page has them,
+    // else files. The `git co` case.
     fn subcommand_or_file_candidates(&self, command: Option<&str>, prefix: &str) -> Vec<CompletionCandidate> {
         if let Some(cmd) = command {
             if let Some(candidates) = subcommand_candidates_core(ready_man_data(cmd).as_deref(), prefix) {
@@ -836,29 +646,18 @@ impl<'a> ShellCompletionProvider<'a> {
         self.file_candidates(prefix)
     }
 
-    // Splits `prefix` at its last '/' into a directory part (kept as a
-    // literal prefix of every candidate's own display string, so the
-    // returned candidates are always the *whole* replacement word, e.g.
-    // "src/fuzzy.rs" not just "fuzzy.rs") and resolves that directory
-    // against `cwd` if relative. Exactly one read_dir -- no recursion,
-    // the explicit "just the explicitly typed level" scope limit.
-    // Directories get a trailing '/' appended, both a UX convention and
-    // what invites pressing Tab again for the next level rather than this
-    // feature ever walking ahead on its own. Matching the full `prefix`
-    // against the full display (rather than just the trailing segment)
-    // works out naturally: the directory part is a literal prefix of
-    // both, so it always matches contiguously at the front, and the fuzzy
-    // step only has real work left to do on the filename itself.
-    /// `file_candidates`, minus everything that is not a directory --
-    /// for a command where a plain file is not a near-miss but an
-    /// answer that cannot work. See `directory_position`.
+    /// `file_candidates` without the non-directories. See
+    /// `directory_position`.
     fn directory_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
-        // Every directory this lists is marked with a trailing `/` by
-        // `file_candidates`, which is what makes the filter a property
-        // of the name rather than a second trip to the filesystem.
+        // `file_candidates` marks directories with a trailing `/`, so this
+        // needs no second trip to the filesystem.
         self.file_candidates(prefix).into_iter().filter(|c| c.display.ends_with('/')).collect()
     }
 
+    // Candidates for `prefix` from a single `read_dir` of its directory
+    // part, resolved against `cwd`. Each candidate is the whole replacement
+    // word (`src/fuzzy.rs`, not `fuzzy.rs`), and directories get a trailing
+    // `/`, which invites Tab for the next level.
     fn file_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
         let Some(cwd) = self.cwd else { return Vec::new() };
         let dir_part = match prefix.rfind('/') {
@@ -866,13 +665,8 @@ impl<'a> ShellCompletionProvider<'a> {
             None => "",
         };
         let dir_path = if let Some(rest) = dir_part.strip_prefix('~') {
-            // `~/...` -- bare-tilde home expansion, the same shape
-            // lexer.rs's own tilde expansion recognizes (no `~user`
-            // lookup). Only the filesystem lookup gets expanded: `dir_part`
-            // itself stays literal, so every candidate this returns still
-            // starts with the `~/` text the user actually typed, matching
-            // what read_line's accept step will splice back into the
-            // buffer.
+            // `~/...`: only the lookup is expanded. `dir_part` stays
+            // literal, so candidates start with the `~/` that was typed.
             let Ok(home) = std::env::var("HOME") else { return Vec::new() };
             PathBuf::from(home).join(rest.trim_start_matches('/'))
         } else if dir_part.is_empty() {
@@ -883,42 +677,30 @@ impl<'a> ShellCompletionProvider<'a> {
             cwd.join(dir_part)
         };
         let Ok(entries) = std::fs::read_dir(&dir_path) else { return Vec::new() };
-        // The `gitignore` bishopt, same one the browser reads. Built
-        // once for the directory being listed rather than per entry --
-        // and only when Tab was actually pressed, so an ordinary
-        // keystroke never touches the filesystem for it.
+        // Built once for the directory, and only when Tab is pressed.
         let ignore = self.honor_gitignore.then(|| crate::gitignore::Stack::for_directory(&dir_path));
         let mut names = Vec::new();
         for entry in entries.flatten() {
             let Ok(name) = entry.file_name().into_string() else { continue };
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            // `target/` and `node_modules/` are the whole reason to
-            // bother: a completion list they are in is a completion list
-            // you have to read past. Recorded rather than dropped,
-            // though -- see the fallback below.
+            // Recorded rather than dropped; see the fallback below.
             let ignored = ignore.as_ref().is_some_and(|i| i.matched(&entry.path(), is_dir).is_ignored());
             names.push((format!("{dir_part}{name}{}", if is_dir { "/" } else { "" }), ignored));
         }
         let visible: Vec<String> = names.iter().filter(|(_, ig)| !ig).map(|(n, _)| n.clone()).collect();
         let ranked = self.rank_files(prefix, visible);
-        // An ignored file is still a file, and asking for one by name is
-        // not a mistake -- `.gitignore` says "don't clutter the listing
-        // with this", not "this cannot be typed". So when hiding them
-        // leaves the word with nothing to complete to, offer them: the
-        // noise they would have added is exactly zero, and the
-        // alternative is a Tab that does nothing while the only possible
-        // answer sits in the directory.
+        // An ignored file can still be asked for by name: `.gitignore`
+        // means "don't clutter the listing", not "can't be typed". So when
+        // hiding them leaves nothing to complete to, they're offered.
         if !ranked.is_empty() || !names.iter().any(|(_, ig)| *ig) {
             return ranked;
         }
         self.rank_files(prefix, names.into_iter().map(|(n, _)| n).collect())
     }
 
-    // `FIGNORE`, last: a suffix is about the name, so this filters what
-    // the listing produced rather than what it read. Directories keep
-    // their trailing `/` here, which is why the suffix test looks past
-    // it -- `FIGNORE=.o` should not be defeated by a directory called
-    // `x.o`.
+    // `FIGNORE` last, on the names the listing produced. Directories keep
+    // their trailing `/`, so the suffix test looks past it: a directory
+    // called `x.o` isn't a `.o` file.
     fn rank_files(&self, prefix: &str, mut names: Vec<String>) -> Vec<CompletionCandidate> {
         if !self.fignore.is_empty() {
             let ignored = |n: &String| {
@@ -926,10 +708,8 @@ impl<'a> ShellCompletionProvider<'a> {
                 self.fignore.iter().any(|suffix| bare.len() > suffix.len() && bare.ends_with(suffix.as_str()))
             };
             let kept: Vec<String> = names.iter().filter(|n| !ignored(n)).cloned().collect();
-            // With `force_fignore` off, an empty result means the filter
-            // took everything -- offer the unfiltered list rather than
-            // nothing, which is the whole point of being able to turn it
-            // off.
+            // With `force_fignore` off, a filter that took everything is
+            // ignored.
             if !kept.is_empty() || self.force_fignore {
                 names = kept;
             }
@@ -948,10 +728,8 @@ mod tests {
 
     const LISTING: &[&str] = &["Makefile", "README.md", "main.rs", "zebra.txt", ".env", ".gitignore", "src/", "node_modules/", ".git/"];
 
-    // Tabbing with nothing typed used to offer `.env`, `.git/` and
-    // `.gitignore` first, because every candidate scores the same and
-    // the alphabetical tiebreak puts `.` before every letter. They are
-    // the least likely thing anyone meant.
+    // With nothing typed every candidate scores the same, and the
+    // alphabetical tiebreak would put dotfiles first.
     #[test]
     fn tabbing_at_nothing_does_not_lead_with_dotfiles() {
         let order = ranked("", LISTING);
@@ -960,24 +738,19 @@ mod tests {
         assert_eq!(&order[6..], &[".env".to_string(), ".git/".to_string(), ".gitignore".to_string()]);
     }
 
-    // Asked for by name, they stop being unlikely -- a `.` is not a
-    // typo, it is the start of what somebody is typing.
+    // Asked for by name, they stop being unlikely.
     #[test]
     fn a_leading_dot_is_a_request_for_them() {
         let order = ranked(".g", LISTING);
-        // Both `.git/` and `.gitignore` match, and which of the two
-        // leads is the score's business; what this pins is that a
-        // hidden name is no longer pushed behind everything else.
+        // Which of `.git/` and `.gitignore` leads is the score's business;
+        // a hidden name just isn't pushed behind the rest.
         assert!(order.first().is_some_and(|n| n.starts_with(".git")), "{order:?}");
         assert!(order.iter().take(2).all(|n| n.starts_with('.')), "{order:?}");
     }
 
-    // `./` is how a relative path is written, not a request for hidden
-    // names -- and this is the case that shows why `hidden` has to
-    // outrank the score rather than break ties under it. Every one of
-    // these matches `./` at the same place, so the only thing left for
-    // the score to measure is name length, which put `./.env` second on
-    // no better grounds than being short.
+    // `./` starts a relative path, not a request for hidden names. Every
+    // candidate matches `./` at the same place, so only name length is left
+    // to score, which is why hidden has to outrank the score.
     #[test]
     fn an_explicit_relative_path_is_not_a_request_for_them() {
         let names: Vec<String> = LISTING.iter().map(|n| format!("./{n}")).collect();
@@ -986,9 +759,6 @@ mod tests {
         assert_eq!(first_hidden, 6, "{order:?}");
     }
 
-    // The last segment decides, not the first character: `src/.env` is
-    // hidden and `./main.rs` is not, and testing the whole string gets
-    // both backwards.
     #[test]
     fn hidden_is_a_property_of_the_last_segment() {
         assert!(hidden_name(".env") && hidden_name("src/.env") && hidden_name(".git/"));
@@ -1004,8 +774,8 @@ mod tests {
         assert!(asking_for_hidden("src/.env"), "the segment being typed is what counts");
     }
 
-    // There is no deriving this -- see `directory_position`'s own doc
-    // comment. The list is short and the test says what is on it.
+    // There's no deriving this (see `directory_position`); the test says
+    // what's on the list.
     #[test]
     fn the_commands_that_can_only_take_a_directory_are_written_down() {
         for cmd in ["cd", "pushd", "chdir", "rmdir", "mkdir"] {
@@ -1046,9 +816,7 @@ mod tests {
         assert_eq!(offer(Vec::new(), true), all, "no FIGNORE offers everything");
         assert_eq!(offer(vec![".o".to_string()], true), vec!["main.c".to_string(), "util.c".to_string()]);
         assert!(offer(vec![".o".to_string(), ".c".to_string()], true).is_empty(), "force_fignore on means gone is gone");
-        // ...and off means the filter only applies while it leaves
-        // something, which is the whole point of being able to turn it
-        // off.
+        // Off, the filter applies only while it leaves something.
         assert_eq!(offer(vec![".o".to_string(), ".c".to_string()], false), all);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1117,9 +885,7 @@ mod tests {
 
     #[test]
     fn classify_word_role_git_co_is_arg_zero_of_git() {
-        // The plan's own worked example: "git co" with the cursor at the
-        // end -- word_start is 4 ("co" starts there), and prefix_text
-        // (chars[0..4]) is "git ".
+        // `word_start` is 4, where `co` starts, and the prefix is `git `.
         let line = "git co";
         let chars: Vec<char> = line.chars().collect();
         let cursor = chars.len();
@@ -1137,16 +903,14 @@ mod tests {
 
     #[test]
     fn classify_word_role_skips_an_assignment_prefix() {
-        // "FOO=bar " leaves the position still expecting the real command
-        // name, not treating FOO=bar as arg 0 of anything.
+        // `FOO=bar ` still expects the command name.
         assert_eq!(classify_word_role("FOO=bar "), CmdRole::Command);
     }
 
     #[test]
     fn classify_word_role_degrades_gracefully_inside_an_unclosed_substitution() {
-        // Must not panic; the exact role isn't asserted since an unclosed
-        // $(...) is documented out-of-scope for a guaranteed-correct
-        // answer here -- only that this stays inert.
+        // Must not panic. The role isn't asserted: an unclosed `$(...)`
+        // gets no guaranteed answer.
         let _ = classify_word_role("echo $(git chec");
     }
 
@@ -1178,10 +942,7 @@ mod tests {
 
     #[test]
     fn command_name_candidates_includes_a_known_function() {
-        // A deliberately unusual prefix (not just "my") -- this
-        // environment's real PATH (WSL interop with Windows system32)
-        // can contain unrelated executables matching short, common
-        // prefixes, which would make the assertion flaky.
+        // An unusual prefix, so no unrelated executable on PATH can match.
         let mut functions = HashSet::new();
         functions.insert("zz_bish_test_func".to_string());
         let provider = ShellCompletionProvider {
@@ -1202,9 +963,7 @@ mod tests {
 
     #[test]
     fn command_name_candidates_includes_a_real_path_executable() {
-        // coreutils -- same real-PATH assumption this whole feature
-        // already leans on elsewhere (highlight.rs's own is_in_path
-        // tests).
+        // coreutils, as highlight.rs's `is_in_path` tests assume.
         let provider = ShellCompletionProvider {
             cwd: None,
             known_functions: None,
@@ -1221,10 +980,8 @@ mod tests {
         assert!(names.iter().any(|n| n == "true"), "{names:?}");
     }
 
-    // Same bug as the command-validity check's: a session that put a
-    // directory on PATH after bish started (a `.bishrc`, or mise/direnv
-    // firing on every `cd`) saw a second, process-environment PATH scan
-    // here, so Tab would not offer a command that ran perfectly well.
+    // Command names come from the session's PATH, which can differ from the
+    // process environment's after a `.bishrc` or a `cd` hook changes it.
     #[test]
     fn command_name_candidates_come_from_the_callers_own_path_scan() {
         let ctx = compgen::ActionContext {
@@ -1245,9 +1002,9 @@ mod tests {
         };
         let names = display_names(provider.command_name_candidates("zz-bish-hook"));
         assert!(names.iter().any(|n| n == "zz-bish-hookbin"), "{names:?}");
-        // Prefix-filtered, as the PATH scan it replaces was.
+        // Prefix-filtered.
         assert!(!names.iter().any(|n| n == "zz-bish-elsewhere"), "{names:?}");
-        // And the real environment's PATH is not consulted alongside it.
+        // And the real environment's PATH isn't consulted as well.
         let names = display_names(provider.command_name_candidates("tru"));
         assert!(!names.iter().any(|n| n == "true"), "{names:?}");
     }
@@ -1281,9 +1038,8 @@ mod tests {
         assert_eq!(subcommand_candidates_core(None, "co"), None);
     }
 
-    // The plan's own literal worked example, via canned man-page data
-    // (never spawns real `man`): commit/config/count-objects should all
-    // rank above checkout for the query "co".
+    // Canned man-page data, no real `man`: commit, config and count-objects
+    // rank above checkout for `co`.
     #[test]
     fn subcommand_candidates_core_git_co_worked_example() {
         let man = manpages::ManPageData {
@@ -1300,15 +1056,9 @@ mod tests {
         assert!(leaders.iter().any(|n| n == "count-objects"), "{names:?}");
     }
 
-    // Real temp-dir fixture, self-cleaning: one subdirectory and one
-    // regular file sharing a prefix, confirming both the prefix filter and
-    // the directory-gets-a-trailing-slash convention.
-    // `mv somedir/{old,new}` is how a rename gets typed, and until now
-    // Tab inside it was dead: the word under the cursor was
-    // `somedir/{old,ne`, which is not a path and never matches one. bash
-    // behaves the same way -- `{` and `,` are not word-break characters
-    // there either -- so this is bish being better rather than bish
-    // catching up.
+    // `mv somedir/{old,new}`: the word under the cursor is
+    // `somedir/{old,ne`, which isn't a path, so the brace has to be
+    // understood.
     #[test]
     fn a_brace_alternative_completes_against_the_path_the_brace_sits_in() {
         let dir = crate::tempdir::TempDir::new("completion-brace");
@@ -1334,40 +1084,34 @@ mod tests {
             (result.word_start, display_names(result.candidates))
         };
 
-        // Right after the opening brace, and after the comma: both are
-        // completed against `somedir/`, and the candidate is only the
-        // alternative -- the editor replaces `ol`, not the whole word, so
-        // a candidate carrying `somedir/` again would double it.
+        // After the brace and after the comma, both completed against
+        // `somedir/`. The candidate is only the alternative, since the
+        // editor replaces `ol`, not the whole word.
         assert_eq!(at("mv somedir/{ol"), ("mv somedir/{".chars().count(), vec!["old-notes.txt".to_string()]));
-        // Fuzzily, as everywhere else here: `somedir/ne` matches the old
-        // file too (an `n` and an `e` in "notes"), exactly as it would
-        // without a brace in the line. What matters is that both answers
-        // are re-rooted onto the alternative and the best one is first.
+        // Fuzzy, as everywhere here: `somedir/ne` matches the old file too.
+        // Both are re-rooted onto the alternative, best first.
         let (from, names) = at("mv somedir/{old-notes.txt,ne");
         assert_eq!(from, "mv somedir/{old-notes.txt,".chars().count());
         assert_eq!(names.first().map(String::as_str), Some("new-notes.txt"), "{names:?}");
         assert!(names.iter().all(|n| !n.contains('/')), "every candidate replaces the alternative alone: {names:?}");
 
-        // The text before the brace need not end in a slash: `{` splits a
-        // word, it does not have to split a path.
+        // The text before the brace needn't end in a slash.
         std::fs::write(dir.join("prefix-one"), b"hi").unwrap();
         assert_eq!(at("cat prefix{-o"), ("cat prefix{".chars().count(), vec!["-one".to_string()]));
 
-        // A closed brace is not a brace context: the whole word is being
-        // completed, as it always was.
+        // A closed brace isn't a brace context.
         assert_eq!(at("cat else"), (4, vec!["elsewhere.txt".to_string()]));
         assert_eq!(at("cat {a,b}else"), (4, Vec::<String>::new()), "nothing is named `{{a,b}}else`");
     }
 
-    // `${` opens a parameter expansion, not a list of alternatives. The
-    // two look alike one character in, and reading one as the other would
-    // have `cat ${HOM` offering the files in this directory.
+    // `${` opens a parameter expansion, not a list: `cat ${HOM` must not
+    // offer files.
     #[test]
     fn a_parameter_expansion_is_not_a_brace_list() {
         assert_eq!(super::brace_alternative(&"somedir/{old,ne".chars().collect::<Vec<_>>()), Some((8, 13)));
         assert_eq!(super::brace_alternative(&"${HOM".chars().collect::<Vec<_>>()), None);
         assert_eq!(super::brace_alternative(&"${HOME}/pro".chars().collect::<Vec<_>>()), None);
-        // Escaped, so literal -- and so not an opening brace either.
+        // Escaped, so not an opening brace.
         assert_eq!(super::brace_alternative(&r"a\{b".chars().collect::<Vec<_>>()), None);
         // Nested: the alternative is the innermost list's, and the
         // inherited text is still everything before the outer one.
@@ -1403,11 +1147,8 @@ mod tests {
         assert!(!names.iter().any(|n| n == "unrelated.txt"), "{names:?}");
     }
 
-    // Regression test for a real bug caught during interactive
-    // verification: `ls ~/.co<Tab>` offered nothing even when `~/.config`
-    // exists -- `dir_part` ("~/") was joined onto `cwd` literally (`~`
-    // isn't special to the filesystem), producing a nonexistent
-    // "$cwd/~/" directory that read_dir always fails to open.
+    // `~/` has to be expanded for the lookup: joined onto `cwd` literally
+    // it names a directory that doesn't exist.
     #[test]
     fn file_candidates_expands_a_leading_tilde_slash_for_the_lookup() {
         let dir = std::env::temp_dir().join(format!("bish-completion-tilde-test-{}", std::process::id()));
@@ -1415,14 +1156,10 @@ mod tests {
 
         let original_home = std::env::var("HOME").unwrap_or_default();
         let names = {
-            // SAFETY: same reasoning as enumerate_path_matches_filters_by_
-            // prefix_and_executable_bit's own PATH mutation above -- no
-            // other thread in this test binary depends on HOME being
-            // atomically consistent across this narrow window, and the
-            // value is restored before returning.
+            // SAFETY: nothing else in this test binary depends on HOME
+            // during this window, and it's restored before returning.
             unsafe { std::env::set_var("HOME", &dir) };
-            // cwd is deliberately a different, unrelated directory --
-            // confirms the lookup actually goes to $HOME, not cwd.
+            // A cwd unrelated to HOME, so the lookup has to go to $HOME.
             let provider = ShellCompletionProvider {
                 cwd: Some(Path::new("/")),
                 known_functions: None,
@@ -1442,9 +1179,8 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
 
-        // The candidate must keep the literal "~/" prefix the user typed
-        // (not the expanded $HOME path) -- it gets spliced straight back
-        // into the buffer on accept.
+        // The candidate keeps the typed `~/`: it's spliced back into the
+        // buffer.
         assert_eq!(names, vec!["~/.config/".to_string()]);
     }
 
@@ -1558,10 +1294,8 @@ mod tests {
 
     #[test]
     fn complete_never_consults_a_registered_spec_when_none_is_supplied() {
-        // completions: None (not Some(empty)) -- the "this caller has no
-        // completions concept at all" case, distinct from "nothing
-        // registered yet" -- must fall straight through to the built-in
-        // command-name-candidates path, same as today.
+        // `completions: None`, a caller with no specs at all, falls through
+        // to command names.
         let provider = ShellCompletionProvider {
             cwd: None,
             known_functions: None,
@@ -1579,13 +1313,8 @@ mod tests {
         assert!(display_names(result.candidates).iter().any(|n| n == "echo"));
     }
 
-    /// A registered spec's candidates come out alphabetically, because
-    /// that is what bash does: `-o nosort` is documented as telling
-    /// readline *not* to sort them, so sorted is the default. bish
-    /// accepted the name and sorted nothing either way, which meant a
-    /// wordlist -- or a `-F` function's COMPREPLY -- was offered in
-    /// whatever order it was built, and `abc` reached `abcdef` before
-    /// `abcd`.
+    /// A registered spec's candidates come out sorted unless it asks for
+    /// `-o nosort`, as in bash.
     #[test]
     fn a_registered_specs_candidates_are_sorted_unless_it_says_nosort() {
         let ordered = |spec: compgen::CompgenSpec| {
@@ -1621,11 +1350,8 @@ mod tests {
 
     #[test]
     fn as_unranked_candidates_keeps_every_entry_even_ones_not_starting_with_the_prefix() {
-        // The whole point of not routing a registered spec's own output
-        // through `rank`'s fuzzy_match/drop-non-matches step -- an -F/-C
-        // source is trusted to have already applied its own filtering
-        // logic, so an entry that doesn't even start with `prefix` must
-        // still come through untouched (see compgen.rs's own doc comment).
+        // A `-F`/`-C` source is trusted to have filtered already, so an
+        // entry not starting with `prefix` still comes through.
         let out = as_unranked_candidates("xyz", vec!["foo".to_string(), "xyzzy".to_string()]);
         assert_eq!(display_names(out.clone()), vec!["foo".to_string(), "xyzzy".to_string()]);
         assert_eq!(out[0].matched_positions, Vec::<usize>::new(), "no highlight for a non-matching entry");
@@ -1642,8 +1368,7 @@ mod tests {
             .collect()
     }
 
-    // `::bish` is reachable from the editor's colon line as well as the
-    // shell prompt, and the colon line is where most of it gets typed.
+    // `::bish` is mostly typed on the editor's colon line.
     fn bish_at(line: &str) -> Vec<String> {
         bishopt_at(line)
     }
@@ -1684,16 +1409,14 @@ mod tests {
         assert!(bish_at("::bish lsp add --apply-edits ").contains(&"always".to_string()));
     }
 
-    // The server's own command line is an ordinary command line, so this
-    // position must be *given up* rather than claimed and answered with
-    // nothing -- the distinction `builtin_argument_candidates`'
-    // `Option` exists for.
+    // The server's command line is an ordinary command line, so this
+    // position is given up rather than claimed and left empty.
     #[test]
     fn bish_lsp_add_hands_the_server_command_back_to_the_ordinary_completions() {
         assert!(bish_candidates(&strs(&["lsp", "add"]), "rust-ana", &[]).is_none());
         assert!(bish_candidates(&strs(&["lsp", "add", "--lang=rust"]), "rust-ana", &[]).is_none());
-        // And a hook's handler, for the same reason -- but only after
-        // its event, which is a fixed list.
+        // Likewise a hook's handler, but only after its event, which is a
+        // fixed list.
         assert!(bish_candidates(&strs(&["hook", "add"]), "editor", &[]).is_some());
         assert!(bish_candidates(&strs(&["hook", "add", "editor:file:open"]), "my_", &[]).is_none());
     }
@@ -1706,15 +1429,11 @@ mod tests {
         let mut got = events;
         got.sort();
         assert_eq!(got, expected);
-        // `--lang=` first is the same position, since it is a flag and
-        // not the event.
+        // `--lang=` first is the same position: it's a flag, not the event.
         assert!(bish_at("::bish hook add --lang=rust ").contains(&"editor:file:open".to_string()));
     }
 
-    // The namespace is open, so this list can only ever be a starting
-    // point -- but `--unset` is the exception: only what is set can be
-    // unset, and offering names that would just error is worse than
-    // offering none.
+    // Only what is set can be unset.
     #[test]
     fn bish_hl_completes_known_names_to_set_and_only_live_ones_to_unset() {
         let set = display_names(hl_candidates(&strs(&["--set"]), "", &[]));
@@ -1729,40 +1448,33 @@ mod tests {
         assert_eq!(unset.len(), 2, "only the two that are set: {unset:?}");
         assert!(display_names(hl_candidates(&strs(&["--unset"]), "", &[])).is_empty(), "nothing set, nothing to unset");
 
-        // The colour itself is free text, but a file name would be
-        // wrong, so the position is claimed and answered with nothing.
+        // The colour is free text, but a file name would be wrong, so the
+        // position is claimed and left empty.
         assert!(hl_candidates(&strs(&["--set", "string"]), "#ff", &[]).is_empty());
         assert!(bish_candidates(&strs(&["hl", "--set", "string"]), "#ff", &[]).is_some());
 
         let flags = bish_at("::bish hl --");
         assert!(flags.contains(&"--set".to_string()) && flags.contains(&"--unset".to_string()), "{flags:?}");
 
-        // And the snapshot really does reach the colon line's own
-        // provider, which is the one place it had to be threaded rather
-        // than read.
+        // The snapshot reaches the colon line's provider, where it had to
+        // be threaded through.
         let line = "::bish hl --unset ";
         let colon = BuiltinCompletionProvider { hl_names: strs(&["colonLineOnly"]), commands: &[] };
         let found = colon.complete(CompletionRequest { line, cursor: line.chars().count() });
         assert_eq!(display_names(found.candidates), strs(&["colonLineOnly"]));
     }
 
-    // A line with a vocabulary of its own completes it in command
-    // position, and only there -- an argument still belongs to whatever
-    // command it follows.
+    // A line's own vocabulary completes in command position only.
     #[test]
     fn the_lines_own_commands_complete_in_command_position() {
         let provider = BuiltinCompletionProvider { hl_names: Vec::new(), commands: &["preview", "prev", "diag"] };
         let at = |line: &str| display_names(provider.complete(CompletionRequest { line, cursor: line.chars().count() }).candidates);
         assert_eq!(at("prev"), strs(&["prev", "preview"]));
         assert_eq!(at("di"), strs(&["diag"]));
-        // Nothing to offer for a word that is an argument, not a command.
         assert_eq!(at("diag prev"), Vec::<String>::new());
     }
 
-    // Ordered by `rank` like every other candidate list here, which for
-    // an empty prefix means alphabetically -- so this compares sets, and
-    // what it pins is that the list *is* the registry: nothing invented,
-    // nothing missed, and a new option completable by existing.
+    // Compares sets: the list is the registry, nothing invented or missed.
     #[test]
     fn bishopt_completes_option_names_from_the_real_registry() {
         let names = bishopt_at("bishopt ");
@@ -1787,8 +1499,7 @@ mod tests {
         assert_eq!(flags, vec!["--quiet", "--set", "--unset"]);
     }
 
-    // A boolean is the one kind of option with a fixed set of values;
-    // anything else is free text, and guessing at it would be inventing.
+    // A boolean has a fixed set of values; anything else is free text.
     #[test]
     fn bishopt_completes_on_and_off_for_a_boolean_value_only() {
         let mut values = bishopt_at("bishopt --set wrap ");
@@ -1798,9 +1509,8 @@ mod tests {
         assert_eq!(bishopt_at("bishopt --set wrap_column "), Vec::<String>::new());
     }
 
-    // `Some(empty)` rather than `None`: bishopt owns its own completion,
-    // so a position with nothing to offer offers nothing, instead of
-    // falling through to file names.
+    // `Some(empty)`: bishopt owns its completion, so nothing to offer means
+    // no file names either.
     #[test]
     fn bishopt_never_falls_through_to_files() {
         let role = CmdRole::Argument { command: Some("bishopt".to_string()), arg_index: 3 };
@@ -1815,7 +1525,6 @@ mod tests {
         assert_eq!(bishopt_at(""), Vec::<String>::new());
     }
 
-    // The shell prompt gets the same answers through its own provider.
     #[test]
     fn the_shell_provider_completes_bishopt_options_too() {
         let provider = ShellCompletionProvider {
@@ -1838,7 +1547,7 @@ mod tests {
 
     #[test]
     fn host_positions_are_where_a_host_can_actually_go() {
-        // One host, then a remote command nothing here can know about.
+        // One host, then a remote command.
         assert!(host_position(Some("ssh"), 0));
         assert!(!host_position(Some("ssh"), 1));
         assert!(host_position(Some("sftp"), 0));
@@ -1846,13 +1555,10 @@ mod tests {
         assert!(host_position(Some("scp"), 0));
         assert!(host_position(Some("scp"), 2));
         assert!(host_position(Some("rsync"), 1));
-        // Everything else is somebody else's business.
         assert!(!host_position(Some("ls"), 0));
         assert!(!host_position(None, 0));
     }
 
-    // `[user@]host` -- completing the host keeps the user, rather than
-    // offering to replace it with one.
     #[test]
     fn a_user_prefix_is_kept_and_the_host_is_what_completes() {
         assert_eq!(host_word("we"), Some(("", "we")));
@@ -1860,9 +1566,6 @@ mod tests {
         assert_eq!(host_word(""), Some(("", "")));
     }
 
-    // Past the `:` this is a *remote* path, and nothing here can
-    // enumerate one -- offering local files for it would be offering the
-    // wrong machine's.
     #[test]
     fn a_colon_ends_host_completion() {
         assert_eq!(host_word("web:"), None);
@@ -1870,8 +1573,7 @@ mod tests {
         assert_eq!(host_word("deploy@web:/etc"), None);
     }
 
-    // The dispatch, not the host list: `ssh web` must not fall through
-    // to the file completion it used to get.
+    // `ssh web` must not fall through to file completion.
     #[test]
     fn ssh_does_not_complete_files() {
         let dir = std::env::temp_dir().join(format!("bish-completion-ssh-test-{}", std::process::id()));
@@ -1900,8 +1602,6 @@ mod tests {
     // ...whereas for scp it is: either end of a copy can be local.
     #[test]
     fn scp_completes_files_as_well_as_hosts() {
-        // The guard owns the directory and removes it when this test
-        // returns; `dir` is just the path the provider needs.
         let guard = crate::tempdir::TempDir::new("completion-scp-test");
         std::fs::write(guard.join("zzz-local.txt"), "").unwrap();
         let dir = guard.path().to_path_buf();
@@ -1923,7 +1623,6 @@ mod tests {
         assert!(names.iter().any(|n| n.contains("zzz-local")), "got {names:?}");
     }
 
-    // `target/` in a completion list is a list you have to read past.
     #[test]
     fn file_completion_skips_gitignored_entries() {
         let dir = std::env::temp_dir().join(format!("bish-completion-ignore-{}", std::process::id()));
@@ -1952,7 +1651,6 @@ mod tests {
         let offered = names(true);
         assert!(offered.contains(&"tangent.txt".to_string()), "got {offered:?}");
         assert!(!offered.iter().any(|n| n.starts_with("target")), "target/ is ignored: {offered:?}");
-        // ...and with the option off it is offered like anything else.
         assert!(names(false).iter().any(|n| n.starts_with("target")));
         let _ = std::fs::remove_dir_all(&dir);
     }
