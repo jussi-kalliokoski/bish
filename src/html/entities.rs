@@ -1,12 +1,8 @@
-// The WHATWG named character reference table -- all 2231 of them, which is
-// what makes `&notit;` tokenize as `\u{00AC}it;` (the legacy no-semicolon
-// `&not`) rather than as literal text. Generated from the spec's own
-// table rather than typed, and sorted by name so lookup is a binary
-// search.
-//
-// Keys keep the spec's own spelling *without* the leading `&`: most end
-// in `;`, and the ~100 that don't are the legacy references HTML still
-// has to accept unterminated.
+// The WHATWG named character reference table, all 2231, generated from
+// the spec and sorted by name for binary search; it's what makes
+// `&notit;` tokenize as `\u{00AC}it;` (the legacy unterminated `&not`).
+// Keys omit the `&`; most end in `;`, and the hundred or so that don't
+// are the legacy references HTML accepts unterminated.
 pub const NAMED: &[(&str, &str)] = &[
     ("AElig", "\u{c6}"),
     ("AElig;", "\u{c6}"),
@@ -2241,6 +2237,5 @@ pub const NAMED: &[(&str, &str)] = &[
     ("zwnj;", "\u{200c}"),
 ];
 
-// The longest name in the table, which bounds how far the tokenizer's
-// named-reference state has to look ahead before giving up.
+// The longest name, bounding the tokenizer's named-reference lookahead.
 pub const MAX_NAME_LEN: usize = 32;
