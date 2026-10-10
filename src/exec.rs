@@ -325,16 +325,14 @@ impl ChildStdio {
     }
 }
 
-// A second handle on the same open file. `try_clone` is a dup, so the
-// two share one write position -- which is the point wherever both
-// streams land on one destination.
+// A second handle on the same open file: `try_clone` dups, so the two
+// share a write position.
 fn file_stream(f: &Option<std::fs::File>) -> Option<SinkStream> {
     f.as_ref()?.try_clone().ok().map(|f| SinkStream::File(Capture::file(f)))
 }
 
-// The same for a stream that already has a capture: sharing the `Rc`
-// rather than duping keeps one write position, and keeps a capture that
-// is still only a buffer from being split into two of them.
+// The same for a stream with a capture: sharing the `Rc` keeps one
+// write position and one buffer.
 fn capture_stream(c: &Option<Rc<Capture>>) -> Option<SinkStream> {
     Some(SinkStream::File(Rc::clone(c.as_ref()?)))
 }
@@ -345,35 +343,20 @@ enum ChildBody<'a> {
     // Text that is its own parse unit: a `$( )` or `<( )` body, which
     // bash reads separately from the source around it.
     Source(&'a str),
-    // Text belonging to a tree the enclosing source has already read --
-    // a `( )` body. bash read it along with everything around it, so an
-    // alias defined inside must not start applying part-way through:
-    // `( alias hi=x<newline>hi )` does not expand, where the same body
-    // in a `$( )` does. See run_program_rereadable.
+    // Text from a tree the enclosing source already read: a `( )` body.
+    // bash read it with its surroundings, so an alias defined inside doesn't
+    // apply part-way through (`( alias hi=x<newline>hi )` doesn't expand,
+    // where in a `$( )` it does). See `run_program_rereadable`.
     Enclosed(&'a str),
     Parsed(&'a parser::Command),
 }
 
-/// Process-global state a construct has disturbed, and what it was
-/// before -- filled in by whatever does the disturbing.
-///
-/// The working directory, the umask and fds 0/1/2 belong to the
-/// *process*, not to a `Shell`. A `( )` or `$( )` is a Shell of its own
-/// but not a process of its own, so it has to put them back on the way
-/// out, and used to do that by snapshotting all three on the way *in*:
-/// a `getcwd`, two `umask(2)` calls and three `dup(2)`, on every
-/// subshell, whether or not the body went near any of them. Measured,
-/// that snapshot and the restore that matches it were about 9 of the 10
-/// microseconds a `( true )` cost more than ksh93's.
-///
-/// Almost no subshell body changes any of the three, so the cost now
-/// falls where the change does: `cd`, `umask` and a bare `exec` each
-/// record the old value the first time they run, and a construct puts
-/// back only what it is told was moved. A body that changes nothing
-/// pays nothing to put nothing back.
-///
-/// The first time only -- the value to restore is the one from before
-/// the construct began, not the one from before the most recent change.
+/// Process-global state a construct disturbed, and its value before.
+/// The cwd, umask and fds 0/1/2 belong to the process, and a `( )` or
+/// `$( )` isn't one, so it puts back what was moved. `cd`, `umask` and a
+/// bare `exec` record the old value the first time they run (the value
+/// from before the construct began), so a body that changes nothing pays
+/// nothing.
 #[derive(Default)]
 struct ProcessRestore {
     cwd: Option<std::path::PathBuf>,
@@ -813,21 +796,17 @@ pub struct WindowInfo {
     pub current: bool,
 }
 
-// What repl.rs should do in response to a `window`-family command -- see
-// ExecResult::Window's doc comment for why this travels as a bubbled
-// signal instead of direct shared-state mutation.
-/// One declared theme: the bishopts it sets, and the highlight colours
-/// it sets. Two maps because they are two namespaces -- `::bish hl`
-/// names are open, bishopt names are a fixed registry -- but one type,
-/// because a theme is a single thing you switch to.
+/// One declared theme: the bishopts and highlight colours it sets. Two
+/// maps, since `::bish hl` names are open and bishopt names a fixed
+/// registry, but one type, since a theme is one thing you switch to.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Theme {
     pub(crate) opts: std::collections::HashMap<String, BishOptValue>,
     pub(crate) hl: std::collections::HashMap<String, String>,
 }
 
-/// Whatever a shell's output sink was before something borrowed it --
-/// opaque, so `OutputSink` itself stays private.
+/// Whatever a shell's output sink was before something borrowed it,
+/// opaque so `OutputSink` stays private.
 pub(crate) struct SavedSink(OutputSink);
 
 /// One registered hook: what to run, when, and for which languages.
@@ -837,10 +816,9 @@ pub struct Hook {
     /// always names the thing `ls` showed.
     pub id: u64,
     pub event: String,
-    /// `--lang=`: a glob matched against the language of the file the
-    /// event is about (`fileeditor::language_of`), the same shape and
-    /// the same matcher `abbr --lang` uses -- so `--lang='*script'`
-    /// covers a family and `--lang='!(bash)'` covers everything else.
+    /// `--lang=`: a glob matched against the language of the event's file
+    /// (`fileeditor::language_of`), as `abbr --lang` matches:
+    /// `--lang='*script'` covers a family, `--lang='!(bash)'` all but one.
     /// `*` when unscoped.
     pub lang: String,
     /// The command line to run, with the file's path appended as its
@@ -848,28 +826,20 @@ pub struct Hook {
     pub command: String,
 }
 
-/// A table of long-running helper processes the shell can report on and
-/// manage, without knowing what any of them are.
-///
-/// `::bish lsp` is a shell builtin -- it has to be readable in `$(...)`
-/// (the lesson `window ls` taught) -- but nothing about running a
-/// language server belongs in the shell. So the shell holds one of
-/// these and knows only that entries have an id, some fields to print,
-/// a recent log, and can be dropped. `lspclient::Table` implements it;
-/// repl.rs, which owns the real thing, keeps the concrete handle.
-///
-/// The row fields are deliberately opaque `String`s rather than a
-/// struct: what a language server's status consists of is not the
-/// shell's business, and a typed row here would be exactly the
-/// dependency this trait exists to remove.
+/// Long-running helper processes the shell can report on and manage
+/// without knowing what they are: entries have an id, fields to print and
+/// a recent log, and can be dropped. `::bish lsp` is a builtin, readable
+/// in `$(...)`, but running a language server isn't the shell's
+/// business. `lspclient::Table` implements it. The row fields are plain
+/// strings so the shell needn't know their shape.
 pub trait ServiceTable {
     /// One row per entry, in the order to print, each already split
     /// into the fields `status` will join with tabs.
     fn rows(&self) -> Vec<Vec<String>>;
 
-    /// Recent output from the entries started from declaration `id`,
-    /// oldest first -- what a helper that failed to start said on its
-    /// way out. Empty when there is nothing, or no such entry.
+    /// Recent output from the entries started from declaration `id`, oldest
+    /// first: what a helper that failed to start said. Empty when there's
+    /// nothing.
     fn logs(&self, id: u64) -> Vec<String>;
 
     /// Forgets every entry started from declaration `id`, including a
@@ -878,18 +848,10 @@ pub trait ServiceTable {
     fn forget(&mut self, id: u64) -> usize;
 }
 
-/// The interactive command history, as much of it as a builtin needs.
-///
-/// The history lives in `repl::SessionState`, not here -- it is a
-/// property of a session at a prompt, and a script has none. `plan.md`
-/// called that an architecture mismatch rather than a small addition,
-/// and it is: the fix is not to move the history down but to give the
-/// shell an opaque way to ask.
-///
-/// Which is the second time this exact shape has been needed, after
-/// `ServiceTable` did it for language servers, and it is the same
-/// answer: a trait exec.rs owns and repl.rs implements, so the
-/// dependency points the way it already does.
+/// The interactive history, as much as a builtin needs. It lives in
+/// `repl::SessionState`, since it belongs to a session at a prompt and a
+/// script has none; like `ServiceTable`, exec.rs owns the trait and
+/// repl.rs implements it.
 pub trait HistoryAccess {
     /// Every entry, oldest first, with when it was recorded if known.
     /// Callers print the position plus one, as bash numbers from 1. The
@@ -1088,6 +1050,8 @@ pub enum WindowMove {
     To(usize),
 }
 
+// What repl.rs should do for a `window` command, returned rather than
+// done here; see `ExecResult::Window`.
 #[derive(Debug, Clone)]
 pub enum WindowAction {
     /// `window create [--name NAME] [--] [COMMAND...]`. The name shows in the
@@ -1269,53 +1233,28 @@ pub struct Shell {
     // pair. The attribute makes a later `A=x` mean `A[0]=x`.
     pub(crate) array_names: std::collections::HashSet<String>,
     pub(crate) assoc_names: std::collections::HashSet<String>,
-    // `alias name=value`, expanded for real -- see
-    // `lexer::expand_aliases`.
-    //
-    // This used to be stored and never expanded, on the reasoning that
-    // bash substitutes aliases *textually* before a line is tokenized,
-    // which is at odds with a shell that tokenizes and parses a whole
-    // script up front. The token stream turned out to be the seam: a
-    // command-position word is replaced by the *tokens* of its value
-    // before the parser sees either, so an alias whose value is a whole
-    // pipeline is a pipeline rather than a command with `|` as an
-    // argument. That was the half-correct expansion worth avoiding, and
-    // it is avoided by not doing it at the word level.
-    //
-    // Gated on `shopt -s expand_aliases`, which is bash's own gate and
-    // is off for a non-interactive shell -- so a script that never
-    // touches it still sees exactly what real bash gives it. repl.rs
-    // turns it on for an interactive session, which is also bash.
-    // Vec, not a map -- bash's own `alias` listing (and real bash's own
-    // internal table) is in definition order, not sorted, and this list is
-    // never large enough for linear lookup to matter.
+    // `alias name=value`, expanded by `lexer::expand_aliases`: a
+    // command-position word is replaced by its value's tokens before the
+    // parser sees them, so an alias whose value is a pipeline is a
+    // pipeline. Gated on `shopt -s expand_aliases`, as in bash, which is
+    // off for scripts; repl.rs turns it on interactively. A Vec, since bash
+    // lists aliases in definition order.
     pub(crate) aliases: Vec<(String, String)>,
-    // `abbr -a NAME EXPANSION`: fish-style abbreviations -- unlike
-    // `aliases` above, these *do* expand, but never here in exec.rs. The
-    // trigger lives entirely in editor.rs's own read_line (Space/Enter
-    // right after typing NAME in command position splices EXPANSION into
-    // the line the user sees, before it's ever submitted; an expansion
-    // with `%s` placeholders splices in as a live snippet instead -- see
-    // bishedit::snippet) -- this table exists in `Shell` purely as the
-    // thing `abbr`'s own builtin (below) reads/writes and repl.rs
-    // snapshots per prompt to hand to read_line, same "owned-snapshot,
-    // not a live borrow" pattern as `cwd`/`function_names()` already use
-    // for `HighlightContext`/`ShellCompletionProvider`. Same Vec-not-map
-    // choice as `aliases`, same reasoning. `pub`, not private, for
-    // exactly that snapshotting (repl.rs is a different module) --
-    // matching `cwd`'s own visibility.
+    // `abbr -a NAME EXPANSION`: abbreviations, expanded by editor.rs's
+    // `read_line` as you type (Space or Enter after NAME in command
+    // position), never here; one with `%s` placeholders becomes a snippet
+    // (bishedit::snippet). repl.rs snapshots this table for `read_line` at
+    // each prompt.
     pub abbrs: Vec<Abbr>,
-    /// `::bish map` -- key remappings, scoped to modes by a glob. Held
-    /// here beside the abbreviations because it is the same kind of
-    /// thing: a small user-defined table the editor consults, defined
-    /// from config.bash and changeable at runtime.
+    /// `::bish map` key remappings, scoped to modes by a glob. Beside the
+    /// abbreviations because it's the same kind of table: user-defined,
+    /// consulted by the editor, set from config.bash or at runtime.
     pub mappings: Vec<crate::keymap::Mapping>,
     /// `enable -n NAME`: builtins taken out of service, so the external
     /// of the same name runs instead.
     pub(crate) disabled_builtins: std::collections::HashSet<String>,
-    /// One entry per function call in progress, oldest first -- what
-    /// `caller` reports on. Pushed by `call_function`, which is the
-    /// only place a function body is entered.
+    /// One entry per function call in progress, oldest first, for `caller`.
+    /// Pushed by `call_function`, the only way into a function body.
     pub(crate) call_stack: Vec<CallFrame>,
     /// The file each function was defined in. `BASH_SOURCE` reports
     /// where a function *is*, not where it was called from, and those
@@ -1326,93 +1265,51 @@ pub struct Shell {
     /// split off should behave like the one you split it from.
     pub hooks: Vec<Hook>,
     pub(crate) next_hook_id: u64,
-    /// Declared language servers -- config, not processes. See
-    /// `LspServer`.
+    /// Declared language servers: config, not processes. See `LspServer`.
     pub lsp_servers: Vec<LspServer>,
     pub(crate) next_lsp_id: u64,
-    /// The helper processes `::bish lsp` reports on, behind a trait so
-    /// this module never names a language-server type. See
-    /// `ServiceTable`.
-    ///
-    /// Shared by every shell in the process the same way `jobs` is
-    /// (`Rc::clone` in `new_virtual_child`). Because it is the live
-    /// table and not a snapshot, `::bish lsp status` is an ordinary
-    /// builtin readable in `$(...)`, which is the lesson `window ls`
-    /// taught.
+    /// The helper processes `::bish lsp` reports on, behind a trait so this
+    /// module never names a language-server type (see `ServiceTable`).
+    /// Shared by every shell in the process, as `jobs` is, so
+    /// `::bish lsp status` works in `$(...)`.
     pub lsp: Rc<RefCell<dyn ServiceTable>>,
-    /// The interactive history, when there is one -- see
-    /// `HistoryAccess`. Shared with whichever session owns it, the same
-    /// `Rc<RefCell<_>>` way `lsp` is.
+    /// The interactive history, when there is one (see `HistoryAccess`),
+    /// shared with the session that owns it as `lsp` is.
     pub history: Rc<RefCell<dyn HistoryAccess>>,
-    /// Set while a hook is running, so a hook that causes its own event
-    /// -- a `shell:cwd:change` hook that `cd`s, most obviously -- fires
-    /// once rather than forever. Not shared with a virtual child: a hook
-    /// that legitimately starts a subshell should not have that
-    /// subshell's own hooks suppressed.
+    /// Set while a hook runs, so a hook that causes its own event (a
+    /// `shell:cwd:change` hook that `cd`s) fires once. Not shared with a
+    /// virtual child: a subshell a hook starts keeps its own hooks.
     firing_hooks: bool,
-    // One frame per active function call (pushed/popped alongside
-    // var_scopes in call_function). `local -a`/`-A name` snapshots the
-    // array's pre-local value here (None if it didn't exist) and takes
-    // the name away from it, so returning from the function restores
-    // whatever the caller had -- a save/restore shadow rather than a real
-    // nested scope chain, since `arrays`/`assoc_arrays` themselves stay
-    // flat (see the comment on `arrays` above).
+    // One frame per function call. `local -a`/`-A name` saves the array's
+    // previous value here (`None` if it didn't exist), and returning
+    // restores it, so `arrays`/`assoc_arrays` stay flat.
     array_local_stack: ArrayShadowStack<std::collections::BTreeMap<usize, String>>,
     assoc_local_stack: ArrayShadowStack<OrderedMap>,
-    // `declare -n`/`local -n ref=target`: ref's own stored value is the
-    // *name* of the target variable, not user data -- lookup_var/assign_var/
-    // var_is_set all redirect through resolve_nameref for any name in this
-    // set before doing anything else, so reading/writing `ref` transparently
-    // reads/writes `target` instead. Scalars only; array-element namerefs
-    // (`declare -n ref=arr[0]`) aren't supported, a scoped gap.
+    // `declare -n ref=target`: `ref` holds the target's name, and lookups,
+    // assignments and `var_is_set` follow it (`resolve_nameref`). Scalars
+    // only; `declare -n ref=arr[0]` isn't supported.
     pub(crate) nameref_names: std::collections::HashSet<String>,
-    // Scoping for `local -n` (mirrors array_local_stack): each frame
-    // records, for every name it nameref'd, whether that name was already
-    // a nameref beforehand -- so call_function can undo just the
-    // membership change on return without disturbing a same-named nameref
-    // the *caller* had declared. `declare -n` at top level (empty
-    // var_scopes) has no frame to push onto and just leaks globally,
-    // matching bash's own top-level `declare -n` behavior.
+    // `local -n` scoping, like `array_local_stack`: per frame, each name
+    // made a nameref and whether it already was one, so returning undoes
+    // only this function's change. A top-level `declare -n` has no frame
+    // and stays, as in bash.
     nameref_local_stack: Vec<Vec<(String, bool)>>,
-    // pushd/popd/dirs: does NOT include the current directory itself (bash
-    // convention -- `dirs` prints cwd first, then this stack). `+N`/`-N`
-    // rotation forms aren't implemented, a scoped gap.
+    // pushd/popd/dirs, without the current directory, which `dirs` prints
+    // first. The `+N`/`-N` rotation forms aren't implemented.
     pub(crate) dir_stack: Vec<String>,
-    // shopt -s/-u NAME: explicit overrides only, keyed by name -- absent
-    // means "use that name's own default from KNOWN_SHOPT_OPTIONS", not
-    // "off" (several real bash options, e.g. cmdhist/promptvars, default
-    // on). Most of these have no actual effect on bish's behavior beyond
-    // being trackable/queryable/listable (e.g. extglob is unconditionally
-    // on regardless of this map, see glob.rs), but recognizing the names
-    // at all means `shopt -s extglob`/`shopt -s nullglob` in a script no
-    // longer fails as an unknown command, which would otherwise abort the
-    // whole script under `set -e`.
+    // `shopt -s`/`-u` overrides by name; absent means the default in
+    // `KNOWN_SHOPT_OPTIONS` (some are on). Most only need to be accepted,
+    // so `shopt -s nullglob` in a script under `set -e` doesn't abort it.
     pub(crate) shopt_options: std::collections::HashMap<String, bool>,
-    // `bishopt --set/--unset NAME [VALUE]`: bish's own config surface, a
-    // deliberately separate namespace from shopt_options above (shopt
-    // exists only for bash-script compatibility -- see KNOWN_BISHOPTS'
-    // own doc comment for why the two shouldn't mix). Same override-only
-    // shape as shopt_options: absent means "use that option's own
-    // registered default", `--unset` removes the entry outright rather
-    // than writing the default back, so "explicitly unset" and "never
-    // touched" collapse to the same state.
-    /// What `$$` reports: the PID of the shell that started, not of
-    /// whichever process is asking.
-    ///
-    /// Read from state rather than from `getpid` because a forked child
-    /// -- a background job, a `( ... ) &` -- must still say the
-    /// *parent's* PID. POSIX is explicit that `$$` does not change in a
-    /// subshell, and scripts depend on it: `kill -HUP -$$` from a
-    /// background helper means "signal the whole thing I am part of",
-    /// and with the child's own PID it means nothing at all. `BASHPID`
-    /// is the one that answers "which process is this", and it asks the
-    /// kernel every time.
-    ///
-    /// A re-exec'd continuation of this shell is told the value
-    /// through `REEXEC_SHELL_PID`; a genuinely new shell process (a
-    /// user's own `bish -c`, the session daemon) gets its own from
-    /// `Shell::new`.
+    /// What `$$` reports: the PID of the shell that started, not of the
+    /// process asking. POSIX keeps `$$` the same in a subshell, and scripts
+    /// rely on it (`kill -HUP -$$` from a background helper); `BASHPID` asks
+    /// the kernel. A re-exec'd shell is told it through `REEXEC_SHELL_PID`; a
+    /// new shell process gets its own in `Shell::new`.
     pub(crate) shell_pid: u32,
+    // `bishopt --set`/`--unset`, bish's own settings, kept apart from
+    // `shopt_options` (see `KNOWN_BISHOPTS`). Overrides only: `--unset`
+    // removes the entry, so unset and never set are the same state.
     pub(crate) bishopts: std::collections::HashMap<String, BishOptValue>,
     // `::bish theme` declarations: theme name to the bishopt overrides
     // captured while declaring it (see `pending_theme`). When the `theme`
@@ -1552,32 +1449,14 @@ pub struct Shell {
     // would call `f` again at every level on the way out, taking exponential
     // time. bash longjmps to the top level; this flag stands in for that.
     nesting_unwind: bool,
-    // `coproc`'s pipe halves that the *shell* keeps (the coprocess's own
-    // ends are handed to the child and closed here after spawn). Kept
-    // alive here, keyed by raw fd number, for as long as the coprocess
-    // might still be interacted with -- otherwise the PipeReader/Writer
-    // would drop and close the fd the moment run_coproc returns. Numbered-
-    // fd redirects on *other* commands (`cmd <&"${NAME[0]}"`) just need
-    // the fd number to still be open in this process at dup2 time, which
-    // this satisfies without those redirects needing to know anything
-    // about coproc specifically; `read -u FD` is the one thing that reads
-    // through this table directly (see run_single's "read" arm).
+    // The shell's ends of `coproc` pipes, by fd, kept open while the
+    // coprocess may be used (the coprocess's ends go to the child). A
+    // redirect like `cmd <&"${NAME[0]}"` only needs the fd open; `read -u`
+    // reads through this table.
     coproc_fds: std::collections::HashMap<i32, KeptFd>,
-    // `set -n`/`-o noexec`, and `bish -n`: read and parse, run nothing.
-    //
-    // A syntax check, and the one shell flag whose whole value is that
-    // it does *not* run the thing you pointed it at -- which is why it
-    // had to be more than accepted. `n` has been in `SET_FLAGS` since
-    // that list was written, so `set -n` was taken without complaint
-    // and then dropped by `apply_shell_flag`'s catch-all: a script that
-    // asked not to run ran.
-    //
-    // Honoured only when this shell is not interactive, which is bash's
-    // own rule and not a simplification -- a prompt that parsed your
-    // line and declined to run it would have no way left to say `set
-    // +n`, since that command would not run either. Non-interactively
-    // that irreversibility is the point: once it is on, nothing turns
-    // it off, because nothing runs.
+    // `set -n`, `-o noexec`, `bish -n`: parse, run nothing. Only when not
+    // interactive, as in bash: a prompt that ran nothing could never take
+    // `set +n`. Once on, nothing turns it off, because nothing runs.
     opt_noexec: bool,
     // `set -e`/`-u`/`-x`/`-o pipefail`/`-f`.
     opt_errexit: bool,
@@ -1585,61 +1464,36 @@ pub struct Shell {
     opt_xtrace: bool,
     opt_pipefail: bool,
     opt_noglob: bool,
-    // `set -m`/`-o monitor`: real bash's `fg`/`bg` refuse to run at all
-    // ("no job control") unless this is on -- confirmed against real bash,
-    // which defaults it off for a non-interactive script (only real
-    // interactive shells, or a script that explicitly opts in, get it).
-    // `jobs`/`wait`/`kill` aren't gated by this; only fg/bg are.
+    // `set -m`: `fg` and `bg` refuse without it ("no job control"), as in
+    // bash, which has it off in scripts. `jobs`, `wait` and `kill` don't
+    // care.
     pub(crate) opt_monitor: bool,
-    // `set -r` (bash's own restricted-shell mode -- NOT the same thing
-    // as restrict_to_builtins below, which is bish's own unrelated
-    // command-mode-colon-line feature). Only a short flag in real bash
-    // -- confirmed there's no `-o restricted` name at all (`set -o`'s
-    // own listing never includes it, unlike every other `-o` name). A
-    // one-way latch: apply_shell_flag only ever turns this on, never
-    // off, matching real bash's own "turning off restricted mode is not
-    // possible" rule (confirmed: `set +r` errors there and leaves it
-    // set). See run_cd/the "exec"/"."/"source" arms in run_single,
-    // check_restricted_command_name, and open_out for what it actually
-    // enforces.
+    // `set -r`, bash's restricted mode (unrelated to
+    // `restrict_to_builtins`). No `-o` name, as in bash. One-way: `set +r`
+    // can't turn it off. Enforced in `run_cd`, the `exec`/`.`/`source` arms,
+    // `check_restricted_command_name` and `open_out`.
     opt_restricted: bool,
-    // `set -C` / `set -o noclobber`: a plain `>` refuses to truncate an
-    // existing regular file. Enforced in open_out, the one place every
-    // output redirect opens its file (see its own doc comment), and
-    // defeated per-redirect by `>|`, which carries a `clobber` flag all
-    // the way from the lexer for exactly this.
+    // `set -C`: a plain `>` refuses to truncate an existing regular file.
+    // Enforced in `open_out`; `>|` carries a `clobber` flag past it.
     opt_noclobber: bool,
-    // `set -o posix`: recognized and toggleable (so a script that
-    // merely checks/sets it doesn't break) but not behaviorally
-    // enforced -- real POSIX mode is dozens of small, scattered parsing/
-    // expansion differences throughout bash; this doesn't attempt that,
-    // same "accepted but not enforced" spirit as this shell's own -u/
-    // -l/-n declare attributes on names that aren't its own scalar
-    // variables.
+    // `set -o posix`: accepted and toggleable, so scripts setting it work,
+    // but POSIX mode's many small differences aren't implemented.
     opt_posix: bool,
-    // Suppresses errexit while >0 -- set around if/while/until conditions
-    // and negated (`!`) pipelines, the cases POSIX explicitly exempts from
-    // triggering -e (a failing condition is meant to be checked, not
-    // treated as a fatal error).
+    // Suppresses errexit while above zero: around if/while/until conditions
+    // and `!` pipelines, which POSIX exempts from `-e`.
     suppress_errexit: u32,
-    // Set by run_and_or when the status it returns came from a command
-    // `set -e` does not apply to. bash exits on a failing pipeline
-    // "except the command following the final && or ||" -- so in
-    // `false && echo no` the `false` is exempt and the `echo` never
-    // runs, and the whole list's failing status must not abort the
-    // shell either. Only the ListItem check below reads it.
+    // Set by `run_and_or` when its status came from a command `set -e`
+    // doesn't apply to: bash exempts all but the command after the final
+    // `&&` or `||`, so `false && echo no` doesn't abort. Read only by the
+    // ListItem check.
     errexit_exempt: bool,
-    // The exit status of the most recent `$(...)`, for the one command
-    // that takes it as its own: a bare assignment. `x=$(false)` is a
-    // failing command in bash -- which is what makes `set -e` catch a
-    // failed capture, the single most common way a strict script means
-    // to stop.
+    // The status of the latest `$(...)`, for a bare assignment, which takes
+    // it as its own: `x=$(false)` fails in bash, which is how `set -e`
+    // catches a failed capture.
     last_subst_status: Option<i32>,
-    // Set by run_single around a command's own word-expansion so mid-
-    // expansion diagnostics (nounset's "unbound variable", etc) go to that
-    // command's own `2>` target instead of unconditionally to the shell's
-    // real stderr, matching bash routing its own error messages through
-    // the command's redirects too.
+    // The current command's `2>` target while its words expand, so an
+    // error during expansion (`set -u`'s "unbound variable") follows the
+    // command's redirect, as in bash.
     current_stderr_target: Option<String>,
     // Set while running command-mode (`:`) input: only builtins run directly
     // (see the gate in `run_single` before function lookup); `command NAME`
@@ -1852,9 +1706,8 @@ impl Shell {
             integer_names: std::collections::HashSet::new(),
             upper_names: std::collections::HashSet::new(),
             lower_names: std::collections::HashSet::new(),
-            // A variable inherited from the environment is an exported
-            // variable -- bash's rule, and what makes `env` agree with
-            // `declare -p` on a fresh shell.
+            // A variable inherited from the environment is exported, as in
+            // bash, so `env` agrees with `declare -p`.
             exported_names: Rc::new(inherited.iter().map(|(k, _)| k.clone()).collect()),
             alias_epoch: 0,
             process_restore: ProcessRestore::default(),
@@ -1914,9 +1767,9 @@ impl Shell {
             pending_exit: None,
             redirect_scopes: 0,
             exit_trap_deferred: false,
-            // A continuation of some other shell -- a background job, a
-            // pipeline stage, anything else re-executed -- is told that
-            // shell's `$$`, which is how it can tell it is one.
+            // A re-executed continuation of another shell (a background
+            // job, a pipeline stage) is told that shell's `$$`, which is
+            // how it knows.
             forked_subshell: shell_pid != crate::platform::process_id(),
             interactive: false,
             started_as_login: false,
@@ -2201,40 +2054,32 @@ impl Shell {
             debug_hook: self.debug_hook.clone(),
             current_line: self.current_line,
             subshell_depth: self.subshell_depth + 1,
-            // Shared with the parent (Rc), not re-collected from the
-            // real process: it is equal to `self.env_snapshot` at this
-            // exact instant regardless (new_virtual_child only ever runs
-            // while `self` is the currently-synced-in session; see
-            // sync_real_state_in/out's own doc comment), and only
-            // session switching ever reads it -- a foreground `$( )`
-            // child never does, so re-collecting `std::env::vars()`
-            // here was pure cost on the hottest path in the shell.
-            // Writers (`run_cd`, `set_terminal_capability_env`) go
-            // through Rc::make_mut.
+            // Shared with the parent: it equals `self.env_snapshot` at this
+            // point (a virtual child is only made in the synced-in
+            // session), and only session switching reads it. Writers
+            // (`run_cd`, `set_terminal_capability_env`) go through
+            // `Rc::make_mut`.
             env_snapshot: Rc::clone(&self.env_snapshot),
             umask_snapshot: current_umask(),
         }
     }
 
-    // True once `window`-family promotion has switched the terminal into
-    // full-screen mode -- repl.rs checks this at exit time to know whether
-    // it needs to restore the normal screen buffer before quitting.
+    // True once promotion has switched the terminal to full screen; repl.rs
+    // checks at exit whether to restore the normal screen.
     pub fn is_promoted(&self) -> bool {
         self.promoted.get()
     }
 
-    /// Marks this shell promoted without the screen-switching escapes
-    /// `promote_if_needed` prints -- for a caller that is capturing
-    /// output rather than showing it, which is bashdiff's pane corpus
-    /// and nothing else.
+    /// Marks this shell promoted without printing the screen-switching
+    /// escapes, for a caller capturing output rather than showing it:
+    /// bashdiff's pane corpus.
     pub fn mark_promoted(&self) {
         self.promoted.set(true);
     }
 
-    /// Runs a job the last command handed off, here, and returns its
-    /// status -- what repl.rs would otherwise have driven. See
-    /// `drive_pending_fg_inline`; this is its one caller outside the
-    /// execution path itself.
+    /// Runs a job the last command handed off, here, returning its status,
+    /// instead of repl.rs driving it. See `drive_pending_fg_inline`; this is
+    /// its one caller outside execution.
     pub fn settle_pending_fg(&mut self) -> i32 {
         match self.pending_fg.is_some() {
             true => self.drive_pending_fg_inline(),
@@ -2530,10 +2375,9 @@ impl Shell {
             }
             fed
         };
-        // A peer asking about the editor is answered from in here too --
-        // see `session::service_while_busy` -- at most every 10ms, so a
-        // job that prints without pause does not pay for the socket on
-        // every read.
+        // A peer asking about the editor is answered from here too
+        // (`session::service_while_busy`), at most every 10ms, so a job that
+        // prints nonstop doesn't pay for the socket on every read.
         let mut serviced = std::time::Instant::now();
         loop {
             let fed = drain(&mut job);
@@ -2549,11 +2393,9 @@ impl Shell {
                 break;
             }
             if !fed {
-                // Nothing to read and not finished. A `<( )` producer
-                // feeding this command is a coroutine in this process,
-                // so give it a turn before sleeping -- it is the only
-                // thing that can put bytes in the pipe this command is
-                // blocked on.
+                // Nothing to read, not finished. A `<( )` producer feeding
+                // this command is a coroutine here, the only thing that can
+                // fill its pipe, so it gets a turn before sleeping.
                 self.pump_coroutines();
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -2561,17 +2403,15 @@ impl Shell {
         // Whatever landed between the last read and the child exiting.
         drain(&mut job);
         let status = job.wait();
-        // Now the command really has finished reading, so any `<( )`
-        // feeding it can be torn down -- deferred from wherever it was
-        // skipped while this job was pending.
+        // The command has finished reading, so any `<( )` feeding it can be
+        // torn down.
         self.drain_proc_subs();
         status
     }
 
-    /// Turns a bubbled `ExecResult::Fg` into an ordinary status by
-    /// running the job here -- for every caller that has more to do
-    /// afterwards and so cannot let the escape past. Anything else is
-    /// handed straight back.
+    /// Turns a bubbled `ExecResult::Fg` into a status by running the job
+    /// here, for callers with more to do afterwards. Anything else is
+    /// returned as is.
     fn settle_fg(&mut self, result: ExecResult) -> ExecResult {
         match result {
             ExecResult::Fg => {
@@ -2822,11 +2662,8 @@ impl Shell {
         status
     }
 
-    // The attribute-flag letters bash's own declare -p/${v@a}/${v@A} all
-    // use, in the same fixed order: array-ness (A/a, mutually exclusive)
-    // first, then i/r/x/n/u/l. Shared by declare_p_line (declare -p's
-    // own output), transform_attributes (${v@A}), and, standing alone,
-    // ${v@a} itself.
+    // The attribute letters `declare -p`, `${v@a}` and `${v@A}` show, in
+    // bash's order: `A`/`a` first, then `i`, `r`, `x`, `n`, `u`, `l`.
     fn attribute_flags_string(&self, name: &str) -> String {
         let mut flags = String::new();
         if self.assoc_names.contains(name) {
@@ -2855,27 +2692,12 @@ impl Shell {
         flags
     }
 
-    // ${v@A}: an assignment/`declare` statement that would recreate the
-    // named variable, matching real bash's own (slightly inconsistent)
-    // formatting rules -- confirmed against real bash:
-    // - A full array/assoc reconstruction (single_element is None and
-    //   the name is array/assoc) is identical to declare -p's own
-    //   output (double-quoted elements, always "declare -a"/"-A"
-    //   prefixed) -- bash's own bare `${arr@A}` (no subscript) actually
-    //   collapses to just the first element instead, a quirk this
-    //   deliberately doesn't replicate since reconstructing the *whole*
-    //   array is what a script reaching for @A almost certainly wants
-    //   (bish also doesn't collapse a bare `$arr` to `${arr[0]}` at
-    //   all, a separate pre-existing simplification this doesn't fix
-    //   either).
-    // - Anything else (a plain scalar, or one specific array/assoc
-    //   index via `single_element`) is single-quoted, with a leading
-    //   "declare -flags" only when there's at least one real attribute
-    //   -- a bare `name='value'` otherwise (unlike declare -p, which
-    //   always prefixes even a plain scalar with "declare --"). An
-    //   array/assoc name still shows its own -a/-A flag here even for
-    //   one specific element, matching bash's own `${arr[0]@A}` ->
-    //   `declare -a arr='1'`.
+    // `${v@A}`: a statement that recreates the variable, as bash formats
+    // it. A whole array is `declare -p`'s output; bash collapses a bare
+    // `${arr@A}` to the first element, but the whole array is what a script
+    // wants. A scalar or one element is single-quoted, prefixed by
+    // `declare -flags` only when there are attributes; an array element
+    // still shows `-a` (`${arr[0]@A}` is `declare -a arr='1'`).
     fn transform_attributes(&mut self, name: &str, single_element: Option<&str>) -> String {
         let is_array = self.assoc_names.contains(name) || self.arrays.contains_key(name) || self.array_names.contains(name);
         if is_array && single_element.is_none() {
@@ -3045,19 +2867,8 @@ impl Shell {
         Some(format!("declare {} {}={}", flag_str, name, declare_p_quote(&value)))
     }
 
-    // Turns a shopt on for a default a mode implies, such as
-    // `expand_aliases` for an interactive shell, bash's rule.
-    /// Substitutes this shell's aliases into a tokenized line, when
-    /// `shopt -s expand_aliases` says to.
-    ///
-    /// Public so every place that turns text into a `Program` can go
-    /// through it -- there are several (`eval`, `source`, a script,
-    /// the interactive prompt, command mode) and an alias that worked
-    /// in one and not the others would be worse than none at all.
-    /// Turns a shopt on from Rust, for a default a *mode* implies rather
-    /// than a user does -- `expand_aliases` for an interactive shell,
-    /// which is bash's own rule and not something anyone should have to
-    /// write in a config file.
+    /// Turns a shopt on from Rust, for a default a mode implies:
+    /// `expand_aliases` for an interactive shell, as in bash.
     pub fn enable_shopt(&mut self, name: &str) {
         self.shopt_options.insert(name.to_string(), true);
     }
@@ -3179,9 +2990,8 @@ impl Shell {
         })
     }
 
-    /// Every highlight colour currently in force, theme included --
-    /// what a redraw builds its overrides from, and what `::bish hl`
-    /// with no arguments lists.
+    /// Every highlight colour in force, theme included: what a redraw builds
+    /// its overrides from, and what bare `::bish hl` lists.
     pub fn hl_colors(&self) -> Vec<(String, String)> {
         let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         if let Some(BishOptValue::Str(active)) = self.bishopts.get("theme") {
@@ -5304,9 +5114,8 @@ impl Shell {
         // `<( )` producer's next write fails, a `>( )` consumer sees end of
         // input.
         self.proc_sub_pipes.clear();
-        // Then let them finish. A consumer *has* to be given this --
-        // `printf x > >(wc -l)` has only just been handed its input --
-        // and a producer takes a turn or two to notice and stop.
+        // Then let them finish: a consumer (`printf x > >(wc -l)`) has only
+        // just had its input, and a producer takes a turn or two to stop.
         for _ in 0..PROC_SUB_WINDDOWN_TURNS {
             if !self.has_live_coroutines() {
                 break;
@@ -5635,10 +5444,9 @@ impl Shell {
                     continue;
                 }
                 ExecResult::Status(s) => self.last_status = s,
-                // A loop body always has the next iteration behind it
-                // -- `for f in a b c; do cp "$f" d/; done` copied only
-                // `a` before this, because the first `cp` escaped with
-                // the rest of the loop still to run. See settle_fg.
+                // A loop body has the next iteration behind it, so the job
+                // is settled here (`for f in a b c; do cp "$f" d/; done`).
+                // See `settle_fg`.
                 ExecResult::Fg => {
                     let status = self.drive_pending_fg_inline();
                     self.last_status = status;
@@ -5962,9 +5770,8 @@ impl Shell {
             // checked on the second word, which tells it from the case
             // below.
             [_, op] if crate::builtins::is_binary_op(op) => Some("unexpected argument `]]' to conditional binary operator".to_string()),
-            // `[[ a b ]]`, `[[ = a ]]`, `[[ -eq a ]]` -- two words with
-            // nothing between them that could join them. bash names the
-            // *second* word here, since that is the one that arrived where
+            // `[[ a b ]]`, `[[ = a ]]`, `[[ -eq a ]]`: two words with
+            // nothing to join them. bash names the second, which came where
             // an operator was due.
             [first, second] if !crate::builtins::is_unary_op(first) => {
                 Some(format!("unexpected token `{second}', conditional binary operator expected"))
@@ -5973,9 +5780,8 @@ impl Shell {
         }
     }
 
-    /// A name for an atom that is not a word, for an error message. The
-    /// alternative is `{:?}` on the enum, which is how `syntax error near
-    /// None` reached a user.
+    /// A name for a non-word atom in an error message, rather than the
+    /// enum's `{:?}`.
     fn test_atom_name(atom: &parser::TestAtom) -> &'static str {
         match atom {
             parser::TestAtom::And => "&&",
@@ -5993,10 +5799,8 @@ impl Shell {
             [op, a] => {
                 let op = self.expand_word(op);
                 let a = self.expand_word(a);
-                // `-v` asks about a *name*, where every other unary
-                // test asks about the text one expands to -- so it
-                // cannot go through `builtins::unary` with the rest,
-                // which has no shell to ask.
+                // `-v` asks about a name, not the text, so it can't go
+                // through `builtins::unary`, which has no shell to ask.
                 match op.as_str() {
                     "-v" => self.name_is_set(&a),
                     // Same reason as `-v`: it asks the shell, not the
@@ -6345,17 +6149,10 @@ impl Shell {
             return ExecResult::Status(self.last_subst_status.take().unwrap_or(0));
         }
 
-        // Named before anything is expanded, and named as it was
-        // *written*. Both halves were wrong: the name was built from the
-        // expanded argv further down, so `echo "$v" a*` reported itself
-        // as `echo q a*`, and it was assigned after expansion, so a
-        // command reading `$BASH_COMMAND` in its own words got the
-        // *previous* command's text. Writing the source back out is
-        // only possible now that a word remembers how it was spelled.
-        // Not while a trap is running: `$BASH_COMMAND` names the
-        // command the trap is *about*, and the trap's own body is made
-        // of commands too. Saving it around the trap does not help --
-        // the body both overwrites and reads it from the inside.
+        // Named before expansion, as written: `echo "$v" a*`, not
+        // `echo q a*`, and a command reading `$BASH_COMMAND` in its own
+        // words sees itself. Not while a trap runs: `$BASH_COMMAND` names
+        // the command the trap is about.
         if !self.in_trap {
             self.bash_command = crate::serialize::rendered_command(cmd);
         }
@@ -6645,23 +6442,14 @@ impl Shell {
         // too, with "not a shell builtin", which falling through gives.
         let dispatch_name: &str = if self.disabled_builtins.contains(&name) { "\u{0}disabled" } else { name.as_str() };
         match dispatch_name {
-            // POSIX special builtin: does nothing, exits 0. Its arguments
-            // are still expanded (already done via argv above) for side
-            // effects like `: ${x:=default}`. Its own redirects (e.g.
-            // `: > file`) still create/truncate the target, same as real
-            // bash -- a side effect of the output-sink override the outer
-            // dispatch_builtin_or_external wrapper installs regardless of
-            // which builtin ends up running, not anything special-cased
-            // here.
+            // `:` does nothing and exits 0. Its arguments are already
+            // expanded (`: ${x:=default}`), and its redirects still create
+            // their targets (`: > file`) through the builtin sink.
             ":" => return ExecResult::Status(0),
-            // command [-v|-V] name [args...]. -v/-V (by far the dominant
-            // real-world use, e.g. `command -v git >/dev/null`) report
-            // what `name` resolves to without running it. Bare `command
-            // name args...` runs it, bypassing shell functions -- the
-            // other thing `command` is for -- by spawning directly as an
-            // external process; unlike real bash this also bypasses
-            // builtins of the same name, a simplification accepted since
-            // this shell doesn't have many commonly-shadowed builtins.
+            // `command [-v|-V] name [args...]`. `-v`/`-V` report what
+            // `name` resolves to without running it
+            // (`command -v git >/dev/null`). Bare, it runs `name` as an
+            // external, past functions and, unlike bash, builtins too.
             "command" => {
                 let mut i = 1;
                 let mut mode_v = false;
@@ -6701,16 +6489,10 @@ impl Shell {
                     return ExecResult::Status(1);
                 }
                 let mut ext = self.command(&argv[i]);
-                // `-p` is POSIX's "find the standard utility, not
-                // whatever the caller's PATH points at" -- the form a
-                // careful script writes when it means the real `rm`, not
-                // a directory planted ahead of it. It had been parsed and
-                // then ignored for resolution, so `command -p rm` still
-                // searched the inherited PATH. Now it searches a fixed
-                // standard path (what `getconf PATH` reports on the
-                // systems bish runs on), for the lookup and for the
-                // command's own environment, since `std::process::Command`
-                // uses the one PATH for both.
+                // `-p` searches a fixed standard path (`getconf PATH`'s
+                // answer) instead of the caller's PATH, for the lookup and
+                // the command's environment, since `Command` uses one PATH
+                // for both.
                 if mode_p {
                     ext.env("PATH", "/usr/bin:/bin");
                 }
@@ -7016,9 +6798,8 @@ impl Shell {
                     },
                     None => 1,
                 };
-                // Shifting past the end is a no-op that *reports* --
-                // `while shift; do ...; done` is how a script walks its
-                // arguments, and it never stops if this always says 0.
+                // Shifting past the end reports failure:
+                // `while shift; do ...; done` would never stop otherwise.
                 let available = self.arg_frames.last().map(Vec::len).unwrap_or(0);
                 if n > available {
                     return ExecResult::Status(1);
@@ -7033,31 +6814,22 @@ impl Shell {
                     sh_eprintln!(self, "bish: local: can only be used inside a function");
                     return ExecResult::Status(1);
                 }
-                // `-a`/`-A` name an array rather than a scalar. `arrays`/
-                // `assoc_arrays` themselves stay flat maps (see the
-                // comments on those fields), but the pre-local value is
-                // snapshotted onto array_local_stack/assoc_local_stack so
-                // call_function can restore it when the function returns --
-                // giving `local -a`/`-A` real scoping without needing every
-                // array read/write site to walk a scope chain.
+                // `-a`/`-A` make an array. `arrays`/`assoc_arrays` stay
+                // flat; the previous value is saved on
+                // `array_local_stack`/`assoc_local_stack` and restored on
+                // return.
                 let mut array_mode: Option<bool> = None;
                 let mut integer_flag = false;
                 let mut nameref_flag = false;
-                // -u/-l/-x attribute membership (like -i above) isn't
-                // unwound when the function returns -- a narrower, already-
-                // accepted gap than the array/nameref leak this function
-                // otherwise guards against, since getting a case-fold or
-                // export attribute stuck past its function is cosmetic
-                // rather than silently wrong data.
+                // `-u`/`-l`/`-x`, like `-i`, aren't undone on return: a
+                // leftover case-fold or export attribute is cosmetic, not
+                // wrong data.
                 let mut upper_flag = false;
                 let mut lower_flag = false;
                 let mut export_flag = false;
-                // `-g`: force the write to the true global scope instead
-                // of a local shadow -- confirmed against real bash
-                // (`f() { local -g x=5; }; f; echo "$x"` prints "5"),
-                // even though `local`'s whole point is otherwise to
-                // localize. Only meaningful for the scalar (non-array,
-                // non-nameref) case below.
+                // `-g` writes the global, past any local, as in bash
+                // (`f() { local -g x=5; }; f; echo "$x"` prints 5). Scalars
+                // only.
                 let mut global_flag = false;
                 // array_literal_args is indexed into the *original* argv
                 // (which still has argv[0] == "local"), so every position
@@ -8032,11 +7804,9 @@ impl Shell {
                 {
                     actions.push(FdAction::Open { fd: 2, file: err });
                 }
-                // And stdin, for the same reason: `{ cat; } < file` in a
-                // pane handed `cat` the pty instead of the file, and it
-                // sat there reading a terminal nothing would ever type
-                // into. Heredocs on a group or a function hung the same
-                // way.
+                // And stdin: `{ cat; } < file` in a pane must read the
+                // file, not the pty. The same for a heredoc on a group or
+                // function.
                 if let Some(o) = self.stdio_override.as_ref()
                     && let Some(input) = o.borrow().stdin.as_ref().and_then(|r| r.borrow().file.try_clone().ok())
                 {
@@ -8055,19 +7825,13 @@ impl Shell {
                             self.push_job_with_pty(vec![child], cmd_text, Some(p.master));
                             ExecResult::Status(0)
                         } else {
-                            // Foreground: bubble up exactly like a
-                            // backgrounded-then-explicitly-`fg`'d pty job
-                            // does (see ExecResult::Fg's doc comment) --
-                            // repl.rs's drive_fg_job already handles
-                            // rendering into the grid and forwarding
-                            // stdin (Ctrl-C/Ctrl-Z included -- see
-                            // FgJob::poll_untraced for why a Ctrl-Z here
-                            // is correctly caught as a real stop, not
-                            // silently ignored). `id: 0` is a throwaway
-                            // placeholder: this job only needs a real
-                            // job-table id if it ends up Stopped (see
-                            // Shell::park_stopped_fg_job), not just to
-                            // run and exit normally.
+                            // Foreground: handed to repl.rs like a job
+                            // brought back with `fg` (see
+                            // `ExecResult::Fg`), whose `drive_fg_job`
+                            // renders it and forwards input, Ctrl-C and
+                            // Ctrl-Z included. `id: 0` is a placeholder; a
+                            // real id is only needed if it stops
+                            // (`park_stopped_fg_job`).
                             self.pending_fg = Some(Job {
                                 id: 0,
                                 pids: vec![child.id()],
@@ -8453,21 +8217,10 @@ impl Shell {
         // stage order, and with a stage running in this shell rather
         // than as a child the two orders stop being the same.
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(n);
-        // Stages that never started, and the status they stand for. A
-        // pipeline is not over because one of its commands does not
-        // exist -- see the `spawn` failure arm below -- so these are
-        // folded into `codes` alongside the ones that really ran.
-        // Every stage is named and traced before any of them runs, which
-        // is bash's own order -- all three traces of a three-stage
-        // pipeline arrive before its first byte of output. bish fired
-        // the trap only for the stage that runs in this shell, so
-        // `echo a | cat` traced one command and `/bin/echo a |
-        // /bin/cat` traced none at all.
-        //
-        // Only a *simple* stage. bash does not trace a compound one,
-        // nor anything inside it: `{ echo g; } | cat` traces `cat`
-        // alone, because the group is a subshell and a DEBUG trap is
-        // not inherited into one.
+        // Every simple stage is traced before any runs, as in bash: all
+        // three traces of a three-stage pipeline come before its output.
+        // Compound stages aren't traced, inside either: a group is a
+        // subshell, and DEBUG isn't inherited into one.
         if self.debug_trap.is_some() {
             for cmd in commands {
                 if let parser::Command::Simple(sc) = cmd
@@ -8478,6 +8231,8 @@ impl Shell {
                 }
             }
         }
+        // Stages that never started, and their status. A pipeline isn't over
+        // because one command doesn't exist, so these join `codes`.
         let mut never_started: Vec<(usize, i32)> = Vec::new();
         // The previous stage's read end, as an fd, since `lastpipe` needs
         // one.
@@ -8783,10 +8538,9 @@ impl Shell {
             restore_fd012(saved);
         }
 
-        // The stage that runs here rather than as a child -- after
-        // every other stage is spawned, and before any of them is
-        // waited for. They are what drains the pipe it writes and fills
-        // the pipe it reads, so they have to be running while it does.
+        // The stage that runs here, after every other stage is spawned and
+        // before any is waited for: they drain the pipe it writes and fill
+        // the pipe it reads.
         let mut inproc_code = None;
         if let (Some(stage), Some((stdin_fd, stdout_fd))) = (inproc_stage, inproc_stdio.take()) {
             use std::os::fd::AsRawFd;
@@ -8794,13 +8548,11 @@ impl Shell {
             if let Some(fd) = &stdin_fd {
                 crate::platform::duplicate_onto(fd.as_raw_fd(), 0);
             }
-            // The last stage has no pipe to write into, so fd 1 would
-            // stay this shell's own -- the real terminal, which in a
-            // pane is painted over. That is invisible to a *builtin*
-            // here (it writes to the sink, which is the grid) but not
-            // to anything this stage spawns: `echo a | { read x; cat; }`
-            // lost the `cat` entirely. Its stderr too, which is where
-            // an external inside a compound or a loop was going.
+            // The last stage has no pipe to write into, so its fd 1 would
+            // be the real terminal, which a pane paints over. A builtin
+            // writes to the grid anyway, but what it spawns doesn't:
+            // `echo a | { read x; cat; }` would lose the `cat`. The same
+            // for stderr.
             let pane_slave = match (stdout_fd.is_none(), &pane_pty) {
                 (true, Some(p)) => std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok(),
                 _ => None,
@@ -8812,13 +8564,9 @@ impl Shell {
             if let Some(fd) = &stdout_fd {
                 crate::platform::duplicate_onto(fd.as_raw_fd(), 1);
             }
-            // A virtual child rather than `run_command` directly: every
-            // stage of a pipeline is a subshell in bash, so an
-            // assignment here must not escape. That is exactly what this
-            // already gives `( )`, and the one thing `lastpipe` above
-            // deliberately does not do.
-            // Armed only around this: an `EPIPE` anywhere else is
-            // still ignored, as it always was.
+            // A virtual child, since every pipeline stage is a subshell in
+            // bash and an assignment mustn't escape; `lastpipe` above
+            // deliberately doesn't. `EPIPE` is watched only around it.
             arm_broken_pipe();
             // The write end is also this stage's explicit stdout, not just
             // fd 1: a builtin writes to the shell's sink, still the
@@ -9427,11 +9175,9 @@ impl Shell {
         arith::eval(raw, self)
     }
 
-    // What a `~` prefix stands for. Empty is `$HOME`; `+` and `-` are
-    // bash's spellings of `$PWD` and `$OLDPWD`; anything else is a user
-    // name, looked up in /etc/passwd. A name with no home found is left
-    // as it was written, which is what bash does -- `~nosuchuser/x`
-    // really is the literal path `~nosuchuser/x`.
+    // What a `~` prefix stands for: empty is `$HOME`, `+` and `-` are `$PWD`
+    // and `$OLDPWD`, anything else a user name from /etc/passwd. A name with
+    // no home stays as written, as in bash: `~nosuchuser/x` is literal.
     fn expand_tilde(&mut self, name: &str) -> String {
         match name {
             "" => self.lookup_var("HOME"),
@@ -9931,10 +9677,9 @@ impl Shell {
     }
 
     /// What the next statement's reading of the source depends on: the
-    /// table itself, and whether it would be consulted at all. Compared
-    /// across a statement to decide whether the rest has to be read
-    /// again -- `shopt -s expand_aliases` alone changes nothing about
-    /// the table but everything about what the next line means.
+    /// table, and whether it's consulted. Compared across a statement to
+    /// decide whether the rest must be read again, since
+    /// `shopt -s expand_aliases` changes what the next line means.
     fn alias_epoch(&self) -> (u64, bool) {
         (self.alias_epoch, self.shopt_is_on("expand_aliases"))
     }
@@ -11292,9 +11037,8 @@ impl Job {
         let (Some(master), Some(screen)) = (&mut self.pty_master, &self.sink_screen) else {
             return;
         };
-        // An editor frame owns this session's screen while it is up,
-        // and that buffer is the editor's, not this job's -- the same
-        // guard drain_background_output documents.
+        // An editor frame owns the screen while it's up; see
+        // `drain_background_output`.
         let Ok(mut screen) = screen.try_borrow_mut() else { return };
         if screen.using_alternate {
             return;
@@ -12731,8 +12475,8 @@ pub(crate) fn restore_fd012_for_scheduler(saved: [i32; 3]) {
     restore_fd012(saved);
 }
 
-// A `File` holding a duplicate of `fd` as it stands now -- the way this
-// shell names "wherever a bare `exec` just pointed this stream".
+// A `File` duplicating `fd` as it stands now: wherever a bare `exec`
+// just pointed this stream.
 fn dup_fd_as_file(fd: i32) -> Option<std::fs::File> {
     crate::platform::duplicate_as_file(fd)
 }
@@ -17254,7 +16998,7 @@ mod tests {
         assert_eq!(hook_ids(&mut shell), vec![1, 2], "ids come from a counter, in order");
         assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["rm", "1"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![2]);
-        // ...and an id is never reused, so `rm` can't hit the wrong one.
+        // An id is never reused, so `rm` can't hit the wrong one.
         assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["add", "editor:file:open", "__again"])), 0);
         assert_eq!(hook_ids(&mut shell), vec![2, 3]);
     }
@@ -17263,37 +17007,19 @@ mod tests {
         shell.lsp_servers.iter().map(|s| s.id).collect()
     }
 
-    // `KNOWN_BUILTINS` is not just the completion list: `run_multi`
-    // reads it to decide whether a pipeline stage needs the self-exec
-    // that lets a builtin run as one. A name the dispatcher handles but
-    // this list omits gets spawned as an external program instead and
-    // dies with ENOENT -- which is what `echo hi | json .` did, while
-    // `json .` on its own worked, so nothing else noticed.
-    //
-    // Read out of the source because there is no table to compare
-    // against: the dispatcher is a `match`, and the two halves can only
-    // be kept honest by looking at it. A new arm shaped differently
-    // enough to escape this regex is a false negative, not a false
-    // failure; a false *failure* means the arm is genuinely absent from
-    // the list, and adding it there is the fix.
-    // The completion menu is only worth having if it lists what is real.
-    // Asked of the dispatcher itself rather than of a second copy of the
-    // list: `::bish` says "unknown subcommand" for anything it does not
-    // handle, so running each one and looking for that answers the
-    // question directly.
+    // The `::bish` completion list must be real. Asked of the dispatcher:
+    // it says "unknown subcommand" for anything it doesn't handle.
     #[test]
     fn every_offered_bish_subcommand_is_really_dispatched() {
         let unknown = |args: &[&str]| {
             let mut shell = Shell::new();
-            // `Capture` takes stderr too, which is where the
-            // "unknown subcommand" line goes.
+            // `Capture` takes stderr, where "unknown subcommand" goes.
             let out = capture_output(&mut shell);
             crate::builtins::bish::run_bish(&mut shell, &strs(args));
             let seen = out.borrow().clone();
             seen.contains("unknown subcommand")
         };
-        // The negative control: a name nothing dispatches really does
-        // say so, or this test proves nothing.
+        // The control: an undispatched name does say so.
         assert!(unknown(&["bishNoSuchSubcommand"]), "the probe itself works");
 
         for sub in bish_subcommands() {
@@ -17304,9 +17030,7 @@ mod tests {
         }
     }
 
-    // Same question for the one flag with a fixed set of values behind
-    // it: an offered value that `add` then rejects would be worse than
-    // offering nothing.
+    // The same for the one flag with a fixed set of values.
     #[test]
     fn every_offered_apply_edits_value_is_accepted() {
         for value in lsp_apply_edits_values() {
@@ -17316,6 +17040,11 @@ mod tests {
         }
     }
 
+    // `KNOWN_BUILTINS` decides whether a pipeline stage re-execs to run a
+    // builtin; a dispatched name missing from it is spawned as a program
+    // and fails with ENOENT. The dispatcher is a `match`, so this reads
+    // the source. An arm shaped differently enough to escape the pattern
+    // is missed; a failure means the name is missing from the list.
     #[test]
     fn every_dispatched_builtin_is_known() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/exec.rs")).expect("exec.rs is readable from its own tests");
@@ -17352,8 +17081,7 @@ mod tests {
         assert_eq!(lsp_ids(&shell), vec![1, 2], "ids come from a counter, in order");
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["rm", "1"])), 0);
         assert_eq!(lsp_ids(&shell), vec![2]);
-        // Never reused, so `rm` can't hit the wrong one -- same
-        // contract `hook` ids have.
+        // Never reused, as with `hook` ids.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "gopls"])), 0);
         assert_eq!(lsp_ids(&shell), vec![2, 3]);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["rm", "99"])), 1);
@@ -17369,7 +17097,7 @@ mod tests {
         assert_eq!(server.lang, "c");
         assert_eq!(server.root_markers, vec![".git".to_string()]);
         assert_eq!(server.command_line(), "clangd --background-index");
-        // ...and a word that would stop being one word does get quoted.
+        // A word with a space in it is quoted.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "some server", "--flag=a b"])), 0);
         assert_eq!(shell.lsp_servers[1].command_line(), "'some server' '--flag=a b'");
     }
@@ -17385,8 +17113,8 @@ mod tests {
             0
         );
         assert_eq!(shell.lsp_servers[0].root_cmd, "cargo metadata | json .workspace_root");
-        // `--root` still has its default, since the command is what
-        // gets asked first and the markers are the fallback.
+        // `--root` keeps its default: the command is asked first, the markers
+        // are the fallback.
         assert_eq!(shell.lsp_servers[0].root_markers, vec![".git".to_string()]);
 
         // Either order, and the `=` spelling.
@@ -17394,8 +17122,7 @@ mod tests {
         assert_eq!(shell.lsp_servers[1].root_cmd, "go env GOMOD");
         assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
 
-        // A flag with nothing usable after it is a config error, not a
-        // silently empty command that would never run.
+        // A flag with nothing usable after it is a config error.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root-cmd"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root-cmd", "   ", "x"])), 2);
         assert_eq!(shell.lsp_servers.len(), 2);
@@ -17420,8 +17147,7 @@ mod tests {
             0
         );
         let server = &shell.lsp_servers[0];
-        // The flags are round-robin, so a `--setting` before `--lang`
-        // is not mistaken for the command to run.
+        // A `--setting` before `--lang` isn't taken for the command.
         assert_eq!(server.command, vec!["rust-analyzer".to_string()]);
         assert_eq!(server.lang, "rust");
         assert_eq!(
@@ -17432,18 +17158,15 @@ mod tests {
             ]
         );
 
-        // A repeated key is the later one, not both -- the same rule
-        // `settings_tree` follows for a key that contradicts an earlier
-        // one.
+        // A repeated key keeps the later value, as in `settings_tree`.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "a.b=1", "--setting", "a.b=2", "srv"])), 0);
         assert_eq!(shell.lsp_servers[1].settings, vec![("a.b".to_string(), "2".to_string())]);
 
-        // A value is free to contain `=`; a key is not.
+        // A value may contain `=`; a key may not.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "a=b=c", "srv"])), 0);
         assert_eq!(shell.lsp_servers[2].settings, vec![("a".to_string(), "b=c".to_string())]);
 
-        // Malformed is a config error rather than a setting nobody
-        // notices was dropped.
+        // Malformed is a config error, not a silently dropped setting.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "nokey", "srv"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting", "=value", "srv"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--setting"])), 2);
@@ -17455,7 +17178,7 @@ mod tests {
         let mut shell = Shell::new();
         let out = capture_output(&mut shell);
         shell.run_source_here("echo \"line $LINENO\"\necho \"line $LINENO\"\n\nf(){ echo \"in f: $LINENO\"; }\nf\n", "<test>");
-        // Checked against real bash, which gives exactly these three.
+        // Checked against bash.
         assert_eq!(out.borrow().as_str(), "line 1\nline 2\nin f: 4\n");
     }
 
@@ -17467,8 +17190,7 @@ mod tests {
         let seen = out.borrow().clone();
         let mut lines = seen.lines();
         let secs: u64 = lines.next().unwrap().parse().expect("a whole number of seconds");
-        // Somewhere after this was written and before the far future --
-        // enough to catch a zero or a garbled value without pinning a
+        // After this was written: catches a zero or garbage without pinning a
         // date.
         assert!(secs > 1_700_000_000, "{secs}");
 
@@ -17478,19 +17200,14 @@ mod tests {
         assert_eq!(frac.len(), 6, "microseconds, zero-padded: {real}");
     }
 
-    // Every expectation was run against real bash first -- the
-    // announce rule in particular is not guessable (a literal `.`
-    // component prints; an *empty* one does not).
+    // Checked against bash; which CDPATH hits are announced (a literal `.`
+    // is, an empty component isn't) can't be guessed.
     #[test]
     fn cdpath_searches_and_says_where_it_landed() {
-        // Moves the real process cwd (`cd` is a real chdir -- see
-        // change_directory), so it has to take the same lock every
-        // other cwd-moving test does.
+        // Moves the process's directory; see `CWD_LOCK`.
         let _guard = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // `cd` moves the *real* process directory (see
-        // `change_directory`), so this has to be put back -- otherwise
-        // every later test resolving a relative path runs from a
-        // directory this one deleted.
+        // Put back afterwards, or later tests would run in a deleted
+        // directory.
         let restore = std::env::current_dir().expect("a current directory");
         let root = std::env::temp_dir().join(format!("bish-cdpath-{}", std::process::id()));
         let (here, away) = (root.join("here"), root.join("away"));
@@ -17498,10 +17215,7 @@ mod tests {
         std::fs::create_dir_all(away.join("beta")).unwrap();
         std::fs::create_dir_all(away.join("alpha")).unwrap();
 
-        // `unset CDPATH` up front on every one: a plain assignment is
-        // real process-wide environment (see `sync_real_state_in`'s own
-        // doc comment), so a value one of these scripts sets is still
-        // there for the next `Shell::new()`.
+        // `unset CDPATH` first, so an inherited one doesn't interfere.
         let run = |script: &str| {
             let mut shell = Shell::new();
             let out = capture_output(&mut shell);
@@ -17510,33 +17224,24 @@ mod tests {
         };
         let prelude = format!("cd {}; CDPATH={}", here.display(), away.display());
 
-        // The announcement *is* the observable here, and a better one
-        // than `pwd`: it says both that CDPATH was used and which
-        // component won. (`pwd` reports the real process directory,
-        // which a test shell's own `cd` deliberately does not move.)
+        // The announcement says CDPATH was used and which component won.
 
-        // Found only via CDPATH: goes there, and says so.
+        // Found only via CDPATH: goes there and says so.
         assert_eq!(run(&format!("{prelude}; cd beta")), format!("{}\n", away.join("beta").display()));
 
-        // A name that exists in *both* -- CDPATH wins, because that is
-        // what a search path means.
+        // In both: CDPATH wins.
         assert_eq!(run(&format!("{prelude}; cd alpha")), format!("{}\n", away.join("alpha").display()));
 
-        // An empty component means "here", and is the one hit that is
-        // not announced. A literal `.` is announced, which is the part
-        // that is not guessable.
+        // An empty component means here, and isn't announced.
         assert_eq!(run(&format!("cd {}; CDPATH=:{}; cd alpha", here.display(), away.display())), "");
         assert_eq!(run(&format!("cd {}; CDPATH=.:{}; cd alpha", here.display(), away.display())), format!("{}\n", here.join("alpha").display()));
 
-        // Never searched: an explicit `./`, an absolute path, or no
-        // CDPATH at all.
+        // Never searched: `./`, an absolute path, or no CDPATH.
         assert_eq!(run(&format!("{prelude}; cd ./alpha")), "");
         assert_eq!(run(&format!("{prelude}; cd {}", away.join("beta").display())), "");
         assert_eq!(run(&format!("cd {}; cd alpha", here.display())), "");
 
-        // A name no component holds is the ordinary failure, reported
-        // against the name as typed rather than against some candidate
-        // the search happened to try last.
+        // Not found anywhere: reported against the name as typed.
         let seen = run(&format!("{prelude}; cd nope"));
         assert!(seen.contains("cd: nope:"), "{seen}");
 
@@ -17565,9 +17270,8 @@ echo "status=$?""#,
         assert!(out.borrow().contains("status=127"), "{}", out.borrow());
     }
 
-    // Real bash loops forever here. The guard is a deliberate
-    // divergence, not an accident: a handler that itself mistypes
-    // something would otherwise call itself until the machine gives up.
+    // bash loops forever here. The guard keeps a handler that mistypes
+    // something from calling itself until the machine gives up.
     #[test]
     fn a_handler_that_mistypes_something_does_not_call_itself_forever() {
         let mut shell = Shell::new();
@@ -17578,10 +17282,8 @@ echo "status=$?""#,
         assert!(seen.contains("status=127"));
     }
 
-    // The one thing a `PROMPT_COMMAND` must not do is change the answer
-    // to `$?` for the command the user actually ran -- a prompt that
-    // colours itself by the last status would be wrong on every line
-    // after the first.
+    // `PROMPT_COMMAND` mustn't change `$?`, or a prompt coloured by status
+    // would be wrong after the first line.
     #[test]
     fn prompt_command_runs_and_gives_the_status_back() {
         let mut shell = Shell::new();
@@ -17599,7 +17301,7 @@ echo "status=$?""#,
     fn prompt_command_takes_the_array_form_too() {
         let mut shell = Shell::new();
         let out = capture_output(&mut shell);
-        // bash 5.1's spelling: each element run in turn.
+        // bash 5.1's array form: each element in turn.
         shell.run_source_here("PROMPT_COMMAND=('echo A' 'echo B')", "<test>");
         shell.run_prompt_command();
         assert_eq!(out.borrow().as_str(), "A\nB\n");
@@ -17615,10 +17317,8 @@ echo "status=$?""#,
         assert_eq!(out.borrow().as_str(), "");
     }
 
-    // Every expectation in this test was run against real bash first.
-    // The inheritance rules in particular are not guessable: DEBUG and
-    // RETURN ride on `functrace`, ERR on `errtrace`, and they are two
-    // different options for a reason.
+    // Checked against bash. DEBUG and RETURN are inherited under
+    // `functrace`, ERR under `errtrace`.
     #[test]
     fn the_pseudo_signal_traps_fire_where_bash_fires_them() {
         let run = |script: &str| {
@@ -17631,33 +17331,28 @@ echo "status=$?""#,
         assert_eq!(run("trap 'echo ERR' ERR; false; true"), "ERR\n");
         assert_eq!(run("trap 'echo ERR' ERR; true"), "");
 
-        // ERR follows `errexit`'s own exemptions, because it is decided
-        // in the same place.
+        // ERR has `errexit`'s exemptions.
         assert_eq!(run("trap 'echo E' ERR; if false; then :; fi; echo done"), "done\n");
         assert_eq!(run("trap 'echo E' ERR; false || true; echo done"), "done\n");
         assert_eq!(run("trap 'echo E' ERR; ! false; echo done"), "done\n");
 
-        // ...and it fires whether or not `errexit` is on, which is the
-        // point: a script traps ERR so it does not have to exit.
+        // And fires with `errexit` off: scripts trap ERR so as not to exit.
         assert_eq!(run("trap 'echo E' ERR; false; echo after"), "E\nafter\n");
 
-        // Not inherited into a function without the option that says so.
+        // Not inherited into a function without `errtrace`.
         assert_eq!(run("f(){ false; }; trap 'echo E' ERR; f; echo done"), "E\ndone\n");
         assert_eq!(run("set -E; f(){ false; }; trap 'echo E' ERR; f; echo done"), "E\nE\ndone\n");
         assert_eq!(run("f(){ echo in; }; trap 'echo RET' RETURN; f"), "in\n");
         assert_eq!(run("set -T; f(){ echo in; }; trap 'echo RET' RETURN; f"), "in\nRET\n");
 
-        // `-` clears one, same as for a real signal.
+        // `-` clears one, as for a signal.
         assert_eq!(run("trap 'echo D' DEBUG; trap - DEBUG; true; true"), "D\n");
 
-        // A trap does not get to change `$?` of the command it fired
-        // around.
+        // A trap doesn't change the `$?` of the command it fired around.
         assert_eq!(run("trap 'false' DEBUG; echo hi; echo $?"), "hi\n0\n");
     }
 
-    // Every expectation here was run against real bash before being
-    // asserted -- `PIPESTATUS` is the kind of thing where "what I think
-    // bash does" and "what bash does" are easy to confuse.
+    // Checked against bash.
     #[test]
     fn pipestatus_reports_every_stage() {
         let run = |script: &str| {
@@ -17666,32 +17361,23 @@ echo "status=$?""#,
             shell.run_source_here(script, "<test>");
             out.borrow().clone()
         };
-        // `sh -c` rather than bare `true`/`false`: those are builtins
-        // now, and a builtin in a pipeline stage self-execs -- under
-        // `cargo test` that resolves to the test harness rather than to
-        // bish (the `current_exe` trap this codebase documents
-        // elsewhere), so it is untestable from here whatever it is.
+        // `sh -c` rather than `true`/`false`: a builtin pipeline stage
+        // re-execs `current_exe()`, which under `cargo test` is the test
+        // harness.
         assert_eq!(run(r#"sh -c 'exit 0' | sh -c 'exit 1'; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "0 1\n");
         assert_eq!(run(r#"sh -c 'exit 1' | sh -c 'exit 0'; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}""#), "1 0\n");
-        // Real external stages, not `exit N`: a builtin in a pipeline
-        // stage self-execs, and under `cargo test` that resolves to the
-        // test harness rather than to bish (the `current_exe` trap this
-        // codebase documents elsewhere). Verified by hand against the
-        // real binary, where `exit 3 | exit 4 | exit 5` also gives
-        // `3 4 5`.
+        // External stages for the same reason; with the real binary,
+        // `exit 3 | exit 4 | exit 5` also gives `3 4 5`.
         assert_eq!(run(r#"sh -c 'exit 3' | sh -c 'exit 4' | sh -c 'exit 5'; echo "${PIPESTATUS[@]}""#), "3 4 5\n");
-        // A plain command is a one-element pipeline, which is what a
-        // script reading `${PIPESTATUS[0]}` after one expects.
+        // A plain command is a one-element pipeline.
         assert_eq!(run(r#"false; echo "${PIPESTATUS[0]}""#), "1\n");
         assert_eq!(run(r#"true; echo "${#PIPESTATUS[@]}""#), "1\n");
-        // The whole reason it exists: `$?` is the *last* stage, so a
-        // failure anywhere earlier is invisible without this.
+        // `$?` is the last stage, so an earlier failure needs this to be
+        // seen.
         assert_eq!(run(r#"sh -c 'exit 1' | sh -c 'exit 0'; echo "$? ${PIPESTATUS[0]}""#), "0 1\n");
     }
 
-    // `nocasematch` has been in the shopt registry since that registry
-    // existed, with nothing at all to act on -- regex.rs could not fold
-    // case. Checked against real bash before being asserted here.
+    // Checked against bash.
     #[test]
     fn nocasematch_makes_the_regex_operator_fold_case() {
         let run = |script: &str| {
@@ -17703,9 +17389,9 @@ echo "status=$?""#,
         assert_eq!(run(r#"[[ HELLO =~ ^hel ]] && echo yes || echo no"#), "no\n");
         assert_eq!(run(r#"shopt -s nocasematch; [[ HELLO =~ ^hel ]] && echo yes || echo no"#), "yes\n");
         assert_eq!(run(r#"shopt -s nocasematch; [[ hello =~ ^[A-Z] ]] && echo yes || echo no"#), "yes\n");
-        // Turned back off again really is off again.
+        // Off again is off.
         assert_eq!(run(r#"shopt -s nocasematch; shopt -u nocasematch; [[ HELLO =~ ^hel ]] && echo yes || echo no"#), "no\n");
-        // Captures still land in BASH_REMATCH.
+        // Captures still land in `BASH_REMATCH`.
         assert_eq!(run(r#"shopt -s nocasematch; [[ FooBar =~ (foo)(bar) ]] && echo "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}""#), "Foo-Bar\n");
     }
 
@@ -17720,17 +17406,14 @@ echo "status=$?""#,
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits", "never", "clangd"])), 0);
         assert_eq!(shell.lsp_servers[2].apply_edits, "never");
 
-        // A misspelling is a config error rather than a silent
-        // downgrade: "--apply-edits=alwyas" quietly meaning `scoped`
-        // is exactly the kind of thing nobody notices until a refactor
-        // does nothing.
+        // A misspelling is a config error, not a silent fallback to `scoped`.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits=sometimes", "x"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--apply-edits"])), 2);
         assert_eq!(shell.lsp_servers.len(), 3);
     }
 
-    // Four flags is enough that insisting on one order means the wrong
-    // one silently becomes part of the command to run.
+    // Any order: with four flags, insisting on one would make a misplaced
+    // one part of the command.
     #[test]
     fn add_takes_its_flags_in_any_order() {
         let mut shell = Shell::new();
@@ -17756,8 +17439,7 @@ echo "status=$?""#,
         assert_eq!(shell.lsp_servers[0].root_markers, vec!["Cargo.toml".to_string(), ".git".to_string()]);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root", "go.mod", "gopls"])), 0);
         assert_eq!(shell.lsp_servers[1].root_markers, vec!["go.mod".to_string()]);
-        // A flag with nothing usable after it is a config error, not a
-        // silently empty marker list that would never match anything.
+        // A flag with nothing usable after it is a config error.
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root=", "x"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add", "--root"])), 2);
         assert_eq!(crate::builtins::bish::run_lsp(&mut shell, &strs(&["add"])), 2, "a registration with no command at all");
@@ -17786,8 +17468,8 @@ echo "status=$?""#,
         assert_eq!(crate::builtins::bish::run_hook(&mut shell, &strs(&["rm", "nonsense"])), 2);
     }
 
-    // A typo'd event is the mistake this can actually catch, and a hook
-    // that never fires is the worst way to find out.
+    // A typo'd event is refused rather than becoming a hook that never
+    // fires.
     #[test]
     fn an_unknown_event_is_refused() {
         let mut shell = Shell::new();
@@ -17809,8 +17491,8 @@ echo "status=$?""#,
         assert!(shell.hooks_for("editor:file:write:pre", "rust").is_empty());
     }
 
-    // Order is registration order, because a config that adds two hooks
-    // for one event means them to run in the order it wrote them.
+    // Registration order: a config adding two hooks for one event means
+    // that order.
     #[test]
     fn hooks_fire_in_the_order_they_were_added() {
         let mut shell = Shell::new();
@@ -17820,7 +17502,6 @@ echo "status=$?""#,
         assert_eq!(shell.hooks_for("editor:file:open", "bash"), vec!["__first", "__second", "__third"]);
     }
 
-    // A split window should behave like the one it was split from.
     #[test]
     fn a_child_shell_inherits_the_hooks() {
         let mut shell = Shell::new();
@@ -17836,8 +17517,6 @@ echo "status=$?""#,
         assert_eq!(shell.hooks[0].command, "lsp start --quiet");
     }
 
-    // The one thing a parallel table gets wrong -- see the identical
-    // guard on BISHOPT_HELP.
     #[test]
     fn every_hook_event_is_described() {
         let mut events: Vec<&str> = HOOK_EVENTS.to_vec();
@@ -17847,9 +17526,8 @@ echo "status=$?""#,
         assert_eq!(events, described, "HOOK_EVENTS and HOOK_EVENT_HELP disagree");
     }
 
-    // The naming rule the whole scheme rests on: every internal node is
-    // a real prefix, so `editor:file:write` names both write moments and
-    // `shell:exec` will name both exec moments the day there are two.
+    // Every internal node is a real prefix, so `editor:file:write` names
+    // both write moments.
     #[test]
     fn the_event_hierarchy_is_prefix_matchable() {
         let with_prefix = |prefix: &str| HOOK_EVENTS.iter().filter(|e| e.starts_with(prefix)).count();
@@ -17858,19 +17536,16 @@ echo "status=$?""#,
         assert_eq!(with_prefix("editor:"), 4);
         assert_eq!(with_prefix("shell:exec"), 2, "and now shell:exec really does name two");
         assert_eq!(with_prefix("shell:"), 3);
-        // ...which is exactly what a `prewrite`/`postwrite` spelling
-        // would have cost: nothing would share a `write` prefix.
+        // Which `prewrite`/`postwrite` names would break.
         assert!(HOOK_EVENTS.iter().all(|e| !e.contains("prewrite") && !e.contains("postwrite")));
     }
 
-    // A hook is not a command the user ran, so it must not become the
-    // answer to their next `$?`.
+    // A hook isn't a command the user ran, so it doesn't change `$?`.
     #[test]
     fn last_status_can_be_put_back_after_a_hook_runs() {
         let mut shell = Shell::new();
         shell.set_last_status(3);
         let saved = shell.last_status();
-        // What running a hook does to it.
         shell.set_last_status(0);
         shell.set_last_status(saved);
         assert_eq!(shell.last_status(), 3);
@@ -17894,7 +17569,6 @@ echo "status=$?""#,
         assert_eq!(shell.hooks_for("shell:cwd:change", "bash"), vec!["__ls"]);
     }
 
-    // A hook that causes its own event has to fire once, not forever.
     #[test]
     fn a_hook_cannot_trigger_more_hooks_while_it_runs() {
         let mut shell = Shell::new();
@@ -17911,9 +17585,8 @@ echo "status=$?""#,
 mod promoted_capture_tests {
     use super::*;
 
-    // A shell in the state every split or tabbed window is in: promoted,
-    // with its output going to a pane's grid rather than the real
-    // terminal.
+    // A shell in a split or tabbed window's state: promoted, writing to a
+    // pane's grid.
     fn promoted_shell() -> Shell {
         let mut shell = Shell::new();
         shell.set_sink_grid(Rc::new(RefCell::new(crate::vt100::Screen::new(24, 80))));
@@ -17925,14 +17598,9 @@ mod promoted_capture_tests {
         shell.lookup_var(name)
     }
 
-    /// Runs `src` the way repl.rs runs a typed line: anything left in
-    /// `pending_fg` afterwards is a job the *last* command handed over
-    /// to be driven, and something has to drive it. repl.rs renders it;
-    /// a test only has to wait for it, which is what
-    /// `discard_pending_fg` already does for command mode.
-    ///
-    /// Without this a test asserting on a file the last command wrote
-    /// is racing that command's own process.
+    /// Runs `src` as repl.rs runs a typed line, then waits for any job left
+    /// in `pending_fg` (`discard_pending_fg`), so a test doesn't race the
+    /// last command's process.
     fn run_line(shell: &mut Shell, src: &str) {
         shell.run_source_here(src, "test");
         shell.discard_pending_fg();
@@ -17940,11 +17608,8 @@ mod promoted_capture_tests {
 
     #[test]
     fn a_promoted_session_still_captures_an_external_commands_output() {
-        // A promoted session gives a foreground external command its own
-        // pty, so the compositor does not paint over its output. Inside
-        // `$( )` that is exactly wrong: the output belongs in the
-        // capture, and a pty sends it somewhere nobody is reading.
-        // `x=$(date)` came back empty in every split window.
+        // A promoted session gives a foreground external a pty, but inside
+        // `$( )` the output belongs in the capture.
         let mut shell = promoted_shell();
         run_line(&mut shell, "x=$(/bin/echo captured)");
         assert_eq!(value_of(&mut shell, "x"), "captured");
@@ -17952,8 +17617,7 @@ mod promoted_capture_tests {
 
     #[test]
     fn the_same_capture_works_unpromoted_and_promoted_alike() {
-        // The bug was invisible at a plain prompt, which is why it
-        // lasted: there the pty is never reached at all.
+        // A plain prompt never reaches the pty.
         let mut plain = Shell::new();
         run_line(&mut plain, "x=$(/bin/echo same)");
         let mut promoted = promoted_shell();
@@ -17964,8 +17628,7 @@ mod promoted_capture_tests {
 
     #[test]
     fn a_captured_external_command_in_a_loop_word_list_still_iterates() {
-        // What made it visible: `for i in $(seq 1 3)` ran its body zero
-        // times, because the word list was empty.
+        // `for i in $(seq 1 3)` must run its body three times.
         let mut shell = promoted_shell();
         run_line(&mut shell, "out=; for i in $(/bin/echo a b c); do out=\"$out$i\"; done");
         assert_eq!(value_of(&mut shell, "out"), "abc");
@@ -17973,11 +17636,9 @@ mod promoted_capture_tests {
 
     #[test]
     fn a_chain_after_an_external_command_still_runs() {
-        // A promoted session hands a foreground external command to
-        // repl.rs on a pty, as `ExecResult::Fg` -- which is a
-        // control-flow escape. Bubbling it out of a `&&` abandoned the
-        // rest of the chain: `cp a b && mv b c` ran the copy, skipped
-        // the move, and reported success.
+        // A promoted session hands a foreground external to repl.rs as
+        // `ExecResult::Fg`, a control-flow escape, which must not abandon the
+        // rest of a `&&` chain (`cp a b && mv b c`).
         let dir = crate::tempdir::TempDir::new("fg-chain");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, b"payload").expect("seed");
@@ -17994,9 +17655,7 @@ mod promoted_capture_tests {
         let seed = dir.join("seed");
         std::fs::write(&seed, b"x").expect("seed");
         let mut shell = promoted_shell();
-        // No `>` anywhere: a redirect of its own is what keeps a command
-        // off the pty path in the first place, so a test written with
-        // one would never reach the bug.
+        // No `>`: a redirect keeps a command off the pty path.
         let cp = crate::toolpath::require("cp");
         let script = format!(
             "{cp} {0} {1}; {cp} {0} {2}; {cp} {0} {3}",
@@ -18013,8 +17672,7 @@ mod promoted_capture_tests {
 
     #[test]
     fn a_loop_body_with_an_external_runs_every_iteration() {
-        // The same escape, one level in: the first iteration's command
-        // took the rest of the loop with it.
+        // The same, inside a loop.
         let dir = crate::tempdir::TempDir::new("fg-loop");
         let seed = dir.join("seed");
         std::fs::write(&seed, b"x").expect("seed");
@@ -18035,9 +17693,7 @@ mod promoted_capture_tests {
 
     #[test]
     fn a_settled_external_reports_its_own_status() {
-        // Driving the job here rather than handing it off must not lose
-        // what it exited with -- `$?` is what the rest of the chain
-        // tests.
+        // Driving the job here keeps its status for `$?`.
         let mut shell = promoted_shell();
         run_line(&mut shell, &format!("{} ; rc=$?", crate::toolpath::require("false")));
         assert_eq!(value_of(&mut shell, "rc"), "1");
@@ -18047,9 +17703,8 @@ mod promoted_capture_tests {
 
     #[test]
     fn an_enclosing_redirect_still_wins_over_the_pane() {
-        // The other case where something has already said where the
-        // output goes: a group redirected to a file. Handing the command
-        // a pty would have lost that too.
+        // A group redirected to a file must not hand its command a pty
+        // either.
         let dir = crate::tempdir::TempDir::new("promoted-redirect");
         let path = dir.path().join("out.txt");
         let mut shell = promoted_shell();
