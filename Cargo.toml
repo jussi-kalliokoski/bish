@@ -5,12 +5,9 @@ edition = "2024"
 
 [dependencies]
 
-# Measured on 2026-10-10 against the defaults: these four together take
-# the native binary from 7.1 MiB to 4.7 MiB and run shell logic about
-# 10% faster -- LTO's cross-crate inlining pays for itself. `panic =
-# "abort"` is safe because nothing live catches a panic; the coroutine
-# scheduler will need revisiting when it is driven, since a panicking
-# stage would then end the shell instead of being reported.
+# `panic = "abort"` holds while nothing catches a panic. Once the
+# coroutine scheduler runs, a panicking stage will end the shell instead of
+# being reported.
 [profile.release]
 strip = true
 panic = "abort"
@@ -18,19 +15,16 @@ lto = true
 codegen-units = 1
 
 # The browser build: `cargo build --profile web --target wasm32-wasip1`.
-# Size over speed -- opt-level "z" takes the wasm from 2.3 MiB (809 KiB
-# gzipped) to 1.3 MiB (497 KiB gzipped), at roughly twice the CPU time
-# for shell logic, which is why native releases do not use it.
+# Optimized for size, which makes shell logic about twice as slow, so
+# native releases don't use it.
 [profile.web]
 inherits = "release"
 opt-level = "z"
 
-# Subsystems a build can leave out. All on by default; the browser build
-# turns them off (`--no-default-features`), since none of them can work
-# there. Each is switched at its entry points with `cfg!`, not `#[cfg]`:
-# the code is still compiled and type-checked either way, so a build
-# without one cannot rot, and the optimizer drops whatever is left
-# unreachable behind a refusal.
+# Subsystems a build can leave out. The browser build drops all of them
+# (`--no-default-features`), since none can work there. Each is switched at
+# its entry points with `cfg!` instead of `#[cfg]`, so the code is still
+# type-checked in both builds and the optimizer drops what's unreachable.
 [features]
 default = ["lsp", "dap", "mcp", "hexedit", "browser", "sessions"]
 # Language-server clients in the editor, and `bish tool lsp-server`.
