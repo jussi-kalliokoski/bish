@@ -1,13 +1,10 @@
 // The lexical layer: where roff's control lines, requests, escapes and
-// comments *are* in the source. Deliberately does not interpret anything
-// -- no macros are expanded, no conditionals taken, no registers read --
-// because its consumer is syntax highlighting, which must colour the
-// source as written rather than as it would run.
+// comments are in the source. Interprets nothing (no macros, no
+// conditionals, no registers): its consumer is syntax highlighting,
+// which colours the source as written.
 //
-// The escape scanner here is shared with the interpreter: both need to
-// know how long `\f(CW` or `\s[+2]` or `\h'|4n'` is, and having two
-// answers to that would show up as a highlighter that colours a
-// different number of characters than the parser consumes.
+// The escape scanner is shared with the interpreter, so the highlighter
+// and the parser agree on how long `\f(CW`, `\s[+2]` or `\h'|4n'` is.
 
 use std::ops::Range;
 
@@ -34,8 +31,8 @@ pub struct Token {
     pub span: Range<usize>,
 }
 
-// Every token in `source`, in order, in *char* offsets -- the unit the
-// editor's own highlighting indexes by.
+// Every token in `source`, in order, in char offsets, as the editor's
+// highlighting indexes.
 pub fn lex(source: &str) -> Vec<Token> {
     let chars: Vec<char> = source.chars().collect();
     let mut out = Vec::new();
@@ -82,9 +79,9 @@ pub fn lex(source: &str) -> Vec<Token> {
     out
 }
 
-// A control line: the `.`, the request name, then its arguments -- which
-// are whitespace-separated except that a `"` opens one that runs to the
-// next `"`, which is how a macro takes an argument containing spaces.
+// A control line: the `.`, the request name, then arguments,
+// whitespace-separated except that a `"` opens one running to the next
+// `"`.
 fn lex_control_line(chars: &[char], start: usize, out: &mut Vec<Token>) -> usize {
     out.push(Token { kind: TokenKind::Control, span: start..start + 1 });
     let mut i = start + 1;
@@ -102,7 +99,7 @@ fn lex_control_line(chars: &[char], start: usize, out: &mut Vec<Token>) -> usize
     if i > name_start {
         out.push(Token { kind: TokenKind::Request, span: name_start..i });
     }
-    // `.\"` -- the comment request, whose "name" is the escape itself.
+    // `.\"`: the comment request, whose "name" is the escape itself.
     if chars.get(i) == Some(&'\\') && is_comment_escape(chars, i) {
         let end = end_of_line(chars, i);
         out.push(Token { kind: TokenKind::Comment, span: i..end });
@@ -172,14 +169,13 @@ pub fn is_comment_escape(chars: &[char], i: usize) -> bool {
     chars.get(i) == Some(&'\\') && matches!(chars.get(i + 1), Some('"') | Some('#'))
 }
 
-// How many characters the escape starting at `i` occupies, including the
-// backslash. Never zero, so a caller can always make progress.
+// How many characters the escape at `i` takes, backslash included.
+// Never zero, so a caller always progresses.
 //
-// The shapes, all of which appear in real pages: a bare two-character
-// escape (`\-`, `\&`, `\e`); a one-argument escape that takes either one
-// character, `(` plus two, or `[` plus a name (`\fB`, `\f(CW`,
-// `\f[bold]` -- and the same for `\*`, `\n`, `\g`, `\$`); a two-character
-// special (`\(bu`) or bracketed one (`\[u2014]`); a size change with an
+// The shapes real pages use: a bare two-character escape (`\-`, `\&`,
+// `\e`); a one-argument escape taking one character, `(` plus two, or
+// `[` plus a name (`\fB`, `\f(CW`, `\f[bold]`, likewise `\*`, `\n`,
+// `\g`, `\$`); a special (`\(bu`, `\[u2014]`); a size change with an
 // optional sign and one or two digits (`\s+2`, `\s[-2]`); and the
 // quote-delimited motion and drawing escapes (`\h'|4n'`, `\D'l 1n 0'`).
 pub fn escape_len(chars: &[char], i: usize) -> usize {
@@ -196,8 +192,7 @@ pub fn escape_len(chars: &[char], i: usize) -> usize {
             None => 2,
         },
         's' => 2 + size_argument_len(chars, i + 2),
-        // Quote-delimited: the character right after the escape is the
-        // delimiter, whatever it is.
+        // Quote-delimited: the character after the escape is the delimiter.
         'h' | 'v' | 'l' | 'L' | 'o' | 'w' | 'A' | 'b' | 'C' | 'D' | 'H' | 'N' | 'R' | 'S' | 'x' | 'X' | 'Z' => match chars.get(i + 2) {
             Some(&delim) => match close_bracket(chars, i + 3, delim) {
                 Some(end) => end + 1 - i,
@@ -209,8 +204,7 @@ pub fn escape_len(chars: &[char], i: usize) -> usize {
     }
 }
 
-// The `X` / `(XX` / `[NAME]` argument shapes shared by `\f`, `\*`, `\n`
-// and friends.
+// The `X` / `(XX` / `[NAME]` argument of `\f`, `\*`, `\n` and the rest.
 fn argument_len(chars: &[char], at: usize) -> usize {
     match chars.get(at) {
         Some('(') => 3.min(chars.len().saturating_sub(at)).max(1),
