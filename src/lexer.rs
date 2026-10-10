@@ -1,30 +1,21 @@
-// Hand-rolled tokenizer for bish's shell grammar: pipelines, redirects,
-// sequencing, quoting, control flow, $VAR/command/arithmetic expansion,
-// globbing, and here-docs.
+// The tokenizer for bish's shell grammar: pipelines, redirects,
+// sequencing, quoting, control flow, expansions, globbing and heredocs.
 
-// `quoted` records whether this expansion appeared inside "..." (or is
-// otherwise not subject to word-splitting) -- exec.rs's expand_word_split
-// only splits unquoted expansion results on IFS, matching bash: `"$x"`
-// never splits even if $x contains spaces, but bare `$x` does.
-/// How a literal run of text was spelled in the source.
-///
-/// The parse tree records what a word *means*; this is the one thing
-/// about how it was written that has to survive, because `declare -f`
-/// output is read by people and by other shells. Without it every
-/// literal came back single-quoted: `trap "echo t" EXIT` printed as
-/// `trap 'echo t' EXIT`, and `"x${y}z"` as `'x'"${y}"'z'`.
+/// How a literal run of text was spelled. The parse tree keeps what a
+/// word means; this is the part of how it was written that `declare -f`
+/// needs to print it back as written (`trap "echo t" EXIT`, not
+/// `trap 'echo t' EXIT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quoting {
-    /// `'...'` -- nothing inside is special.
+    /// `'...'`: nothing inside is special.
     Single,
-    /// One run of literal text inside `"..."`. A double-quoted word is
-    /// usually several chunks (the expansions between them are their
-    /// own), and they are written back as one pair of quotes again.
+    /// One literal run inside `"..."`. A double-quoted word is usually
+    /// several chunks, written back inside one pair of quotes.
     Double,
     /// A single character behind a backslash, as in `c\ d`.
     Escape,
-    /// `$'...'`, whose escapes were resolved at lex time and have to be
-    /// put back to be written.
+    /// `$'...'`, whose escapes were resolved here and are put back to be
+    /// written.
     Dollar,
 }
 
@@ -34,99 +25,71 @@ pub struct HereDocSpelling {
     pub delimiter: String,
     /// `<<'E'` or `<<"E"`: the body is literal.
     pub quoted: bool,
-    /// `<<-`, which strips leading tabs from the body and the
-    /// delimiter line.
+    /// `<<-`, which strips leading tabs from the body and delimiter line.
     pub strip_tabs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Chunk {
     Str(String),
-    // A `~` prefix at the start of a word. `name` is what followed it:
-    // empty for `~` and `~/...`, `+`/`-` for `$PWD`/`$OLDPWD`, or a
-    // user name to look up. Resolved at expansion time, since it needs
-    // the shell (and /etc/passwd).
+    // A `~` prefix at the start of a word. `name` is what followed: empty
+    // for `~` and `~/...`, `+`/`-` for `$PWD`/`$OLDPWD`, or a user name.
+    // Resolved at expansion, which needs the shell and /etc/passwd.
     Tilde { name: String },
-    // `$name` or `${name}`, and which of the two it was written as.
-    // `braced` carries no meaning at expansion time -- the two forms
-    // expand identically -- and exists so that writing the word back
-    // out says what the source said. `declare -f` is where that shows:
-    // bash reprints a function body from its own parse tree and a `$x`
-    // comes back as `$x`, where collapsing both forms onto `${x}` made
-    // every variable in every body look braced.
+    // `$name` or `${name}`. `braced` doesn't change the expansion; it's for
+    // writing the word back as written, as bash's `declare -f` does. Every
+    // `quoted` here means inside `"..."` or otherwise not word-split: `"$x"`
+    // never splits, bare `$x` does.
     Var { name: String, quoted: bool, braced: bool },
-    // Raw, not-yet-parsed source text of a $(...) or `...` command
-    // substitution -- re-tokenized/parsed/run recursively at expansion time.
-    // `$( )` or `` ` ` ``, and which of the two it was written as.
-    // They run the same command; only writing the word back out can
-    // tell, and bash's `declare -f` shows a backticked substitution as
-    // it was written.
+    // The raw text of a `$( )` or `` ` ` `` substitution, parsed and run at
+    // expansion. `backticks` only matters for writing it back, as bash's
+    // `declare -f` does.
     Sub { raw: String, quoted: bool, backticks: bool },
     // Raw source text of a $((...)) arithmetic expansion.
     Arith { raw: String, quoted: bool },
     VarExpand { name: String, op: VarOp, quoted: bool },
-    // ${name[index]} -- index is raw text: "@"/"*" (all elements, one
-    // element per field like $@/$*) or an arithmetic expression evaluated
-    // at access time (so ${arr[i+1]} works).
+    // `${name[index]}`. `index` is raw: `@`/`*` (every element, a field each
+    // like `$@`/`$*`) or arithmetic evaluated at access (`${arr[i+1]}`).
     ArrayVar { name: String, index: String, quoted: bool },
-    // ${#name[index]} -- index "@"/"*" gives the array length; a specific
-    // index gives that element's string length.
+    // `${#name[index]}`: with `@`/`*` the array's length, else the element's
+    // length.
     ArrayLength { name: String, index: String },
-    // ${name[index]:-word} and friends -- same operators as VarExpand, but
-    // reading from the array element instead of a scalar.
+    // `${name[index]:-word}` and friends: `VarExpand`'s operators on an
+    // element.
     ArrayVarExpand { name: String, index: String, op: VarOp, quoted: bool },
-    // ${!name} -- indirect expansion: look up the variable NAMED by the
-    // current value of `name` (one level only, same as bash).
+    // `${!name}`: the variable named by `name`'s value, one level, as in
+    // bash.
     Indirect { name: String, quoted: bool },
-    // ${!name[@]} / ${!name[*]} -- the array's keys/indices, not its values
-    // (indexed arrays: their set indices as decimal strings; associative:
-    // their string keys), one field per key like ${name[@]}.
+    // `${!name[@]}` / `${!name[*]}`: the array's indices (decimal) or keys,
+    // a field each like `${name[@]}`.
     ArrayKeys { name: String, quoted: bool },
-    // ${!prefix*} / ${!prefix@} -- the names of every variable (scalar or
-    // array) whose name starts with `prefix`, sorted and deduped; `at`
-    // distinguishes the two spellings the same way `quoted`+"@" already
-    // does for ArrayKeys/ArrayVar (one field per name when quoted, joined
-    // otherwise).
+    // `${!prefix*}` / `${!prefix@}`: every variable name starting with
+    // `prefix`, sorted and deduplicated; `at` is which spelling, splitting
+    // as `@` does for `ArrayKeys`.
     VarNamesMatchingPrefix { prefix: String, at: bool, quoted: bool },
-    // <(cmd) / >(cmd) process substitution. Real bash backs these with a
-    // FIFO/`/dev/fd/N` so the substituted command streams concurrently;
-    // that needs fd-passing into a spawned child, which isn't available
-    // from safe std without unsafe pre_exec plumbing. Approximated instead
-    // with a temp file: ProcSubIn runs `cmd` to completion and substitutes
-    // the file it wrote; ProcSubOut substitutes the file path immediately
-    // and runs `cmd` reading it back after the enclosing command finishes.
-    // Correct data flow, but not concurrent -- documented gap.
+    // `<(cmd)` / `>(cmd)`: see exec.rs's `run_proc_sub_in` and
+    // `run_proc_sub_out`.
     ProcSubIn { raw: String },
     ProcSubOut { raw: String },
-    // A literal run of text that was quoted or backslash-escaped in the
-    // source -- read_word always flushes buf and emits one of these at a
-    // quote/escape boundary rather than merging the quoted text into the
-    // surrounding Chunk::Str, so a quoted/escaped metachar next to real
-    // unquoted glob or regex syntax in the same word stays distinguishable
-    // (see expand_word_split's pattern-building and expand_regex_operand
-    // in exec.rs, both of which escape LiteralStr but not Chunk::Str).
-    // Treated identically to Chunk::Str everywhere else that just wants
-    // the plain text value (word-splitting, serialization, command-name
-    // lookup): see the `Chunk::Str(s) | Chunk::LiteralStr(s, _)` arms.
+    // Literal text that was quoted or backslash-escaped. `read_word` emits
+    // one at each quote or escape boundary rather than merging it into a
+    // `Chunk::Str`, so a quoted metacharacter beside real glob or regex
+    // syntax stays literal (`expand_word_split`'s pattern and
+    // `expand_regex_operand` escape `LiteralStr` only). Elsewhere it's the
+    // same as `Str`.
     LiteralStr(String, Quoting),
 }
 
-// The operand ("word"/"pattern") of each variant is kept as raw source text
-// and re-expanded/glob-matched at evaluation time (see exec.rs), same
-// deferred-parsing approach as Sub/Arith. `colon` distinguishes `${V:-x}`
-// (triggers on unset-or-empty) from `${V-x}` (triggers on unset only) --
-// eval_var_op (exec.rs) branches on it via var_is_set vs is_empty.
-// Which redirect a `{name}...` form is. Kept apart from the numbered
-// tokens because the number does not exist until the shell allocates
-// one.
+// Which redirect a `{name}...` form is, kept apart from the numbered
+// tokens because the number doesn't exist until the shell allocates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VarFdKind {
     In,
     Out { append: bool, clobber: bool },
     InOut,
-    // `{v}<&N` / `{v}>&N` duplicates N onto a fresh descriptor and
-    // names it `v`; `{v}<&-` / `{v}>&-` closes the one `v` already
-    // names. The word after the operator says which.
+    // `{v}<&N` / `{v}>&N` duplicate N onto a new descriptor named `v`;
+    // `{v}<&-` / `{v}>&-` close the one `v` names. The word after the
+    // operator says which.
     Dup,
 }
 
@@ -139,29 +102,21 @@ pub enum VarOp {
     AltIfSet { word: String, colon: bool },
     RemovePrefix { pattern: String, longest: bool },
     RemoveSuffix { pattern: String, longest: bool },
-    // ${V^pattern}/${V^^pattern}/${V,pattern}/${V,,pattern} -- `upper`
-    // picks the direction, `all` picks first-char-only vs every char. An
-    // empty pattern (the common case, e.g. `${V^^}`) means "any character";
-    // otherwise the pattern is matched against each candidate char with the
-    // same glob matcher `case` patterns use.
+    // `${V^pat}`, `${V^^pat}`, `${V,pat}`, `${V,,pat}`: `upper` is the
+    // direction, `all` every char or just the first. An empty pattern
+    // (`${V^^}`) matches any character; otherwise each is matched as a
+    // `case` pattern.
     CaseConvert { pattern: String, upper: bool, all: bool },
-    // ${V:offset} / ${V:offset:length}. offset/length are raw arithmetic
-    // expression text, evaluated at expansion time so `${V:$i:$n}` works.
-    // A negative offset counts from the end; a negative length is an end
-    // position counted from the end too (bash: "an offset from the end of
-    // the string"), not an error -- both match real bash's substring
-    // semantics exactly (see substring_expand in exec.rs).
+    // `${V:offset}` / `${V:offset:length}`, raw arithmetic evaluated at
+    // expansion (`${V:$i:$n}`). A negative offset counts from the end, and a
+    // negative length is an end position from the end, as in bash (see
+    // `substring_expand`).
     Substring { offset: String, length: Option<String> },
-    // ${V/pat/repl}, ${V//pat/repl}, ${V/#pat/repl}, ${V/%pat/repl} --
-    // `global` picks first-match vs all-matches, `anchor` restricts the
-    // match to the start/end of the string (mirrors RemovePrefix/
-    // RemoveSuffix's pattern-matching, but for substitution instead of
-    // deletion). pattern/repl are raw text, expanded at match/substitution
-    // time.
+    // `${V/pat/repl}`, `${V//pat/repl}`, `${V/#pat/repl}`, `${V/%pat/repl}`:
+    // `global` is first or all matches, `anchor` pins the match to the
+    // start or end. Raw text, expanded when matching.
     Replace { pattern: String, repl: String, global: bool, anchor: ReplaceAnchor },
-    // ${V@Q}/@U/@L/@E -- bash's "parameter transformation" operators,
-    // scoped to bash's own set minus `@P` (see TransformKind's own doc
-    // comment for why that one's still missing).
+    // bash's parameter transformations (`${v@Q}` and the rest).
     Transform(TransformKind),
 }
 
@@ -174,130 +129,92 @@ pub enum ReplaceAnchor {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TransformKind {
-    // Shell-quoted so the result can be reused as input (`${v@Q}`).
+    // Quoted so the result can be reused as input (`${v@Q}`).
     Quote,
-    // Upper/lowercase the entire value (`${v@U}`/`${v@L}`), and
-    // uppercase just the first character (`${v@u}`).
+    // `${v@U}`, `${v@L}` and `${v@u}` (first character only).
     Upper,
     UpperFirst,
     Lower,
-    // Expands backslash escape sequences in the value the same way
-    // `$'...'` does (`${v@E}`).
+    // Backslash escapes expanded as `$'...'` does (`${v@E}`).
     Escape,
-    // An assignment/`declare` statement that would recreate the
-    // parameter with its attributes and value (`${v@A}`) -- see
-    // exec.rs's transform_attributes for the exact format (matches
-    // real bash's own quote-style/attribute-prefix rules, which
-    // genuinely differ between a plain scalar and a full array).
+    // A statement that recreates the variable with its attributes
+    // (`${v@A}`); see exec.rs's `transform_attributes`.
     Attributes,
-    // Just the attribute-flag letters (`${v@a}`), e.g. "rx" for a
-    // readonly+exported scalar, "" for a plain one.
+    // The attribute letters (`${v@a}`): "rx" for readonly and exported.
     AttributeFlags,
-    // `${arr[@]@K}`/`${assoc[@]@K}`: "key value key value ..." pairs
-    // (double-quoted values, matching declare -p's own array-element
-    // quoting) -- a bare name or a specific single index instead just
-    // behaves like `@Q` on that one value, matching real bash exactly
-    // (confirmed: `${arr[0]@K}` and a plain scalar `${x@K}` both give
-    // the same single-quoted result `@Q` would).
+    // `${arr[@]@K}`: "key value key value ..." with double-quoted values,
+    // as `declare -p` prints elements. A scalar or a single element behaves
+    // like `@Q`, as in bash.
     KeyValue,
-    // Expands the value as if it were a PS1-style prompt string (`${v@P}`)
-    // -- bash's own backslash escapes (`\u`, `\h`, `\w`, `\$`, `\t`, ...),
-    // computed fresh from the shell's live state. Deliberately not wired
-    // into bish's own actual prompt (prompt.rs stays exactly as
-    // hardcoded as it already was) -- this only ever expands a value on
-    // request, standalone, the same as every other transform operator.
+    // The value expanded as a prompt string (`${v@P}`): `\u`, `\h`, `\w`,
+    // `\$` and the rest, from the shell's current state.
     Prompt,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
-    // Word(chunks, globbable) -- globbable is a fast-path flag, true only
-    // if the word had no quoting/escaping/expansion at all (see
-    // read_word); expand_words (exec.rs) takes a cheap literal-string path
-    // for these. Words that don't qualify (partly quoted, or containing
-    // any expansion) still glob-expand -- expand_word_split builds a
-    // second, per-chunk-escaped pattern string alongside the split fields,
-    // escaping each LiteralStr chunk (quoted/escaped source text) so only
-    // its literal characters are excluded from matching, while Chunk::Str
-    // and expansion results stay real pattern syntax.
+    // `Word(chunks, globbable)`: `globbable` is true only for a word with no
+    // quoting, escaping or expansion, for `expand_words`'s fast path. Other
+    // words still glob: `expand_word_split` builds a pattern alongside the
+    // fields with `LiteralStr` chunks escaped.
     Word(Vec<Chunk>, bool),
     Pipe,
     And,
     Or,
     Semi,
     DSemi,
-    // `;&` (case: fall through to the next arm's body unconditionally) and
-    // `;;&` (case: keep testing subsequent patterns instead of stopping).
+    // `;&` (case: run the next arm's body too) and `;;&` (case: keep testing
+    // the following patterns).
     SemiAmp,
     DSemiAmp,
     Amp,
-    // `clobber` is `>|`: overwrite even under `set -C`. Only ever
-    // true for the plain form -- `>>|` is not a thing.
+    // `clobber` is `>|`, overwriting under `set -C`; there's no `>>|`.
     RedirOut { append: bool, clobber: bool },
     RedirIn,
-    // `<>`: opens the target for *both* reading and writing, on fd 0 (or
-    // the explicit leading digit, RedirFdInOut below). Real bash's own
-    // use case this exists for is almost entirely `/dev/tcp/HOST/PORT`
-    // (see exec.rs's dev_socket_file) -- a plain `<`/`>` against that
-    // same path would each open an independent, unrelated connection,
-    // useless for a request/response protocol that needs one connection
-    // used both ways.
+    // `<>`: open the target for reading and writing, on fd 0 or the given
+    // digit (`RedirFdInOut`). Mostly for `/dev/tcp/HOST/PORT` (see
+    // `dev_socket_file`), where `<` and `>` would open two connections.
     RedirInOut,
     RedirErr { append: bool, clobber: bool },
     RedirBoth { append: bool },
     DupErrToOut,
-    // Arbitrary-fd redirects: `N>`/`N>>`/`N<`/`N<>`/`N>&M`/`N<&M`. The fd=2
-    // forms (`2>`, `2>>`, `2>&1`) stay on the dedicated tokens above -- this
-    // is for every other explicit fd number, plus `2<`/`2<>`/`2>&M` (M !=
-    // 1), which the fd=2 fast path above doesn't cover.
+    // `N>`, `N>>`, `N<`, `N<>`, `N>&M`, `N<&M` for any other fd. `2>`, `2>>`
+    // and `2>&1` have the tokens above; this covers the rest, including
+    // `2<`, `2<>` and `2>&M` for M other than 1.
     RedirFdOut { fd: u32, append: bool, clobber: bool },
-    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>`: bash's own way of
-    // not colliding with a hardcoded descriptor number. The shell picks
-    // a free fd and assigns it to `name`; see Redirect::VarFd.
+    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>`: the shell picks a free fd
+    // and assigns it to `name` (see `Redirect::VarFd`).
     RedirVarFd { var: String, kind: VarFdKind },
     RedirFdIn { fd: u32 },
     RedirFdInOut { fd: u32 },
-    // `input` is whether it was written `<&` rather than `>&`. The two do
-    // the same dup2, but `declare -f` writes back what was written.
+    // `input` is whether it was `<&`, not `>&`; the same dup2, but
+    // `declare -f` writes it back as written.
     RedirFdDup { fd: u32, target: u32, input: bool },
-    // `[N]>&WORD` / `[N]<&WORD` where WORD isn't a bare literal digit
-    // sequence -- e.g. `>&"$fd"`, needed for anything using a dynamically-
-    // obtained fd (like a coproc's array entries) rather than a fixed
-    // number known at parse time. Same shape as RedirOut/RedirFdOut/etc:
-    // just the operator, with the target read as the *next* token via the
-    // ordinary word-lexing fallback, consumed by the parser's expect_word.
-    // `fd` is the source side (1 for a bare `>&`, 0 for a bare `<&`, or the
-    // explicit leading digit for `N>&`/`N<&`); the target word is expanded
-    // and parsed as the target fd number at redirect-resolution time.
+    // `[N]>&WORD` / `[N]<&WORD` where WORD isn't plain digits (`>&"$fd"`,
+    // for a coproc's fd). Just the operator: the target is the next word,
+    // read by the parser's `expect_word` and parsed as a number when the
+    // redirect is resolved. `fd` is the source: 1 for `>&`, 0 for `<&`, or
+    // the leading digit.
     RedirDupWord { fd: u32, input: bool },
-    // `[N]>&-` / `[N]<&-`: closes fd N (1/0 if no leading digit).
+    // `[N]>&-` / `[N]<&-`: closes fd N (1 or 0 by default).
     RedirFdClose { fd: u32 },
     HereString,
     // `N<<<` / `N<<`: the descriptor a here-string or heredoc goes to,
-    // pushed immediately ahead of the ordinary `HereString`/`HereDoc`
-    // token for it. Two tokens rather than a numbered copy of each, so
-    // a numbered heredoc's body is filled in by exactly the code that
-    // fills in any other's.
+    // pushed just before its `HereString`/`HereDoc` token, so a numbered
+    // heredoc's body is filled by the same code as any other.
     RedirFdHere { fd: u32 },
-    // Placeholder pushed at the `<<WORD` site; patched in place with the
-    // real (already expansion-processed) body once the line's newline is
-    // reached (see Lexer::pending_heredocs).
-    // The body, plus how the heredoc was written: its delimiter, and
-    // whether that delimiter was quoted (`<<'E'`, no expansion) and
-    // whether `<<-` stripped the leading tabs. None of it changes what
-    // the body *is* -- that is already captured -- but `declare -f`
-    // reproduces a heredoc as a heredoc, which needs all three.
+    // A heredoc: pushed as a placeholder at `<<WORD` and patched with the
+    // expanded body at the line's newline (see `pending_heredocs`). Its
+    // spelling (delimiter, quoting, `<<-`) is kept for `declare -f`.
     HereDoc(Vec<Chunk>, HereDocSpelling),
     Newline,
     LBrace,
     RBrace,
     RParen,
-    // Raw, not-yet-parsed source text of a (...) subshell pipeline stage.
-    // `attached` means the `(` sat directly against the previous
-    // token, with no space -- the difference between `arr=(a b)` (an
-    // array assignment) and `arr= (a b)` (a syntax error in bash).
+    // The raw text of a `( )` subshell. `attached` means the `(` touched the
+    // previous token: `arr=(a b)` is an array, `arr= (a b)` a syntax error.
     Subshell { raw: String, attached: bool },
-    // Raw source text of a standalone ((...)) arithmetic command.
+    // The raw text of a standalone `(( ))` arithmetic command.
     Arith(String),
     KwIf,
     KwThen,
@@ -315,11 +232,8 @@ pub enum Tok {
     KwCase,
     KwEsac,
     KwFunction,
-    // `[[`/`]]` are recognized here (not left as plain Word tokens) so the
-    // parser can treat everything between them as a single test expression
-    // -- otherwise `&&`/`||` inside `[[ ]]` would be swallowed by the outer
-    // AndOr grammar and silently split one logical `[[ ]]` into two
-    // commands.
+    // `[[` and `]]` are tokens so the parser takes everything between as one
+    // test; otherwise `&&` and `||` inside would split it into commands.
     KwLBracket2,
     KwRBracket2,
 }
@@ -348,20 +262,13 @@ fn keyword(s: &str) -> Option<Tok> {
     })
 }
 
-// Reverses `keyword` above -- the literal source text a keyword token
-// stands for. This lexer has no notion of "command position": any bare
-// word exactly matching one of these names always becomes its keyword
-// token regardless of where it appears (see the tokenize() call site
-// above), so `echo function` or `case $x in if)` would otherwise fail to
-// parse at all, since "function"/"if" show up as Tok::KwFunction/Tok::KwIf
-// instead of an ordinary Tok::Word there. The parser uses this everywhere
-// it's already past the point where a bare word could legitimately start
-// a *new* command (mid-argument-list, a for/select wordlist, a case
-// pattern/subject, inside `[[ ]]`, a redirect target, ...) to fall back to
-// treating an accidentally-keyword-shaped word as the plain literal it
-// was always meant to be -- confirmed against real bash, which allows
-// exactly this (`for x in if while do done; do echo $x; done` prints each
-// of those words verbatim).
+// The source text a keyword token stands for. The lexer doesn't know
+// command position, so a bare word matching a keyword always becomes
+// its token, and `echo function` or `case $x in if)` would fail to
+// parse. Wherever a new command can't start (arguments, a for list, a
+// case pattern, `[[ ]]`, a redirect target), the parser uses this to
+// read the token as the word it is, as bash does
+// (`for x in if while do done; ...`).
 pub(crate) fn keyword_text(tok: &Tok) -> Option<&'static str> {
     Some(match tok {
         Tok::KwIf => "if",
@@ -388,65 +295,36 @@ pub(crate) fn keyword_text(tok: &Tok) -> Option<&'static str> {
 
 pub struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
-    // (index into `toks`, delimiter, strip-leading-tabs, expand-in-body) for
-    // each `<<`/`<<-` seen on the current logical line, resolved once the
-    // line's terminating newline is reached (see the body-capture comment
-    // below for why this two-phase approach is needed).
+    // (index into `toks`, delimiter, strip tabs, expand body) for each
+    // `<<`/`<<-` on this line, resolved at the line's newline (see the body
+    // capture below).
     pending_heredocs: Vec<(usize, String, bool, bool)>,
-    // How many `[[`s we're currently nested inside (tracked so `=~`'s
-    // special word-reading below only kicks in there, not for a stray
-    // `=~` word elsewhere).
+    // How many `[[` are open, so `=~`'s word reading applies only inside.
     bracket2_depth: u32,
-    // Set right after emitting the `=~` word while inside `[[ ]]`; makes
-    // the *next* word read via read_word(relaxed: true) instead of the
-    // normal dispatch. See the =~ handling in tokenize().
+    // Set after the `=~` word inside `[[ ]]`: the next word is read with
+    // `read_word(relaxed: true)`. See the `=~` handling in `tokenize`.
     regex_operand_next: bool,
-    // How many chars have been consumed via advance() so far -- a CHAR
-    // index (matching Vec<char>/bishedit's HighlightSpan contract), not a
-    // byte offset. Exists purely for the syntax-highlighting path
-    // (tokenize_spanned and the raw-capture-span instrumentation below);
-    // ordinary tokenize()/execution never reads it. Always tracked
-    // (unconditionally, not behind a flag) since that's simpler than
-    // threading an opt-in through every call site, and the cost is one
-    // usize increment per char already being consumed regardless.
+    // Chars consumed through `advance`: a char index, as `HighlightSpan`
+    // uses, not a byte offset. Only highlighting reads it
+    // (`tokenize_spanned`); it's always kept, which costs an increment per
+    // char.
     pos: usize,
-    // Half-open char-index ranges, one per chunk pushed while reading a
-    // word EXCEPT plain Chunk::Str, in the same left-to-right order as the
-    // chunks themselves -- i.e. one entry per Chunk::{LiteralStr, Sub,
-    // Arith, Var, VarExpand, ArrayVar, ArrayLength, ArrayVarExpand,
-    // Indirect, ArrayKeys, ProcSubIn, ProcSubOut}, pushed by
-    // capture_balanced_parens/capture_backtick, by push_var's own two
-    // non-recursive dispatch branches (the ${...} brace-content path and
-    // the bare $NAME fallback), or by read_word's own three LiteralStr
-    // sites (single-quoted, double-quoted, and single-char backslash-
-    // escape runs). Chunk::Str is the one exception: its source span is
-    // always recoverable without a side-channel entry, since it's a
-    // verbatim, unescaped copy of source chars (never true for LiteralStr,
-    // whose decoded length can differ from its source span whenever a
-    // double-quote escape sequence -- \$, \\, \" -- consumed 2 source
-    // chars for 1 decoded char).
-    // For Sub/Arith/ProcSubIn/ProcSubOut the range excludes the
-    // construct's own delimiters ($( ), backtick, <( )/>( )) since that's
-    // the raw text a highlighter recursively re-lexes. For the terminal
-    // (non-recursive) LiteralStr/${...}/bare $NAME chunks, the range
-    // similarly excludes their own delimiters (quotes, `{`/`}` braces, or
-    // nothing to exclude for the bare $NAME/backslash-escape forms) --
-    // same "delimiters excluded" convention either way, even though these
-    // never get recursed into.
-    // capture_double_paren doesn't push its own -- it just wraps a
-    // capture_balanced_parens call whose span already covers the same raw
-    // text -- so pushing there too would desync the one-span-per-chunk
-    // correspondence.
-    // Always populated (no Option-gating), like `pos`: ordinary
-    // tokenize()/execution never reads this either.
+    // Char ranges, one per chunk pushed while reading a word other than
+    // `Chunk::Str`, in chunk order: `LiteralStr`, `Sub`, `Arith`, `Var`,
+    // `VarExpand`, `ArrayVar`, `ArrayLength`, `ArrayVarExpand`, `Indirect`,
+    // `ArrayKeys`, `ProcSubIn`, `ProcSubOut`. `Str` needs none: it's a
+    // verbatim copy of the source, unlike `LiteralStr`, whose escapes make
+    // its decoded length differ.
+    //
+    // Ranges exclude the construct's delimiters (`$( )`, backticks, quotes,
+    // braces), which for `Sub`, `Arith` and process substitutions is the raw
+    // text a highlighter re-lexes. `capture_double_paren` pushes none, since
+    // its inner `capture_balanced_parens` already did. Always kept, like
+    // `pos`.
     raw_capture_spans: Vec<std::ops::Range<usize>>,
-    // 1-based source line the char about to be read by advance() sits on
-    // -- bumped there whenever the consumed char is '\n', same "always
-    // tracked, one extra increment per char" treatment as `pos`. Used by
-    // tokenize() to tag every emitted token with the line it started on
-    // (see push_tok!'s own doc comment), for the debugger's breakpoint/
-    // current-line machinery -- the real executable AST otherwise has no
-    // position information at all.
+    // The 1-based line of the next char, bumped by `advance` on `\n`, so
+    // `tokenize` can tag tokens with their line (`push_tok!`) for the
+    // debugger's breakpoints; the AST otherwise has no positions.
     line: usize,
 }
 
@@ -463,12 +341,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // The one and only place that actually consumes a char from `chars` --
-    // every other call site in this file goes through this instead of
-    // calling `self.chars.next()` directly, purely so `pos` (see its own
-    // doc comment) stays accurate everywhere spans get recorded, not just
-    // at the top-level tokenize() loop. Behaviorally identical to a bare
-    // `self.chars.next()` in every other respect.
+    // The only place a char is consumed, so `pos` stays accurate wherever
+    // spans are recorded.
     fn advance(&mut self) -> Option<char> {
         let c = self.chars.next();
         if c.is_some() {
@@ -482,34 +356,25 @@ impl<'a> Lexer<'a> {
 
     pub fn tokenize(mut self) -> Result<Vec<(Tok, usize)>, String> {
         let mut toks = Vec::new();
-        // Tags every token pushed in this function with the source line
-        // it started on -- a thin wrapper (not touching argument
-        // parenthesization at all) around every existing `toks.push(...)`
-        // call site, so the real Parser (unlike the separate
-        // tokenize_spanned copy lint/format/highlight already use) gets
-        // line numbers for the actual executed AST.
+        // Tags every token pushed here with its starting line, so the
+        // parser's AST (unlike `tokenize_spanned`'s) has line numbers.
         macro_rules! push_tok {
             ($tok:expr) => {
                 toks.push(($tok, self.line))
             };
         }
         loop {
-            // Whether this token touches the one before it, with no
-            // space between them. Only `(` after an `name=` word cares
-            // -- see Tok::Subshell.
+            // Whether this token touches the previous one: only `(` after
+            // `name=` cares (see `Tok::Subshell`).
             let attached = !self.skip_spaces() && !toks.is_empty();
             if self.regex_operand_next {
                 self.regex_operand_next = false;
                 if self.chars.peek().is_some() {
                     let (word, plain) = self.read_word(true, false)?;
-                    // Real bash rejects an unquoted `<`/`>` immediately
-                    // following (no space) a `=~` regex operand with a
-                    // syntax error, confirmed empirically -- read_word's
-                    // own relaxed-mode word-breaking just stops *before*
-                    // the character without consuming it, which would
-                    // otherwise silently truncate the pattern there and
-                    // let the rest of the line be reinterpreted as
-                    // ordinary redirect/word tokens instead of erroring.
+                    // bash rejects an unquoted `<` or `>` right after a
+                    // `=~` operand. `read_word`'s relaxed mode stops before
+                    // it without consuming it, so otherwise the pattern
+                    // would be cut short and the rest read as redirects.
                     if let Some(c @ ('<' | '>')) = self.chars.peek().copied() {
                         return Err(format!("syntax error near unexpected token `{}'", c));
                     }
@@ -530,12 +395,9 @@ impl<'a> Lexer<'a> {
                 Some('\n') => {
                     self.advance();
                     push_tok!(Tok::Newline);
-                    // A `<<WORD` redirect's body is the lines immediately
-                    // following the line it appeared on, not the text right
-                    // after the operator -- so the operator is tokenized
-                    // where it appears (as a placeholder), and the body is
-                    // only captured once we reach this newline, then patched
-                    // into the already-pushed placeholder token.
+                    // A `<<WORD` body is the lines after this one, so the
+                    // operator was tokenized as a placeholder, and the body
+                    // is captured at this newline and patched in.
                     if !self.pending_heredocs.is_empty() {
                         let pending = std::mem::take(&mut self.pending_heredocs);
                         for (tok_idx, delim, strip_tabs, expand) in pending {
@@ -603,10 +465,9 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     push_tok!(Tok::RParen);
                 }
-                // `{name}>file` and friends, before the brace-group
-                // arm below: a `{` that opens a group is followed by a
-                // word boundary, and this one is followed by a name and
-                // a redirect operator, so the two never overlap.
+                // `{name}>file` and friends, before the brace-group arm: a
+                // group's `{` is followed by a word boundary, this one by a
+                // name and a redirect.
                 Some('{') if self.var_fd_redirect().is_some() => {
                     let (var, kind, consumed) = self.var_fd_redirect().unwrap();
                     for _ in 0..consumed {
@@ -639,8 +500,7 @@ impl<'a> Lexer<'a> {
                     if append {
                         self.advance();
                     }
-                    // `>|` -- the escape hatch from `set -C`, and the
-                    // only reason a script writes it.
+                    // `>|`: past `set -C`.
                     let clobber = !append && self.chars.peek().copied() == Some('|');
                     if clobber {
                         self.advance();
@@ -693,12 +553,8 @@ impl<'a> Lexer<'a> {
                         self.advance(); // '1'
                         push_tok!(Tok::DupErrToOut);
                     } else if self.chars.peek().copied() == Some('&') {
-                        // `2>&3`, `2>&$fd`, `2>&-`. This arm matches
-                        // before the general numbered-fd path below, so
-                        // anything it does not handle itself never
-                        // reaches that path -- and everything but `&1`
-                        // used to fall through to `RedirErr`, leaving
-                        // the `&` for the parser to trip over.
+                        // `2>&3`, `2>&$fd`, `2>&-`. This arm comes before
+                        // the numbered-fd path, so it handles all of them.
                         self.advance(); // '&'
                         push_tok!(self.lex_dup_target(2, false));
                     } else {
@@ -713,14 +569,9 @@ impl<'a> Lexer<'a> {
                         push_tok!(Tok::RedirErr { append, clobber });
                     }
                 }
-                // Any other explicit fd number (0,1,3-9,...; also covers
-                // `2<`, which the fd=2 fast path above doesn't handle)
-                // immediately followed by `>`/`<` with no
-                // intervening whitespace -- e.g. `3>file`, `4<&0`. A digit
-                // with no immediately-following `>`/`<` (an ordinary
-                // numeric word, or a redirect target's own value) isn't
-                // touched by this arm and falls through to read_word below
-                // as before.
+                // Any other fd number (0, 1, 3-9, and `2<`) directly
+                // followed by `>` or `<`: `3>file`, `4<&0`. A digit not
+                // followed by one is an ordinary word.
                 Some(c) if c.is_ascii_digit() && self.peek_numbered_fd_redirect().is_some() => {
                     let (fd, ndigits) = self.peek_numbered_fd_redirect().unwrap();
                     for _ in 0..ndigits {
@@ -751,9 +602,8 @@ impl<'a> Lexer<'a> {
                                 self.advance();
                                 push_tok!(Tok::RedirFdInOut { fd });
                             } else if self.chars.peek().copied() == Some('<') {
-                                // `N<<<` and `N<<DELIM`. Lexed as `N<` and
-                                // then a stray `<<`, which the parser
-                                // could only call a syntax error.
+                                // `N<<<` and `N<<DELIM`, which would
+                                // otherwise lex as `N<` and a stray `<<`.
                                 self.advance();
                                 push_tok!(Tok::RedirFdHere { fd });
                                 if self.chars.peek().copied() == Some('<') {
@@ -811,13 +661,9 @@ impl<'a> Lexer<'a> {
         Ok(toks)
     }
 
-    // Called with the '&' of a `>&`/`<&` dup-redirect already consumed.
-    // `fd` is the source side, already determined by the caller (1/0 for
-    // the bare forms, or the explicit leading digit). Produces the plain
-    // literal-target token when a bare digit sequence follows (the common,
-    // already-well-tested case); otherwise pushes the word-based token and
-    // leaves the target itself to be lexed as an ordinary following word,
-    // same as every other redirect operator's target.
+    // Called after the `&` of `>&`/`<&`; `fd` is the source. Bare digits
+    // give the literal-target token; otherwise the word-based token, with
+    // the target lexed as the next word, like any redirect target.
     fn lex_dup_target(&mut self, fd: u32, input: bool) -> Tok {
         if self.chars.peek().copied() == Some('-') {
             self.advance();
@@ -837,10 +683,9 @@ impl<'a> Lexer<'a> {
         it.next() == Some('>')
     }
 
-    // Looks ahead for a digit run immediately followed by `>`/`<` (no
-    // consumption). Returns the fd number and how many digit characters it
-    // spanned -- needed separately from the number itself since a leading
-    // zero (`007>`) would otherwise desync consumption from `fd.to_string()`.
+    // Looks ahead for digits followed by `>` or `<` without consuming.
+    // Returns the fd and how many digits it took, since a leading zero
+    // (`007>`) differs from `fd.to_string()`.
     fn peek_numbered_fd_redirect(&self) -> Option<(u32, usize)> {
         let mut it = self.chars.clone();
         let mut digits = String::new();
@@ -861,11 +706,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // Consumes a target fd number after `>&`/`<&` (e.g. the `1` in `3>&1`).
-    // Only called once lex_dup_target has already ruled out the `-` (close)
-    // case, so a malformed redirect with no digits here just yields fd 0
-    // rather than hard-failing the lexer, matching this codebase's
-    // best-effort stance elsewhere.
+    // Reads the target fd after `>&`/`<&` (the `1` in `3>&1`). The `-`
+    // case is already ruled out; with no digits this gives 0 rather than
+    // failing.
     fn read_fd_number(&mut self) -> u32 {
         let mut s = String::new();
         while let Some(c) = self.chars.peek().copied() {
@@ -879,11 +722,9 @@ impl<'a> Lexer<'a> {
         s.parse().unwrap_or(0)
     }
 
-    // Called with the next char being the `[` that follows an
-    // identifier: is this `NAME[...]=` (or `+=`), an assignment whose
-    // subscript may hold spaces -- rather than a glob character class or
-    // the `[` builtin? Looks ahead over a clone, so nothing is consumed
-    // when the answer is no.
+    // With the next char the `[` after an identifier: is this `NAME[...]=`
+    // (or `+=`), whose subscript may hold spaces, rather than a glob class
+    // or the `[` builtin? Looks ahead on a clone.
     fn subscript_is_an_assignment(&self) -> bool {
         let mut it = self.chars.clone();
         if it.next() != Some('[') {
@@ -899,9 +740,8 @@ impl<'a> Lexer<'a> {
                         break;
                     }
                 }
-                // A newline or a metacharacter means this was never a
-                // subscript -- stop rather than scanning the rest of
-                // the script for a `]` that closes something else.
+                // A newline or metacharacter means it was never a
+                // subscript; stop rather than scan the script for a `]`.
                 '\n' | ';' | '|' | '&' => return false,
                 _ => {}
             }
@@ -922,10 +762,9 @@ impl<'a> Lexer<'a> {
         it.next()
     }
 
-    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>` -- the variable-fd
-    // redirect. Returns the name, which form it is, and how many
-    // characters to consume; `None` when this `{` is something else
-    // entirely, which is every other `{` in the language.
+    // `{name}<`, `{name}>`, `{name}>>`, `{name}<>`: the variable-fd
+    // redirect. Returns the name, the form and how many chars to consume;
+    // `None` for every other `{`.
     fn var_fd_redirect(&self) -> Option<(String, VarFdKind, usize)> {
         let mut it = self.chars.clone();
         if it.next() != Some('{') {
@@ -969,15 +808,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // Called with one '(' already consumed (depth 1). Scans forward,
-    // honoring nested parens and quotes, and returns the raw text up to
-    // (not including) the matching close paren. Shared by $(...) command
-    // substitution and (...) subshells -- neither is tokenized/parsed until
-    // the substitution actually runs.
+    // With one `(` consumed, scans past nested parens and quotes to the
+    // matching `)`, returning the raw text before it. For `$( )` and `( )`,
+    // both parsed only when run.
     fn capture_balanced_parens(&mut self) -> Result<String, String> {
-        // The opening '(' this call is scoped to was already consumed by
-        // the caller, so `pos` right now is exactly the raw content's
-        // first char index -- see raw_capture_spans's own doc comment.
+        // The opening `(` is consumed, so `pos` is the content's first char
+        // (see `raw_capture_spans`).
         let start = self.pos;
         let mut depth = 1;
         let mut s = String::new();
@@ -991,9 +827,8 @@ impl<'a> Lexer<'a> {
                 Some(')') => {
                     depth -= 1;
                     if depth == 0 {
-                        // `pos` was just bumped past the closing ')' by the
-                        // advance() above, so pos - 1 is that ')' 's own
-                        // index -- the content's exclusive end.
+                        // `pos` is past the closing `)`, so `pos - 1` is
+                        // its index, the content's end.
                         self.raw_capture_spans.push(start..self.pos - 1);
                         break;
                     }
@@ -1043,20 +878,12 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
-    // Called with BOTH opening parens of `((...))` already consumed by the
-    // caller. Captures the inner expression text and consumes the matching
-    // final ')' (capture_balanced_parens stops after the first of the two
-    // closing parens, since it only tracks the depth opened by the second
-    // '(').
+    // With both `((` consumed: the inner text, then the final `)`, since
+    // `capture_balanced_parens` stops after the first of the two.
     fn capture_double_paren(&mut self) -> Result<String, String> {
-        // No separate raw_capture_spans push here: the inner
-        // capture_balanced_parens call below already records the exact
-        // same raw text's span (this function doesn't append anything to
-        // `raw` afterward, just consumes the second closing paren).
+        // No span push: the inner `capture_balanced_parens` recorded it.
         let raw = self.capture_balanced_parens()?;
-        // The *second* `)` is not optional. `for ((i=0; i<2; i++) do`
-        // has only one, and swallowing that silently turned an
-        // unbalanced loop header into a working loop over nonsense.
+        // The second `)` is required: `for ((i=0; i<2; i++) do` has one.
         if self.chars.peek().copied() != Some(')') {
             return Err(format!("near `{}'", raw.trim()));
         }
@@ -1065,8 +892,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn capture_backtick(&mut self) -> Result<String, String> {
-        // Same reasoning as capture_balanced_parens's own `start`: the
-        // opening backtick is already consumed by the caller.
+        // As in `capture_balanced_parens`: the opening backtick is consumed.
         let start = self.pos;
         let mut s = String::new();
         loop {
@@ -1089,15 +915,10 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
-    // Reads a $'...' ANSI-C quoted string (opening $' already consumed).
-    // Result is a plain literal -- no further $ expansion happens inside,
-    // matching bash. Common C-style escapes only (no \xHH/\uHHHH/octal).
-    // `$'...'`, whose escapes are C's rather than the shell's.
-    //
-    // Assembled as *bytes* and decoded at the end, because `\303\244`
-    // has to mean the two bytes of `ä` and not the two characters
-    // U+00C3 U+00A4. That is the form `printf %q` writes a non-ASCII
-    // string in, so this is the reading end of that round trip.
+    // `$'...'` (opening consumed): C's escapes rather than the shell's, no
+    // `$` expansion inside, as in bash. Built as bytes and decoded at the
+    // end, so `\303\244` is the two bytes of `ä`, the form `printf %q`
+    // writes.
     fn read_ansi_c_string(&mut self) -> Result<String, String> {
         let mut bytes: Vec<u8> = Vec::new();
         loop {
@@ -1114,16 +935,12 @@ impl<'a> Lexer<'a> {
                     Some('?') => bytes.push(b'?'),
                     Some('a') => bytes.push(0x07),
                     Some('b') => bytes.push(0x08),
-                    // `\E` as well as `\e`: `printf %q` writes the
-                    // capital one.
+                    // `\E` too: `printf %q` writes the capital.
                     Some('e' | 'E') => bytes.push(0x1b),
                     Some('f') => bytes.push(0x0c),
                     Some('v') => bytes.push(0x0b),
-                    // Up to three octal digits, counting the one just
-                    // read -- so `\0` is NUL, `\101` is `A`, and
-                    // `\0101` is NUL-then-`101`... no: it is `\010`
-                    // then `1`, which is what the three-digit limit
-                    // gives on its own.
+                    // Up to three octal digits including this one: `\101`
+                    // is `A`, and `\0101` is `\010` then `1`.
                     Some(d @ '0'..='7') => {
                         let mut value = d.to_digit(8).unwrap();
                         for _ in 0..2 {
@@ -1139,8 +956,7 @@ impl<'a> Lexer<'a> {
                     }
                     // `\xHH`, one or two hex digits.
                     Some('x') => bytes.push(read_hex(&mut self.chars, 2) as u8),
-                    // `\uHHHH` / `\UHHHHHHHH` name a code point rather
-                    // than a byte, so they go in as UTF-8.
+                    // `\u`/`\U` are code points, written as UTF-8.
                     Some(u @ ('u' | 'U')) => {
                         let width = if u == 'u' { 4 } else { 8 };
                         let value = read_hex(&mut self.chars, width);
@@ -1152,7 +968,7 @@ impl<'a> Lexer<'a> {
                             None => bytes.push(b'?'),
                         }
                     }
-                    // `\cX` is the control character X stands for.
+                    // `\cX` is the control character for X.
                     Some('c') => match self.advance() {
                         Some(c) => bytes.push((c as u8) & 0x1f),
                         None => return Err("unterminated $'...'".to_string()),
@@ -1173,11 +989,9 @@ impl<'a> Lexer<'a> {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    // Reads the delimiter word after `<<`/`<<-`. Only the common forms are
-    // supported: a bare identifier-like word, or one fully wrapped in single
-    // or double quotes -- either quote form suppresses expansion in the
-    // body (matching bash: any quoting anywhere in the delimiter disables
-    // it), a bare word allows it.
+    // The delimiter after `<<`/`<<-`: a bare word, or one wrapped in single
+    // or double quotes, which disables expansion in the body (as any
+    // quoting does in bash).
     fn read_heredoc_delimiter(&mut self) -> (String, bool) {
         match self.chars.peek().copied() {
             Some(q @ ('\'' | '"')) => {
@@ -1205,10 +1019,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // Reads raw lines (bypassing normal tokenization entirely) until one
-    // equals the delimiter, per bash here-doc rules. `strip_tabs` (the `<<-`
-    // form) strips leading tabs from both the delimiter comparison and the
-    // retained body lines.
+    // Raw lines up to the one equal to the delimiter, bypassing
+    // tokenization. `strip_tabs` (`<<-`) strips leading tabs from the lines
+    // and the delimiter comparison.
     fn capture_heredoc_body(&mut self, delimiter: &str, strip_tabs: bool) -> String {
         let mut body = String::new();
         loop {
@@ -1237,10 +1050,8 @@ impl<'a> Lexer<'a> {
         body
     }
 
-    // Returns whether anything was actually skipped. `arr=(a b)` and
-    // `arr= (a b)` produce the same two tokens otherwise, and only the
-    // first is an array assignment -- the second is bash's own syntax
-    // error, and was bish quietly doing the assignment anyway.
+    // Whether anything was skipped: `arr=(a b)` is an array assignment, and
+    // `arr= (a b)` a syntax error, as in bash.
     fn skip_spaces(&mut self) -> bool {
         let mut skipped = false;
         while let Some(c) = self.chars.peek().copied() {
@@ -1248,18 +1059,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 skipped = true;
             } else if c == '\\' && self.peek2() == Some('\n') {
-                // A line continuation between words is *erased*, and
-                // erasing it can leave more spaces behind it, so the
-                // loop goes round again.
-                //
-                // read_word handles the continuation too, for the
-                // `a\<newline>b` that joins one word across two lines.
-                // But it can only do that once a word has started, and
-                // a `\` reached with no word in progress started one --
-                // which the very next space then ended, as an empty
-                // word. `cmd a \<newline>    b` came out as three
-                // arguments, the middle one `''`, and every wrapped
-                // command line in a config file is written that way.
+                // A line continuation between words is erased, which can
+                // leave more spaces, so loop again. `read_word` handles one
+                // inside a word (`a\<newline>b`), but reached with no word
+                // started it would make an empty word:
+                // `cmd a \<newline>    b` would have three arguments.
                 self.advance();
                 self.advance();
                 skipped = true;
@@ -1270,33 +1074,9 @@ impl<'a> Lexer<'a> {
         skipped
     }
 
-    // Returns the word's chunks plus whether it was written with no
-    // quoting/escaping at all -- only a fully "plain" word is eligible for
-    // reserved-word (keyword) recognition, matching bash: `"if"` or `\if`
-    // is always a literal word, never the `if` keyword.
-    // `relaxed` is used for exactly one thing: the right-hand operand of
-    // `[[ ... =~ pattern ]]`. A regex pattern routinely contains `|`, `(`,
-    // `)` (alternation, grouping) that otherwise mean pipe/subshell to this
-    // lexer -- but real bash exempts exactly those three from operator
-    // tokenization for an unquoted =~ operand and nothing else (confirmed
-    // empirically: bash accepts `=~ ^(cat|dog)$` unquoted but rejects bare
-    // `&`/`<`/`>` there with a syntax error, same as it would anywhere
-    // else in `[[ ]]`), so this mirrors that narrow exemption rather than
-    // relaxing every shell metacharacter. Whitespace and `]]` still end
-    // the word normally.
-    // `literal_ws`: true for a `${...}` operator word (pattern/replacement/
-    // default text) parsed out of band via `parse_expansion_word` -- that
-    // text is a single semantic unit with no field splitting inside it, so
-    // an unquoted space there is pattern content (`${s#hello }`), not a
-    // word boundary. False (the normal command-line case) still breaks the
-    // word on whitespace.
-    /// Takes a tilde prefix at the current position, if there is one, and
-    /// pushes it as a `Chunk::Tilde` -- flushing whatever plain text is
-    /// already collected first, since a tilde can begin partway through a
-    /// word (`PATH=~/bin`, `x=a:~/b`).
-    ///
-    /// Answers whether it took one, which the `=` arm uses to decide
-    /// nothing and the tests use to ask directly.
+    /// Takes a tilde prefix here, if there is one, as a `Chunk::Tilde`,
+    /// flushing pending text first, since a tilde can begin mid-word
+    /// (`PATH=~/bin`, `x=a:~/b`). Returns whether it took one.
     fn take_tilde_prefix(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String) -> bool {
         if self.chars.peek().copied() != Some('~') {
             return false;
@@ -1323,13 +1103,9 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        // A tilde prefix ends at `/`, at `:` (so `PATH=~/a:~/b` has two of
-        // them), or at the end of the word -- and a word ends at a
-        // metacharacter as much as at a space, which this used to miss.
-        // `echo ~;` printed a literal `~`, and so did `cd ~; pwd` and
-        // `echo ~ &&`: every shape where the tilde is the last thing in
-        // the word and the word is ended by an operator rather than by
-        // whitespace.
+        // A tilde prefix ends at `/`, `:` (`PATH=~/a:~/b` has two), or the
+        // end of the word, which a metacharacter ends as well as a space
+        // (`cd ~;`).
         let ends_the_prefix = match probe.peek().copied() {
             None | Some('/') | Some(':') => true,
             Some(c) => c.is_whitespace() || is_metacharacter(c),
@@ -1347,28 +1123,32 @@ impl<'a> Lexer<'a> {
         true
     }
 
+    // Returns the word's chunks and whether it had no quoting or escaping:
+    // only a plain word can be a keyword (`"if"` and `\if` never are).
+    // `relaxed` is for the operand of `[[ ... =~ pattern ]]`, where bash
+    // takes `|`, `(` and `)` as regex text but still rejects `&`, `<` and
+    // `>`; whitespace and `]]` still end the word. `literal_ws` is for a
+    // `${...}` operator word (`parse_expansion_word`), which is one unit:
+    // an unquoted space is content (`${s#hello }`).
     fn read_word(&mut self, relaxed: bool, literal_ws: bool) -> Result<(Vec<Chunk>, bool), String> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut buf = String::new();
         let mut plain = true;
 
         // Tilde expansion at the start of a word: `~`, `~/...`, `~user`,
-        // and bash's `~+`/`~-` for `$PWD`/`$OLDPWD`. The name is resolved
-        // at expansion time, not here -- see Chunk::Tilde. An
-        // assignment's value is the other place one can begin; see the
-        // `=` and `:` arms in the loop below.
+        // `~+` and `~-`, resolved at expansion (`Chunk::Tilde`). An
+        // assignment's value is the other place one can begin; see the `=`
+        // and `:` arms.
         self.take_tilde_prefix(&mut chunks, &mut buf);
 
-        // `m[x y]=1`: an associative array's key may contain spaces, and
-        // the assignment is still one word. Set while inside those
-        // brackets so the whitespace break below does not split it --
-        // see subscript_is_an_assignment for why this cannot simply be
-        // "any `[`" (`echo m[x y]` is two words, and `[ x = y ]` is the
-        // test builtin).
-        // Depth rather than a flag, so `a[b[0]]=1` closes correctly.
+        // `m[x y]=1`: an associative key may contain spaces in one word, so
+        // whitespace doesn't break inside those brackets. Not any `[`
+        // (`echo m[x y]` is two words, `[ x = y ]` the test builtin; see
+        // `subscript_is_an_assignment`). A depth, so `a[b[0]]=1` closes
+        // correctly.
         let mut in_assign_subscript = 0u32;
-        // Set once this word's own `=` has gone by, which is what makes a
-        // later `:` a place a tilde prefix may begin.
+        // Set after this word's `=`, after which a `:` may begin a tilde
+        // prefix.
         let mut assignment_value = false;
 
         loop {
@@ -1386,21 +1166,18 @@ impl<'a> Lexer<'a> {
                     in_assign_subscript -= 1;
                     buf.push(self.advance().unwrap());
                 }
-                // Everything between the brackets goes in as raw text,
-                // expansions included: `m[$k]=1` keeps `$k` unexpanded
-                // here and array_set_index resolves it later, exactly
-                // as `${m[$k]}` already does. Expanding it here instead
-                // would field-split the key.
+                // Raw text inside the brackets, expansions included:
+                // `m[$k]=1` keeps `$k` for `array_set_index` to resolve, as
+                // `${m[$k]}` does; expanding here would field-split the
+                // key.
                 Some(_) if in_assign_subscript > 0 => {
                     buf.push(self.advance().unwrap());
                 }
                 Some(c) if !literal_ws && (c == ' ' || c == '\t' || c == '\n') => break,
-                // extglob: @(...) !(...) +(...) *(...) ?(...) -- the '('
-                // immediately follows one of these prefix chars (already in
-                // buf, having fallen through the default char arm below) --
-                // so bish always recognizes it as a pattern group rather
-                // than a subshell/word boundary, unlike real bash which
-                // gates this behind `shopt -s extglob` (see glob.rs).
+                // extglob: `@(`, `!(`, `+(`, `*(`, `?(`, the prefix already
+                // in `buf`, is a pattern group, not a subshell. bash needs
+                // `shopt -s extglob`; bish always recognizes them (see
+                // glob.rs).
                 Some('(') if matches!(buf.chars().last(), Some('@') | Some('!') | Some('+') | Some('*') | Some('?')) => {
                     self.advance();
                     let inner = self.capture_balanced_parens()?;
@@ -1411,52 +1188,35 @@ impl<'a> Lexer<'a> {
                 Some('|') | Some('(') | Some(')') if relaxed => {
                     buf.push(self.advance().unwrap());
                 }
-                // `#` only opens a comment where a word could begin.
-                // Inside one it is an ordinary character: bash reads
-                // `echo a#b` as `a#b`, and `printf %q` relies on that
-                // -- it leaves a mid-word `#` unescaped, so a shell
-                // that broke the word there could not read back what it
-                // had just written.
-                //
-                // `literal_ws` says the caller handed over something
-                // that is already *one word* rather than a line, so
-                // there is no position in it where a word could begin
-                // and no comment to open. Without that, everything from
-                // a leading `#` was silently dropped: `${x:-# hi}`
-                // expanded to nothing, and `PS4='# '` traced every line
-                // with no prefix at all.
+                // `#` opens a comment only where a word could begin: bash
+                // reads `echo a#b` as `a#b`, and `printf %q` leaves a
+                // mid-word `#` unescaped. With `literal_ws` the input is
+                // already one word, so there's no comment to open
+                // (`${x:-# hi}`, `PS4='# '`).
                 Some('#') if literal_ws || !buf.is_empty() || !chunks.is_empty() => {
                     buf.push(self.advance().unwrap());
                 }
-                // A metacharacter ends a word -- except inside a
-                // `${...}` operator, where there is no word to end.
-                // That body was already scanned to its matching brace
-                // (`capture_var_expansion_body`), so a `|` in
-                // `${s//:/|}` is text and not a pipe, and breaking on it
-                // silently truncated both the pattern and the
-                // replacement: `${s//:/a|b}` replaced with `a`, and
-                // `${s//|/x}` searched for the empty string and so
-                // matched everywhere.
-                // `x=~/y`, and `m[k]=~`, and `x+=~`: an assignment's
-                // value is the second place a tilde prefix can begin.
-                // The name has to be a real one and unquoted -- bash
-                // leaves `--opt=~/y`, `9x=~/y` and `"a"=~/b` alone, and
-                // so does this: a quoted run would have pushed a chunk
-                // of its own by now, and `is_assignment_target` answers
-                // for the rest.
+                // `x=~/y`, `m[k]=~`, `x+=~`: an assignment's value is the
+                // second place a tilde prefix can begin. The name must be
+                // real and unquoted: bash leaves `--opt=~/y`, `9x=~/y` and
+                // `"a"=~/b` alone. A quoted run would have pushed its own
+                // chunk by now, and `is_assignment_target` checks the rest.
                 Some('=') if in_assign_subscript == 0 && chunks.is_empty() && is_assignment_target(&buf) => {
                     buf.push(self.advance().expect("peeked"));
                     assignment_value = true;
                     self.take_tilde_prefix(&mut chunks, &mut buf);
                 }
-                // ...and after every unquoted `:` in one, which is what
-                // makes `PATH=~/bin:~/sbin` two expansions rather than
-                // one. Only inside an assignment: `echo a:~/b` is `a:~/b`
-                // in bash, tilde untouched.
+                // And after each unquoted `:` in one: `PATH=~/bin:~/sbin`
+                // has two. Only in an assignment; `echo a:~/b` is
+                // untouched, as in bash.
                 Some(':') if assignment_value => {
                     buf.push(self.advance().expect("peeked"));
                     self.take_tilde_prefix(&mut chunks, &mut buf);
                 }
+                // A metacharacter ends a word, except inside a `${...}`
+                // operator, already scanned to its brace
+                // (`capture_var_expansion_body`): the `|` in `${s//:/|}` is
+                // text.
                 Some(c) if !literal_ws && (is_metacharacter(c) || c == '#') => break,
                 Some(c) if is_metacharacter(c) => {
                     self.advance();
@@ -1474,25 +1234,17 @@ impl<'a> Lexer<'a> {
                             Some(c) => lit.push(c),
                         }
                     }
-                    // Always flush buf and push the quoted run as its own
-                    // LiteralStr rather than merging it into buf -- merging
-                    // would make a quoted metachar indistinguishable from
-                    // real unquoted glob/regex syntax elsewhere in the same
-                    // word (see LiteralStr's doc comment).
+                    // The quoted run goes in as its own `LiteralStr`, so a
+                    // quoted metacharacter stays distinct from real glob or
+                    // regex syntax.
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
                     {
-                        // Pushed even when empty. `''` and `""` are
-                        // words, and `a""b` is one word with a pair of
-                        // quotes in the middle of it -- bash writes all
-                        // three back exactly as they were, and dropping
-                        // the empty run left nothing to write.
-                        //
-                        // pos was just bumped past the closing quote, so
-                        // pos - 1 is that quote's own index -- same
-                        // "excludes delimiters" convention as everywhere
-                        // else in raw_capture_spans.
+                        // Pushed even when empty: `''`, `""` and `a""b` are
+                        // written back as they were. `pos - 1` is the
+                        // closing quote, so the span excludes the
+                        // delimiters.
                         self.raw_capture_spans.push(lit_start..self.pos - 1);
                         chunks.push(Chunk::LiteralStr(lit, Quoting::Single));
                     }
@@ -1500,27 +1252,16 @@ impl<'a> Lexer<'a> {
                 Some('"') => {
                     plain = false;
                     self.advance();
-                    // What this quoted region has produced so far, so
-                    // the empty case below can tell "the quotes held
-                    // nothing" from "the quotes held an expansion and
-                    // no text". `"${a[@]:9}"` is the second, and an
-                    // empty literal there gave `echo "x" "${a[@]:9}"`
-                    // an empty argument where the expansion should
-                    // simply have vanished.
-                    // Counting the text waiting in `buf`, which the
-                    // close below flushes before it looks: `a""b` has
-                    // an `a` pending, and without allowing for it the
-                    // region looked as though it had produced
-                    // something.
+                    // What this quoted region has produced, so the empty
+                    // case can tell "held nothing" from "held only an
+                    // expansion" (`"${a[@]:9}"`, which may vanish). Text
+                    // pending in `buf` counts: `a""b` has an `a`.
                     let region_start = chunks.len() + usize::from(!buf.is_empty());
                     let mut lit = String::new();
-                    // Tracks where the *current* literal run (since the
-                    // last flush) started -- unlike single quotes,
-                    // double-quote escapes ($/`/\ prefixed with a
-                    // backslash) consume 2 source chars but produce 1
-                    // decoded char, so `lit`'s own length can't be used to
-                    // recover its source span; this has to be tracked by
-                    // position, not length, across every flush point below.
+                    // Where the current literal run started. Double-quote
+                    // escapes take two source chars for one decoded char,
+                    // so the span is tracked by position, not `lit`'s
+                    // length.
                     let mut lit_start = self.pos;
                     loop {
                         match self.advance() {
@@ -1531,18 +1272,16 @@ impl<'a> Lexer<'a> {
                                     self.advance();
                                     lit.push(n);
                                 }
-                                // A continuation inside the quotes,
-                                // exactly as outside them: `"a\<newline>b"`
-                                // is `"ab"`.
+                                // A continuation inside quotes too:
+                                // `"a\<newline>b"` is `"ab"`.
                                 Some('\n') => {
                                     self.advance();
                                 }
                                 _ => lit.push('\\'),
                             },
                             Some('$') => {
-                                // `$` was just consumed by the advance()
-                                // above, so pos - 1 is its own index -- the
-                                // literal run's exclusive end.
+                                // `pos - 1` is the `$` just consumed: the
+                                // literal run's end.
                                 let dollar_pos = self.pos - 1;
                                 if !buf.is_empty() {
                                     chunks.push(Chunk::Str(std::mem::take(&mut buf)));
@@ -1551,21 +1290,15 @@ impl<'a> Lexer<'a> {
                                     self.raw_capture_spans.push(lit_start..dollar_pos);
                                     chunks.push(Chunk::LiteralStr(std::mem::take(&mut lit), Quoting::Double));
                                 }
-                                // Pass `lit` (now empty), not `buf`: if
-                                // nothing valid follows the `$`, push_var's
-                                // fallback writes a literal "$" back into
-                                // whatever buffer it's given -- it must
-                                // land in the quoted accumulator here, or a
-                                // trailing "$" (e.g. a regex end-anchor
-                                // written *inside* quotes) would wrongly
-                                // lose its quoted-ness.
+                                // Pass `lit`, not `buf`: if nothing valid
+                                // follows the `$`, `push_var` writes a
+                                // literal `$` into the buffer it's given,
+                                // which must be the quoted one (a `$`
+                                // end-anchor inside quotes stays quoted).
                                 let produced = self.push_var(&mut chunks, &mut lit, true)?;
-                                // If push_var fell back to a literal "$"
-                                // (produced == false, 0 chars consumed by
-                                // push_var itself), the next literal run
-                                // actually starts AT the '$' -- not after
-                                // it -- since that's exactly what just got
-                                // written back into `lit`.
+                                // If `push_var` wrote a literal `$` back,
+                                // the next run starts at the `$`, which is
+                                // now in `lit`.
                                 lit_start = if produced { self.pos } else { dollar_pos };
                             }
                             Some('`') => {
@@ -1587,27 +1320,21 @@ impl<'a> Lexer<'a> {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
                     if !lit.is_empty() || chunks.len() == region_start {
-                        // Empty included, but only when the quotes held
-                        // nothing at all -- see the single-quoted case.
-                        // pos was just bumped past the closing '"'.
+                        // Empty only when the quotes held nothing; see the
+                        // single-quoted case.
                         self.raw_capture_spans.push(lit_start..self.pos - 1);
                         chunks.push(Chunk::LiteralStr(lit, Quoting::Double));
                     }
                 }
                 Some('\\') => {
                     plain = false;
-                    // The whole 2-char escape (backslash + escaped char)
-                    // maps to LiteralStr's 1-char decoded value -- the span
-                    // covers both source chars, not just the escaped one.
+                    // The escape's two source chars map to one decoded
+                    // char; the span covers both.
                     let start = self.pos;
                     self.advance();
-                    // A backslash before a newline is a line
-                    // continuation: both characters go and the word
-                    // carries straight on. `echo a\<newline>b` is
-                    // `echo ab`, and this produced `a`, a real newline,
-                    // and `b` instead -- so a wrapped command line came
-                    // out as two of them, and `then \<newline>echo t`
-                    // looked for a command called "<newline>echo".
+                    // A backslash-newline is a continuation: both go and
+                    // the word goes on. `echo a\<newline>b` is `echo ab`,
+                    // and `then \<newline>echo t` works.
                     if self.chars.peek().copied() == Some('\n') {
                         self.advance();
                     } else if let Some(n) = self.advance() {
@@ -1618,12 +1345,9 @@ impl<'a> Lexer<'a> {
                         chunks.push(Chunk::LiteralStr(n.to_string(), Quoting::Escape));
                     }
                 }
-                // `$"..."` is a *translated* string. With no message
-                // catalogues to consult there is nothing to translate,
-                // so it is exactly a double-quoted string -- which is
-                // also what bash does when no translation is found.
-                // Reading it as a literal `$` followed by a quote,
-                // which is what happened before, printed the dollar.
+                // `$"..."` is a translated string. With no message
+                // catalogues it's a double-quoted string, as in bash when
+                // no translation is found.
                 Some('$') if self.peek2() == Some('"') => {
                     self.advance(); // '$'
                 }
@@ -1632,14 +1356,10 @@ impl<'a> Lexer<'a> {
                     self.advance(); // '$'
                     self.advance(); // '\''
                     let lit = self.read_ansi_c_string()?;
-                    // `LiteralStr`, not `Str`: `$'...'` is *quoting*,
-                    // and what comes out of it is no more subject to
-                    // globbing than what comes out of `'...'`. Appended
-                    // to `buf` it became a `Chunk::Str`, so `echo $'*'`
-                    // listed the directory where bash prints an
-                    // asterisk. The serializer's round trip is what
-                    // caught it: `$'a\tb'` was written back out with a
-                    // real tab in it, which then read as two words.
+                    // `LiteralStr`, not `Str`: `$'...'` is quoting, so its
+                    // result doesn't glob any more than `'...'`'s
+                    // (`echo $'*'` prints an asterisk), and the serializer
+                    // writes it back quoted.
                     if !buf.is_empty() {
                         chunks.push(Chunk::Str(std::mem::take(&mut buf)));
                     }
@@ -1678,17 +1398,11 @@ impl<'a> Lexer<'a> {
         Ok((chunks, plain))
     }
 
-    // Scans the raw text between `${` and its matching `}`, tracking brace
-    // depth for plain unquoted/unescaped `{`/`}` so a `}` reached only
-    // through a nested expansion -- most commonly a double-quoted
-    // alternate value that itself contains `${...}`, e.g. `${v+"${v}"}`
-    // -- isn't mistaken for the outer terminator. Quoting/escaping here
-    // mirrors capture_balanced_parens's own quote loops. Confirmed against
-    // real bash's own scanning rules: `${x:-{}}` => "{}" (plain braces
-    // still count toward depth), `${x:-\{}` => "{" (an escaped brace
-    // doesn't), `${y:-"a}b"}` => "a}b" (a quoted brace never does). No
-    // unterminated-input error path, same best-effort convention as the
-    // loop this replaces.
+    // Scans the text between `${` and its `}`, counting plain `{`/`}` so a
+    // `}` inside a nested expansion (`${v+"${v}"}`) isn't taken for the end.
+    // Quoting follows `capture_balanced_parens`. As in bash: `${x:-{}}` is
+    // `{}`, `${x:-\{}` is `{`, `${y:-"a}b"}` is `a}b`. No unterminated-input
+    // error.
     fn capture_var_expansion_body(&mut self) -> (String, bool) {
         let mut inner = String::new();
         let mut depth: usize = 0;
@@ -1747,16 +1461,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // Consumes a variable reference (command substitution, arithmetic
-    // expansion, or ${...} parameter expansion) after the '$' has already
-    // been consumed, and pushes the appropriate Chunk, or a literal "$" if
-    // nothing valid follows.
-    // Returns whether a real expansion chunk was produced, as opposed to
-    // falling back to a literal "$" (e.g. a trailing `$` with nothing
-    // valid after it, like a regex end-anchor). Callers that track a
-    // word's "plain" (unquoted/unescaped) status use this to avoid
-    // treating a bare literal `$` as if the word had been quoted or
-    // escaped -- see the unquoted `$` case in read_word().
+    // Reads an expansion after its `$` (command substitution, arithmetic or
+    // `${...}`) and pushes the chunk, or a literal `$` when nothing valid
+    // follows. Returns whether a real expansion was pushed, so callers
+    // tracking whether a word is plain don't count a literal `$` (a regex
+    // end-anchor) as quoting.
     fn push_var(&mut self, chunks: &mut Vec<Chunk>, buf: &mut String, quoted: bool) -> Result<bool, String> {
         if self.chars.peek().copied() == Some('(') {
             self.advance();
@@ -1770,22 +1479,16 @@ impl<'a> Lexer<'a> {
         }
         if self.chars.peek().copied() == Some('{') {
             self.advance();
-            // Content span excludes the braces, same convention as
-            // capture_balanced_parens -- see raw_capture_spans's own doc
-            // comment. Recorded once we know a real chunk will be pushed
-            // (the empty-name case below returns early with none).
+            // The span excludes the braces, as elsewhere; recorded once a
+            // chunk is certain (an empty name pushes none).
             let start = self.pos;
-            // Unlike capture_balanced_parens/capture_backtick, this scan
-            // has no unterminated-input error path (matches this
-            // function's pre-existing best-effort behavior) -- so `closed`
-            // distinguishes "stopped at a real '}'" (span excludes it,
-            // same delimiter-excluded convention as elsewhere) from "ran
-            // out of input first" (span includes every char actually
-            // consumed, matching what `inner` itself already contains).
+            // This scan has no unterminated-input error, so `closed` tells
+            // a real `}` (span excludes it) from running out of input (span
+            // covers what was consumed, as `inner` does).
             let (inner, closed) = self.capture_var_expansion_body();
             if !closed {
-                // `echo ${x` -- expanding it as though the brace were
-                // there is how a truncated line went on to run.
+                // `echo ${x`: an error, not expanded as if the brace were
+                // there.
                 return Err("unexpected EOF while looking for matching `}'".to_string());
             }
             let span = start..(self.pos - 1);
@@ -1830,8 +1533,7 @@ impl<'a> Lexer<'a> {
             }
             return Ok(true);
         }
-        // Bare $NAME: no delimiters at all, so the span is just the name's
-        // own char range.
+        // Bare `$NAME`: no delimiters, so the span is the name.
         let start = self.pos;
         let name = self.read_var_name();
         if name.is_empty() {
@@ -1862,16 +1564,9 @@ impl<'a> Lexer<'a> {
     }
 }
 
-// One lexed item from tokenize_spanned, carrying its own source range --
-// the highlighting-only sibling of a plain Tok. Deliberately not folded
-// into Tok itself as a `Tok::Comment` variant: keeping comments out of Tok
-// entirely means parser.rs's exhaustive matches over Tok never need to
-// account for a variant the real grammar never produces.
-// Unused outside of this file's own tests until the highlighter (a later
-// stage) becomes the first real caller -- same "build ahead of wiring"
-// staging bishedit's own modules use, just narrowly scoped here rather
-// than a module-wide allow, since lexer.rs is otherwise live execution
-// code where a stray real dead-code warning should still surface.
+// One item from `tokenize_spanned` with its source range, for
+// highlighting and lint. Comments aren't a `Tok` variant, so the
+// parser's matches over `Tok` never see one.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpannedItem {
@@ -1883,50 +1578,40 @@ pub enum SpannedItem {
 pub struct SpannedResult {
     pub items: Vec<SpannedItem>,
     pub raw_capture_spans: Vec<std::ops::Range<usize>>,
-    // On a lex error, `items` still holds everything collected before the
-    // error point instead of being discarded (unlike tokenize()'s own
-    // Result<_, String>) -- a syntactically incomplete line-in-progress is
-    // the common case while typing in bish's single-line editor, so it
-    // must degrade to "highlighted up to the error point, plain after",
-    // not go fully colorless.
+    // On a lex error, `items` keeps what came before it, unlike
+    // `tokenize`'s `Result`: a half-typed line is the usual case, and
+    // should highlight up to the error rather than not at all.
     pub error: Option<String>,
 }
 
-// A duplicate of tokenize()'s own dispatch loop, not a modification of it
-// -- zero risk to real command execution, since nothing here is on that
-// code path. Kept in lockstep with tokenize() by hand; see that function
-// for arm-by-arm rationale (redirect/heredoc/brace-expansion edge cases
-// etc.), which isn't re-explained here.
+// A copy of `tokenize`'s dispatch loop rather than a change to it, so
+// nothing here touches execution. Kept in step with `tokenize` by hand;
+// the reasoning for each arm is there.
 #[allow(dead_code)]
-// A plain shell identifier -- what may sit in front of a `[subscript]=`
-// in an assignment. Deliberately not `is_valid_ident` from parser.rs:
-// the lexer does not depend on the parser.
-/// The characters that end a word wherever one is being read.
-///
-/// `#` is deliberately absent: it only ends a word where a word could
-/// *begin* (it opens a comment there), and is an ordinary character
-/// inside one -- `echo a#b` is one word, and `printf %q` relies on it.
-/// The two places that care add it themselves.
+/// The characters that end a word wherever one is read. Not `#`, which
+/// ends a word only where one could begin (a comment); inside a word it's
+/// ordinary (`echo a#b`, which `printf %q` relies on). The two places
+/// that care add it.
 fn is_metacharacter(c: char) -> bool {
     matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
-/// Whether `text` is the name part of an assignment, as bash decides it:
-/// an identifier, optionally subscripted, optionally appending.
-///
-/// `x`, `x+`, `m[k]`, `m[k]+` -- and not `--opt`, `9x` or `a-b`, none of
-/// which bash treats as an assignment either, so a tilde after their `=`
-/// stays literal.
+/// Whether `text` is an assignment's name part, as bash decides: an
+/// identifier, maybe subscripted, maybe appending (`x`, `x+`, `m[k]`,
+/// `m[k]+`), not `--opt`, `9x` or `a-b`, after whose `=` a tilde stays
+/// literal.
 fn is_assignment_target(text: &str) -> bool {
     let text = text.strip_suffix('+').unwrap_or(text);
     match text.split_once('[') {
-        // A subscript this lexer already decided was an assignment's (see
-        // `subscript_is_an_assignment`), so only its name needs checking.
+        // A subscript already judged an assignment's
+        // (`subscript_is_an_assignment`), so only the name is checked.
         Some((name, subscript)) => subscript.ends_with(']') && is_ident(name),
         None => is_ident(text),
     }
 }
 
+// A plain shell identifier, which may precede `[subscript]=`. Not
+// parser.rs's `is_valid_ident`: the lexer doesn't depend on the parser.
 fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -2194,11 +1879,9 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                             lexer.advance();
                             items.push(SpannedItem::Tok(Tok::RedirFdInOut { fd }, start..lexer.pos));
                         } else if lexer.chars.peek().copied() == Some('<') {
-                            // `N<<<` and `N<<DELIM`, the same two tokens the
-                            // parser's lexer makes of them. Read as `N<` and
-                            // a stray heredoc, the lines after `3<<<x` were
-                            // highlighted as the body of a document nobody
-                            // had started.
+                            // `N<<<` and `N<<DELIM`, the same tokens
+                            // `tokenize` makes, so `3<<<x` isn't
+                            // highlighted as starting a heredoc.
                             lexer.advance();
                             items.push(SpannedItem::Tok(Tok::RedirFdHere { fd }, start..lexer.pos));
                             let here = lexer.pos;
@@ -2245,11 +1928,9 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
                             if s.contains('{') {
                                 let expanded = brace_expand(s);
                                 if expanded.len() > 1 || expanded[0] != *s {
-                                    // Every token expanded from one
-                                    // `{a,b,c}` source region shares that
-                                    // region's full original span rather
-                                    // than being subdivided -- the whole
-                                    // expression highlights as one unit.
+                                    // Every token from one `{a,b,c}` shares
+                                    // the region's span, so it highlights as
+                                    // one unit.
                                     let end = lexer.pos;
                                     for e in expanded {
                                         items.push(SpannedItem::Tok(Tok::Word(vec![Chunk::Str(e)], true), start..end));
@@ -2271,24 +1952,18 @@ pub fn tokenize_spanned(src: &str) -> SpannedResult {
     SpannedResult { items, raw_capture_spans: lexer.raw_capture_spans, error }
 }
 
-// Parses the operator-word text of a `${...}` construct (the pattern in
-// `${v#pat}`/`${v%pat}`, the replacement/pattern in `${v/pat/rep}`, the
-// word in `${v:-word}`, etc.) for VarOp evaluation. Uses read_word's
-// `literal_ws` mode: nested expansions and quoting still work, but unlike
-// normal command-line tokenization, unquoted whitespace is literal pattern
-// content rather than a word boundary -- `${s#hello }` must strip exactly
-// "hello " (trailing space included), not just "hello".
+// Parses a `${...}` operator word (the pattern in `${v#pat}`, the
+// replacement in `${v/pat/rep}`, the word in `${v:-word}`) in
+// `read_word`'s `literal_ws` mode: expansions and quoting work, but
+// unquoted whitespace is content, so `${s#hello }` strips "hello ".
 pub(crate) fn parse_expansion_word(raw: &str) -> Vec<Chunk> {
     Lexer::new(raw).read_word(false, true).map(|(chunks, _)| chunks).unwrap_or_else(|_| vec![Chunk::Str(raw.to_string())])
 }
 
-// Expands $VAR / $(...) / `...` / $((...)) within an expansion-enabled
-// here-doc body. Can't reuse read_word directly since a heredoc body
-// doesn't quote-process (' and " are literal there, not quote operators)
-// and must keep embedded newlines as literal content, not word separators.
-// Backslash escaping here mirrors double-quote semantics (only \$, \\, \`
-// are special). Expansions are marked `quoted: true` since the body is
-// used verbatim as stdin text, never word-split.
+// Expansions in an expanding heredoc body. Not `read_word`: quotes are
+// literal in a body and newlines are content. Backslash works as in
+// double quotes (only `\$`, `\\` and `` \` ``). Expansions are
+// `quoted`, since the body is stdin text, never split.
 fn expand_heredoc_chunks(body: &str) -> Result<Vec<Chunk>, String> {
     let mut lexer = Lexer::new(body);
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -2344,16 +2019,13 @@ enum BraceContent {
     ArrayOp(String, String, VarOp),
     Indirect(String),
     ArrayKeys(String),
-    // ${!prefix*}/${!prefix@} -- names of every variable whose name
-    // starts with `prefix`, one field per name (bool is true for the
-    // '@' spelling, matching the $@-vs-$*-style splitting distinction
-    // every other "@"/"*" index already carries elsewhere in this file).
+    // `${!prefix*}` / `${!prefix@}`: every variable name starting with
+    // `prefix`; the bool is the `@` spelling, which splits as `$@` does.
     VarNamesMatchingPrefix(String, bool),
 }
 
-// Same identifier-first-character rule as an ordinary variable name,
-// but allowed to be any non-empty prefix of one (used by ${!prefix*}/
-// ${!prefix@} below, where `prefix` need not itself be a complete name).
+// An identifier's first-character rule, but any prefix of a name, for
+// `${!prefix*}`.
 fn is_name_prefix(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -2362,10 +2034,9 @@ fn is_name_prefix(s: &str) -> bool {
     }
 }
 
-// `name[index]rest` -- name must be a plain identifier; returns whatever
-// text follows the closing ']' (empty if nothing does) so the caller can
-// decide between a bare array access and one with an operator suffix
-// (${arr[0]:-x}).
+// `name[index]rest`, name an identifier. Returns what follows `]`, so
+// the caller can tell a plain access from one with an operator
+// (`${arr[0]:-x}`).
 fn try_split_array(s: &str) -> Option<(String, String, &str)> {
     let bracket = s.find('[')?;
     let name = &s[..bracket];
@@ -2379,8 +2050,7 @@ fn try_split_array(s: &str) -> Option<(String, String, &str)> {
     Some((name.to_string(), rest[..close].to_string(), &rest[close + 1..]))
 }
 
-// Shared by the scalar and array paths: parses the operator suffix that
-// follows a name (or `name[index]`) inside `${...}`.
+// The operator suffix after a name or `name[index]` in `${...}`.
 fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     macro_rules! op {
         ($prefix:expr, $variant:ident, $colon:expr) => {
@@ -2393,11 +2063,9 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
     op!(":=", AssignDefault, true);
     op!(":?", ErrorIfUnset, true);
     op!(":+", AltIfSet, true);
-    // ${V:offset} / ${V:offset:length} -- only reached once the four ":x"
-    // operators above have failed to match, so `${V:-x}` (default) still
-    // takes precedence over reading `-x` as a substring offset; bash's own
-    // disambiguation rule is that a *negative* offset needs a space before
-    // it (`${V: -1}`) for exactly this reason.
+    // `${V:offset}` / `${V:offset:length}`, reached only after the four
+    // `:x` operators fail, so `${V:-x}` is a default; bash needs a space
+    // before a negative offset (`${V: -1}`) for this reason.
     if let Some(spec) = rest.strip_prefix(':') {
         return Some(match spec.find(':') {
             Some(idx) => VarOp::Substring { offset: spec[..idx].to_string(), length: Some(spec[idx + 1..].to_string()) },
@@ -2459,20 +2127,16 @@ fn parse_operator_suffix(rest: &str) -> Option<VarOp> {
             "a" => Some(VarOp::Transform(TransformKind::AttributeFlags)),
             "K" => Some(VarOp::Transform(TransformKind::KeyValue)),
             "P" => Some(VarOp::Transform(TransformKind::Prompt)),
-            // Anything else after '@': not recognized -- falling back to
-            // None here, same as any other unrecognized operator syntax,
-            // lets the caller treat the whole thing as a literal name
-            // instead of silently misparsing it.
+            // Anything else after `@` isn't recognized, so the caller
+            // treats the whole as a name rather than misparsing it.
             _ => None,
         };
     }
     None
 }
 
-// Splits "pattern/repl" on the first unescaped '/' (a backslash-escaped
-// `\/` in the pattern, e.g. matching a literal path separator, doesn't end
-// it). No trailing '/' at all (`${V/pat}`) means "replace with nothing"
-// (deletion), matching bash.
+// Splits "pattern/repl" at the first unescaped `/` (`\/` matches a
+// slash). No `/` (`${V/pat}`) replaces with nothing, as in bash.
 fn split_replace_spec(spec: &str) -> (String, String) {
     let chars: Vec<char> = spec.chars().collect();
     let mut i = 0;
@@ -2488,9 +2152,8 @@ fn split_replace_spec(spec: &str) -> (String, String) {
     (spec.to_string(), String::new())
 }
 
-// Parses the text captured between `${` and `}`. `${#VAR}` (length) is
-// checked first since '#' would otherwise be read as the RemovePrefix
-// operator on an empty name.
+// Parses the text between `${` and `}`. `${#VAR}` comes first, since `#`
+// would otherwise read as RemovePrefix on an empty name.
 fn parse_brace_content(inner: &str) -> BraceContent {
     if let Some(rest) = inner.strip_prefix('!') {
         if let Some((name, index, after)) = try_split_array(rest) {
@@ -2532,9 +2195,8 @@ fn parse_brace_content(inner: &str) -> BraceContent {
         if let Some(op) = parse_operator_suffix(after) {
             return BraceContent::ArrayOp(name, index, op);
         }
-        // Unrecognized operator after an array index: fall through to the
-        // scalar path below, which will end up treating the whole thing as
-        // a best-effort literal name (same fallback as the scalar case).
+        // An unknown operator after an index falls to the scalar path, which
+        // treats the whole as a name.
     }
 
     let mut name_end = 0;
@@ -2562,17 +2224,14 @@ fn parse_brace_content(inner: &str) -> BraceContent {
         return BraceContent::Op(name, op);
     }
 
-    // Unrecognized operator syntax: fall back to treating the whole thing
-    // as a literal (best-effort; will just look up a likely-nonexistent
-    // variable name rather than crashing).
+    // Unknown operator syntax: the whole is a name, which likely doesn't
+    // exist.
     BraceContent::Plain(inner.to_string())
 }
 
-// Brace expansion ({a,b,c}, {1..5}, {a..e}, and nested combinations).
-// Scoped to fully literal, unquoted words only (see the tokenize() call
-// site) -- bash technically allows brace expansion alongside other
-// expansions in the same word, but that's a rare combination not worth the
-// added complexity here.
+// Brace expansion (`{a,b,c}`, `{1..5}`, `{a..e}`, nested), only for
+// fully literal unquoted words (see `tokenize`); bash also expands
+// braces beside other expansions, which is rare.
 fn brace_expand(s: &str) -> Vec<String> {
     if let Some((prefix, items, suffix)) = split_brace_group(s) {
         let mut result = Vec::new();
@@ -2622,10 +2281,8 @@ fn split_brace_group(s: &str) -> Option<(String, Vec<String>, String)> {
 }
 
 fn try_brace_range(inner: &str) -> Option<Vec<String>> {
-    // {start..end} or {start..end..step} -- step's sign doesn't affect
-    // direction (bash always steps toward `end` from `start`; the range's
-    // own ordering decides ascending vs descending), so only its magnitude
-    // is used.
+    // `{start..end}` or `{start..end..step}`: bash always steps from
+    // `start` toward `end`, so only the step's magnitude is used.
     let parts: Vec<&str> = inner.splitn(3, "..").collect();
     if parts.len() < 2 {
         return None;
@@ -2651,14 +2308,11 @@ fn try_brace_range(inner: &str) -> Option<Vec<String>> {
     None
 }
 
-// Zero-padding trigger: bash pads a numeric brace range's output to a
-// common field width whenever either endpoint was written with a
-// literal leading zero on a multi-digit number (`{01..5}`, `{1..05}`)
-// -- a lone "0"/"-0" doesn't count (`{-0..3}` stays unpadded). The
-// field width is just the longer endpoint's own written length, sign
-// included, so a negative endpoint reserves a column for '-' that
-// non-negative members of the same range fill with an extra zero
-// instead (`{-01..3}` -> "-01 000 001 002 003").
+// bash pads a numeric range to a common width when either endpoint is
+// written with a leading zero on more than one digit (`{01..5}`); a lone
+// `0` or `-0` doesn't count. The width is the longer endpoint as
+// written, sign included, so non-negative members fill the sign's column
+// with a zero (`{-01..3}` is `-01 000 001 002 003`).
 fn brace_range_zero_pad_width(a: &str, b: &str) -> Option<usize> {
     let has_leading_zero = |s: &str| {
         let digits = s.trim_start_matches(['+', '-']);
@@ -2667,10 +2321,8 @@ fn brace_range_zero_pad_width(a: &str, b: &str) -> Option<usize> {
     if has_leading_zero(a) || has_leading_zero(b) { Some(a.chars().count().max(b.chars().count())) } else { None }
 }
 
-// Rust's own zero-padded integer formatting already places the '-'
-// before the zero-fill and counts it toward the requested width, which
-// is exactly brace_range_zero_pad_width's own field-width definition
-// above -- no separate sign handling needed here.
+// Rust's zero padding puts `-` before the zeros and counts it in the
+// width, as `brace_range_zero_pad_width` defines it.
 fn format_brace_range_int(n: i64, pad_width: Option<usize>) -> String {
     match pad_width {
         Some(width) => format!("{:0width$}", n, width = width),
@@ -2700,57 +2352,40 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
     items
 }
 
-// ---------------------------------------------------------------------
-// Alias expansion
-// ---------------------------------------------------------------------
-
-/// The most alias expansions one pass will perform.
-///
-/// Two aliases that name each other (`alias a=b; alias b=a`) would
-/// otherwise expand forever. bash's own answer is a per-chain guard;
-/// this is that plus a hard ceiling, because a ceiling cannot be
-/// reasoned around and a real command line never comes near it.
+/// The most alias expansions in one pass. bash guards each chain; this
+/// adds a hard ceiling, which no real command line nears, against
+/// `alias a=b; alias b=a`.
 const MAX_ALIAS_EXPANSIONS: usize = 200;
 
-/// Substitutes aliases into an already-tokenized line.
+/// Substitutes aliases into a tokenized line. bash expands aliases
+/// textually while reading; here a command-position word is replaced by
+/// the tokens of its value, operators included, before the parser sees
+/// them, so `alias l='ls | less'` is a pipeline.
 ///
-/// bash expands aliases while *reading*, textually, before the line is
-/// parsed -- which is what let `alias l='ls | less'` work, and what made
-/// this look impossible in a shell that tokenizes and parses a whole
-/// script up front. The token stream is the seam that resolves it: a
-/// word in command position is replaced by the tokens of its alias's
-/// value, operators and all, before the parser ever sees either. So an
-/// alias whose value is a whole pipeline is a pipeline, not a command
-/// with `|` as an argument -- which is exactly the "half-correct
-/// expansion" this was held back to avoid.
+/// bash's rules:
 ///
-/// The rules are bash's:
-///
-///  * Only the **first word** of a command, and only where a command can
-///    start. A variable assignment before it does not count as the
-///    command word, so `FOO=1 ll` still expands `ll`.
-///  * Only an **unquoted, unescaped** word. `\ll` and `'ll'` run the real
-///    thing -- `Tok::Word`'s own "no quoting or expansion at all" flag is
-///    already exactly this question.
-///  * An alias whose value **ends in a blank** makes the next word
-///    eligible too, which is the whole point of `alias sudo='sudo '`.
-///  * An alias's own value cannot re-trigger it, so `alias ls='ls -F'`
+///  * Only the first word of a command, where a command can start.
+///    Assignments before it don't count, so `FOO=1 ll` expands `ll`.
+///  * Only an unquoted, unescaped word: `\ll` and `'ll'` run the real
+///    thing (`Tok::Word`'s plain flag).
+///  * A value ending in a blank makes the next word eligible
+///    (`alias sudo='sudo '`).
+///  * A value can't re-trigger its own alias: `alias ls='ls -F'`
 ///    terminates.
 ///
-/// `lookup` rather than a table so the lexer stays ignorant of `Shell`.
+/// `lookup` keeps the lexer ignorant of `Shell`.
 pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<(Tok, usize)> {
     let mut queue: std::collections::VecDeque<(Tok, usize)> = toks.into();
     let mut out: Vec<(Tok, usize)> = Vec::new();
-    // How many tokens are left from each alias currently being spliced
-    // in, and whether that alias's value ended in a blank. Popped as
-    // each runs out, which is when the trailing-blank rule fires.
+    // For each alias being spliced in: tokens left, and whether its value
+    // ended in a blank. Popped as each runs out, when the trailing-blank rule
+    // applies.
     let mut frames: Vec<(usize, bool)> = Vec::new();
     let mut command_position = true;
     let mut budget = MAX_ALIAS_EXPANSIONS;
 
     while let Some((tok, line)) = queue.pop_front() {
-        // Account for this token against whichever alias produced it,
-        // before anything else can change what "next" means.
+        // Count this token against the alias that produced it first.
         let mut trailing_blank = false;
         while let Some(frame) = frames.last_mut() {
             frame.0 -= 1;
@@ -2768,16 +2403,15 @@ pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<S
         if let (Some(name), Some(value)) = (name, value)
             && let Ok(mut sub) = Lexer::new(&value).tokenize()
         {
-            // The lexer ends a line with a `Newline`; an alias's value is
-            // a fragment of one, not a line of its own.
+            // The lexer ends a line with `Newline`; an alias's value is a
+            // fragment.
             while matches!(sub.last(), Some((Tok::Newline, _))) {
                 sub.pop();
             }
             if !sub.is_empty() {
                 budget -= 1;
-                // An alias's own value cannot re-trigger it: emit its
-                // first word directly when that word *is* the alias, so
-                // `alias ls='ls -F'` terminates instead of recursing.
+                // When the value's first word is the alias itself, it's
+                // emitted as is, so `alias ls='ls -F'` terminates.
                 let self_referential = literal_word(&sub[0].0).as_deref() == Some(name.as_str());
                 let ends_blank = value.ends_with([' ', '\t']);
                 if self_referential {
@@ -2791,8 +2425,8 @@ pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<S
                         queue.push_front((t, line));
                     }
                     if !self_referential {
-                        // Still at the start of a command: the alias's
-                        // own first token is the command word now.
+                        // Still at a command's start: the value's first
+                        // token is the command word.
                         command_position = true;
                     }
                 } else if ends_blank {
@@ -2808,8 +2442,8 @@ pub fn expand_aliases(toks: Vec<(Tok, usize)>, lookup: &dyn Fn(&str) -> Option<S
     out
 }
 
-/// A word made of exactly one literal run, with nothing expanded or
-/// quoted in it -- the only shape that can name an alias.
+/// A word of exactly one literal run, nothing expanded or quoted: the
+/// only shape that can name an alias.
 fn literal_word(tok: &Tok) -> Option<String> {
     match tok {
         Tok::Word(chunks, true) => match chunks.as_slice() {
@@ -2820,9 +2454,8 @@ fn literal_word(tok: &Tok) -> Option<String> {
     }
 }
 
-/// `NAME=` -- a variable assignment sitting in front of the command
-/// word. bash expands an alias after these, so they must not consume
-/// command position.
+/// `NAME=` before the command word: bash expands an alias after these, so
+/// they don't use up command position.
 fn is_assignment_word(tok: &Tok) -> bool {
     let Some(word) = literal_word(tok) else { return false };
     let Some(eq) = word.find('=') else { return false };
@@ -2830,11 +2463,9 @@ fn is_assignment_word(tok: &Tok) -> bool {
     !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Whether a command can start immediately after this token.
-///
-/// Deliberately only the separators and block openers, not every
-/// keyword: the word after `for` is a variable name and the words after
-/// `in` are a list, and expanding an alias into either would be wrong.
+/// Whether a command can start right after this token: separators and
+/// block openers only. After `for` comes a name and after `in` a list,
+/// which mustn't expand.
 fn starts_a_command(tok: &Tok) -> bool {
     matches!(
         tok,
@@ -2860,8 +2491,7 @@ fn starts_a_command(tok: &Tok) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // The text of every word a line lexes to, for the tests just below.
-    // Only the plain-literal chunks matter to them.
+    // The literal text of each word a line lexes to.
     fn words_of(src: &str) -> Vec<String> {
         super::Lexer::new(src)
             .tokenize()
@@ -2882,13 +2512,8 @@ mod tests {
             .collect()
     }
 
-    // `$'...'` carries C's escapes, and the numeric ones name *bytes*:
-    // `\303\244` is the two bytes of `ä`, not the two characters
-    // U+00C3 U+00A4. That is the form `printf %q` writes a non-ASCII
-    // string in, and this is the reading end of that round trip.
-    // The chunk shape itself, independent of what expansion later does
-    // with it: an assignment's value carries a `Tilde` chunk per prefix,
-    // and a word bash would not call an assignment carries none.
+    // An assignment's value carries a `Tilde` chunk per prefix; a word bash
+    // wouldn't call an assignment carries none.
     #[test]
     fn an_assignments_value_gets_a_tilde_chunk_and_a_flag_does_not() {
         let tildes = |src: &str| {
@@ -2916,13 +2541,15 @@ mod tests {
         assert_eq!(tildes("m[k]=~"), vec!["m[k]=", "~"]);
         assert_eq!(tildes("~-"), vec!["~-"]);
 
-        // Not assignments, so not expanded -- bash agrees on all four.
+        // Not assignments, so not expanded, as in bash.
         assert_eq!(tildes("--opt=~/y"), vec!["--opt=~/y"]);
         assert_eq!(tildes("9x=~/y"), vec!["9x=~/y"]);
         assert_eq!(tildes("a:~/b"), vec!["a:~/b"]);
         assert_eq!(tildes("x==~/y"), vec!["x==~/y"]);
     }
 
+    // `$'...'`'s numeric escapes are bytes: `\303\244` is `ä`, as
+    // `printf %q` writes it.
     #[test]
     fn ansi_c_quoting_reads_the_escapes_printf_q_writes() {
         let read = |body: &str| words_of(&format!("x $'{body}'")).pop().unwrap_or_default();
@@ -2938,10 +2565,8 @@ mod tests {
         assert_eq!(read(r"\q"), r"\q", "an escape it does not know keeps its backslash");
     }
 
-    // `#` opens a comment only where a word could begin. `printf %q`
-    // leaves a mid-word `#` unescaped, so a shell that ended the word
-    // there could not read back what it had just written -- which is
-    // exactly what this one used to do.
+    // `#` opens a comment only where a word could begin, so a mid-word `#`
+    // from `printf %q` reads back.
     #[test]
     fn a_hash_inside_a_word_is_an_ordinary_character() {
         assert_eq!(words_of("echo a#b"), vec!["echo".to_string(), "a#b".to_string()]);
@@ -2983,11 +2608,7 @@ mod tests {
         assert_eq!(brace_expand("{00..10..2}"), vec!["00", "02", "04", "06", "08", "10"]);
     }
 
-    // Regression: a `${var#pattern}`-style pattern is one semantic word,
-    // not a command line -- an unquoted trailing space is pattern content,
-    // not a separator to be dropped. parse_expansion_word previously went
-    // through the normal tokenize() path, which splits on whitespace and
-    // silently lost it.
+    // A `${var#pattern}` pattern is one word: a trailing space is content.
     #[test]
     fn parse_expansion_word_preserves_trailing_space() {
         assert_eq!(parse_expansion_word("hello "), vec![Chunk::Str("hello ".to_string())]);
@@ -2998,12 +2619,9 @@ mod tests {
         assert_eq!(parse_expansion_word("a  b"), vec![Chunk::Str("a  b".to_string())]);
     }
 
-    // Regression: the raw ${...} scan used to stop at the first literal
-    // '}', even one reached only through a nested expansion inside a
-    // double-quoted alternate value -- `${x:-"${x}"}` (the
-    // `${VAR+"${VAR}"}` idiom mise's own activation script uses) would
-    // mistake the inner ${x}'s own '}' for the outer terminator, leaving a
-    // stray '"' and a real closing '}' for the *next* token to choke on.
+    // A `}` inside a nested expansion in a quoted alternate value isn't
+    // the outer terminator: `${x:-"${x}"}`, the `${VAR+"${VAR}"}` idiom
+    // mise's activation uses.
     #[test]
     fn tokenize_handles_a_nested_quoted_expansion_inside_a_var_op_word() {
         assert!(Lexer::new(r#"echo ${x:-"${x}"}"#).tokenize().is_ok());
@@ -3040,29 +2658,26 @@ mod tests {
         let src = "echo $(foo";
         let res = tokenize_spanned(src);
         assert!(res.error.is_some());
-        // "echo" was fully lexed before the unterminated $( was hit.
+        // `echo` was lexed before the unterminated `$(`.
         assert!(res.items.iter().any(|it| matches!(it, SpannedItem::Tok(Tok::Word(w, true), _) if w == &vec![Chunk::Str("echo".to_string())])));
     }
 
     #[test]
     fn tokenize_spanned_nested_quote_inside_substitution_recurses_via_raw_capture_spans() {
-        // The user's own motivating example: the single-quoted string
-        // inside $(...) must be independently re-lexable from its own
-        // recorded raw_capture_spans entry, not flattened into one span.
+        // The single-quoted string inside `$(...)` can be re-lexed from its
+        // own recorded span.
         let src = "echo \"yooo, $(printf 'hello %' world)\"";
         let res = tokenize_spanned(src);
         assert_eq!(res.error, None);
-        // Two entries now: the leading "yooo, " double-quoted literal run
-        // (LiteralStr instrumentation) followed by the $(...) substitution
-        // itself, in that left-to-right order.
+        // Two entries, in order: the `"yooo, "` literal run, then the
+        // substitution.
         assert_eq!(res.raw_capture_spans.len(), 2);
         assert_eq!(spanned_text(src, &res.raw_capture_spans[0]), "yooo, ");
         let sub_span = &res.raw_capture_spans[1];
         let inner_src = spanned_text(src, sub_span);
         assert_eq!(inner_src, "printf 'hello %' world");
-        // Re-lexing just the captured raw text independently finds its own
-        // quoted string -- this is the recursion mechanism the future
-        // BashHighlighter relies on.
+        // Re-lexing the captured text finds its quoted string: how the
+        // highlighter recurses.
         let inner = tokenize_spanned(inner_src);
         assert_eq!(inner.error, None);
         assert!(inner.items.iter().any(|it| matches!(
@@ -3077,9 +2692,8 @@ mod tests {
         let src = "echo $((1 + 2))";
         let res = tokenize_spanned(src);
         assert_eq!(res.error, None);
-        // $((...)) is captured via capture_double_paren wrapping a single
-        // capture_balanced_parens call -- exactly one raw-capture span,
-        // not two (capture_double_paren must not push its own on top).
+        // `$((...))` gives one span: `capture_double_paren` doesn't push its
+        // own.
         assert_eq!(res.raw_capture_spans.len(), 1);
         assert_eq!(spanned_text(src, &res.raw_capture_spans[0]), "1 + 2");
         let word = res.items.iter().find_map(|it| match it {
@@ -3092,13 +2706,9 @@ mod tests {
         }
     }
 
-    // Parity test for Stage 3's push_var instrumentation: a word built
-    // entirely from expansion constructs (no literal Str/LiteralStr text
-    // between them) should produce exactly one raw_capture_spans entry
-    // per chunk, in the same order, each substring matching what that
-    // chunk semantically represents. A missed instrumentation site would
-    // desync the two lists (either a chunk with no span, or an extra span
-    // with no corresponding chunk) -- this test would catch either.
+    // A word made only of expansions gives one `raw_capture_spans` entry
+    // per chunk, in order, each matching its chunk; a missed or extra push
+    // would desync them.
     #[test]
     fn push_var_instrumentation_keeps_raw_capture_spans_in_parity_with_chunks() {
         let src = "$a${b}$(echo c)$((1+2))${#arr[@]}";
@@ -3138,28 +2748,22 @@ mod tests {
         }
     }
 
-    // LiteralStr instrumentation (added alongside the highlighter, since
-    // it's what lets quoted-string spans get colored): covers single
-    // quotes (1:1, no escapes), double quotes (escapes shrink source
-    // chars to fewer decoded chars, so this must track by position, not
-    // by `lit`'s own length), and the standalone backslash-escape case.
+    // `LiteralStr` spans: single quotes (one to one), double quotes
+    // (escapes make decoded text shorter, so position is tracked), and a
+    // lone backslash escape.
     #[test]
     fn literal_str_spans_cover_source_text_not_decoded_length() {
         let src = r#"echo 'a b'"c\"d"\x"#;
         let res = tokenize_spanned(src);
         assert_eq!(res.error, None);
 
-        // Chunk::LiteralStr sources, in order: 'a b' -> "a b" (single
-        // quotes, 1:1); "c\"d" -> the double-quoted run containing an
-        // escaped quote, decoded to `c"d` (4 source chars -> 3 decoded);
-        // \x -> decoded to `x` (2 source chars, backslash + x -> 1
-        // decoded char).
+        // The `LiteralStr` values: `'a b'` is `a b`; `"c\"d"` decodes to
+        // `c"d`; `\x` to `x`.
         let expected = ["a b", "c\"d", "x"];
         assert_eq!(res.raw_capture_spans.len(), expected.len(), "spans: {:?}", res.raw_capture_spans);
 
-        // The spans must cover the *source* text (surrounding quotes
-        // excluded, but the escaping backslash included where present),
-        // which differs from the decoded chunk value in both cases above.
+        // The spans cover the source, quotes excluded and escaping
+        // backslashes included.
         let expected_source = ["a b", "c\\\"d", "\\x"];
         for (span, expected) in res.raw_capture_spans.iter().zip(expected_source) {
             assert_eq!(spanned_text(src, span), expected);
@@ -3186,9 +2790,8 @@ mod tests {
 mod alias_tests {
     use super::*;
 
-    // Round-trips through the lexer so a test reads as the shell line it
-    // is, and so what is asserted is the *token stream* the parser will
-    // actually see.
+    // Through the lexer, so a test reads as the shell line and asserts the
+    // token stream the parser sees.
     fn expand(line: &str, aliases: &[(&str, &str)]) -> String {
         let toks = Lexer::new(line).tokenize().expect("lexes");
         let out = expand_aliases(toks, &|name| aliases.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string()));
@@ -3197,9 +2800,8 @@ mod alias_tests {
 
     fn describe(t: &Tok) -> String {
         match t {
-            // Both literal shapes, so a quoted word prints as its text
-            // -- the point of the quoting tests is that it survived
-            // unexpanded, not that it is unprintable.
+            // Both literal shapes print as text: the quoting tests check
+            // that a word survived unexpanded.
             Tok::Word(chunks, _) => chunks
                 .iter()
                 .map(|c| match c {
@@ -3226,12 +2828,11 @@ mod alias_tests {
     fn the_first_word_of_a_command_is_replaced() {
         assert_eq!(expand("ll", &[("ll", "ls -la")]), "ls -la");
         assert_eq!(expand("ll /tmp", &[("ll", "ls -la")]), "ls -la /tmp");
-        // Not a *later* word: `ll` as an argument is an argument.
+        // `ll` as an argument stays.
         assert_eq!(expand("echo ll", &[("ll", "ls -la")]), "echo ll");
     }
 
-    // The reason this is done on tokens rather than on words: an alias
-    // whose value is a pipeline has to *become* a pipeline.
+    // On tokens, not words: a value that's a pipeline becomes one.
     #[test]
     fn an_alias_can_expand_to_a_whole_pipeline() {
         assert_eq!(expand("g", &[("g", "echo x | tr a-z A-Z")]), "echo x | tr a-z A-Z");
@@ -3248,13 +2849,12 @@ mod alias_tests {
         assert_eq!(expand("echo x\nll", a), "echo x \\n ls -la");
     }
 
-    // A variable assignment sits in front of the command word without
-    // being it.
+    // An assignment before the command word isn't the command word.
     #[test]
     fn an_assignment_does_not_consume_command_position() {
         assert_eq!(expand("FOO=1 ll", &[("ll", "ls")]), "FOO=1 ls");
         assert_eq!(expand("FOO=1 BAR=2 ll", &[("ll", "ls")]), "FOO=1 BAR=2 ls");
-        // ...but something that only looks like one does.
+        // But something that only looks like one is.
         assert_eq!(expand("1FOO=x ll", &[("ll", "ls")]), "1FOO=x ll");
     }
 
@@ -3265,32 +2865,26 @@ mod alias_tests {
         assert_eq!(expand("\"ll\"", &[("ll", "ls -la")]), "ll");
     }
 
-    // `alias ls='ls -F'` is the single most common alias there is, and it
-    // has to terminate.
     #[test]
     fn an_alias_cannot_re_trigger_itself() {
         assert_eq!(expand("ls", &[("ls", "ls -F")]), "ls -F");
         assert_eq!(expand("ls /tmp", &[("ls", "ls -F")]), "ls -F /tmp");
-        // Two aliases naming each other cannot spin forever either.
+        // Two aliases naming each other terminate too.
         let mutual = &[("a", "b"), ("b", "a")][..];
         let out = expand("a", mutual);
         assert!(out == "a" || out == "b", "terminated with {out:?}");
     }
 
-    // `alias sudo='sudo '` -- the trailing blank is what makes the *next*
-    // word eligible, and the only reason anyone writes one.
     #[test]
     fn a_trailing_blank_makes_the_next_word_eligible() {
         let a = &[("sudo", "sudo "), ("ll", "ls -la")][..];
         assert_eq!(expand("sudo ll", a), "sudo ls -la");
-        // Without the blank, the next word is just an argument.
+        // Without the blank, the next word is an argument.
         let b = &[("sudo", "sudo"), ("ll", "ls -la")][..];
         assert_eq!(expand("sudo ll", b), "sudo ll");
     }
 
-    // Only the separators and block openers put us back in command
-    // position: the word after `for` is a variable name, and the words
-    // after `in` are a list.
+    // Only separators and block openers return to command position.
     #[test]
     fn a_loop_variable_and_its_list_are_not_commands() {
         let a = &[("i", "echo NO"), ("x", "echo NO")][..];
@@ -3304,8 +2898,7 @@ mod alias_tests {
     }
 }
 
-// Up to `max` hexadecimal digits, as one value. Fewer is fine -- `\x7`
-// is a complete escape -- which is why this peeks rather than demands.
+// Up to `max` hex digits as one value; fewer is fine (`\x7`).
 fn read_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) -> u32 {
     let mut value = 0u32;
     for _ in 0..max {
