@@ -108,6 +108,22 @@ pub struct History {
     appended: usize,
 }
 
+/// Takes group and other off an existing history file.
+///
+/// Only when there is something to take: a `set_permissions` on every
+/// append would be a syscall per command for nothing, and a file that is
+/// already 0600 is the overwhelmingly common case after the first time.
+/// Failure is ignored on purpose -- a history file on a filesystem that
+/// cannot represent the mode is still worth appending to.
+fn tighten_history_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700));
+    }
+}
+
 impl History {
     // `filename` is a bare filename under $HOME, e.g. ".bish_history" for
     // the normal shell history or ".bish_cmd_history" for command mode's.
@@ -208,7 +224,21 @@ impl History {
             prev: self.tail.take(),
         }));
         if let Some(p) = &self.path {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 0600, and not whatever the umask says. This file is every
+            // command anybody has typed at a bish prompt, which on a
+            // shared machine includes the ones with a password or a
+            // token in them -- it was being created 0644 under the
+            // ordinary 0022 umask, so every other user on the host could
+            // read all of it. bash creates its own history 0600;
+            // measured side by side with a fresh HOME for each.
+            //
+            // `mode` only applies to a file this call creates, so an
+            // install that already has one is tightened just below:
+            // nobody chose 0644, a umask did, and leaving it would mean
+            // the fix only ever helped new installs.
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p) {
+                tighten_history_permissions(p);
                 // One `write_all` of one line, deliberately -- not a
                 // `writeln!` per field and not a two-line record. A
                 // single write to a file opened O_APPEND is serialized
@@ -992,6 +1022,31 @@ mod tests {
         let path = dir.join("history");
         std::fs::write(&path, contents).unwrap();
         (dir, path)
+    }
+
+    // The history file is every command anybody typed, so it is 0600 and
+    // not whatever the umask said. It was being created 0644 under the
+    // ordinary 0022 umask, which on a shared machine is every password
+    // ever typed at a prompt, readable by everyone.
+    #[test]
+    fn the_history_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tempdir::TempDir::new("hist-mode");
+        let path = dir.join("history");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let mut h = History::load_at(Some(path.clone()), 100);
+        h.record("echo one", None);
+        assert_eq!(mode(&path), 0o600, "a file this created must not be readable by anyone else");
+
+        // An install that already has a loose one is tightened rather
+        // than left: nobody chose 0644, a umask did.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        h.record("echo two", None);
+        assert_eq!(mode(&path), 0o600);
+        // ...and the entries are still there, which is the half that
+        // makes it a fix.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
     }
 
     #[test]
