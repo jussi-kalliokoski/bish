@@ -1,28 +1,17 @@
-// A corpus of editor keystrokes that vim and bish's own editor should
-// agree on, run through both and diffed.
+// A corpus of editor keystrokes vim and bish's editor should agree on,
+// run through both and diffed, as `bashdiff.rs` does for the shell. A
+// case is one line.
 //
-// The same idea as `bashdiff.rs`, one layer up: bish's editor is
-// vim-like, vim is the reference, and the two can be driven the same
-// way. Adding a case costs one line, so the next question of the form
-// "does bish's `dt,` do what vim's does?" is answered by writing it
-// down.
+// The file is compared, never the screen: both editors get the same
+// content and keys, then `:wq`, and the bytes on disk are diffed, so
+// nothing depends on rendering or cursor placement.
 //
-// What is compared is the *file*, never the screen. Both editors are
-// given the same starting content, the same keystrokes and then `:wq`,
-// and the resulting bytes on disk are diffed -- so nothing here depends
-// on rendering, colours, or where either editor puts the cursor.
+// - Keys go in one at a time: `dt,` arriving in one read differs from
+//   someone typing it.
+// - vim runs as `vim -u NONE -i NONE -N` (no vimrc, no viminfo,
+//   nocompatible), or the corpus measures the local configuration.
 //
-// Two details that are not obvious and cost a real finding each:
-//
-// - Keys go in one at a time. `dt,` arriving in a single read is a
-//   different thing from a person typing it, and one of the first three
-//   differences this found went away once they were separated.
-// - vim is run as `vim -u NONE -i NONE -N`: no vimrc, no viminfo, and
-//   nocompatible. Without `-u NONE` the corpus measures the local
-//   configuration instead of vim.
-//
-// Skipped where there is no vim, the way the bash corpus skips without
-// bash.
+// Skipped where there's no vim.
 
 #[cfg(test)]
 mod tests {
@@ -33,10 +22,8 @@ mod tests {
 
     struct Case {
         name: &'static str,
-        /// The file's own bytes before the keys are sent. Bytes rather
-        /// than text because what an editor does with a file that is
-        /// not UTF-8 is one of the things this corpus is here to
-        /// measure -- see `case_raw`.
+        /// The file's bytes before the keys. Bytes, as what an editor does
+        /// with non-UTF-8 is part of what's measured (see `case_raw`).
         before: &'static [u8],
         /// Sent one character at a time, in order.
         keys: &'static str,
@@ -46,14 +33,13 @@ mod tests {
         Case { name, before: before.as_bytes(), keys }
     }
 
-    /// A case whose file cannot be written as Rust source text: a
-    /// latin-1 byte, a byte-order mark, anything an editor has to work
-    /// out rather than read.
+    /// A case whose file can't be written as Rust text: a latin-1 byte, a
+    /// byte-order mark.
     const fn case_raw(name: &'static str, before: &'static [u8], keys: &'static str) -> Case {
         Case { name, before, keys }
     }
 
-    // `\u{1b}` is escape and `\r` is Enter; both are ordinary keys here.
+    // `\u{1b}` is Escape and `\r` Enter; both are ordinary keys here.
     const CASES: &[Case] = &[
         // -- deleting --------------------------------------------------
         case("dd", "one\ntwo\nthree\n", "dd"),
@@ -61,9 +47,8 @@ mod tests {
         case("cc-with-count", "a\nb\nc\n", "2ccZ\u{1b}"),
         case("r", "abc\n", "rZ"),
         case("r-with-count", "abcdef\n", "3rZ"),
-        // `Z` is `ZZ`'s own first key, intercepted ahead of the key
-        // machine -- so `rZ` is the case that catches an interception
-        // that forgot to check whether anything was pending.
+        // `Z` is `ZZ`'s first key, intercepted before the key machine, so
+        // `rZ` catches an interception that ignores what's pending.
         case("ZZ-still-saves", "one\ntwo\n", "xZZ"),
         case("t-motion", "a,b,c\n", "dt,"),
         case("t-motion-mid-line", "abcdef\n", "dtc"),
@@ -77,8 +62,8 @@ mod tests {
         case("dot-repeats-a-change", "one two three\n", "cwZ\u{1b}w."),
         case("dot-repeats-a-line-delete", "a\nb\nc\nd\n", "dd."),
         case("dot-after-undo-repeats-the-change-not-the-undo", "abcdef\n", "xu."),
-        // A count before an insert repeats what is typed; before `.` it
-        // takes the place of the count the change was made with.
+        // A count before an insert repeats what's typed; before `.` it
+        // replaces the change's count.
         case("insert-with-count", "a\n", "3ihi\u{1b}"),
         case("append-at-end-with-count", "a\n", "2Abc\u{1b}"),
         case("open-line-with-count", "a\nb\n", "3oX\u{1b}"),
@@ -89,9 +74,8 @@ mod tests {
         case("dot-with-nothing-to-repeat", "abc\n", "."),
         case("mark-linewise-delete", "a\nb\nc\n", "maGd'a"),
         case("mark-linewise-delete-partial", "a\nb\nc\nd\n", "jmaGd'a"),
-        // An empty file and a file of one empty line are different
-        // files, and a buffer that always keeps a line to put the
-        // cursor on has to remember which it started as.
+        // An empty file and a file of one empty line differ, and a buffer
+        // that always has a line for the cursor must remember which it was.
         case("empty-file-stays-empty", "", "0"),
         case("one-newline-file-stays-one-newline", "\n", "0"),
         case("deleting-every-line-empties-the-file", "a\nb\nc\n", "dG"),
@@ -202,9 +186,8 @@ mod tests {
         // -- arithmetic on the buffer ----------------------------------
         case("ctrl-a", "x 41 y\n", "\u{1}"),
         case("ctrl-x", "x 41 y\n", "\u{18}"),
-        // -- roadmap 05 item 8: a sweep of untouched editor ground ----
-        // Joining, and the shorthand operators -- the ones that are a
-        // whole command in one key.
+        // -- a sweep of less-trodden ground --------------------------------
+        // Joining, and the one-key shorthand operators.
         case("join-lines", "a\nb\n", "J"),
         case("join-with-count", "a\nb\nc\n", "3J"),
         case("join-without-a-space", "a\nb\n", "gJ"),
@@ -239,7 +222,7 @@ mod tests {
         case("backtick-mark", "abc\n", "lmax0d`a"),
         // Registers: appending with an uppercase name.
         case("uppercase-register-appends", "a\nb\n", "\"ayyj\"Ayygg\"ap"),
-        // Ex forms the corpus had not reached.
+        // More ex forms.
         case("ex-copy-a-line", "a\nb\n", ":1t$\r"),
         case("ex-invert-global", "a\nb\na\n", ":v/b/d\r"),
         case("hash-search", "aa\nbb\naa\n", "G#dd"),
@@ -250,33 +233,26 @@ mod tests {
         case("gu-upper-a-word", "abc\n", "gUiw"),
         case("g-tilde-a-line", "aBc\n", "g~~"),
         case("visual-paste-over", "ab\ncd\n", "yyjVp"),
-        // The editor's `/` is ERE, and now has GNU's zero-width
-        // assertions in it. `\<`, `\>`, `\w` and `\s` mean the same
-        // things to vim, so these are cases where the two surfaces
-        // agree and the corpus can say so.
+        // The editor's `/` is ERE with GNU's zero-width assertions; `\<`,
+        // `\>`, `\w` and `\s` mean the same in vim.
         case("search-word-start", "foobar\nfoo bar\n", "/\\<bar\rx"),
         case("search-word-end", "barn\nfoo bar\n", "/bar\\>\rx"),
         case("search-word-class", "  %%\nab12\n", "/\\w\\w\rx"),
         case("search-space-class", "ab\na b\n", "/\\s\rx"),
-        // -- encodings -------------------------------------------------
-        // A file that is not UTF-8 is still a file. These used to be
-        // unopenable here: `TextBuffer::open` was `read_to_string`, so
-        // the editor's answer to a latin-1 file was an error message.
-        // Now the question is the one that matters -- whether editing
-        // one line of it leaves the other bytes alone.
+        // -- encodings ------------------------------------------------- A
+        // file that isn't UTF-8 is still a file: editing one line must
+        // leave the other bytes alone.
         case_raw("latin1-file-keeps-its-bytes", b"caf\xe9\nna\xefve\n", "jx"),
         case_raw("latin1-file-edited-on-the-accented-line", b"caf\xe9\n", "$x"),
-        // A byte-order mark is not a character in the file and not
-        // something an editor gets to drop: whatever reads the file
-        // next may be looking for it.
+        // A byte-order mark isn't a character, and isn't the editor's to
+        // drop: whatever reads the file next may look for it.
         case_raw("utf8-bom-survives-an-edit", b"\xef\xbb\xbfone\ntwo\n", "jx"),
         case_raw("utf16-file-keeps-its-encoding", b"\xff\xfeo\x00n\x00e\x00\n\x00t\x00w\x00o\x00\n\x00", "jx"),
         // -- folds -----------------------------------------------------
-        // Only the file is compared, so a fold has to show itself by
-        // what an edit does to it: a closed fold is one line to `j`,
-        // `k`, `dd` and a count, and every line of it to the operator.
-        // `vim -u NONE` has manual folding and a `foldlevel` of 0, so a
-        // new fold starts closed there, as it does here.
+        // Only the file is compared, so a fold shows by what an edit does:
+        // a closed fold is one line to `j`, `k`, `dd` and counts, and all
+        // its lines to an operator. `vim -u NONE` has manual folding and
+        // `foldlevel` 0, so a new fold starts closed there too.
         case("fold-dd-deletes-a-closed-fold", "1\n2\n3\n4\n", "zfjdd"),
         case("fold-j-steps-over-a-closed-fold", "1\n2\n3\n4\n", "zfjjdd"),
         case("fold-k-steps-over-a-closed-fold", "1\n2\n3\n4\n", "jzfjGkkdd"),
@@ -295,8 +271,8 @@ mod tests {
         case("fold-ex-fold-folds-a-range", "1\n2\n3\n4\n", ":2,3fold\rggjdd"),
         case("fold-zj-moves-to-the-next-fold", "1\n2\n3\n4\n5\n", "jjzfjggzjdd"),
         case("fold-nested-zo-opens-one-level", "1\n2\n3\n4\n", "zfjzfjzodd"),
-        // What moves by rows stops on a closed fold; what was looking for
-        // something opens the fold it finds it in.
+        // What moves by rows stops on a closed fold; a search opens the fold
+        // it lands in.
         case("fold-search-opens-the-fold-it-lands-in", "one\ntwo\nthree\nfour\n", "jjzfjgg/four\rdd"),
         case("fold-l-opens-the-fold", "ab\ncd\nef\n", "zfjlx"),
         // A fold moves with its lines.
@@ -304,17 +280,15 @@ mod tests {
         case("fold-survives-an-undo", "1\n2\n3\n4\n", "zfjGdduggdd"),
     ];
 
-    // Cases bish does not match today, each with why. Asserted to
-    // *still* differ, so one that gets fixed fails this test until its
-    // entry is removed -- the same contract `bashdiff.rs` uses.
+    // Cases bish doesn't match yet, each with why. Asserted to still differ,
+    // so a fixed one fails until its entry goes, as in `bashdiff.rs`.
     const DIVERGENCES: &[(&str, &str)] = &[
         (
             "indent-width",
             "`>>` inserts four spaces where `vim -u NONE` inserts a tab -- bish reads .editorconfig and defaults to spaces, which is a choice rather than a bug, but it is a difference and it is recorded",
         ),
         ("visual-indent", "indents with spaces where `vim -u NONE` uses a tab -- the same deliberate choice as `indent-width`"),
-        // Both of these do the right thing and reach it with the wrong
-        // character: the shift happens, on the right lines, in spaces.
+        // Both shift the right lines, with spaces where vim uses a tab.
         ("ex-shift-right", "`:>` shifts with spaces where `vim -u NONE` uses a tab -- the same choice as `indent-width`"),
         ("shift-right-with-count", "`2>>` shifts both lines, in spaces where `vim -u NONE` uses a tab -- the same choice as `indent-width`"),
         (
@@ -331,30 +305,21 @@ mod tests {
         case("shift-right-with-count", "a\nb\n", "2>>"),
     ];
 
-    /// The vim this machine would run, or `None` when it has none and
-    /// the corpus has nothing to compare against.
+    /// The vim this machine would run, or `None`.
     fn vim() -> Option<String> {
         crate::toolpath::find("vim")
     }
 
-    /// `target/<profile>/bish`, worked out from the test binary's own
-    /// path -- same as `bashdiff.rs`.
+    /// `target/<profile>/bish`, from the test binary's path, as in
+    /// `bashdiff.rs`.
     fn bish_binary() -> Option<PathBuf> {
         let exe = std::env::current_exe().ok()?;
         let path = exe.parent()?.parent()?.join("bish");
         path.exists().then_some(path)
     }
 
-    /// Runs one editor in a pty over `path`, sends `keys` one character
-    /// at a time and then `:wq`, and returns what the file holds
-    /// afterwards.
-    /// `None` when the editor never answered the handshake, which is a
-    /// failure of this harness rather than a difference between the two
-    /// editors -- see the call site.
-    /// A file's bytes, as something a failure message can print. Valid
-    /// UTF-8 prints as itself; anything else prints as escaped bytes
-    /// behind a marker, so a file of text and a file of bytes never
-    /// render alike.
+    /// A file's bytes for a failure message: UTF-8 prints as itself, anything
+    /// else as escaped bytes behind a marker, so the two never look alike.
     fn render(bytes: Vec<u8>) -> String {
         match String::from_utf8(bytes) {
             Ok(text) => text,
@@ -365,34 +330,32 @@ mod tests {
         }
     }
 
+    /// Runs one editor in a pty over `path`, sends `keys` one character at a
+    /// time and then `save`, and returns what the file holds. `Err` when the
+    /// editor never answered the handshake, a harness failure rather than a
+    /// difference (see the call site).
     fn edit(argv: &[String], path: &Path, keys: &str, save: &str) -> Result<String, &'static str> {
         let Ok(pty) = crate::pty::open() else { return Err("no pty could be opened for it") };
         let _ = crate::pty::set_size(std::os::fd::AsRawFd::as_raw_fd(&pty.master), 24, 80);
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.env("TERM", "xterm-256color");
-        // No config of either editor's: this measures the editors, not
-        // the machine they are on.
+        // No config for either editor: this measures editors, not the
+        // machine.
         cmd.env_remove("VIMINIT");
-        // Nor its clipboard, which is the machine at its most global. A
-        // corpus whose cases open with `dd` would otherwise write the
-        // developer's clipboard several hundred times a run, and each
-        // `wl-copy` daemonizes holding the stdout it inherited, so
-        // `cargo test` piped anywhere never reaches EOF. vim leaves the
-        // system clipboard alone by default; bish's unnamed register is
-        // it, so bish is the one that has to be told.
+        // Nor the clipboard. bish's unnamed register is the system
+        // clipboard, and each `wl-copy` daemonizes holding the stdout it
+        // inherited, so a corpus full of `dd` would fill the clipboard and
+        // keep a piped `cargo test` from ever reaching EOF.
         cmd.env("BISH_NO_CLIPBOARD", "1");
         let Ok(mut child) = crate::pty::spawn_attached(cmd, &pty.slave_path) else {
             return Err("could not be started");
         };
         let mut master = pty.master;
         let _ = crate::pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
-        // Every read goes through here, and `settle` decides whether
-        // the editor has gone quiet from what *this* returns. An
-        // earlier version also read directly in `settle` and only
-        // counted what was left over, which made "quiet" mean
-        // "something else drained it" -- the keys were then sent while
-        // the editor was still painting, and it never saw them.
+        // Every read goes through here, and `settle` judges quiet by what
+        // this returns; reading elsewhere too let keys go out while the
+        // editor was still painting.
         let mut drain = |master: &mut std::fs::File| -> usize {
             let mut buf = [0u8; 4096];
             let mut total = 0;
@@ -404,21 +367,14 @@ mod tests {
             }
             total
         };
-        // Wait for it to paint its first screen before typing at it.
-        // Not just "until quiet": an editor that has not started yet is
-        // also quiet, and a key sent before it puts the terminal in raw
-        // mode is read by the line discipline instead of by the editor.
-        // An editor that never answers is not an editor that did
-        // something unexpected. Typing at it anyway produces the file
-        // exactly as it was, which is indistinguishable from "the
-        // editor ignored every key" -- and that is what a lost
-        // handshake used to be reported as.
-        // Thirty seconds, not ten. The budget is the one guess left in
-        // here about how fast the machine is, and it costs nothing when
-        // it is wrong in this direction: the handshake returns the
-        // moment it is answered, so a healthy run never waits. A run
-        // alongside the rest of the suite, with two editors and a few
-        // thousand processes competing, is the case it has to cover.
+        // Wait for the first screen before typing: an editor not yet
+        // started is quiet too, and a key sent before raw mode goes to the
+        // line discipline. An editor that never answers is a harness
+        // failure, not a divergence: typing anyway leaves the file
+        // unchanged, which looks like "ignored every key".
+        //
+        // Thirty seconds: returning on the answer, a healthy run never
+        // waits, and a run beside the whole suite needs the room.
         if !handshake(&mut master, &mut drain, Duration::from_secs(30)) {
             let _ = child.kill();
             let _ = child.wait();
@@ -430,23 +386,9 @@ mod tests {
             let floor = if c == '\u{1b}' { ESC_DWELL } else { Duration::from_millis(20) };
             settle(&mut master, &mut drain, floor, KEY_LIMIT, QUIET_TICKS);
         }
-        // Wait for it to finish writing, killing it if it will not --
-        // and then say so, rather than reading the file regardless.
-        //
-        // This was the last flake. A `:wq` that has not finished is not
-        // a slower version of the answer, it is no answer: the file on
-        // disk is still the *input*, so reading it hands back the
-        // unedited text as though the editor had ignored every
-        // keystroke. That is precisely what this corpus kept reporting
-        // -- `dot-repeats-a-line-delete`, `G-then-dd` and `gv` each
-        // turned up once, always "bish kept the lines vim deleted",
-        // always passing on a rerun. And the retry could not rescue it,
-        // because a machine slow enough to miss the deadline once
-        // misses it three times.
-        //
-        // `None` is the word this harness already has for "could not
-        // drive it", so a kill returns that and the caller treats it
-        // the way it treats a handshake that never completed.
+        // Wait for it to finish writing, killing it if it won't, and say
+        // so: a `:wq` that hasn't finished leaves the input on disk, which
+        // reads as "ignored every key". An `Err`, like a missed handshake.
         let mut exited = false;
         let deadline = Instant::now() + EXIT_LIMIT;
         loop {
@@ -467,62 +409,37 @@ mod tests {
             }
         }
         match exited {
-            // Compared as *bytes*: a case about encodings is a case
-            // about which bytes came out, and reading the result as
-            // UTF-8 would turn every latin-1 file on both sides into
-            // the same error message. Rendered readably when it is
-            // text, and escaped when it is not, with a marker so the
-            // two renderings can never be confused for each other.
+            // Compared as bytes: read as UTF-8, every latin-1 file would
+            // become the same error message on both sides.
             true => Ok(std::fs::read(path).map(render).unwrap_or_else(|e| format!("<unreadable: {e}>"))),
-            // Named apart from the handshake failure on purpose: the
-            // two have different causes and different fixes, and a
-            // single message for both cost an afternoon working out
-            // which one was happening.
+            // Distinct from the handshake failure: different causes,
+            // different fixes.
             false => Err("never finished writing the file"),
         }
     }
 
-    /// Blocks until the editor has demonstrably read a key, by asking
-    /// it a question it must answer on screen: Ctrl-L redraws in both
-    /// editors and changes nothing in the buffer.
+    /// Blocks until the editor has demonstrably read a key, by asking it
+    /// something it must answer on screen: Ctrl-L redraws in both editors
+    /// and changes nothing.
     ///
-    /// Waiting for output instead cannot establish this. An editor
-    /// writes several times on its way up and is quiet in the gaps, so
-    /// "it has gone quiet" and "it has not started" look identical from
-    /// out here -- and a key sent into one of those gaps, before the
-    /// terminal is raw, is swallowed by the line discipline rather than
-    /// queued. Asking until answered is the only version of this that
-    /// does not encode a guess about how fast the machine is: it costs
-    /// one poll when the editor is up and waits when it is not.
+    /// Waiting for output can't establish this: an editor writes several
+    /// times on its way up and is quiet between, so "gone quiet" and "not
+    /// started" look alike, and a key sent before raw mode is swallowed by
+    /// the line discipline. Asking until answered encodes no guess about
+    /// machine speed. The wait for quiet before each ask matters: otherwise
+    /// the startup paint counts as the answer.
     ///
-    /// The wait for quiet before each ask is the load-bearing part.
-    /// Without it the startup paint still arriving counts as the
-    /// answer, and the ask is "confirmed" by output that predates it.
+    /// Ctrl-L rather than `:`, which needs cancelling with Esc, and an Esc
+    /// just before a case's first key can merge with it (`Esc O` is SS3).
     ///
-    /// Ctrl-L rather than the more obvious `:`, because `:` has to be
-    /// cancelled afterwards and the only key that cancels it is Esc --
-    /// which would then sit directly in front of the case's first
-    /// keystroke. `Esc` `O` is the SS3 introducer, so the `O` case
-    /// lost both its `O` and the `n` after it, and vim recorded a
-    /// difference that was entirely the harness's doing. A probe that
-    /// needs no cancelling cannot cause that.
-    /// Returns whether the editor ever answered. Giving up quietly and
-    /// typing anyway is the one thing this must not do: the keys go to
-    /// the line discipline, the file comes back untouched, and the case
-    /// reports a difference that is entirely this harness's.
+    /// Returns whether the editor answered. Typing anyway would leave the
+    /// file untouched and report a difference that's the harness's.
     fn handshake(master: &mut std::fs::File, drain: &mut impl FnMut(&mut std::fs::File) -> usize, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
-        // First, wait for the editor to actually take the terminal.
-        // Asking before that is the whole hazard: the line discipline
-        // holds what is typed and the editor never sees it.
-        //
-        // This is an observation rather than an inference. The two ends
-        // of a pty share one set of line settings, so ICANON going off
-        // *is* the editor putting the terminal in raw mode -- where
-        // "it answered something" can be fooled by a startup paint that
-        // happens to have a gap in it, which is how a case could still
-        // come back with its file untouched after the handshake said
-        // yes.
+        // First wait for the editor to take the terminal: the pty's ends
+        // share line settings, so ICANON going off is the editor entering
+        // raw mode. An answer alone can be faked by a startup paint with a
+        // gap in it.
         let fd = std::os::fd::AsRawFd::as_raw_fd(&*master);
         while Instant::now() < deadline && !crate::term::is_raw(fd) {
             drain(master);
@@ -543,64 +460,34 @@ mod tests {
         false
     }
 
-    /// How long to leave an escape alone before sending the next key.
-    ///
-    /// bish decides a lone Esc is a lone Esc by polling for a following
-    /// byte for `ESCAPE_TIMEOUT_MS` (30ms, editor.rs) -- and if one
-    /// arrives that soon and is not `[` or `O`, the pair decodes to
-    /// `Key::Unknown` and *both* bytes are gone. Typed at the speed of
-    /// a pty write, `Esc :wq` therefore became nothing at all: the
-    /// editor sat there until the harness killed it and the case read
-    /// back its unedited file, which is what made every bish result
-    /// look like the editor had ignored the whole sequence.
+    /// How long to leave an Escape before the next key. bish takes Esc as
+    /// alone if nothing follows within `ESCAPE_TIMEOUT_MS` (30ms, editor.rs);
+    /// a byte arriving sooner that isn't `[` or `O` decodes the pair as
+    /// `Key::Unknown`, losing both, so `Esc :wq` at pty speed did nothing.
     const ESC_DWELL: Duration = Duration::from_millis(90);
 
-    /// How many consecutive silent 4ms polls mean the editor has
-    /// finished responding to a key.
-    ///
-    /// A redraw is not one burst. bish answers a single keystroke in
-    /// several chunks with real gaps between them, so a short run of
-    /// silence lands *inside* one keystroke's response and the next key
-    /// goes out while the editor is still writing -- which is the
-    /// condition ESC_DWELL exists to avoid. This is the number that has
-    /// to be generous; the floor only covers keys that draw nothing.
+    /// Consecutive silent 4ms polls meaning the editor finished responding.
+    /// bish answers a key in several chunks with gaps, so a short silence
+    /// can fall inside one response and the next key goes out mid-write,
+    /// which `ESC_DWELL` exists to avoid.
     const QUIET_TICKS: u32 = 40;
 
-    /// How long a single keystroke may take before the next one is sent
-    /// anyway.
-    ///
-    /// Generous on purpose, and for a subtler reason than "give it time
-    /// to finish". This clock is what makes ESC_DWELL mean anything.
-    /// The dwell has to separate the two bytes *as the editor reads
-    /// them*, not as the harness writes them -- and bytes written while
-    /// the editor is still redrawing the previous key simply queue up,
-    /// so a dwell spent against a busy editor buys no separation at
-    /// all. Waiting for the redraw to actually finish before sending
-    /// the escape is what keeps the pair apart. A debug-build editor on
-    /// a loaded machine can take most of a second on one keystroke.
+    /// How long one keystroke may take before the next is sent anyway.
+    /// Generous because it's what makes `ESC_DWELL` work: the dwell must
+    /// separate bytes as the editor reads them, and bytes written while it's
+    /// still redrawing just queue. A debug build on a loaded machine can take
+    /// most of a second per key.
     const KEY_LIMIT: Duration = Duration::from_millis(2500);
 
-    /// How long `:wq` may take before the editor is given up on.
-    ///
-    /// As generous as the handshake's own budget, and for the same
-    /// reason: a debug-build editor writing a file on a machine running
-    /// the rest of this suite is slow in ways that have nothing to do
-    /// with whether it works. The old five seconds was tight enough to
-    /// lose to ordinary load, and losing meant reporting the *unedited*
-    /// file as bish's answer.
+    /// How long `:wq` may take before the editor is given up on: as long as
+    /// the handshake's budget, since a debug build writing a file beside the
+    /// suite is slow, and giving up reported the unedited file as bish's.
     const EXIT_LIMIT: Duration = Duration::from_secs(30);
 
-    /// Reads until the editor has produced nothing for `quiet_ticks`
-    /// consecutive 4ms polls, or `limit` elapses. Adaptive rather than
-    /// a fixed sleep, so a fast keystroke does not pay for a slow one.
-    ///
-    /// `floor` matters as much as `limit`. A key that changes nothing
-    /// on screen produces no output at all, so "quiet" alone cannot
-    /// distinguish "done" from "not started"; and an editor still
-    /// coming up is quiet in the gaps between its startup writes. Send
-    /// a key into one of those gaps -- before it has put the terminal
-    /// in raw mode -- and the line discipline eats it. That is exactly
-    /// what made this corpus report every bish case as unedited.
+    /// Reads until the editor is silent for `quiet_ticks` consecutive 4ms
+    /// polls, or `limit` passes; adaptive, so fast keys don't pay for slow
+    /// ones. `floor` matters too: a key that changes nothing on screen
+    /// produces no output, so quiet alone can't tell done from not started.
     fn settle(master: &mut std::fs::File, drain: &mut impl FnMut(&mut std::fs::File) -> usize, floor: Duration, limit: Duration, quiet_ticks: u32) {
         let started = Instant::now();
         let mut quiet = 0;
@@ -613,51 +500,34 @@ mod tests {
         }
     }
 
-    /// Runs every case through both editors and returns the ones whose
-    /// files came out different.
-    ///
-    /// A case that differs is run again, twice, before it is believed.
-    /// Two live editors are being typed at through a pty, and a
-    /// keystroke lost to a slow redraw shows up here as "bish did
-    /// nothing" -- which looks exactly like a real divergence and is
-    /// not one. A genuine difference is deterministic and survives
-    /// every rerun; timing noise does not. Twice rather than once
-    /// because a single retry still let a flake through when this ran
-    /// alongside the rest of the suite, with the machine loaded enough
-    /// to lose a key on two attempts running. The reruns cost nothing
-    /// on a clean run, since only a differing case pays for them.
-    /// A case whose two editors disagreed: its name, vim's file, and
-    /// bish's.
+    /// A case whose editors disagreed: its name, vim's file and bish's.
     type Divergence = (&'static str, String, String);
 
-    /// A case this harness could not drive: its name, and which editor
-    /// failed how.
+    /// A case this harness couldn't drive: its name, and which editor failed
+    /// how.
     type Undriveable = (&'static str, String);
 
-    /// The cases whose files came out different, and separately the
-    /// cases this harness could not drive at all.
+    /// The cases whose files differ, and separately those this harness
+    /// couldn't drive. Not driving an editor is the harness losing a race on
+    /// a busy machine, not a fact about either editor, so the two are kept
+    /// apart.
     ///
-    /// Two editors are being typed at through a pty, and "could not
-    /// drive it" is not a fact about either of them -- it is this
-    /// harness losing a race on a busy machine. Reporting the two
-    /// together is how a loaded run used to produce a *divergence*
-    /// naming content neither editor ever produced.
+    /// A differing case is rerun twice before it's believed: a key lost to a
+    /// slow redraw looks like a real divergence, but a real one survives
+    /// every rerun. Only differing cases pay for reruns.
     fn compare(cases: &[Case], bish: &Path, vim: &str) -> (Vec<Divergence>, Vec<Undriveable>) {
         let root = std::env::temp_dir().join(format!("bish-vimdiff-{}", std::process::id()));
         let mut differing = Vec::new();
         let mut undriveable = Vec::new();
-        // `BISH_VIMDIFF_ONLY=name` runs just that case. Driving two
-        // real editors through a pty takes minutes for the whole
-        // corpus, which is a long way to go to look at one case that
-        // only misbehaves sometimes.
+        // `BISH_VIMDIFF_ONLY=name` runs one case; the whole corpus takes
+        // minutes.
         let only = std::env::var("BISH_VIMDIFF_ONLY").ok();
         for c in cases {
             if only.as_deref().is_some_and(|want| want != c.name) {
                 continue;
             }
-            // A directory per case, named after it -- same reasoning as
-            // the bash corpus: two tests share this root, and an index
-            // would collide.
+            // A directory per case, named after it: two tests share this
+            // root, and an index would collide.
             let dir = root.join(c.name);
             let path = dir.join("f.txt");
             let run = |argv: Vec<String>, save: &str| -> Result<String, &'static str> {
@@ -668,16 +538,12 @@ mod tests {
             };
             let want =
                 run(vec![vim.to_string(), "-u".into(), "NONE".into(), "-i".into(), "NONE".into(), "-N".into(), path.display().to_string()], ":wq\r");
-            // bish gets an extra escape first: a case that ends in
-            // insert mode would otherwise type `:wq` into the buffer.
-            // vim does not need it because `:wq` from insert mode is
-            // the same mistake there, and every case here already
-            // leaves normal mode.
+            // bish gets an extra Escape first, or a case ending in insert
+            // mode would type `:wq` into the buffer; every case leaves vim
+            // in normal mode.
             let got = run(vec![bish.display().to_string(), "tool".into(), "edit".into(), path.display().to_string()], "\u{1b}:wq\r");
-            // An `Err` on either side is an editor this harness could
-            // not drive, not a difference between the two -- retried
-            // like any other, and reported separately below so it can
-            // never be read as a divergence.
+            // An `Err` on either side is a harness failure: retried like
+            // any other, and reported apart from divergences.
             if want != got || want.is_err() {
                 let mut confirmed = None;
                 for _ in 0..2 {
@@ -693,10 +559,8 @@ mod tests {
                     confirmed = Some((want_again, got_again));
                 }
                 match confirmed {
-                    // Neither side could be driven three times running,
-                    // or one of them could not. Either way this is the
-                    // harness's own failure and is kept apart from the
-                    // divergences -- see `compare`'s return type.
+                    // Couldn't be driven, three times running: the
+                    // harness's failure, kept apart from divergences.
                     Some((Err(why), _)) => undriveable.push((c.name, format!("vim {why}"))),
                     Some((_, Err(why))) => undriveable.push((c.name, format!("bish {why}"))),
                     Some((Ok(want), Ok(got))) => differing.push((c.name, want, got)),
@@ -709,26 +573,12 @@ mod tests {
         (differing, undriveable)
     }
 
-    /// How many cases may be undriveable before the run stops counting
-    /// as evidence.
-    ///
-    /// Not zero, because a machine running the rest of this suite does
-    /// occasionally lose one and that says nothing about the editor.
-    /// Not unbounded, because an editor that genuinely stopped
-    /// answering would otherwise report nothing at all and pass.
-    ///
-    /// It was 3, and 3 was a guess about how fast a machine is. On a
-    /// developer's own machine doing its own work -- load average
-    /// between 6 and 12, this suite taking 1850 seconds where it
-    /// normally takes 620 -- two consecutive runs lost 5 and 6, and
-    /// both were green when run again on a quiet one. A number that
-    /// turns "somebody else is compiling" into a failing suite is
-    /// noise, and noise is what a guard stops being read.
-    ///
-    /// Ten is still nowhere near the failure this exists to catch: an
-    /// editor that stopped answering loses all 156, and every
-    /// undriveable case is printed either way, so a run that was quietly
-    /// short of evidence still says so.
+    /// How many cases may be undriveable before the run stops counting as
+    /// evidence. Not zero: a machine running the rest of the suite loses one
+    /// now and then. Not unbounded: an editor that stopped answering would
+    /// pass. Under heavy load (load average 6 to 12) runs lost 5 and 6
+    /// cases. An editor that stopped answering loses all of them, and every
+    /// undriveable case is printed either way.
     const UNDRIVEABLE_TOLERANCE: usize = 10;
 
     #[test]
@@ -743,8 +593,8 @@ mod tests {
             CASES.len(),
             differing.iter().map(|(name, want, got)| format!("  {name}\n    vim : {want:?}\n    bish: {got:?}")).collect::<Vec<_>>().join("\n")
         );
-        // Said out loud even when it is within tolerance, so a run that
-        // was quietly short of evidence cannot look like a clean one.
+        // Printed even within tolerance, so a run short of evidence can't
+        // look clean.
         for (name, why) in &undriveable {
             eprintln!("vimdiff: {name}: {why} -- not counted either way");
         }
@@ -761,14 +611,8 @@ mod tests {
     fn the_known_editor_divergences_are_still_divergences() {
         let Some(bish) = bish_binary() else { return };
         let Some(vim) = vim() else { return };
-        // A case this harness could not drive is no evidence that a
-        // known divergence has been fixed -- and saying so takes both
-        // halves of `compare`'s answer, not just the first. Reading
-        // only the differences made "could not be driven" and "agrees
-        // with vim" the same observation: the case is simply absent
-        // from the list, and this test then announced that
-        // `cc-keeps-the-indent` matched vim now, on a run where the
-        // editor had never been driven far enough to disagree.
+        // An undriveable case is no evidence a divergence was fixed: absent
+        // from the differences alone, it would read as agreeing with vim.
         let (differing, undriveable) = compare(PENDING, &bish, &vim);
         let differing: Vec<&str> = differing.into_iter().map(|(name, _, _)| name).collect();
         for (name, why) in DIVERGENCES {
