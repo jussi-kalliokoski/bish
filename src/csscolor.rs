@@ -1,14 +1,10 @@
-// Hand-rolled CSS Color parser -- no external crate, same spirit as
-// glob.rs/regex.rs. Supports: named colors (the standard 148 CSS Color
-// keywords, plus `transparent`), #hex (3/4/6/8 digit), rgb()/rgba(),
-// hsl()/hsla(), hwb(), and color-mix() -- the "color math" piece,
-// restricted to the three interpolation spaces this hand-rolled parser
-// can mix correctly by just averaging channels (srgb, hsl, hwb).
-// Perceptual spaces (lab()/lch()/oklab()/oklch(), color(display-p3 ...)),
-// relative color syntax (`rgb(from ... )`), calc() inside individual
-// channels, and light-dark() are all out of scope -- those need real
-// colorimetry (matrix transforms, calibrated primaries) or surrounding
-// context this parser doesn't have, not just more parsing.
+// A CSS color parser: the 148 named colors and `transparent`, hex (3, 4,
+// 6 or 8 digits), `rgb()`/`rgba()`, `hsl()`/`hsla()`, `hwb()`, and
+// `color-mix()` in the spaces that mix by averaging channels (srgb, hsl,
+// hwb). Not supported: perceptual spaces (`lab()`, `oklch()`,
+// `color(display-p3 ...)`), relative color syntax, `calc()` in channels,
+// and `light-dark()`, which need real colorimetry or context this doesn't
+// have.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgba {
@@ -23,15 +19,9 @@ impl Rgba {
         Rgba { r, g, b, a }
     }
 
-    // Canonical text form: 6-digit hex when fully opaque (the common
-    // case, and what most people mean by "a color"), 8-digit otherwise --
-    // never 3/4-digit shorthand, so this is always round-trippable
-    // through `parse` without loss. #[allow(dead_code)]: bishopt's own
-    // `get` deliberately echoes back the *original* text a color was set
-    // to rather than calling this (see exec.rs's BishOptValue::Color),
-    // but a resolved Rgba still needs a canonical serialization for
-    // whatever eventually actually *renders* a color (a prompt segment,
-    // truecolor escape codes, ...) -- this is that, kept ready for it.
+    // Canonical text: 6-digit hex when opaque, 8-digit otherwise, never
+    // shorthand, so it round-trips through `parse`. Unused: bishopt echoes a
+    // colour's original text (see `BishOptValue::Color`).
     #[allow(dead_code)]
     pub fn to_hex(self) -> String {
         if self.a == 255 {
@@ -71,30 +61,20 @@ pub fn parse(input: &str) -> Result<Rgba, String> {
     named_color(&lower).ok_or_else(|| format!("{s}: not a valid CSS color"))
 }
 
-// A resolved color that's either a concrete Rgba (anything `parse` above
-// understands) or a still-symbolic reference into the *terminal's own*
-// palette (an xterm-indexed slot 0-255, of which 0-15 are typically
-// user-themed) -- bish has no fixed RGB for that, only the terminal
-// displaying it does, so it can't be folded into Rgba the way every
-// other color form here is.
+// A color that's either a concrete Rgba or a slot in the terminal's own
+// palette (xterm-indexed 0-255, 0-15 usually themed by the user), which
+// has no RGB bish could know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TermColor {
     Rgba(Rgba),
     Ansi(u8),
 }
 
-// Vendor-prefixed extension, CSS's own convention for "not a standard
-// property/value, but shaped like one" (`-webkit-...`, `-moz-...`) --
-// `-bish-<name>` for one of the 16 standard ANSI slots by name, or
-// `-bish-ansi(<0-255>)` for any xterm-indexed slot by number (the 16
-// named ones are just `-bish-ansi(0)`..`-bish-ansi(15)` with a memorable
-// spelling). Deliberately its own entry point, not folded into `parse`
-// above: every other color form here resolves to a concrete Rgba that
-// color-mix() etc. can do real math on, but a terminal-palette color has
-// no fixed RGB bish itself knows -- `color-mix(in srgb, -bish-red,
-// blue)` has nothing to mix *with*, so it's simply not a color `parse`
-// (what color-mix's own component parsing calls) recognizes at all;
-// only a bare top-level value can be a terminal color.
+// `-bish-<name>` for one of the 16 ANSI slots by name, or
+// `-bish-ansi(<0-255>)` for any slot, styled after CSS vendor prefixes.
+// Separate from `parse` because a palette slot has no RGB to compute with:
+// `color-mix(in srgb, -bish-red, blue)` has nothing to mix, so only a bare
+// top-level value can be a terminal color.
 pub fn parse_terminal(input: &str) -> Result<TermColor, String> {
     let s = input.trim();
     match s.strip_prefix("-bish-") {
@@ -119,11 +99,8 @@ fn parse_vendor(rest: &str) -> Result<TermColor, String> {
         .ok_or_else(|| format!("-bish-{rest}: not a known terminal palette color"))
 }
 
-// The 16 standard ANSI slots' conventional names -- the same 8 base +
-// "bright" variant vocabulary terminal emulators themselves use in their
-// own palette settings (iTerm2/kitty/Alacritty/...), so `-bish-red`
-// means exactly the same slot a user's own terminal config already calls
-// "red".
+// The 16 ANSI slots' usual names, base and bright, as terminal emulators
+// name them in their palette settings.
 const ANSI_NAMES: &[(&str, u8)] = &[
     ("black", 0),
     ("red", 1),
@@ -143,13 +120,9 @@ const ANSI_NAMES: &[(&str, u8)] = &[
     ("bright-white", 15),
 ];
 
-// What a terminal's own color capability actually is -- ordered from
-// least to most capable so `>=` means "at least this good," the way
-// `ColorSupport::Ansi256 >= ColorSupport::Ansi16` reads naturally.
-// `TermColor::is_supported`/`pick` below are the only things that care
-// about this; detecting it for the *real* terminal bish is running in
-// is exec.rs's job (env vars, an inherently impure lookup this pure
-// parser module has no business doing itself).
+// A terminal's color capability, ordered so `>=` means "at least this".
+// Detecting the real terminal's is exec.rs's job (environment variables),
+// not this pure module's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ColorSupport {
     None,
@@ -159,13 +132,9 @@ pub enum ColorSupport {
 }
 
 impl TermColor {
-    // Would this exact color render as intended at this capability level
-    // -- not "would it render at all" (most terminals degrade a code
-    // they don't fully support rather than reject it outright), but
-    // "would it render as the *specific* color asked for." An Ansi slot
-    // beyond 15 needs at least a 256-color palette even though a 16-color
-    // terminal would still accept the escape code (mapping it to
-    // *something*, just not necessarily this color).
+    // Whether this color renders as this specific color at this level. A slot
+    // past 15 needs a 256-color palette, even though a 16-color terminal
+    // accepts the code and shows something else.
     pub fn is_supported(self, support: ColorSupport) -> bool {
         match self {
             TermColor::Rgba(_) => support >= ColorSupport::Truecolor,
@@ -175,27 +144,18 @@ impl TermColor {
     }
 }
 
-// CSS `font-family`'s own fallback convention, applied to color: a
-// comma-separated list of candidates in the author's own preference
-// order, e.g. "#ff0000, -bish-ansi(1), -bish-red" -- `pick` below picks
-// whichever one actually suits the terminal at hand. Reuses
-// split_top_level (paren-depth-aware) so an entry that's itself a
-// function taking commas of its own (rgb(), color-mix()) isn't split
-// apart by this list's own commas.
+// A comma-separated list of candidates in order of preference, like CSS
+// `font-family` (`#ff0000, -bish-ansi(1), -bish-red`); `pick` chooses.
+// Split at paren depth 0, so `rgb(1, 2, 3)` stays one entry.
 pub fn parse_terminal_list(input: &str) -> Result<Vec<TermColor>, String> {
     split_top_level(input, ',').into_iter().map(parse_terminal).collect()
 }
 
-// The first candidate that's actually supported at `support`, in the
-// list's own order -- same "first match wins, not best match" contract
-// `font-family` itself has (a browser doesn't reorder your font list by
-// quality either). Falls back to the *last* candidate if none qualify,
-// on the assumption a fallback list is written most-preferred-first,
-// least-demanding-last -- better to still send a terminal something
-// (most gracefully degrade an SGR code they can't fully honor, rather
-// than reject it) than send nothing. `candidates` empty is a caller
-// bug -- parse_terminal_list can never produce one (every split segment,
-// including "" itself, has to parse as *some* TermColor to reach Ok).
+// The first candidate supported at `support`, in list order, like
+// `font-family`. If none qualify, the last, assuming lists run from most
+// preferred to least demanding: a terminal degrades a code it can't fully
+// honour, so sending something beats nothing. `parse_terminal_list` never
+// returns an empty list.
 pub fn pick(candidates: &[TermColor], support: ColorSupport) -> TermColor {
     candidates
         .iter()
@@ -233,9 +193,9 @@ fn frac_to_u8(v: f64) -> u8 {
     clamp_u8(v * 255.0)
 }
 
-// Splits an `rgb()`/`hsl()`/`hwb()` function's inner text into its three
-// channels plus an optional alpha, honoring both legacy comma syntax
-// (`255, 0, 0, 0.5`) and modern space syntax (`255 0 0 / 0.5`).
+// Splits a color function's text into three channels and an optional
+// alpha, in the comma form (`255, 0, 0, 0.5`) or the space form
+// (`255 0 0 / 0.5`).
 fn split_channels(inner: &str) -> (Vec<String>, Option<String>) {
     let inner = inner.trim();
     if inner.contains(',') {
@@ -285,9 +245,8 @@ fn parse_rgb(inner: &str) -> Result<Rgba, String> {
     Ok(Rgba::new(chan(c0)?, chan(c1)?, chan(c2)?, a))
 }
 
-// Leading number, trailing unit -- e.g. "180deg" -> ("180", "deg"). Good
-// enough for hue's small unit vocabulary; doesn't need to handle
-// scientific notation ("1e2"), which no CSS hue value in practice uses.
+// A leading number and a trailing unit: `180deg` to (`180`, `deg`). No
+// scientific notation, which hue values don't use.
 fn split_number_unit(s: &str) -> (&str, &str) {
     let idx = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
     (&s[..idx], &s[idx..])
@@ -307,9 +266,8 @@ fn parse_hue(s: &str) -> Result<f64, String> {
     Ok(deg.rem_euclid(360.0))
 }
 
-// hsl()'s saturation/lightness and hwb()'s whiteness/blackness are always
-// percentages in CSS -- unlike rgb()'s channels, a bare number is never
-// valid here.
+// `hsl()`'s saturation and lightness and `hwb()`'s whiteness and
+// blackness are always percentages; a bare number is invalid.
 fn parse_percent(s: &str) -> Result<f64, String> {
     let s = s.trim();
     let pct = s.strip_suffix('%').ok_or_else(|| format!("'{s}': expected a percentage"))?;
@@ -337,8 +295,8 @@ fn parse_hwb(inner: &str) -> Result<Rgba, String> {
     Ok(Rgba::new(frac_to_u8(r), frac_to_u8(g), frac_to_u8(b), a))
 }
 
-// Standard HSL->RGB conversion; h in degrees (any range, wraps), s/l in
-// 0.0..=1.0. Returns each channel as a 0.0..=1.0 fraction.
+// HSL to RGB, with `h` in degrees (wrapping) and `s`, `l` and the results
+// in 0.0..=1.0.
 fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h.rem_euclid(360.0) / 60.0;
@@ -355,8 +313,8 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
     (r1 + m, g1 + m, b1 + m)
 }
 
-// hwb() is defined in terms of hsl() with full saturation/half lightness,
-// then linearly mixed toward white/black by w/b.
+// `hwb()` is `hsl()` at full saturation and half lightness, mixed toward
+// white and black by `w` and `b`.
 fn hwb_to_rgb(h: f64, w: f64, b: f64) -> (f64, f64, f64) {
     if w + b >= 1.0 {
         let gray = w / (w + b);
@@ -393,8 +351,8 @@ fn rgb_to_hwb(c: Rgba) -> (f64, f64, f64) {
     (h, r.min(g).min(b), 1.0 - r.max(g).max(b))
 }
 
-// Splits on `sep` only at paren-depth 0, so a color-mix() argument that's
-// itself a function call (`rgb(1 2 3 / 0.5)`) doesn't get split apart.
+// Splits on `sep` only at paren depth 0, so a function argument stays
+// whole.
 fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
@@ -442,8 +400,8 @@ fn split_top_level_ws(s: &str) -> Vec<String> {
     parts
 }
 
-// A color-mix() argument is `<color>` with an optional percentage, either
-// before or after it (both orders are valid CSS).
+// A `color-mix()` argument: a color with an optional percentage before or
+// after it.
 fn parse_mix_component(s: &str) -> Result<(String, Option<f64>), String> {
     let tokens = split_top_level_ws(s);
     match tokens.as_slice() {
@@ -464,14 +422,11 @@ fn parse_mix_component(s: &str) -> Result<(String, Option<f64>), String> {
     }
 }
 
-// Resolves two optional percentages into final 0..=100 mix weights that
-// sum to exactly 100, plus an alpha multiplier -- CSS Color 4's own
-// color-mix() algorithm: missing percentages default to 50/50 (or fill
-// in the complement of whichever one *was* given); if what's given (or
-// filled in) doesn't already sum to 100%, both are scaled up
-// proportionally so they do, and the result's alpha is scaled down by
-// however much they under-summed (mixing 30% of a color with 30% of
-// another leaves 40% "nothing", which reads as extra transparency).
+// Two optional percentages to weights summing to 100, plus an alpha
+// multiplier, per CSS Color 4: a missing one is the other's complement
+// (50/50 with neither). Weights summing under 100 are scaled up, and the
+// alpha down by the shortfall: 30% plus 30% leaves 40% of nothing, which
+// reads as transparency.
 fn resolve_mix_weights(p1: Option<f64>, p2: Option<f64>) -> Result<(f64, f64, f64), String> {
     let (mut w1, mut w2) = match (p1, p2) {
         (None, None) => (50.0, 50.0),
@@ -551,11 +506,9 @@ fn parse_color_mix(inner: &str) -> Result<Rgba, String> {
     Ok(scale_alpha(mixed, alpha_mult))
 }
 
-// The 148 standard CSS Color named keywords (the SVG 1.0 list CSS
-// adopted verbatim, plus `rebeccapurple`), cross-checked against the
-// W3C CSS Color 4 spec's own named-color table. `transparent` isn't
-// here -- it's handled directly in `parse` since it's the one keyword
-// with alpha 0 rather than 255.
+// The 148 CSS named colors (SVG 1.0's list plus `rebeccapurple`), checked
+// against CSS Color 4's table. `transparent` is handled in `parse`, being
+// the one with alpha 0.
 const NAMED_COLORS: &[(&str, Rgba)] = &[
     ("aliceblue", Rgba::new(240, 248, 255, 255)),
     ("antiquewhite", Rgba::new(250, 235, 215, 255)),
@@ -777,8 +730,7 @@ mod tests {
 
     #[test]
     fn color_mix_scales_alpha_when_percentages_undersum() {
-        // 20% + 20% = 40% of full coverage -- the rest reads as "mixed
-        // with nothing", so the result is 40% as opaque as a normal mix.
+        // 20% plus 20% covers 40%, so the result is 40% as opaque.
         let c = parse("color-mix(in srgb, red 20%, blue 20%)").unwrap();
         assert_eq!(c, Rgba::new(128, 0, 128, 102));
     }
@@ -848,11 +800,8 @@ mod tests {
 
     #[test]
     fn a_vendor_terminal_color_cannot_be_used_inside_color_mix() {
-        // color-mix() parses its own component colors via `parse`, not
-        // `parse_terminal` -- there's no fixed RGB to mix a terminal
-        // palette slot with, so this must fail rather than silently
-        // treating "-bish-red" as an unrecognized (and thus ignored)
-        // color function.
+        // `color-mix()` parses its components with `parse`, which rejects a
+        // palette slot: there's nothing to mix it with.
         assert!(parse("color-mix(in srgb, -bish-red, blue)").is_err());
     }
 
@@ -875,8 +824,7 @@ mod tests {
         let list = parse_terminal_list("#ff0000, -bish-ansi(1), -bish-red").unwrap();
         assert_eq!(list, vec![TermColor::Rgba(Rgba::new(255, 0, 0, 255)), TermColor::Ansi(1), TermColor::Ansi(1)]);
 
-        // rgb()'s own internal comma must not be treated as a fallback
-        // separator -- one candidate, not four broken fragments.
+        // `rgb()`'s commas aren't list separators.
         let list = parse_terminal_list("rgb(1, 2, 3)").unwrap();
         assert_eq!(list, vec![TermColor::Rgba(Rgba::new(1, 2, 3, 255))]);
     }
