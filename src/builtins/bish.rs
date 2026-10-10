@@ -1,7 +1,5 @@
-// `::bish` and its subcommands, plus `bishopt` and `abbr`: everything
-// bish has that bash does not.
-//
-// Free functions taking `&mut Shell` -- see `builtins/mod.rs`.
+// `::bish` and its subcommands, plus `bishopt` and `abbr`: what bish has
+// and bash doesn't.
 
 use crate::bishedit::snippet::{self, Abbr};
 use crate::exec::{
@@ -9,30 +7,21 @@ use crate::exec::{
     lsp_help, parse_size_spec, sh_eprintln, sh_println,
 };
 
-// The subcommand names each `::bish` family answers to. One list per
-// family, used both for the "expected:" line and for the "did you
-// mean" beside it -- so a name added to a `match` below and forgotten
-// here shows up as a wrong error message rather than as a silently
-// unsuggestable command.
+// The subcommands each `::bish` family answers to, used for both the
+// "expected:" line and the "did you mean" beside it.
 const BISH_SUBCOMMANDS: &[&str] = &["theme", "window", "hook", "hl", "lsp", "map", "trust"];
 const HOOK_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "help"];
 const LSP_SUBCOMMANDS: &[&str] = &["ls", "add", "rm", "status", "log", "restart", "help"];
-// `pub(crate)` so `exec::bish_sub_subcommands` can hand completion this
-// very list rather than a second copy of it: the two drifted apart the
-// moment `list` was added, offering a subcommand the dispatcher had and
-// the menu did not.
+// `pub(crate)` so `exec::bish_sub_subcommands` gives completion this list
+// rather than a copy that can drift.
 pub(crate) const THEME_SUBCOMMANDS: &[&str] = &["begin", "end", "list"];
-// Long forms only. The one-letter aliases (`s`, `v`, `h`, `=`) are real
-// spellings but useless as suggestions: at a one-edit threshold every
-// mistyped single character is a near miss for most of them, so the
-// answer would be arbitrary.
+// Long forms only: the one-letter aliases (`s`, `v`, `h`, `=`) would make
+// almost any single mistyped character a near miss.
 const WINDOW_SUBCOMMANDS: &[&str] = &[
     "next", "previous", "new", "create", "close", "quit", "split", "vsplit", "left", "below", "above", "right", "zoom", "swap", "break", "join",
     "vjoin", "layout", "move", "focus", "save", "restore", "balance", "minimize", "sizeup", "sizedown", "size", "fg",
 ];
 
-// "theme, window, hook, hl, lsp, map" -- the list as an error message
-// says it.
 fn listed(names: &[&str]) -> String {
     names.join(", ")
 }
@@ -41,10 +30,8 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
     enum Mode<'a> {
         List,
         Get(&'a str, bool), // bool: quiet
-        // `--describe [NAME]`: what an option is for, what it
-        // accepts, and what it is set to. Everything `bishopt` could
-        // already tell you was the *value*; this is the half that
-        // makes an option findable rather than merely settable.
+        // `--describe [NAME]`: what an option is for, what it accepts, and
+        // its current value.
         Describe(Option<&'a str>),
         Set(&'a str, Option<&'a str>),
         Unset(&'a str),
@@ -193,26 +180,16 @@ pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, Bi
     }
 }
 
-// `::bish SUBCOMMAND...`: a small namespace of its own for bish-
-// specific commands (`theme begin`/`theme end` today) that don't
-// read naturally as an ordinary top-level builtin name -- `theme` on
-// its own would either collide with a real bash script's own
-// variable/function of that name, or need its own awkward "begin"/
-// "end" builtins polluting the global command namespace for
-// something this narrow. `::` is never a valid start of an ordinary
-// bash command word in practice, so `::bish` reads unambiguously as
-// "this is bish's own thing," the same spirit as `set -o` bundling
-// bash's own less-common toggles under one name instead of each
-// getting its own builtin.
+// `::bish SUBCOMMAND...`: a namespace for bish's own commands, so they
+// don't take common words (`theme`, `window`) from the global command
+// namespace, where they'd shadow scripts' functions and real programs.
+// `::` never starts an ordinary command word.
 pub(crate) fn run_bish(sh: &mut Shell, args: &[String]) -> ExecResult {
     match args {
         [sub, rest @ ..] if sub == "theme" => ExecResult::Status(run_bish_theme(sh, rest)),
-        // The canonical spelling of the window manager. `window`/
-        // `win` survive only as *command-mode* aliases (see
-        // run_single's own arm): a top-level builtin called `window`
-        // shadows any real `window` on `$PATH` for every script that
-        // runs under bish, and this namespace exists precisely for
-        // bish-specific commands that shouldn't spend a common word.
+        // `window` and `win` remain only as command-mode aliases (see
+        // `run_single`): a builtin called `window` would shadow a real
+        // `window` on `$PATH` in every script.
         [sub, rest @ ..] if sub == "window" || sub == "win" => run_window(sh, rest),
         [sub, rest @ ..] if sub == "hook" => ExecResult::Status(run_hook(sh, rest)),
         [sub, rest @ ..] if sub == "hl" => ExecResult::Status(run_hl(sh, rest)),
@@ -254,10 +231,9 @@ pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
                 return 2;
             }
             let dir = resolve(sh, rest.first().map(String::as_str).unwrap_or("."));
-            // A predicate: silent, and the exit status is the answer --
-            // `::bish trust --check git && ...`, the way `test` is used.
-            // Honours `trust_owned` too, so a hook's check gives the
-            // same answer bish's own git integration would.
+            // A predicate: silent, with the exit status as the answer, like
+            // `test`. Honours `trust_owned`, as bish's git integration
+            // does.
             i32::from(!crate::trust::is_trusted(&dir, capability, &sh.bishopt_str("trust_owned")))
         }
         Some("--remove") | Some("-r") => {
@@ -281,7 +257,7 @@ pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
             status
         }
         _ => {
-            // The default and the explicit `-c GLOB [DIR...]` form.
+            // The default form and `-c GLOB [DIR...]`.
             let mut capabilities = "*".to_string();
             let mut dirs: Vec<String> = Vec::new();
             let mut rest = args;
@@ -314,10 +290,9 @@ pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
             }
             for dir in &dirs {
                 let path = resolve(sh, dir);
-                // A place you cannot name is a place you cannot have
-                // meant: trusting a directory that is not there is
-                // almost always a typo, and recording it would trust
-                // whatever later takes the name.
+                // Trusting a directory that doesn't exist is almost always
+                // a typo, and recording it would trust whatever later takes
+                // the name.
                 if !path.is_dir() {
                     sh_eprintln!(sh, "bish: ::bish trust: {dir}: not a directory");
                     return 1;
@@ -344,10 +319,9 @@ pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
                 Err(status) => return status,
             };
             for hook in sh.hooks.clone() {
-                // Listing by language asks "what would fire for a
-                // file of this language", so it matches the *glob*
-                // against the language given, exactly as firing
-                // does -- not the two globs against each other.
+                // Listing by language asks what would fire for that
+                // language, so the glob is matched against the language, as
+                // firing does, not glob against glob.
                 if let Some(lang) = lang.as_deref()
                     && !crate::glob::matches(&hook.lang, lang)
                 {
@@ -377,8 +351,8 @@ pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
             let id = sh.next_hook_id;
             sh.next_hook_id += 1;
             sh.hooks.push(Hook { id, event: event.clone(), lang: lang.unwrap_or_else(|| "*".to_string()), command: command.join(" ") });
-            // The id is the return value: a config that adds a hook
-            // is usually the thing that will want to remove it.
+            // The id is printed: a config that adds a hook may want to
+            // remove it.
             sh_println!(sh, "{id}");
             0
         }
@@ -409,15 +383,9 @@ pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
-// `::bish lsp ls|add|rm|status` -- which language servers exist and
-// which are running. Deliberately the same shape as `::bish hook`
-// right above: a per-shell counter for ids, `--lang` as a glob, `rm`
-// by the id `add` printed. Two registries that worked differently
-// would be two things to learn.
-//
-// Canonical under `::bish` rather than a bare `lsp` builtin, for the
-// reason `window` was moved there: this namespace exists so
-// bish-specific commands don't shadow real ones in scripts.
+// `::bish lsp ls|add|rm|status`: which language servers exist and which
+// run. Shaped like `::bish hook`: per-shell ids, `--lang` as a glob, `rm`
+// by the id `add` printed.
 pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("ls") | Some("list") | None => {
@@ -431,10 +399,7 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
                 Err(status) => return status,
             };
             for server in sh.lsp_servers.clone() {
-                // Same question `hook ls --lang` answers: "what
-                // would be used for a file of this language" -- so
-                // the glob is matched against the language given,
-                // not the two globs against each other.
+                // As `hook ls --lang`: the glob against the language given.
                 if let Some(lang) = lang.as_deref()
                     && !crate::glob::matches(&server.lang, lang)
                 {
@@ -446,13 +411,11 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some("add") => {
-            // Round-robin rather than a fixed order: with four
-            // flags, an order that only reads correctly one way
-            // means `--apply-edits=always --lang=rust rust-analyzer`
-            // silently tries to *run* `--apply-edits=always`. Each
-            // helper leaves the slice alone when its flag isn't at
-            // the front, so a pass that consumes nothing is the
-            // signal that what remains is the command.
+            // Flags in any order: with four of them, a fixed order would
+            // make `--apply-edits=always --lang=rust rust-analyzer` try to
+            // run `--apply-edits=always`. Each helper leaves the slice
+            // alone when its flag isn't first, so a pass that consumes
+            // nothing means the command remains.
             let mut rest = &args[1..];
             let mut lang = None;
             let mut root_markers = None;
@@ -502,9 +465,7 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
                 match sh.lsp_setting_flag(rest) {
                     Ok((found, after)) => {
                         if let Some(pair) = found {
-                            // Last one wins for a repeated key, so a
-                            // config that overrides an earlier line
-                            // reads the way it looks.
+                            // The last one wins for a repeated key.
                             settings.retain(|(k, _)| k != &pair.0);
                             settings.push(pair);
                         }
@@ -521,9 +482,8 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
                 sh_eprintln!(sh, "bish: ::bish lsp: add: usage: ::bish lsp add [--lang=GLOB] [--root=NAME,...] COMMAND...");
                 return 2;
             }
-            // The server is started later, by code with no `Shell` to
-            // ask, so a restricted shell's one rule about program names
-            // is applied where the name is given instead.
+            // The server starts later, from code with no `Shell`, so a
+            // restricted shell's rule on program names is applied here.
             if sh.restricted_program_refused("::bish lsp: add", &rest[0]) {
                 return 1;
             }
@@ -538,9 +498,7 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
                 apply_edits,
                 settings,
             });
-            // The id is the return value, same as `hook add`: a
-            // config that registers something usually wants to be
-            // able to take it back.
+            // The id is printed, as for `hook add`.
             sh_println!(sh, "{id}");
             0
         }
@@ -558,8 +516,7 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some("status") => {
-            // Collected before printing: `sh_println!` needs the
-            // shell mutably, and the table is reached through it.
+            // Collected first: `sh_println!` needs the shell mutably.
             let rows: Vec<String> = sh.lsp.borrow().rows().iter().map(|fields| fields.join("\t")).collect();
             for row in rows {
                 sh_println!(sh, "{row}");
@@ -567,9 +524,8 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some("log") => {
-            // The whole reason a server's stderr is captured rather
-            // than discarded: when one fails to start, what it said
-            // on the way out is the only explanation there is.
+            // A server's stderr is kept because when it fails to start,
+            // what it said is the only explanation.
             let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
                 sh_eprintln!(sh, "bish: ::bish lsp: log: usage: ::bish lsp log <id>");
                 return 2;
@@ -585,11 +541,9 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         Some("restart") => {
-            // A server that died, or never started, stays that way
-            // on purpose -- retrying on every file open would turn
-            // one bad line of config into a spawn per keystroke of
-            // navigation. This is how someone who has *fixed* that
-            // line says so.
+            // A dead server stays dead rather than respawning on every file
+            // open, which would turn one bad config line into a spawn per
+            // keystroke. This is how to say the line is fixed.
             let Some(id) = args.get(1).and_then(|a| a.parse::<u64>().ok()) else {
                 sh_eprintln!(sh, "bish: ::bish lsp: restart: usage: ::bish lsp restart <id>");
                 return 2;
@@ -615,18 +569,12 @@ pub(crate) fn run_lsp(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
-// `::bish hl` -- the syntax-highlighting palette.
-//
-// Shaped like `bishopt` (`--set`, `--unset`, a bare name to read,
-// nothing to list) because it does the same job, and two commands
-// that behave differently for no reason are two things to learn.
-// It is a *separate* command because the names are open: bishopt is
-// a closed registry with a default and a description for each
-// entry, and a highlight colour cannot be, since a language
-// server's semantic token types are not knowable in advance.
-//
-// Only colours. The chrome colours (`ui_col_*`) stay bishopts --
-// those really are a fixed set of things bish draws.
+// `::bish hl`: the syntax-highlighting palette. Shaped like `bishopt`
+// (`--set`, `--unset`, a bare name to read) for the same job, but separate
+// because its names are open: a language server's semantic token types
+// can't be known in advance, while bishopt is a closed registry with a
+// default and description per entry. The chrome colours (`ui_col_*`) stay
+// bishopts.
 pub(crate) fn run_hl(sh: &mut Shell, args: &[String]) -> i32 {
     match args {
         [] => {
@@ -636,8 +584,8 @@ pub(crate) fn run_hl(sh: &mut Shell, args: &[String]) -> i32 {
             0
         }
         [flag, name] if flag == "--unset" || flag == "-u" => {
-            // Live state even mid-declaration, exactly as
-            // `bishopt --unset` is: unsetting is not declaring.
+            // Even mid-declaration, like `bishopt --unset`: unsetting isn't
+            // declaring.
             if sh.hl.remove(name.as_str()).is_none() {
                 sh_eprintln!(sh, "bish: ::bish hl: {name} is not set");
                 return 1;
@@ -658,8 +606,7 @@ pub(crate) fn run_hl(sh: &mut Shell, args: &[String]) -> i32 {
                     sh_println!(sh, "{value}");
                     0
                 }
-                // Nothing said about this name, which is not an
-                // error: an open namespace has no unknown names,
+                // Not an error: an open namespace has no unknown names,
                 // only unset ones.
                 None => 1,
             }
@@ -688,26 +635,17 @@ pub(crate) fn run_bish_theme(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
-// `::bish map [-m GLOB] LHS RHS` -- remap a key sequence.
-//
-// Always non-recursive, the way vim's `noremap` is, and there is no
-// recursive form: a mapping's right-hand side is resolved against
-// the *default* bindings and can never chain through another
-// mapping. That removes the whole class of surprise vim's `map` is
-// famous for (a mapping that changes meaning because an unrelated
-// one was defined later), and it is why a listing can name the
-// action a mapping performs rather than just echoing keys.
-//
-// The flags follow `abbr`'s, not `::bish lsp`'s: this is a small
-// user table with add/erase/list, the same shape abbreviations
-// already have, rather than a subcommand family.
+// `::bish map [-m GLOB] LHS RHS`: remap a key sequence. Always
+// non-recursive (vim's `noremap`), with no recursive form: the right-hand
+// side resolves against the default bindings, so a mapping never changes
+// meaning because another was defined, and a listing can name its action.
+// Flags follow `abbr`, the same add/erase/list shape.
 pub(crate) fn run_map(sh: &mut Shell, args: &[String]) -> i32 {
     let (args, mode) = crate::keymap::take_mode_flag(args);
     let mode = mode.unwrap_or_else(|| crate::keymap::DEFAULT_MODE.to_string());
     if !crate::keymap::mode_glob_is_known(&mode) {
-        // A glob matching no mode would be stored, listed, and never
-        // fire, with nothing anywhere saying why -- so it is refused
-        // where the typo was made.
+        // A glob matching no mode would be stored and never fire, so it's
+        // refused here.
         sh_eprintln!(sh, "bish: ::bish map: --mode '{mode}' matches no mode (have: {})", crate::keymap::MODES.join(", "));
         return 2;
     }
@@ -725,12 +663,9 @@ pub(crate) fn run_map(sh: &mut Shell, args: &[String]) -> i32 {
                 .iter()
                 .filter(|m| crate::keymap::modes_matching(&mode).iter().any(|one| m.applies_to(one)))
                 .map(|m| {
-                    // The fourth column is what the mapping *does*,
-                    // which only exists where keys resolve to named
-                    // actions. For an insert/command/terminal-only
-                    // mapping the keys are the whole story, and a
-                    // dash says so rather than inventing a
-                    // normal-mode reading of them.
+                    // The fourth column is the mapping's action, which
+                    // exists only in normal and visual modes; elsewhere the
+                    // keys are the whole story, shown as a dash.
                     let action = if crate::keymap::has_vim_mode(&m.modes) {
                         crate::keymap::describe_rhs(&m.rhs).unwrap_or_else(|why| format!("({why})"))
                     } else {
@@ -773,10 +708,8 @@ pub(crate) fn run_map(sh: &mut Shell, args: &[String]) -> i32 {
                 return 2;
             };
             if rest.len() > 2 {
-                // Two halves, always. A right-hand side split over
-                // several words would be ambiguous about whether the
-                // space is a key or a separator, which is the exact
-                // ambiguity `<Space>` exists to remove.
+                // Two halves: a right-hand side over several words would
+                // make a space ambiguous, which is what `<Space>` is for.
                 sh_eprintln!(sh, "bish: ::bish map: too many arguments (a space in a mapping is <Space>)");
                 return 2;
             }
@@ -795,17 +728,10 @@ pub(crate) fn run_map(sh: &mut Shell, args: &[String]) -> i32 {
                 sh_eprintln!(sh, "bish: ::bish map: {} cannot carry a mapping", crate::keymap::format_keys(&[*bad]));
                 return 2;
             }
-            // Resolved here rather than at the keystroke: a
-            // right-hand side that means nothing should fail where
-            // it was written, not silently swallow keys later.
-            //
-            // Only where it *has* a meaning to check, though. Normal
-            // and visual resolve keys to named actions, so a
-            // right-hand side that resolves to nothing there is a
-            // mistake. Insert, command and terminal have no such
-            // vocabulary -- keys are keys -- and `<Esc>` is a
-            // perfectly good insert-mode right-hand side while being
-            // no normal-mode action at all.
+            // Resolved now, so a right-hand side that means nothing fails
+            // where it was written. Only in normal and visual mode, which
+            // have named actions: in insert, command and terminal mode keys
+            // are keys, and `<Esc>` is a fine insert-mode right-hand side.
             if crate::keymap::has_vim_mode(&mode)
                 && let Err(why) = crate::keymap::describe_rhs(&rhs)
             {
@@ -853,9 +779,8 @@ pub(crate) fn run_abbr(sh: &mut Shell, args: &[String]) -> i32 {
             }
             let expansion = expansion_words.join(" ");
             let lang = lang.unwrap_or_else(|| snippet::DEFAULT_LANG.to_string());
-            // Redefinition is keyed on both name *and* language: the
-            // same name under a different `--lang=` is a different
-            // abbreviation, not a replacement for this one.
+            // Keyed on name and language: the same name under another
+            // `--lang=` is a different abbreviation.
             match sh.abbrs.iter_mut().find(|a| a.name == *name && a.lang == lang) {
                 Some(existing) => existing.expansion = expansion,
                 None => sh.abbrs.push(Abbr { name: name.clone(), expansion, lang }),
@@ -869,10 +794,8 @@ pub(crate) fn run_abbr(sh: &mut Shell, args: &[String]) -> i32 {
             }
             let mut status = 0;
             for name in rest {
-                // With no `--lang=`, erasing a name erases it in
-                // every language it was defined for -- "get rid of
-                // `foo`" is what someone typing that means. With one,
-                // only the exact `(name, lang)` entry goes.
+                // Without `--lang=`, erasing a name erases it in every
+                // language; with one, only that entry.
                 let before = sh.abbrs.len();
                 sh.abbrs.retain(|a| a.name != *name || lang.as_ref().is_some_and(|l| a.lang != *l));
                 if sh.abbrs.len() == before {
@@ -890,9 +813,8 @@ pub(crate) fn run_abbr(sh: &mut Shell, args: &[String]) -> i32 {
         }
         Mode::Show => {
             for abbr in &sh.abbrs {
-                // A non-default language is printed back as the same
-                // `--lang=`, so `abbr -s` stays something you can
-                // paste straight back in.
+                // A non-default language is printed as `--lang=`, so
+                // `abbr -s` output pastes back in.
                 let lang = if abbr.lang == snippet::DEFAULT_LANG {
                     String::new()
                 } else {
@@ -913,34 +835,17 @@ pub(crate) fn run_abbr(sh: &mut Shell, args: &[String]) -> i32 {
                 sh_eprintln!(sh, "bish: abbr: -q: requires at least one NAME");
                 return 2;
             }
-            // `--lang=` narrows the question to that one language;
-            // without it, any language counts.
+            // `--lang=` narrows to that language; without it any counts.
             let hit = |a: &Abbr, name: &String| a.name == *name && lang.as_ref().is_none_or(|l| a.lang == *l);
             if rest.iter().all(|name| sh.abbrs.iter().any(|a| hit(a, name))) { 0 } else { 1 }
         }
     }
 }
 
-// `window`/`w`/`win` -- the window-manager builtin. Only validates the
-// subcommand and triggers promotion; the actual session/window
-// mutation happens in repl.rs, reached via the bubbled-up
-// ExecResult::Window signal (see that variant's doc comment for why
-// this can't just mutate shared state directly from here).
-// `::bish window ...` (and command mode's `window` alias). The
-// read-only subcommands answer from `Shell::windows` right here; the
-// rest bubble an action up to repl.rs -- and only where something is
-// actually there to act on it, since `ExecResult::Window` is a
-// signal `run_program` stops on and letting one escape from `bish
-// script.sh` would end the script for no reason.
-// `window create [--name NAME] [--] [COMMAND...]` -- the name, and the
-// command to run in the new window, either of which may be absent.
-//
-// `--name` stays greedy to the end of the arguments, so `window create
-// --name my project` still names a window "my project" the way it
-// always has; `--` is what ends it, and everything after is the
-// command. Without `--name` there is nothing to be greedy about, so a
-// bare `window create make` is simply the command -- which used to be
-// an error, so nothing that worked before means anything different now.
+// `window create [--name NAME] [--] [COMMAND...]`: an optional name and an
+// optional command. `--name` takes everything to the end or to `--`, so
+// `window create --name my project` names "my project"; without it, the
+// arguments are the command.
 fn parse_new_args(rest: &[String]) -> Result<(Option<String>, Option<String>), &'static str> {
     match rest.first().map(String::as_str) {
         None => Ok((None, None)),
@@ -959,10 +864,8 @@ fn parse_new_args(rest: &[String]) -> Result<(Option<String>, Option<String>), &
     }
 }
 
-// `window split`/`vsplit [--] [COMMAND...]`. Neither took an argument
-// before, so every spelling here is new ground; `--` is accepted purely
-// so a command starting with a dash can be written without the
-// shell-flag question ever coming up.
+// `window split`/`vsplit [--] [COMMAND...]`. `--` lets a command start
+// with a dash.
 fn parse_split_command(rest: &[String]) -> Option<String> {
     match rest.first().map(String::as_str) {
         Some("--") => joined(&rest[1..]),
@@ -970,10 +873,9 @@ fn parse_split_command(rest: &[String]) -> Option<String> {
     }
 }
 
-// Arguments back into one command line, the way `window rename` has
-// always rejoined a name. Quoting is lost -- `split echo "a  b"` runs
-// `echo a b` -- which is what tmux does with the same shape, and what
-// a single quoted argument (`split 'echo "a  b"'`) is for.
+// Arguments back into one command line, as `window rename` joins a name.
+// Quoting is lost (`split echo "a  b"` runs `echo a b`); quote the whole
+// command to keep it.
 fn joined(parts: &[String]) -> Option<String> {
     match parts.is_empty() {
         true => None,
@@ -981,6 +883,11 @@ fn joined(parts: &[String]) -> Option<String> {
     }
 }
 
+// `::bish window ...` and command mode's `window`. The read-only
+// subcommands answer here; the rest return an `ExecResult::Window` for
+// repl.rs, but only where something will act on it: `run_program` stops
+// on that signal, so one escaping from `bish script.sh` would end the
+// script.
 pub(crate) fn run_window(sh: &mut Shell, args: &[String]) -> ExecResult {
     let result = run_window_inner(sh, args);
     if matches!(result, ExecResult::Window(_)) && !sh.windows_available && !sh.restrict_to_builtins {
@@ -1003,18 +910,14 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             }
         },
         Some("rename") | Some("ren") => match args.get(1) {
-            // A bare `window rename` clears the name; anything else
-            // is the new one, joined so `window rename my project`
-            // means what it looks like.
+            // A bare `window rename` clears the name; otherwise the words
+            // are joined.
             None => ExecResult::Window(WindowAction::Rename(None)),
             Some(_) => ExecResult::Window(WindowAction::Rename(Some(args[1..].join(" ")))),
         },
-        // The two that only *read*. Both answer from
-        // `Shell::windows`, which means both behave like any other
-        // builtin: `ls` writes to whatever sink it has (so
-        // `$(window ls)` captures it) and `select` fails
-        // synchronously (so `select || create` works in a function,
-        // a subshell or an `if`).
+        // The two read-only subcommands answer from `Shell::windows` like
+        // any builtin: `$(window ls)` captures, and `select` fails
+        // synchronously, so `select || create` works anywhere.
         Some("ls") | Some("list") => {
             for w in &sh.windows.clone() {
                 let name = w.name.clone().unwrap_or_default();
@@ -1025,8 +928,7 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         }
         Some("select") | Some("sel") => match args.get(1) {
             Some(target) => {
-                // A name first, an id second: a name is what a config
-                // function knows, an id is what it falls back to.
+                // By name first, then by id.
                 let found = sh
                     .windows
                     .iter()
@@ -1046,16 +948,11 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             }
         },
         Some("close") | Some("q") | Some("quit") => ExecResult::Window(WindowAction::Close),
-        // WindowAction::Split's own `horizontal` names the divider
-        // LINE's orientation (true = a horizontal dividing line,
-        // panes stacked top/bottom), matching vim's :split/:vsplit
-        // convention. Users read "vertical"/"horizontal" by the
-        // panes' own arrangement axis instead (stacked = panes
-        // arranged *vertically*, side by side = arranged
-        // *horizontally*) -- the opposite pairing -- so `split`/`s`
-        // maps to horizontal:false (side by side) and `vsplit`/`v`
-        // to horizontal:true (stacked), even though that looks
-        // inverted next to the field's own name.
+        // `WindowAction::Split`'s `horizontal` is the divider line's
+        // orientation, as in vim's `:split`. People name a split by how the
+        // panes are arranged, the opposite pairing, so `split` (side by
+        // side) is `horizontal: false` and `vsplit` (stacked) is
+        // `horizontal: true`.
         Some("split") | Some("s") => ExecResult::Window(WindowAction::Split { horizontal: false, command: parse_split_command(&args[1..]) }),
         Some("vsplit") | Some("v") => ExecResult::Window(WindowAction::Split { horizontal: true, command: parse_split_command(&args[1..]) }),
         Some("h") | Some("left") => ExecResult::Window(WindowAction::FocusPane(PaneDirection::Left)),
@@ -1082,8 +979,8 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             Some("left") | Some("l") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Left)),
             Some("right") | Some("r") => ExecResult::Window(WindowAction::MoveWindow(WindowMove::Right)),
             Some(n) => match n.parse::<usize>() {
-                // 1-based, because that is how a tab bar is counted out
-                // loud -- `move 1` makes this the first tab.
+                // 1-based, as a tab bar is counted: `move 1` makes this the
+                // first tab.
                 Ok(position) if position >= 1 => ExecResult::Window(WindowAction::MoveWindow(WindowMove::To(position))),
                 _ => {
                     sh_eprintln!(sh, "bish: window: move: usage: window move <left|right|N> (N counts from 1)");
@@ -1096,8 +993,8 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
             }
         },
         Some("layout") => match args.get(1).map(String::as_str) {
-            // No name at all cycles too, so the command is usable
-            // before anyone has learned the five names.
+            // No name cycles too, so the command works before the names are
+            // learned.
             None | Some("next") => ExecResult::Window(WindowAction::SetLayout(None)),
             Some(name) => match crate::window::NamedLayout::parse(name) {
                 Some(layout) => ExecResult::Window(WindowAction::SetLayout(Some(layout))),
@@ -1112,9 +1009,8 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
         },
         Some("swap") | Some("x") => ExecResult::Window(WindowAction::SwapPane),
         Some("break") => ExecResult::Window(WindowAction::BreakPane),
-        // `join`/`vjoin` pair with `split`/`vsplit` and mean the same
-        // thing by the same names: `join` puts the pane beside this
-        // one, `vjoin` stacks it underneath.
+        // `join` puts the pane beside this one and `vjoin` stacks it
+        // beneath, as `split`/`vsplit` do.
         Some(sub @ ("join" | "vjoin")) => match args.get(1).and_then(|a| a.parse::<u32>().ok()) {
             Some(from) => ExecResult::Window(WindowAction::JoinPane { from, horizontal: sub == "vjoin" }),
             None => {
@@ -1155,28 +1051,12 @@ pub(crate) fn run_window_inner(sh: &mut Shell, args: &[String]) -> ExecResult {
     }
 }
 
-// Starts a new theme declaration -- every `bishopt --set` from here
-// until the matching `::bish theme end` is captured into
-// `pending_theme` instead of applying live (see store_bishopt's own
-// doc comment). Refuses to nest: a `begin` while one is already in
-// progress would otherwise silently discard whatever the outer one
-// had captured so far the moment `end` ran, with no way back --
-// there's no real use for nesting this anyway (a theme is a flat set
-// of opts, not something that composes from an inner declaration).
-// `::bish theme list` -- what there is to switch to.
-//
-// Shipped themes and declared ones in one list, because the only thing a
-// reader wants from it is a name they can put in `bishopt --set theme`,
-// and which of the two kinds it came from is the second question. The
-// active one is marked, since a theme is exactly the sort of setting
-// somebody checks because they cannot remember whether it took.
-//
-// A declared theme of a shipped theme's name appears once, as declared:
-// it is one name, and the shipped colours it does not mention still show
-// through (see `Shell::bishopt_value`).
+// `::bish theme list`: the names `bishopt --set theme` accepts, shipped
+// and declared together, with the active one marked. A declared theme
+// with a shipped theme's name appears once; the shipped colours it doesn't
+// set still show through (see `Shell::bishopt_value`).
 pub(crate) fn run_bish_theme_list(sh: &mut Shell) -> i32 {
-    // Empty when nothing is active, which is the default -- an empty
-    // name can never match one of these, so no special case is needed.
+    // Empty when no theme is active, which matches none of these.
     let active = sh.bishopt_str("theme");
     let mut declared: Vec<&String> = sh.themes.keys().collect();
     crate::sort::sort(&mut declared);
@@ -1200,6 +1080,10 @@ pub(crate) fn run_bish_theme_list(sh: &mut Shell) -> i32 {
     0
 }
 
+// Starts a theme declaration: every `bishopt --set` until `::bish theme
+// end` goes into `pending_theme` instead of applying (see
+// `store_bishopt`). Doesn't nest: a theme is a flat set of options, and a
+// nested `begin` would lose what the outer one captured.
 pub(crate) fn run_bish_theme_begin(sh: &mut Shell) -> i32 {
     if sh.pending_theme.is_some() {
         sh_eprintln!(sh, "bish: ::bish theme: a theme declaration is already in progress -- `::bish theme end` it first");
@@ -1209,21 +1093,11 @@ pub(crate) fn run_bish_theme_begin(sh: &mut Shell) -> i32 {
     0
 }
 
-// Ends the current theme declaration. The captured "theme" entry (if
-// any -- set via an ordinary `bishopt --set theme NAME` *inside* the
-// declaration, which store_bishopt diverted here instead of applying
-// live) names which entry of `sh.themes` the rest of the captured
-// opts get registered under; it's removed from that captured map
-// first so a theme's own opts never include a "theme" entry pointing
-// at itself. If "theme" was never set during the declaration, there's
-// no name to register anything under -- the whole batch is just
-// discarded, matching "theme behaves unset until explicitly declared
-// inside a theme declaration" (declaring opts with no name doesn't
-// retroactively give them one). Registering a theme here never
-// switches to it -- that still needs its own ordinary `bishopt --set
-// theme NAME` afterward, outside any declaration, the same way
-// defining a theme and activating one are two separate, deliberate
-// steps.
+// Ends a theme declaration. The `theme` entry captured inside it (from
+// `bishopt --set theme NAME`) names the theme the rest are registered
+// under, and is removed so a theme doesn't name itself. Without one, the
+// batch is discarded. Registering never activates the theme; that's a
+// separate `bishopt --set theme NAME`.
 pub(crate) fn run_bish_theme_end(sh: &mut Shell) -> i32 {
     let Some(mut pending) = sh.pending_theme.take() else {
         sh_eprintln!(sh, "bish: ::bish theme: no theme declaration in progress");
@@ -1258,9 +1132,8 @@ mod window_argument_tests {
 
     #[test]
     fn name_stays_greedy_so_an_unquoted_name_still_works() {
-        // What `window create --name my project` has always meant. A
-        // command argument that silently stole the second word would
-        // rename every window anyone had already scripted.
+        // `--name` still takes the rest, so existing scripts keep naming
+        // windows.
         assert_eq!(parse_new_args(&args("--name my project")), Ok((Some("my project".to_string()), None)));
     }
 
@@ -1272,8 +1145,7 @@ mod window_argument_tests {
 
     #[test]
     fn a_leading_double_dash_means_the_rest_is_all_command() {
-        // How a command that starts with a dash gets written without
-        // ever raising the question of whether it is a flag.
+        // A command starting with a dash, after `--`.
         assert_eq!(parse_new_args(&args("-- ls -d /etc")), Ok((None, Some("ls -d /etc".to_string()))));
         assert_eq!(parse_split_command(&args("-- ls -d /etc")), Some("ls -d /etc".to_string()));
     }
@@ -1294,10 +1166,9 @@ mod trust_command_tests {
         words.iter().map(|w| (*w).to_string()).collect()
     }
 
-    // The builtin over a store of its own, so it touches neither the
-    // real trust file nor another test's. The store is keyed off the
-    // environment, so this serializes on its own lock and restores what
-    // it changed -- the shape session.rs's env-mutating tests use.
+    // The builtin over a store of its own, keyed off the environment, so it
+    // serializes on its own lock and restores what it changed (as
+    // session.rs's env tests do).
     fn with_shell(body: impl FnOnce(&mut Shell, &std::path::Path)) {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1324,28 +1195,25 @@ mod trust_command_tests {
         }
     }
 
-    // `--check` is the hook contract: silent, and the exit status is the
-    // whole of the answer, so a toolchain can write
-    // `::bish trust --check mise:env && setup`.
+    // `--check` is the hook contract: silent, the exit status the answer.
     #[test]
     fn check_is_a_silent_predicate_over_the_exit_status() {
         with_shell(|sh, work| {
             std::fs::create_dir_all(work.join("sub")).unwrap();
             // Nothing trusted yet.
             assert_eq!(run_trust(sh, &strs(&["--check", "git"])), 1);
-            // The default form trusts `.` -- bish's cwd -- for everything.
+            // The default form trusts `.` (bish's cwd) for everything.
             assert_eq!(run_trust(sh, &[]), 0);
             assert_eq!(run_trust(sh, &strs(&["--check", "git"])), 0);
             assert_eq!(run_trust(sh, &strs(&["--check", "anything"])), 0);
-            // and descends: a relative subdirectory resolves against cwd.
+            // And it descends: a relative subdirectory resolves against cwd.
             assert_eq!(run_trust(sh, &strs(&["--check", "git", "sub"])), 0);
         });
     }
 
-    // A capability glob narrows what a trust covers -- shown on a
-    // directory with no broader ancestor, since an ancestor trusted for
-    // `*` would cover everything under it regardless (trust descending,
-    // tested in the module itself).
+    // A capability glob narrows a trust. Shown on a directory with no
+    // broader ancestor, since one trusted for `*` would cover everything
+    // below.
     #[test]
     fn a_capability_glob_scopes_what_the_trust_covers() {
         with_shell(|sh, work| {
@@ -1360,7 +1228,7 @@ mod trust_command_tests {
     fn trusting_a_nonexistent_directory_is_refused() {
         with_shell(|sh, _work| {
             assert_eq!(run_trust(sh, &strs(&["does-not-exist"])), 1);
-            // and nothing was recorded.
+            // And nothing was recorded.
             assert_eq!(run_trust(sh, &strs(&["--check", "git", "does-not-exist"])), 1);
         });
     }
