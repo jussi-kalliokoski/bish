@@ -1,30 +1,18 @@
-// The WHATWG HTML tokenizer (§13.2.5), hand-rolled -- no external crate,
-// same as every other parser in this codebase. One state per state in
-// the spec, named the same way, so a state here can be read straight
-// against the section that defines it; the `//` comment on each arm is
-// the spec's own wording where it isn't obvious.
+// The WHATWG HTML tokenizer (§13.2.5), one state per spec state, named
+// the same, so each reads against its section; arm comments quote the
+// spec where it isn't obvious. Written to the spec because the hard
+// cases fall out of it: `<a href=b?c=d>`, `<!-->`, `&notit;` (a legacy
+// reference without its semicolon), `</div>` inside `<script>`, `a < b`
+// in prose.
 //
-// Written to the spec rather than to "what markdown files usually
-// contain" on purpose: the whole reason to have a real tokenizer is the
-// cases a reasonable-looking shortcut gets wrong -- `<a href=b?c=d>`
-// (unquoted attribute values), `<!-->`, `&notit;` (a legacy reference
-// that stops without its semicolon), `<script>` containing `</div>`,
-// `a < b` in prose. Those all come out right here because the state
-// machine is the spec's, not because any of them was special-cased.
-//
-// Not implemented, and it can't be: everything that only exists for a
-// *scripting* host. There's no `document.write`, so the tokenizer never
-// has to be re-entered mid-token, and the script-data double-escape
-// states are still here (they change how `</script>` inside a string is
-// tokenized) while actually running any of it is not a thing this can
-// do. Character encoding detection is also out: input arrives as Rust
-// `&str`, so it is already decoded UTF-8, which is what the spec's own
-// "encoding sniffing" would have concluded for any modern document.
+// There's no `document.write`, so the tokenizer is never re-entered
+// mid-token; the script double-escape states are here because they
+// change how `</script>` in a string tokenizes. No encoding detection:
+// input is a `&str`, already UTF-8.
 
 use super::entities;
 
-// U+FFFD, which the spec substitutes for a NULL in most states rather
-// than dropping it.
+// U+FFFD, which replaces a NULL in most states.
 const REPLACEMENT: char = '\u{FFFD}';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,23 +48,21 @@ pub enum Token {
     StartTag(Tag),
     EndTag(Tag),
     Comment(String),
-    // One character at a time, exactly as the spec emits them -- the
-    // tree builder is what coalesces runs into text nodes, and it has
-    // rules (whitespace-only runs in tables, for one) that depend on
-    // seeing them individually.
+    // One character at a time, as the spec emits them: the tree builder
+    // coalesces text, with rules (whitespace in tables) that need them
+    // singly.
     Char(char),
     Eof,
 }
 
-// Which of the four content models the *tree builder* has put the
-// tokenizer into. The tokenizer can't decide this itself: whether
-// `<title>` contents are markup depends on the element that opened, so
-// the tree construction stage sets it (see Tokenizer::set_state).
+// Which content model the tree builder put the tokenizer in. Whether
+// `<title>` contents are markup depends on the element, so tree
+// construction sets it (`Tokenizer::set_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentState {
     Data,
-    // `<title>`, `<textarea>`: character references still resolve, tags
-    // don't -- except the matching end tag.
+    // `<title>`, `<textarea>`: references resolve, tags don't, except the
+    // matching end tag.
     Rcdata,
     // `<style>`, `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>`: neither.
     Rawtext,
@@ -172,44 +158,37 @@ pub struct Tokenizer {
     input: Vec<char>,
     pos: usize,
     state: State,
-    // Where a character reference goes back to. The spec calls this the
-    // "return state" and it's what makes one reference implementation
-    // serve both text and attribute values.
+    // Where a character reference returns to, the spec's "return state",
+    // so one implementation serves text and attribute values.
     return_state: State,
-    // Tokens produced by the current step. A single step can emit more
-    // than one (a character reference expanding to two code points, a
-    // run of text flushed before a tag), so this is drained by `next`.
+    // Tokens from the current step; one step can emit several (a reference
+    // expanding to two code points, text flushed before a tag), so `next`
+    // drains this.
     pending: Vec<Token>,
     tag: Tag,
-    // Whether the tag being built is an end tag -- kept separate so the
-    // one set of tag states serves both, as the spec does.
+    // Whether the tag being built is an end tag, so one set of tag states
+    // serves both, as in the spec.
     end_tag: bool,
     attr: Option<Attr>,
     comment: String,
     doctype: Doctype,
     temp: String,
     char_ref_code: u32,
-    // The last start tag name emitted, which is the only way an end tag
-    // in RCDATA/RAWTEXT/script data can be recognized as "appropriate".
+    // The last start tag emitted, which decides whether an end tag in
+    // RCDATA, RAWTEXT or script data is "appropriate".
     last_start_tag: String,
-    // Set by the tree builder when the adjusted current node is a
-    // foreign (SVG/MathML) element -- the only context where `<![CDATA[`
-    // is real markup rather than a bogus comment.
+    // Set by the tree builder when the adjusted current node is SVG or
+    // MathML, the only context where `<![CDATA[` isn't a bogus comment.
     cdata_ok: bool,
-    // The parse errors the spec names. Collected rather than acted on:
-    // HTML has no such thing as a fatal parse error, every one of them
-    // has defined recovery, and something has to be able to *report*
-    // them (see html::Document::errors) for a linter or a preview to say
-    // "this markup is malformed" without changing what it renders.
+    // The parse errors the spec names, collected for `Document::errors`.
     pub errors: Vec<String>,
 }
 
 impl Tokenizer {
     pub fn new(input: &str) -> Tokenizer {
         Tokenizer {
-            // Pre-processing per §13.2.3.5: a CRLF pair and a lone CR
-            // both become a single LF, before anything else looks at the
-            // input.
+            // §13.2.3.5: CRLF and a lone CR become LF before anything reads
+            // the input.
             input: normalize_newlines(input),
             pos: 0,
             state: State::Data,
@@ -228,13 +207,13 @@ impl Tokenizer {
         }
     }
 
-    // The tree builder's own switch: `<title>` puts this in RCDATA,
-    // `<script>` in script data, and so on. See ContentState.
     // See the `cdata_ok` field.
     pub fn set_cdata_ok(&mut self, ok: bool) {
         self.cdata_ok = ok;
     }
 
+    // The tree builder's switch: `<title>` sets RCDATA, `<script>` script
+    // data. See `ContentState`.
     pub fn set_state(&mut self, content: ContentState) {
         self.state = match content {
             ContentState::Data => State::Data,
@@ -262,9 +241,9 @@ impl Tokenizer {
         self.input.get(self.pos).copied()
     }
 
-    // Advances past the end as well as within it, so that "reconsume"
-    // is a plain decrement in every state including the EOF arms -- the
-    // spec's own model, where EOF is a character you can put back.
+    // Advances past the end too, so "reconsume" is a decrement in every
+    // state including EOF: in the spec, EOF is a character you can put
+    // back.
     fn consume(&mut self) -> Option<char> {
         let c = self.input.get(self.pos).copied();
         self.pos = (self.pos + 1).min(self.input.len() + 1);
@@ -289,9 +268,9 @@ impl Tokenizer {
         }
     }
 
-    // Whether the end tag being built matches the last start tag emitted
-    // -- §13.2.5's "appropriate end tag token", the condition that lets
-    // `</script>` close a script while `</div>` inside one doesn't.
+    // Whether the end tag matches the last start tag, §13.2.5's
+    // "appropriate end tag token", which lets `</script>` close a script
+    // and not `</div>` inside one.
     fn appropriate_end_tag(&self) -> bool {
         self.end_tag && self.tag.name == self.last_start_tag
     }
@@ -305,8 +284,8 @@ impl Tokenizer {
     fn finish_attr(&mut self) {
         let Some(attr) = self.attr.take() else { return };
         // "If there is already an attribute with that name, this is a
-        // duplicate-attribute parse error and the new attribute is
-        // removed" -- the *first* one wins.
+        // duplicate-attribute parse error and the new attribute is removed":
+        // the first wins.
         if self.tag.attrs.iter().any(|a| a.name == attr.name) {
             self.error("duplicate attribute");
             return;
@@ -318,9 +297,8 @@ impl Tokenizer {
         self.finish_attr();
         let tag = std::mem::replace(&mut self.tag, Tag { name: String::new(), attrs: Vec::new(), self_closing: false });
         if self.end_tag {
-            // "An end tag with attributes / a self-closing end tag is a
-            // parse error" -- reported, and the attributes ignored,
-            // which is what the tree builder expects to receive.
+            // An end tag with attributes, or self-closing, is a parse
+            // error; the attributes are dropped.
             if !tag.attrs.is_empty() {
                 self.error("end tag with attributes");
             }
@@ -333,15 +311,14 @@ impl Tokenizer {
         }
     }
 
-    // Whether the character reference being parsed sits in an attribute
-    // value, which changes the rules for an unterminated named one.
+    // Whether the reference is in an attribute value, which changes the
+    // rule for an unterminated named one.
     fn in_attribute(&self) -> bool {
         matches!(self.return_state, State::AttributeValueDoubleQuoted | State::AttributeValueSingleQuoted | State::AttributeValueUnquoted)
     }
 
-    // §13.2.5.72's "flush code points consumed as a character
-    // reference": into the attribute value if that's where we came from,
-    // otherwise out as character tokens.
+    // §13.2.5.72's "flush code points consumed as a character reference":
+    // into the attribute value if we came from one, else as characters.
     fn flush_char_ref(&mut self) {
         let temp = std::mem::take(&mut self.temp);
         if self.in_attribute() {
@@ -362,8 +339,7 @@ impl Tokenizer {
                 }
                 Some('<') => self.state = State::TagOpen,
                 Some('\0') => {
-                    // In data, a NULL is emitted as-is rather than
-                    // replaced -- one of the few places that's true.
+                    // In data a NULL is emitted as is, one of the few places.
                     self.error("unexpected null character");
                     self.emit(Token::Char('\0'));
                 }
@@ -471,11 +447,9 @@ impl Tokenizer {
                     self.emit(Token::Eof);
                 }
             },
-            // The three "less than sign" trios below are the same shape
-            // three times over, differing only in which state they fall
-            // back to -- the spec spells each out separately, and so
-            // does this, because collapsing them would hide exactly the
-            // differences that matter.
+            // The three "less than sign" states below have the same shape,
+            // falling back to different states; spelled out separately, as
+            // in the spec, to keep the differences visible.
             State::RcdataLessThanSign => {
                 if self.peek() == Some('/') {
                     self.pos += 1;
@@ -542,11 +516,9 @@ impl Tokenizer {
                 }
             }
             State::ScriptDataEndTagName => self.end_tag_name(State::ScriptData),
-            // `<script><!--` puts the tokenizer in "escaped" script data,
-            // where `</script>` still ends the element but the content
-            // may contain `<`. The double-escaped states below handle a
-            // `<script>` *inside* that comment, which is the case that
-            // makes this worth implementing rather than approximating.
+            // `<script><!--` enters escaped script data, where `</script>`
+            // still ends the element; the double-escaped states handle a
+            // `<script>` inside that comment.
             State::ScriptDataEscapeStart => {
                 if self.peek() == Some('-') {
                     self.pos += 1;
@@ -845,8 +817,8 @@ impl Tokenizer {
                     self.emit(Token::Eof);
                 }
             },
-            // `<a href=b?c=d>`: an unquoted value runs to whitespace or
-            // `>`, so the `=` and `?` inside it are ordinary characters.
+            // `<a href=b?c=d>`: unquoted runs to whitespace or `>`, so `=`
+            // and `?` are ordinary.
             State::AttributeValueUnquoted => match self.consume() {
                 Some('\t') | Some('\n') | Some('\x0C') | Some(' ') => self.state = State::BeforeAttributeName,
                 Some('&') => {
@@ -902,8 +874,8 @@ impl Tokenizer {
                     self.emit(Token::Eof);
                 }
             },
-            // `<?php ... ?>` and `</3>` both land here: everything up to
-            // the next `>` becomes a comment.
+            // `<?php ... ?>` and `</3>` land here: up to the next `>` is a
+            // comment.
             State::BogusComment => match self.consume() {
                 Some('>') => {
                     let comment = std::mem::take(&mut self.comment);
@@ -930,10 +902,9 @@ impl Tokenizer {
                     self.pos += 7;
                     self.state = State::Doctype;
                 } else if self.starts_with("[CDATA[") {
-                    // Only meaningful in foreign content; in an HTML
-                    // context the spec makes it a bogus comment, and the
-                    // tree builder is what knows the difference (see
-                    // Tokenizer::cdata_ok).
+                    // Only meaningful in foreign content; elsewhere a bogus
+                    // comment. The tree builder knows which
+                    // (`Tokenizer::cdata_ok`).
                     self.pos += 7;
                     if self.cdata_ok {
                         self.state = State::CdataSection;
@@ -1376,9 +1347,8 @@ impl Tokenizer {
                     }
                 }
             }
-            // The spec's own longest-match rule, which is why the whole
-            // 2231-entry table has to be present: `&notin;` is one
-            // reference, `&notit;` is `&not` plus "it;".
+            // Longest match, hence the full table: `&notin;` is one
+            // reference, `&notit;` is `&not` plus `it;`.
             State::NamedCharacterReference => {
                 let rest: String = self.input[self.pos..].iter().take(entities::MAX_NAME_LEN).collect();
                 match longest_named_match(&rest) {
@@ -1386,12 +1356,11 @@ impl Tokenizer {
                         self.pos += name.chars().count();
                         self.temp.push_str(name);
                         let terminated = name.ends_with(';');
-                        // "If the character reference was consumed as
-                        // part of an attribute, and the last character
-                        // matched is not a semicolon, and the next input
-                        // character is `=` or alphanumeric, flush as-is"
-                        // -- what keeps `?a&not=b` a literal query
-                        // string rather than turning it into `?a\u{AC}=b`.
+                        // "If the character reference was consumed as part
+                        // of an attribute, and the last character matched
+                        // is not a semicolon, and the next input character
+                        // is `=` or alphanumeric, flush as-is": `?a&not=b`
+                        // stays a query string.
                         let next = self.peek();
                         if !terminated && self.in_attribute() && next.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric()) {
                             self.flush_char_ref();
@@ -1472,9 +1441,8 @@ impl Tokenizer {
                 _ => self.reconsume(State::NumericCharacterReferenceEnd),
             },
             State::NumericCharacterReferenceEnd => {
-                // Reached either by consuming the `;` or by reconsuming
-                // whatever came instead of one, which is a parse error
-                // the spec attributes to this state.
+                // Reached by consuming the `;` or by reconsuming what came
+                // instead, a parse error attributed to this state.
                 if self.input.get(self.pos.wrapping_sub(1)) != Some(&';') {
                     self.error("missing semicolon after character reference");
                 }
@@ -1487,9 +1455,8 @@ impl Tokenizer {
         }
     }
 
-    // The tail shared by the six `*EndTagName` states: build the name,
-    // and if it turns out not to match the element that opened, spit
-    // everything back out as text.
+    // The tail of the six `*EndTagName` states: build the name, and if it
+    // doesn't match the opening element, emit everything as text.
     fn end_tag_name(&mut self, fallback: State) {
         match self.consume() {
             Some(c @ ('\t' | '\n' | '\x0C' | ' ')) if self.appropriate_end_tag() => {
@@ -1593,9 +1560,9 @@ fn normalize_newlines(input: &str) -> Vec<char> {
     out
 }
 
-// The longest entry in the table that prefixes `rest`. Binary search
-// finds *a* neighbourhood; the table is sorted, so the longest match is
-// found by walking candidate lengths down from the longest possible.
+// The longest table entry prefixing `rest`. The table is sorted, so
+// candidate lengths are tried from the longest down, each by binary
+// search.
 fn longest_named_match(rest: &str) -> Option<(&'static str, &'static str)> {
     let chars: Vec<char> = rest.chars().collect();
     for len in (1..=chars.len().min(entities::MAX_NAME_LEN)).rev() {
@@ -1607,11 +1574,9 @@ fn longest_named_match(rest: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-// §13.2.5.80's table of numeric references that don't mean what they
-// say: NULL and out-of-range become U+FFFD, surrogates are invalid, and
-// the C1 range 0x80-0x9F is remapped to the windows-1252 characters
-// authors actually meant (a real-world compatibility rule, not a
-// mistake).
+// §13.2.5.80's numeric references that don't mean what they say: NULL
+// and out-of-range become U+FFFD, surrogates are invalid, and 0x80-0x9F
+// map to the windows-1252 characters authors meant.
 fn numeric_reference_char(code: u32, error: &mut dyn FnMut(&str)) -> char {
     const C1: [char; 32] = [
         '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}', '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}',
@@ -1659,8 +1624,7 @@ fn is_control(c: u32) -> bool {
 mod tests {
     use super::*;
 
-    // Every token, with character runs coalesced into strings so a test
-    // reads as the markup it describes rather than as a list of chars.
+    // Tokens with character runs coalesced, so a test reads as markup.
     #[derive(Debug, PartialEq, Eq)]
     enum T {
         Text(String),
@@ -1686,10 +1650,9 @@ mod tests {
                     _ => out.push(T::Text(c.to_string())),
                 },
                 Token::StartTag(tag) => {
-                    // A start tag switching the tokenizer's content
-                    // model is normally the tree builder's job; these
-                    // tests do it here so RCDATA/RAWTEXT/script data can
-                    // be exercised at all.
+                    // Switching the content model is the tree builder's
+                    // job; done here so RCDATA, RAWTEXT and script data can
+                    // be tested.
                     match tag.name.as_str() {
                         "title" | "textarea" => tk.set_state(ContentState::Rcdata),
                         "style" | "xmp" | "iframe" | "noembed" | "noframes" => tk.set_state(ContentState::Rawtext),
@@ -1728,9 +1691,6 @@ mod tests {
         assert_eq!(tokenize(r#"<DIV CLASS="Big">"#), vec![start("div", &[("class", "Big")])]);
     }
 
-    // An unquoted value runs to whitespace or `>`, so `=` and `?` inside
-    // it are ordinary characters -- the case a naive `split('=')` gets
-    // wrong.
     #[test]
     fn an_unquoted_attribute_value_may_contain_equals_and_question_marks() {
         assert_eq!(tokenize("<a href=b?c=d&e=f>"), vec![start("a", &[("href", "b?c=d&e=f")])]);
@@ -1758,8 +1718,6 @@ mod tests {
         assert!(tk.errors.iter().any(|e| e.contains("duplicate")));
     }
 
-    // A `<` that starts nothing is text, which is what keeps prose like
-    // `a < b` intact.
     #[test]
     fn a_less_than_that_starts_no_tag_is_literal_text() {
         assert_eq!(tokenize("a < b"), vec![text("a < b")]);
@@ -1776,8 +1734,8 @@ mod tests {
         assert_eq!(tokenize("<!--a-b-->"), vec![T::Comment("a-b".to_string())]);
     }
 
-    // `<?php ... ?>` isn't a processing instruction in HTML -- it's a
-    // bogus comment, which is exactly why a preview can drop it whole.
+    // `<?php ... ?>` isn't a processing instruction in HTML but a bogus
+    // comment.
     #[test]
     fn a_processing_instruction_becomes_a_bogus_comment() {
         assert_eq!(tokenize("<?php echo 1; ?>"), vec![T::Comment("?php echo 1; ?".to_string())]);
@@ -1800,9 +1758,8 @@ mod tests {
         assert_eq!(tokenize("<!DOCTYPE>"), vec![T::Doctype(None, None, None, true)]);
     }
 
-    // The reason the whole 2231-entry table has to be there: `&notin;`
-    // is one reference, but `&notit;` matches the *legacy* `&not` and
-    // leaves "it;" as text.
+    // Why the whole table is needed: `&notin;` is one reference, `&notit;`
+    // is the legacy `&not` and `it;`.
     #[test]
     fn named_character_references_take_the_longest_match() {
         assert_eq!(tokenize("&notin;"), vec![text("\u{2209}")]);
@@ -1811,17 +1768,17 @@ mod tests {
         assert_eq!(tokenize("&AMP"), vec![text("&")]);
         // Two code points from one reference.
         assert_eq!(tokenize("&NotEqualTilde;"), vec![text("\u{2242}\u{338}")]);
-        // Not a reference at all: left completely alone.
+        // Not a reference: left alone.
         assert_eq!(tokenize("&nope;"), vec![text("&nope;")]);
         assert_eq!(tokenize("a & b"), vec![text("a & b")]);
     }
 
-    // In an attribute, an unterminated reference followed by `=` or a
-    // letter stays literal -- what keeps a query string a query string.
+    // In an attribute an unterminated reference before `=` or a letter
+    // stays literal.
     #[test]
     fn an_unterminated_reference_in_an_attribute_stays_literal() {
         assert_eq!(tokenize("<a href='?a&not=b'>"), vec![start("a", &[("href", "?a&not=b")])]);
-        // ...but with the semicolon it really is a reference.
+        // With the semicolon it's a reference.
         assert_eq!(tokenize("<a href='?a&not;=b'>"), vec![start("a", &[("href", "?a\u{AC}=b")])]);
     }
 
@@ -1835,15 +1792,13 @@ mod tests {
         assert_eq!(tokenize("&#x110000;"), vec![text("\u{FFFD}")]);
         // A surrogate is not a character.
         assert_eq!(tokenize("&#xD800;"), vec![text("\u{FFFD}")]);
-        // The windows-1252 remapping of the C1 range: &#128; is the euro
-        // sign, not U+0080.
+        // The C1 range maps to windows-1252: `&#128;` is the euro sign.
         assert_eq!(tokenize("&#128;"), vec![text("\u{20AC}")]);
-        // No digits at all: literal.
+        // No digits: literal.
         assert_eq!(tokenize("&#x;"), vec![text("&#x;")]);
     }
 
-    // RCDATA: references resolve, tags don't -- except the one that
-    // closes the element.
+    // RCDATA: references resolve, tags don't, except the closing one.
     #[test]
     fn rcdata_keeps_tags_as_text_but_still_expands_references() {
         assert_eq!(tokenize("<title>a <b> &amp; c</title>d"), vec![start("title", &[]), text("a <b> & c"), T::End("title".to_string()), text("d")]);
@@ -1857,8 +1812,7 @@ mod tests {
         );
     }
 
-    // The case that makes script data its own content model: a `</div>`
-    // inside a script is script text, and only `</script>` ends it.
+    // In script data `</div>` is text; only `</script>` ends it.
     #[test]
     fn script_data_ends_only_at_its_own_end_tag() {
         assert_eq!(
@@ -1867,8 +1821,8 @@ mod tests {
         );
     }
 
-    // And the escaped states: inside `<!--`, a nested `<script>` opens a
-    // double-escape where `</script>` no longer closes the outer one.
+    // Inside `<!--`, a nested `<script>` opens a double escape where
+    // `</script>` doesn't close the outer one.
     #[test]
     fn script_data_handles_the_escaped_and_double_escaped_forms() {
         assert_eq!(
@@ -1892,8 +1846,7 @@ mod tests {
         assert_eq!(tokenize("<plaintext>a<b>c"), vec![start("plaintext", &[]), text("a<b>c")]);
     }
 
-    // Truncated input has to terminate, not spin -- every state's EOF
-    // arm eventually emits Eof.
+    // Truncated input terminates: every state's EOF arm reaches Eof.
     #[test]
     fn every_truncation_of_a_document_terminates() {
         let doc = r#"<!DOCTYPE html><html><body class="x"><!-- c --><script>a<b</script>&amp;&#65;<p/></body>"#;
@@ -1901,7 +1854,7 @@ mod tests {
             if !doc.is_char_boundary(cut) {
                 continue;
             }
-            // The assertion is simply that this returns at all.
+            // The assertion is that this returns.
             let _ = tokenize(&doc[..cut]);
         }
     }
