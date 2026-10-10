@@ -1,11 +1,6 @@
-// The mutable multi-line buffer -- the "once real editing lands" half of
-// `Buffer`'s own module doc comment. Everything built before this
-// (`editor.rs`'s `LineBuffer`) only ever mutated a single flat `Vec<char>`
-// line; a real file has many. Navigation goes through the shared `Buffer`
-// trait exactly like `ScreenBuffer`/`LineBuffer` already do; mutation is
-// deliberately *not* added to that trait (mutation has never gone through
-// it, even for `LineBuffer` -- keeping it bespoke per concrete type is the
-// established pattern here, not a shortcut).
+// The mutable multi-line buffer behind the file editor. Navigation goes
+// through the shared `Buffer` trait; editing is this type's own, as it is
+// for `editor.rs`'s `LineBuffer`.
 
 use std::collections::HashMap;
 use std::io;
@@ -18,10 +13,9 @@ use super::registers::{RegisterShape, RegisterValue, Registers};
 use super::snippet;
 use super::undo::UndoTree;
 
-// One placeholder of a live `abbr` snippet, in this buffer's own
-// (line, column) space. `active` is the one being typed into, which the
-// renderer marks differently from the rest -- see
-// `fileeditor::build_editor_frame`.
+// One placeholder of a live snippet, in this buffer's (line, column)
+// space. `active` is the one being typed into, drawn differently (see
+// `fileeditor::build_editor_frame`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnippetHole {
     pub line: usize,
@@ -31,294 +25,183 @@ pub struct SnippetHole {
 }
 
 pub struct TextBuffer {
-    // Always at least one line, matching a real file (an empty file is
-    // one empty line, same as vim's own "new, empty buffer" convention --
-    // see `new_unnamed`/`delete_range`'s own Linewise branch, which
-    // restores this invariant after deleting every line).
+    // Never empty: an empty file is one empty line, as in vim (`empty` tells
+    // them apart).
     lines: Vec<Vec<char>>,
     cursor: (usize, usize),
     vtop: usize,
     vheight: usize,
-    // Horizontal counterpart to vtop -- how many columns of the current
-    // line are scrolled off to the left, so `set_cursor`/motions moving
-    // past whatever width the pane last rendered don't just get clipped
-    // off-screen with no way back (see Buffer::viewport_left's own doc
-    // comment). Kept in sync by fileeditor::scroll_to_show_cursor,
-    // exactly the way vtop is.
+    // How many columns of the current line are scrolled off to the left (see
+    // `Buffer::viewport_left`). Kept in sync by
+    // `fileeditor::scroll_to_show_cursor`, like `vtop`.
     hleft: usize,
     marks: HashMap<char, (usize, usize)>,
-    // Visual mode's own committed selections -- same field, same shape,
-    // same reasoning as `repl.rs`'s `ScreenBuffer::selections`.
+    // Visual mode's committed selections, as in repl.rs's
+    // `ScreenBuffer::selections`.
     pub selections: Vec<motion::MotionRange>,
-    // A live `abbr` snippet's own placeholders, for whoever draws this
-    // buffer -- same field, same "view state the buffer carries so every
-    // frame showing it agrees" reasoning as `selections` just above,
-    // which also gets a detached editor pane's frozen frame right for
-    // free. Written by fileeditor::run_insert_mode while a snippet is
-    // live and cleared the moment it ends; empty every other time.
+    // A live snippet's placeholders, for whoever draws this buffer. View
+    // state carried on the buffer like `selections`, so every frame showing
+    // it agrees, a detached pane's frozen one included. Set by
+    // `fileeditor::run_insert_mode` while a snippet is live.
     pub snippet_holes: Vec<SnippetHole>,
-    /// The `ignorecase`/`smartcase` bishopts, copied here by
-    /// `apply_view_options` the way every other view option is -- see
-    /// `bishedit::ignore_case_for` for how the two combine, and
-    /// `Buffer::search_ignore_case` for why the answer lives on the
-    /// buffer at all.
+    /// The `ignorecase`/`smartcase` bishopts, copied in by
+    /// `apply_view_options` (see `bishedit::ignore_case_for` and
+    /// `Buffer::search_ignore_case`).
     pub ignorecase: bool,
     pub smartcase: bool,
-    /// The `iskeyword` bishopt, copied here the same way -- see
-    /// `Buffer::word_chars` for what it means and why the buffer is
-    /// where a motion can ask.
+    /// The `iskeyword` bishopt, copied the same way (see
+    /// `Buffer::word_chars`).
     pub iskeyword: String,
-    /// The project root this buffer's language server was reached
-    /// through, when it was *inherited* rather than computed.
-    ///
-    /// A file opened fresh has none, and `repl::server_target` works one
-    /// out from its own ancestors. A file reached by a jump keeps the
-    /// one it was reached from -- which is the difference between
-    /// `gd` into the Rust standard library answering immediately and
-    /// starting a second rust-analyzer for the toolchain directory,
-    /// because that file's own nearest `Cargo.toml` lives there.
+    /// The project root this buffer's language server was reached through,
+    /// when inherited rather than computed. A file opened fresh has none,
+    /// and `repl::server_target` works one out. A file reached by a jump
+    /// keeps its origin's, so `gd` into the Rust standard library uses the
+    /// running rust-analyzer instead of starting one for the toolchain
+    /// directory.
     pub lsp_root: Option<std::path::PathBuf>,
-    /// What this buffer's language server says it is busy with, for the
-    /// status line. `None` when it is idle, has nothing to say, or does
-    /// not exist. Refreshed on the idle tick like `diagnostics` and
-    /// `semantic_spans`, and for the same reason: this is the one place
-    /// with both the buffer and a moment to spare.
+    /// What this buffer's language server says it's busy with, for the status
+    /// line. `None` when idle or absent. Refreshed on the idle tick, like
+    /// `diagnostics`.
     pub lsp_progress: Option<String>,
-    /// Something to tell the user once: a language server's
-    /// `window/showMessage` (most often that it could not load the
-    /// project), or the file on disk having changed underneath this
-    /// buffer. Takes the status line's progress slot while it is set,
-    /// and is cleared by the next keypress -- vim's own convention for
-    /// an echoed message, and the reason it does not need dismissing.
+    /// A message to show once: a server's `window/showMessage` (usually that
+    /// it couldn't load the project), or the file changing on disk. Takes the
+    /// status line's progress slot and is cleared by the next key, vim's
+    /// convention for an echoed message.
     pub echoed_message: Option<String>,
-    // A language server's semantic tokens for this buffer, already
-    // resolved to colours and to this buffer's own char offsets (see
-    // repl::sync_semantic_tokens) -- painted as one more layer over
-    // whatever the local highlighter made of the same text.
+    // A language server's semantic tokens, resolved to colours and this
+    // buffer's char offsets (see `repl::sync_semantic_tokens`), painted
+    // over the local highlighter's layer. Resolved on arrival because
+    // that's where the `Shell` is: a token type's colour comes from
+    // `::bish hl`, whose open namespace the renderer's `ColorOverrides`
+    // can't cover.
     //
-    // Resolved at arrival rather than at draw time because that is where
-    // the `Shell` is: a token type's colour comes from `::bish hl`,
-    // whose namespace is open, so it cannot be looked up through the
-    // closed `ColorOverrides` map the renderer is given.
-    //
-    // Deliberately *not* cleared by an edit, unlike `diagnostics` just
-    // below. A diagnostic in the wrong place is a claim about code that
-    // is not there; a colour in the wrong place for the 150ms until the
-    // next answer arrives is a colour in the wrong place, and clearing
-    // them on every keystroke would strobe the whole file instead.
+    // Not cleared by an edit, unlike `diagnostics`: a misplaced colour for
+    // the moment until the next answer beats the whole file strobing on
+    // every keystroke.
     pub semantic_spans: Vec<super::highlight::StyledSpan>,
-    /// Where else in this file the thing under the cursor appears, as
-    /// the language server sees it (`textDocument/documentHighlight`).
-    /// Whole-buffer char offsets, like `semantic_spans`.
-    ///
-    /// Only the attributes are used: these compose over the colour
-    /// already there rather than replacing it (see
-    /// `highlight::compose_attrs`), because the point of the mark is
-    /// "this is the same symbol", not "this is something else".
-    /// Refreshed on the idle tick as the cursor moves, and emptied as
-    /// soon as it moves somewhere the server has nothing to say about.
+    /// Where else the symbol under the cursor appears, per the language
+    /// server (`textDocument/documentHighlight`), in whole-buffer char
+    /// offsets. Only the attributes are used, over the existing colour (see
+    /// `highlight::compose_attrs`). Refreshed on the idle tick, emptied
+    /// when the server has nothing to say.
     pub document_highlights: Vec<super::highlight::StyledSpan>,
-    /// The language server's inlay hints for this buffer, as
-    /// `(line, column, text)` in this buffer's own char positions.
-    /// Spliced into the drawn line -- see `fileeditor::display_row` --
-    /// so they are between characters, never over them.
-    ///
-    /// Sorted by position, which is what the splice walks in one pass.
-    /// Refreshed on the idle tick for the visible range only: the
-    /// request takes a range, and a hint nobody can see costs the same
-    /// to compute as one they can.
+    /// The language server's inlay hints as `(line, column, text)` in char
+    /// positions, spliced between characters when drawn (see
+    /// `fileeditor::display_row`). Sorted, for the one-pass splice. Requested
+    /// for the visible range only.
     pub inlay_hints: Vec<(usize, usize, String)>,
-    /// Whether to draw them at all. On by default; `bishopt
-    /// inlayhints=false` turns them off.
+    /// Whether to draw them: the `inlayhints` bishopt, on by default.
     pub inlayhints: bool,
-    /// Whether the bracket under the cursor and the one it pairs with are
-    /// marked -- the `matchbrackets` bishopt, copied here the way
-    /// `inlayhints` just above is. `bishopt --set matchbrackets off`
-    /// turns the marks off.
+    /// The `matchbrackets` bishopt: whether the bracket under the cursor and
+    /// its partner are marked.
     pub matchbrackets: bool,
-    // A fingerprint of the file's bytes as of the last read or write, for
-    // noticing that something else rewrote it since. `None` for a buffer
-    // that is not a view of a file on disk at all.
+    // A fingerprint of the file's bytes as of the last read or write, to
+    // notice it being rewritten. `None` for a buffer that isn't a view of a
+    // file.
     disk_hash: Option<u64>,
-    // `:diag`'s own last result (see fileeditor::diagnose_buffer) -- rides
-    // along with the buffer exactly like `selections` does (survives a
-    // Ctrl+G detach/reattach, since both live on the one thing that
-    // does), cleared by `:diag clear` or implicitly by any real edit (see
-    // insert_text/delete_range/join_lines below): a lint::Diagnostic's
-    // start/end are char offsets into this buffer's *current* text, so
-    // keeping a stale one around past the edit that invalidated its
-    // position would just be showing the user a lie.
+    // `:diag`'s last result (see `fileeditor::diagnose_buffer`). Survives a
+    // Ctrl+G detach like `selections`. Cleared by `:diag clear` or by any
+    // edit, since its offsets point into the text as it was.
     pub diagnostics: Vec<lint::Diagnostic>,
-    // `:git blame`'s own toggle state (see fileeditor::toggle_git_blame,
-    // and GUTTER_COLUMNS's blame column, which is what actually reads
-    // this) -- `None` means off (the gutter's blame column collapses to
-    // zero width entirely), `Some` is one entry per buffer line, indexed
-    // the same way `lines` is. The *inner* `None` is a line git had
-    // nothing to say about: typed since the revision being blamed, or
-    // simply not in it (see fileeditor::toggle_git_blame, which lines the
-    // two up rather than assuming they match). Cleared on any real edit
-    // for the same reason `diagnostics` is: a line-indexed snapshot of
-    // "who last touched this line" goes stale the instant a line shifts
-    // or its content changes, and re-running `git blame` is the caller's
-    // job (`:git blame` again), not something a single-line edit could
-    // patch up correctly on its own.
-    // How this view lays out a line wider than the pane -- vim's `wrap`
-    // family, set from bishopt by whoever is driving this buffer (see
-    // repl.rs's `wrap_options`). A *view* setting rather than a document
-    // one, which is why it lives beside `vtop`/`hleft` rather than
-    // anywhere near the text.
+    // How this view lays out a line wider than the pane: vim's `wrap` family,
+    // set from bishopt by the driver (see repl.rs's `wrap_options`). A view
+    // setting, like `vtop` and `hleft`.
     pub wrap: crate::bishedit::wrap::Options,
-    // The delimiter this buffer's columns line up on, for a language
-    // that has a tabular form and whose language the `tabular` bishopt's
-    // glob matches. `None` for everything else, which is almost every
-    // buffer. A *display* setting like `wrap`: the text is untouched,
-    // only where padding is drawn between it changes.
+    // The delimiter this buffer's columns line up on, when its language has
+    // a tabular form the `tabular` bishopt matches. Display only, like
+    // `wrap`.
     pub tabular: Option<crate::bishedit::tabular::Style>,
-    // The `hyperlinks` bishopt: whether links are drawn as real OSC 8
-    // hyperlinks. Only affects rendering -- the link spans are computed
-    // either way, since the styling that marks them comes from the same
-    // pass.
+    // The `hyperlinks` bishopt: whether links are real OSC 8 hyperlinks.
+    // The link spans are computed either way.
     pub hyperlinks: bool,
-    // The `relativenumber` bishopt: whether the gutter numbers each line
-    // by its distance from the cursor's instead of absolutely.
+    // The `relativenumber` bishopt: gutter numbers relative to the cursor's
+    // line.
     pub relativenumber: bool,
-    /// The `cursorshape` bishopt: whether the terminal's cursor changes
-    /// shape to show the mode.
-    /// This session's resolved `ui_col_*` colours (see theme.rs) --
-    /// carried on the buffer for the same reason `wrap` and `tabular`
-    /// are: every frame showing this buffer has to agree, including a
-    /// detached pane's frozen one, and the gutter's own renderers are
-    /// plain functions of a `TextBuffer`.
+    /// This session's `ui_col_*` colours (see theme.rs), carried here like
+    /// `wrap` and `tabular` so every frame agrees, a detached pane's
+    /// included, and the gutter renderers can stay plain functions of a
+    /// `TextBuffer`.
     pub colors: Option<crate::theme::UiColors>,
+    /// The `cursorshape` bishopt: whether the terminal cursor's shape shows
+    /// the mode.
     pub cursorshape: bool,
-    /// The `mouse` bishopt, carried here so the frame that draws this
-    /// buffer and the loop that reads keys for it agree.
+    /// The `mouse` bishopt, so the frame and the key loop agree.
     pub mouse: bool,
     /// How this buffer indents: `expandtab` off inserts a literal tab,
-    /// `shiftwidth` is what `>>` shifts by and what Tab advances to,
-    /// `tabstop` is how wide a literal tab draws.
+    /// `shiftwidth` is what `>>` shifts by and Tab advances to, `tabstop` how
+    /// wide a tab draws.
     pub expandtab: bool,
     pub shiftwidth: usize,
     pub tabstop: usize,
     /// Whether `:w` strips whitespace from the end of every line.
     pub trim_trailing_whitespace: bool,
-    /// Whether the file on disk ends in a newline. Detected from what
-    /// was loaded, so a file without one keeps not having one -- and
-    /// overridden by `fixendofline`/`insert_final_newline`.
+    /// Whether the file ends in a newline. Detected on load, so a file
+    /// without one stays without, unless `fixendofline` or
+    /// `insert_final_newline` says otherwise.
     pub final_newline: bool,
-    /// Whether this buffer holds *no lines* -- as opposed to holding one
-    /// line that happens to be empty, which is a different thing and
-    /// writes differently.
-    ///
-    /// A buffer always keeps at least one line so there is somewhere to
-    /// put the cursor, which makes those two states look identical in
-    /// `lines`. They are not: a file of one empty line is one byte, and
-    /// a file of no lines is zero, and vim keeps the same distinction
-    /// (its `ML_EMPTY`) for the same reason. Set by loading an empty
-    /// file or by deleting the last line, cleared by inserting anything
-    /// -- so `dd` on a one-line file writes an empty file, while typing
-    /// a character and deleting it again writes the newline back.
+    /// Whether this buffer holds no lines, as opposed to one empty line. A
+    /// buffer always keeps a line for the cursor, so `lines` can't tell them
+    /// apart, but they write differently: one byte versus zero (vim's
+    /// `ML_EMPTY`). Set by loading an empty file or deleting the last line,
+    /// cleared by inserting anything: `dd` on a one-line file writes an empty
+    /// file.
     pub empty: bool,
-    /// The line ending this file is written back with. Detected on load,
-    /// so opening and saving a CRLF file leaves it a CRLF file.
+    /// The line ending written back, detected on load, so a CRLF file stays
+    /// CRLF.
     pub eol: crate::editorconfig::Eol,
-    /// What this file's bytes are written back as, detected on load for
-    /// the same reason `eol` is: a latin-1 file that came back as UTF-8
-    /// would be every accented character in it changed by an editor
-    /// that was only asked to change one line.
+    /// The encoding written back, detected on load: a latin-1 file saved as
+    /// UTF-8 would change every accented character in it.
     pub encoding: crate::encoding::Encoding,
-    /// Whether the file began with a byte-order mark, kept apart from
-    /// `encoding` because a UTF-8 file with one and a UTF-8 file
-    /// without one are the same encoding and different files -- and
-    /// adding or dropping one is a change to every tool that reads it.
+    /// Whether the file began with a byte-order mark. Separate from
+    /// `encoding`: with and without one are the same encoding but different
+    /// files.
     pub bom: bool,
-    // Which visual row of `vtop`'s own line the viewport starts at. Only
-    // ever non-zero with wrapping on, and only for a line tall enough to
-    // exceed the pane by itself -- without it, a minified file would
-    // scroll to the right line and then be unable to reach the cursor
-    // inside it.
+    // Which visual row of `vtop`'s line the viewport starts at. Non-zero only
+    // with wrapping, for a line taller than the pane, so a minified file can
+    // still reach the cursor inside its one line.
     vtop_sub: usize,
+    // `:git blame`'s toggle state (see `fileeditor::toggle_git_blame` and
+    // the gutter's blame column). `None` is off; `Some` has one entry per
+    // line, the inner `None` being a line git has nothing on (typed since,
+    // or not in the blamed revision). Cleared on any edit, since a shifted
+    // line invalidates it; `:git blame` again recomputes it.
     pub blame: Option<Vec<Option<crate::git::BlameLine>>>,
-    // `:git diff`'s own toggle state -- same shape/lifecycle as `blame`
-    // just above (`None` off, gutter column collapses to zero width;
-    // `Some` on), except sparse: only lines crate::git::diff actually
-    // marked appear as keys (0-indexed, matching `lines`/`blame`), most
-    // lines have no entry at all rather than an explicit "unchanged"
-    // marker.
+    // `:git diff`'s toggle state, like `blame`: `None` is off. Sparse: only
+    // lines `crate::git::diff` marked have entries.
     pub diff: Option<std::collections::HashMap<usize, crate::git::DiffMark>>,
-    // `zf` and friends. Unlike `diff` and `blame` just above, not thrown
-    // away on an edit: a fold is the reader's own structure, so it moves
-    // with its lines instead -- see `content_changed`'s callers.
+    // `zf` and friends. Not discarded on an edit like `diff` and `blame`: a
+    // fold moves with its lines (see `content_changed`'s callers).
     pub folds: crate::bishedit::fold::Folds,
-    // `:dbg`'s own breakpoint set (see GUTTER_COLUMNS's breakpoint column
-    // in fileeditor.rs, which is what actually reads this) -- 1-based
-    // line numbers, matching how the debugger itself reports lines.
-    // Empty (the common case: an ordinary `e`-opened buffer never
-    // touches this) collapses the gutter column to zero width, same
-    // convention `blame`/`diff` already use. Deliberately *not* cleared
-    // on edit the way diagnostics/blame/diff are -- a buffer with any
-    // breakpoints is always `readonly` too (see that field's own doc
-    // comment) for the whole time it could have any set, so there's
-    // never an edit to invalidate a line-indexed breakpoint set against
-    // in the first place.
+    // `:dbg`'s breakpoints, 1-based as the debugger reports lines, read by
+    // the gutter's breakpoint column (see `GUTTER_COLUMNS` in fileeditor.rs).
+    // Not cleared on edit: a buffer with breakpoints is `readonly` while it
+    // has them.
     pub breakpoints: std::collections::BTreeSet<usize>,
-    /// Whether a debug session is attached to this buffer -- either
-    /// `:dbg`'s own, or an adapter's from `:dbg launch`.
-    ///
-    /// Only the gutter reads it, and only to keep the breakpoint column
-    /// present for the whole session. Without it that column exists
-    /// exactly while at least one breakpoint does, so setting the first
-    /// one shifts every line of the file two columns to the right and
-    /// clearing the last one shifts it back -- and there is no column
-    /// to *click* a first breakpoint into.
+    /// Whether a debug session (`:dbg`'s own or an adapter's) is attached.
+    /// Only the gutter reads it, to keep the breakpoint column for the whole
+    /// session: otherwise the first breakpoint shifts every line right, and
+    /// there's no column to click the first one into.
     pub debug_attached: bool,
-    // Set while a `:dbg` session is attached to this buffer (repl.rs) --
-    // every mutating `KeyOutcome` arm in run_normal_mode_navigation
-    // already gates itself on `NavBuffer::Editable(tb)` individually (no
-    // single chokepoint -- see that function's own doc comment), so this
-    // is consulted as one extra condition at each of those sites rather
-    // than needing a new `NavBuffer` variant: same buffer type, same
-    // rendering/navigation/command-mode, just mutation refused. Doesn't
-    // affect `dirty`/`save` at all -- a buffer opened for debugging was
-    // never dirty to begin with (`:dbg` itself refuses to attach to one
-    // that is), and nothing here can make it dirty since nothing can
-    // mutate it while this is set.
+    // Set while a `:dbg` session is attached (repl.rs). Each mutating
+    // `KeyOutcome` arm in `run_normal_mode_navigation` checks it alongside
+    // `NavBuffer::Editable`. Doesn't affect `dirty` or `save`: `:dbg` won't
+    // attach to a dirty buffer, and nothing can edit it meanwhile.
     readonly: bool,
-    // `u`/`Ctrl-R` -- a real branching tree, not a linear undo/redo stack
-    // (see bishedit::undo's own module doc comment for why). Rides along
-    // with the buffer exactly like `selections`/`diagnostics` (survives a
-    // Ctrl+G detach/reattach), seeded with this buffer's own starting
-    // content in `new_unnamed`/`open` below. Checkpointed by
-    // `checkpoint_undo` -- see its own doc comment for exactly when that
-    // gets called and why that's what defines one undo-able "group".
+    // `u`/`Ctrl-R`: a branching tree (see `bishedit::undo`), seeded with the
+    // starting content in `new_unnamed`/`open`, and grouped by
+    // `checkpoint_undo`. Survives a Ctrl+G detach.
     undo: UndoTree<Vec<Vec<char>>>,
-    // The undo-tree node id that was on disk as of the last successful
-    // `save` (or the buffer's own starting content, if never saved) --
-    // `undo()`/`redo()`/`time_travel` compare against this to decide
-    // whether landing on a given node means "this exact content is
-    // already on disk," clearing `dirty` precisely the way real vim's own
-    // undo-tree-aware `modified` flag does. Ordinary edits (insert_text/
-    // delete_range/join_lines) don't consult this at all -- they always
-    // set `dirty = true` directly, which is already correct for them (an
-    // edit either just happened or it didn't; there's no "did this
-    // particular edit happen to reproduce the saved content" question
-    // worth asking there the way there is for undo/redo/time-travel,
-    // which can legitimately land back exactly on it).
+    // The undo node that was on disk as of the last save (or the starting
+    // content). Undo, redo and time travel compare against it so landing back
+    // on it clears `dirty`, like vim's undo-aware `modified`. Ordinary edits
+    // just set `dirty`.
     saved_node: usize,
     dirty: bool,
-    // Bumped by `content_changed` on every real edit, and never reset --
-    // a monotonic "which revision of this buffer is this" stamp, as
-    // against `dirty`'s "does it differ from disk" (which undo can and
-    // does clear again).
-    //
-    // Exists for anything that computes something *from* the text and
-    // gets an answer back later, when the text may have moved on: a
-    // language server's diagnostics arrive asynchronously and carry the
-    // version they describe, so a reply about a revision this buffer has
-    // already left can be dropped instead of drawn at offsets that no
-    // longer mean anything. `dirty` cannot answer that question and
-    // `diagnostics.clear()` alone can't either -- clearing says the old
-    // answer is gone, not which new one is still worth waiting for.
+    // Bumped on every edit, never reset: which revision this is, where
+    // `dirty` (which undo can clear) is whether it differs from disk. For
+    // answers computed from the text that arrive later: a language server's
+    // diagnostics carry the version they describe, so a reply about a past
+    // revision can be dropped instead of drawn at stale offsets.
     version: u64,
     path: Option<PathBuf>,
 }
@@ -379,14 +262,11 @@ impl TextBuffer {
         }
     }
 
-    // A nonexistent path opens as a fresh unnamed-but-pathed buffer --
-    // vim's own ":e newfile" behavior (the file is created on first
-    // `:w`, not on open).
+    // A nonexistent path opens as a new buffer with that path, as vim's
+    // `:e newfile` does; the file is created on the first `:w`.
     pub fn open(path: &Path, vheight: usize) -> io::Result<TextBuffer> {
-        // Bytes, not a `String`: what encoding those bytes are in is
-        // this file's own property and is worked out from them, so a
-        // latin-1 file opens as text rather than as an error nobody can
-        // get past. See encoding.rs.
+        // Bytes, not a `String`: the encoding is worked out from them, so a
+        // latin-1 file opens as text (see encoding.rs).
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -401,27 +281,19 @@ impl TextBuffer {
     }
 
     /// Whether the file changed on disk since this buffer last read or
-    /// wrote it.
-    ///
-    /// Compares *content*, not mtime: a `touch`, a formatter that made no
-    /// change, or a checkout that restored the same bytes all move the
-    /// timestamp without changing anything, and refusing to save over
-    /// those would be the false positive that makes this annoying rather
-    /// than useful.
-    ///
-    /// `false` for a buffer with no path, one whose file has since been
-    /// removed (writing it back is exactly what you would want), and one
-    /// whose content never came from that path in the first place -- a
-    /// zip member, a decompressed stream -- since for those there is
-    /// nothing on disk this is a view of.
+    /// wrote it. Compares content, not mtime: a `touch`, a no-op formatter
+    /// or a checkout of the same bytes changes nothing. `false` for a
+    /// buffer with no path, a deleted file (writing it back is what you'd
+    /// want), or content that never came from the path (a zip member, a
+    /// decompressed stream).
     pub fn changed_on_disk(&self) -> bool {
         let Some(path) = self.path.as_deref() else { return false };
         let Some(known) = self.disk_hash else { return false };
         disk_hash(path).is_some_and(|now| now != known)
     }
 
-    /// Re-reads this buffer from its own file, discarding whatever is in
-    /// it -- `:e!`. The cursor is kept where it was, clamped.
+    /// Re-reads this buffer from its file, discarding its content: `:e!`. The
+    /// cursor stays where it was, clamped.
     pub fn reload(&mut self) -> io::Result<()> {
         let path = self.path.clone().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
         let decoded = crate::encoding::decode(&std::fs::read(&path)?);
@@ -444,36 +316,26 @@ impl TextBuffer {
         Ok(())
     }
 
-    // A buffer holding `text` but named `path` -- for content that has a
-    // path worth showing and a place worth saving to, but doesn't come
-    // from reading that path directly. Today that's compressed content
-    // (a gzip'd file, a member inside a zip), which is why every caller
-    // also marks the result readonly; see fileeditor::compressed_text.
+    // A buffer holding `text` under `path`, for content not read from `path`
+    // directly: compressed content (a gzipped file, a zip member), which
+    // callers also mark readonly. See `fileeditor::compressed_text`.
     pub fn from_text(path: &Path, text: &str, vheight: usize) -> TextBuffer {
-        // What this file's own line ending is, before anything is
-        // normalized away -- remembered so `save` writes the same one
-        // back. Without it, opening and saving a CRLF file silently
-        // rewrote every line of it.
+        // The file's line ending, before normalizing, so `save` writes it
+        // back.
         let eol = detect_eol(text);
-        // Normalized to "\n" for everything above this line: the buffer,
-        // every motion, every highlighter and every offset in this
-        // codebase assume one character per line break, and a `\r`
-        // riding along on the end of each line would be a character in
-        // the buffer that the file's own text does not have.
+        // Normalized to `\n`: everything here assumes one character per
+        // line break, and a `\r` would be a character the file's text
+        // doesn't have.
         let normalized = match eol {
             crate::editorconfig::Eol::Lf => std::borrow::Cow::Borrowed(text),
             crate::editorconfig::Eol::Crlf => std::borrow::Cow::Owned(text.replace("\r\n", "\n")),
             crate::editorconfig::Eol::Cr => std::borrow::Cow::Owned(text.replace('\r', "\n")),
         };
-        // A trailing newline is the normal case -- stripped here so it
-        // doesn't show up as a phantom trailing empty line; *whether* it
-        // was there is remembered instead, so a file without one keeps
-        // not having one.
-        //
-        // An empty file counts as having one, which matters only once
-        // it stops being empty: what an untouched empty file writes
-        // back as is decided by `empty`, not here, and typing into one
-        // should leave a newline at the end the way a new file does.
+        // A trailing newline is stripped so it isn't a phantom empty last
+        // line, and remembered so a file without one stays without. An
+        // empty file counts as having one: what an untouched empty file
+        // writes is up to `empty`, and typing into one should end with a
+        // newline, as a new file does.
         let final_newline = normalized.is_empty() || normalized.ends_with('\n');
         let text = normalized.strip_suffix('\n').unwrap_or(&normalized);
         let lines: Vec<Vec<char>> = text.split('\n').map(|l| l.chars().collect()).collect();
@@ -531,8 +393,7 @@ impl TextBuffer {
         }
     }
 
-    // See `vtop_sub`. Cleared whenever the top line itself moves, since
-    // an offset into a different line means nothing.
+    // See `vtop_sub`. Cleared when the top line moves.
     pub fn viewport_sub(&self) -> usize {
         self.vtop_sub
     }
@@ -545,9 +406,8 @@ impl TextBuffer {
         self.path.as_deref()
     }
 
-    /// Points the buffer at the file its own has been renamed to. The
-    /// text, and whether it is saved, stay as they are: the file on disk
-    /// moved with its contents.
+    /// Points the buffer at its file's new name. The text and saved state
+    /// stay: the file moved with its contents.
     pub fn set_path(&mut self, path: &Path) {
         self.path = Some(path.to_path_buf());
     }
@@ -556,26 +416,19 @@ impl TextBuffer {
         self.dirty
     }
 
-    /// This buffer's current revision -- see the `version` field.
+    /// This buffer's revision; see `version`.
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    // The one thing every real edit does: bump the revision, and drop
-    // everything derived from the old text. Called by insert_text/
-    // delete_range/join_lines and by restore_snapshot (undo/redo/time
-    // travel), which are between them the only four places this
-    // buffer's content actually changes.
-    //
-    // Deliberately does not touch `dirty`: the three edit methods set it
-    // unconditionally, while restore_snapshot's is save-aware (landing
-    // back on the node that's on disk clears it). That difference is
-    // real, so it stays at the call sites rather than being averaged
-    // into something wrong for one of them here.
+    // What every edit does: bump the revision and drop everything derived
+    // from the old text. Called by `insert_text`, `delete_range`,
+    // `join_lines` and `restore_snapshot`, the only places content changes.
+    // Leaves `dirty` alone: the edits set it, while `restore_snapshot`
+    // compares against the saved node.
     fn content_changed(&mut self) {
         self.version += 1;
-        // Positions in any of these are char offsets into the text that
-        // just changed, so keeping them would be showing a lie.
+        // Their positions are char offsets into the text that just changed.
         self.diagnostics.clear();
         self.blame = None;
         self.diff = None;
@@ -585,29 +438,20 @@ impl TextBuffer {
         self.readonly
     }
 
-    // `:dbg`'s own on/off switch (repl.rs) -- see `readonly`'s own field
-    // doc comment.
+    // `:dbg`'s switch (repl.rs); see `readonly`.
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
     }
 
-    // Commits the buffer's current content/cursor as a new undo-tree node
-    // if it differs from whatever's already there -- a no-op otherwise
-    // (see UndoTree::checkpoint's own doc comment for exactly what "no-op"
-    // means and why). Called by repl.rs's `render_nav_frame`, once per
-    // top-level key dispatch in the unified Normal-mode loop -- that one
-    // call site is what actually defines an undo "group": an entire
-    // Insert-mode session (many individual `insert_text` calls) only
-    // reaches `render_nav_frame` once, after the whole session ends, so it
-    // collapses into a single checkpoint/undo step, with no changes needed
-    // to any of the individual mutation call sites themselves.
+    // Commits the content and cursor as a new undo node if they changed
+    // (see `UndoTree::checkpoint`). Called by repl.rs's `render_nav_frame`
+    // once per key dispatched in Normal mode, which is what makes a whole
+    // Insert session one undo step.
     pub fn checkpoint_undo(&mut self) {
         self.undo.checkpoint(&self.lines, self.cursor);
     }
 
-    // `u`: moves to the parent node and restores its content/cursor.
-    // `false` (buffer untouched) at the tree's root -- there's nothing
-    // further back than the content this buffer started with.
+    // `u`: restores the parent node. `false` at the root.
     pub fn undo(&mut self) -> bool {
         let Some(snap) = self.undo.undo() else { return false };
         let (content, cursor) = (snap.content.clone(), snap.cursor);
@@ -615,10 +459,8 @@ impl TextBuffer {
         true
     }
 
-    // `Ctrl-R`: moves to the most recently created child and restores its
-    // content/cursor -- see UndoTree::redo's own doc comment for exactly
-    // which branch that is. `false` (buffer untouched) if the current node
-    // has no children (nothing to redo from here).
+    // `Ctrl-R`: restores the most recently created child (see
+    // `UndoTree::redo`). `false` without children.
     pub fn redo(&mut self) -> bool {
         let Some(snap) = self.undo.redo() else { return false };
         let (content, cursor) = (snap.content.clone(), snap.cursor);
@@ -626,11 +468,10 @@ impl TextBuffer {
         true
     }
 
-    // `g-`/`g+`: walks the undo tree's own flat creation history rather
-    // than parent/child edges -- see UndoTree::time_travel_back/forward's
-    // own doc comment for why that reaches branches undo/redo alone
-    // can't. `forward: false` is `g-`, `true` is `g+`. `false` (buffer
-    // untouched) at either end of that history.
+    // `g-`/`g+`: walks the tree's creation history rather than its edges,
+    // reaching branches undo and redo can't (see
+    // `UndoTree::time_travel_back`). `forward: true` is `g+`. `false` at
+    // either end.
     pub fn time_travel(&mut self, forward: bool) -> bool {
         let result = if forward { self.undo.time_travel_forward() } else { self.undo.time_travel_back() };
         let Some(snap) = result else { return false };
@@ -639,46 +480,22 @@ impl TextBuffer {
         true
     }
 
-    // Shared tail of undo/redo/time_travel: splices a snapshot's own
-    // content/cursor back into the buffer and updates everything that
-    // depends on "what does the buffer actually contain right now."
+    // Restores a snapshot for undo, redo and time travel.
     fn restore_snapshot(&mut self, content: Vec<Vec<char>>, cursor: (usize, usize)) {
-        // A snapshot says what the text was, not which lines moved to
-        // get there; `text_replaced` works that out for the folds.
+        // A snapshot doesn't say which lines moved; `text_replaced` works
+        // it out for the folds.
         self.folds.text_replaced(&self.lines, &content);
         self.lines = content;
         self.cursor = cursor;
-        // Positions may no longer be valid -- same reasoning insert_text/
-        // delete_range/join_lines already apply for any real edit.
         self.content_changed();
-        // Save-aware: landing back exactly on the node that was on disk
-        // as of the last `:w` clears `dirty`, matching real vim's own
-        // undo-tree-aware `modified` flag -- see `saved_node`'s own doc
-        // comment.
+        // Landing on the saved node clears `dirty`; see `saved_node`.
         self.dirty = self.undo.current_id() != self.saved_node;
     }
 
-    // Writes every line joined by "\n", plus one trailing "\n" (matching
-    // a real text file, and `open`'s own inverse -- see its doc comment).
-    // `path` overrides `self.path` for this write and, if this buffer had
-    // none yet, becomes the buffer's own path afterward -- vim's own
-    // ":w newname" behavior on an unnamed buffer.
-    // The buffer's own full text, `\n`-joined with a trailing newline --
-    // `save`'s own inverse (what actually gets written to disk). Also
-    // used by anything that needs an ordinary, re-parseable source
-    // string rather than this buffer's line-based representation --
-    // e.g. `K`-hover's own doc-comment lookup (repl.rs/docs.rs), which
-    // parses the *live* in-memory buffer so a not-yet-saved edit is
-    // reflected immediately, rather than requiring a `:w` first.
-    /// The bytes this buffer writes to disk: its own text with *this
-    /// file's* line ending, trailing whitespace trimmed if asked, and a
-    /// final newline only if it should have one.
-    ///
-    /// Separate from `text()` on purpose. `text()` is what every
-    /// highlighter, linter and span offset in this codebase reads, and
-    /// it is always `\n`-separated with one trailing newline -- making
-    /// *that* depend on a file's line ending would put a `\r` into every
-    /// offset in the editor.
+    /// The bytes this buffer writes: its text with this file's line ending,
+    /// trailing whitespace trimmed if asked, and a final newline only if it
+    /// should have one. Separate from `text()`, which every highlighter,
+    /// linter and offset reads: a `\r` there would shift every offset.
     pub fn on_disk_text(&self) -> String {
         let mut lines: Vec<String> = self.lines.iter().map(|l| l.iter().collect::<String>()).collect();
         if self.trim_trailing_whitespace {
@@ -689,8 +506,7 @@ impl TextBuffer {
                 }
             }
         }
-        // No lines means no bytes -- not one empty line's worth of
-        // newline. See `empty`'s own doc comment.
+        // No lines means no bytes; see `empty`.
         if self.empty {
             return String::new();
         }
@@ -701,28 +517,29 @@ impl TextBuffer {
         out
     }
 
+    /// The full text, `\n`-joined with a trailing newline. For anything that
+    /// wants a re-parseable string of the live buffer, such as `K` hover's
+    /// doc-comment lookup, which sees unsaved edits.
     pub fn text(&self) -> String {
         let mut text: String = self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
         text.push('\n');
         text
     }
 
+    /// Writes `on_disk_text`. `path` overrides the buffer's path for this
+    /// write, and becomes it if there was none, as vim's `:w newname` does
+    /// on an unnamed buffer.
     pub fn save(&mut self, path: Option<&Path>) -> io::Result<()> {
         let target = path.or(self.path.as_deref()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No file name"))?;
-        // Vim's own rule, and the reason this guard is here rather than
-        // at the `:w` command: read-only is about *this file*, not about
-        // the text, so `:w SOMEWHERE-ELSE` still works -- which is how
-        // you get a zip member or a gzip'd file back out as an ordinary
-        // file. Enforced at the one place that writes, so no caller can
-        // forget it; with compressed buffers that matters, since writing
-        // one back to its own path would replace an archive with its own
-        // decompressed contents.
+        // Read-only concerns this file, not the text, so `:w ELSEWHERE`
+        // still works (vim's rule). Enforced at the one place that writes:
+        // writing a compressed buffer back to its own path would replace an
+        // archive with its decompressed contents.
         if self.readonly && Some(target) == self.path.as_deref() {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "buffer is read-only"));
         }
-        // Encoded before anything is written, so a character this
-        // file's encoding has no room for leaves the file on disk
-        // exactly as it was rather than half-replaced.
+        // Encoded before anything is written, so a character the encoding
+        // can't hold leaves the file untouched.
         let bytes = crate::encoding::encode(&self.on_disk_text(), self.encoding, self.bom)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         std::fs::write(target, bytes)?;
@@ -730,30 +547,22 @@ impl TextBuffer {
             self.path = Some(target.to_path_buf());
         }
         self.dirty = false;
-        // Remembers exactly what's now on disk -- see `saved_node`'s own
-        // doc comment. Safe to read here (rather than needing its own
-        // fresh checkpoint first): `self.undo.current()` and `self.lines`
-        // are always already in sync by the time any new top-level key
-        // (including the `:w` that reached this call) starts being
-        // handled -- repl.rs's own `render_nav_frame` checkpoints after
-        // *every* one, before the next key is ever read.
+        // Records what's now on disk (see `saved_node`). The undo tree and
+        // `lines` are already in sync: `render_nav_frame` checkpoints after
+        // every key, before the next is read.
         self.saved_node = self.undo.current_id();
         self.disk_hash = self.path.as_deref().and_then(disk_hash);
         Ok(())
     }
 
-    // Splits `text` on '\n' and splices it into the buffer at `at`,
-    // joining/splitting lines as needed -- the one real new primitive
-    // this whole feature depends on: nothing before this ever inserted
-    // text that could itself contain newlines into a multi-line buffer.
-    // Returns the cursor position right after the inserted text (vim's
-    // own convention -- see `apply_put`'s own doc comment in vimkeys.rs
-    // for the single-line precedent this generalizes).
+    // Splits `text` on `\n` and splices it in at `at`, joining and splitting
+    // lines as needed. Returns the position just after the inserted text, as
+    // vim leaves the cursor (see vimkeys.rs's `apply_put`).
     pub fn insert_text(&mut self, at: (usize, usize), text: &str) -> (usize, usize) {
         if text.is_empty() {
             return at;
         }
-        // There is content now, so the placeholder line is a real line.
+        // There's content now, so the placeholder line is a real one.
         self.empty = false;
         let row = at.0.min(self.lines.len().saturating_sub(1));
         let parts: Vec<&str> = text.split('\n').collect();
@@ -783,10 +592,9 @@ impl TextBuffer {
             new_lines.push(last);
             let new_row = row + parts.len() - 1;
             self.lines.splice(row..=row, new_lines);
-            // Inserted at the very start of the line, what the line held
-            // moved down and the new lines are above it; anywhere else
-            // they follow it. A fold only grows by lines that land
-            // between two of its own.
+            // Inserted at the very start of a line, the old line moved down
+            // below the new ones; anywhere else, they follow it. A fold
+            // only grows by lines landing between two of its own.
             let at = if col == 0 { row } else { row + 1 };
             self.folds.lines_inserted(at, parts.len() - 1);
             (new_row, new_col)
@@ -794,24 +602,17 @@ impl TextBuffer {
         self.dirty = true;
         self.content_changed();
         self.cursor = new_pos;
-        // `.` -- vim's own "position of the last change" mark (`` `. ``),
-        // set automatically by every mutation here rather than at each of
-        // fileeditor.rs's own many call sites -- these three methods are
-        // the only places a real edit actually happens (and, per
-        // `diagnostics`'s own doc comment, the only places a stale
-        // diagnostic's position could actually go wrong).
+        // `.`: vim's last-change mark (`` `. ``), set here because these
+        // three methods are the only places an edit happens.
         self.marks.insert('.', new_pos);
         new_pos
     }
 
-    /// Replaces the lines in `range` with `with`, whole lines for whole
-    /// lines -- what putting back one refused change of a review is.
-    ///
-    /// Not a `delete_range` then an `insert_text`: removing every line
-    /// leaves a placeholder that the insert would then keep as a real,
-    /// empty last line, and a range at the very end has no line after it
-    /// to insert in front of. Working on the lines themselves has neither
-    /// edge.
+    /// Replaces whole lines in `range` with `with`: putting back one
+    /// refused change of a review. Not a delete then an insert: deleting
+    /// every line leaves a placeholder the insert would keep as an empty
+    /// last line, and a range at the end has no line after it to insert
+    /// before.
     pub fn replace_lines(&mut self, range: std::ops::Range<usize>, with: Vec<String>) {
         let start = range.start.min(self.lines.len());
         let end = range.end.min(self.lines.len());
@@ -834,15 +635,9 @@ impl TextBuffer {
         self.marks.insert('.', self.cursor);
     }
 
-    // Removes a `MotionRange` that may span several real lines (joining
-    // the two cut ends into one line), returning the removed text.
-    // `motion::extract_text`/`motion::motion_range` already resolve a
-    // range correctly across multiple lines (built for `ScreenBuffer`'s
-    // own y{motion} originally) -- this is the missing mutating
-    // counterpart. Row indices are clamped to the buffer's own *current*
-    // bounds up front, so a stale/overlapping range (multiple Visual
-    // selections deleted back-to-back -- see `delete_selections` below)
-    // degrades gracefully instead of panicking.
+    // Removes a `MotionRange` that may span lines, joining the cut ends, and
+    // returns the removed text. Rows are clamped to the current bounds first,
+    // so a stale range (Visual selections deleted back to back) can't panic.
     pub fn delete_range(&mut self, range: &motion::MotionRange) -> String {
         let last_row = self.lines.len().saturating_sub(1);
         let range =
@@ -853,23 +648,19 @@ impl TextBuffer {
                 self.lines.drain(range.from.0..=range.to.0);
                 self.folds.lines_deleted(range.from.0, range.to.0 - range.from.0 + 1);
                 if self.lines.is_empty() {
-                    // No lines left at all. The placeholder below is
-                    // somewhere to keep the cursor, not content -- see
-                    // `empty`'s own doc comment. Only a *linewise*
-                    // delete can do this: `x`-ing the last character of
-                    // a line leaves a line that is empty, which still
-                    // writes its newline.
+                    // No lines left. The placeholder is somewhere for the
+                    // cursor, not content (see `empty`). Only a linewise
+                    // delete gets here: `x` on a line's last character
+                    // leaves an empty line, which still writes its newline.
                     self.empty = true;
                     self.lines.push(Vec::new());
                 }
                 let row = range.from.0.min(self.lines.len() - 1);
                 self.cursor = (row, 0);
             }
-            // A block cuts the same columns out of each of its rows and
-            // leaves the rows themselves, which is the whole point: the
-            // lines above and below stay put and only the rectangle
-            // goes. A row shorter than the block contributes whatever of
-            // it falls inside, which may be nothing.
+            // A block cuts the same columns from each row and leaves the
+            // rows. A row shorter than the block gives what falls inside,
+            // possibly nothing.
             motion::MotionShape::Blockwise => {
                 let (left, right) = motion::block_columns(&range).expect("blockwise");
                 for line in range.from.0..=range.to.0 {
@@ -890,8 +681,8 @@ impl TextBuffer {
                 let mut joined: Vec<char> = first_line[..range.from.1.min(first_line.len())].to_vec();
                 joined.extend(after);
                 self.lines.splice(range.from.0..=range.to.0, std::iter::once(joined));
-                // The lines after the first were joined onto it, so it is
-                // those that are gone.
+                // The lines after the first were joined onto it, so those
+                // are gone.
                 self.folds.lines_deleted(range.from.0 + 1, range.to.0 - range.from.0);
                 let row = range.from.0;
                 self.cursor = (row, range.from.1.min(self.lines[row].len()));
@@ -903,16 +694,12 @@ impl TextBuffer {
         text
     }
 
-    // `J`/`gJ`: joins `count` lines (minimum 2, matching vim -- a bare `J`
-    // or `1J` both just join the current line with the next one) starting
-    // at the cursor's own line. `with_space` selects vim's default
-    // whitespace-aware join (strips each joined-in line's own leading
-    // whitespace and inserts a single space, unless the current line
-    // already ends in whitespace, the joined-in line is empty, or it
-    // starts with ')') vs. `gJ`'s raw concatenation. Returns whether
-    // anything was actually joined (false at the last line, matching
-    // every other buffer command's own "nothing happened" signal).
-    // Cursor lands at the last join's own boundary, matching vim.
+    // `J`/`gJ`: joins `count` lines (at least 2, so `J` and `1J` both join
+    // with the next) from the cursor's. `with_space` is vim's `J`: strip the
+    // joined line's leading whitespace and put one space between, unless the
+    // current line ends in whitespace, the joined line is empty, or it starts
+    // with `)`. `gJ` concatenates. Returns whether anything was joined. The
+    // cursor lands at the last join's boundary, as in vim.
     pub fn join_lines(&mut self, count: usize, with_space: bool) -> bool {
         let (row, _) = self.cursor;
         let available = self.lines.len().saturating_sub(1).saturating_sub(row);
@@ -945,10 +732,8 @@ impl TextBuffer {
         true
     }
 
-    // Visual mode's own `y`: every selection, concatenated with no
-    // separator -- same rule `editor.rs`'s own `yank_selections_line`/
-    // repl.rs's `yank_selections` already establish (a `Linewise` part
-    // already ends in "\n", so it naturally lands on its own line).
+    // Visual `y`: every selection, concatenated, as in editor.rs and repl.rs.
+    // A `Linewise` part already ends in `\n`.
     pub fn yank_selections(&self, registers: &mut Registers, register: Option<char>) {
         if self.selections.is_empty() {
             return;
@@ -957,9 +742,8 @@ impl TextBuffer {
         let mut shape = RegisterShape::Char;
         for range in &self.selections {
             text.push_str(&motion::extract_text(self, range));
-            // Same rule as `delete_selections` just below and repl.rs's
-            // own `yank_selections`: a block stays a block through the
-            // register, `Line` wins over both.
+            // A block stays a block through the register; `Line` wins over
+            // both.
             match range.shape {
                 motion::MotionShape::Linewise => shape = RegisterShape::Line,
                 motion::MotionShape::Blockwise if shape == RegisterShape::Char => shape = RegisterShape::Block,
@@ -969,30 +753,14 @@ impl TextBuffer {
         registers.record_yank(register, RegisterValue { text, shape });
     }
 
-    // Visual mode's own `d`: removes every selection, writing the
-    // concatenated deleted text to a register first (vim's own "delete
-    // always yanks" rule). Selections are removed highest-position
-    // first (`(line, col)` ordered, `(usize, usize)`'s own `Ord` is
-    // already exactly that lexicographic order) so removing a later one
-    // never shifts a still-pending earlier one's own coordinates --
-    // same reasoning `editor.rs`'s own `delete_selections` already
-    // established for a single line, just ordered by position instead
-    // of a bare column. `delete_range`'s own defensive row-clamping
-    // (see its doc comment) covers the rest against any pathological
-    // overlap between selections.
+    // Visual `d`: writes the deleted text to a register first (in vim,
+    // delete always yanks), then removes selections from the highest
+    // position down, so earlier ones keep their coordinates. `delete_range`
+    // clamps rows against any overlap.
     //
-    // Returns every selection's own resulting gap position (ascending,
-    // empty iff there was nothing to delete) rather than just a bool --
-    // `d`'s own caller only cares whether that's empty, but `c`'s
-    // (repl.rs's Key::Char('c') arm) needs every one of them: the exact
-    // same "removed highest-first" rule that keeps the *lowest*
-    // position's own coordinates valid afterward (the only one the old
-    // bool-returning version exposed, as this buffer's own new cursor)
-    // applies identically to *every* lower position relative to
-    // whichever one is currently being removed, not just the very
-    // lowest overall -- so each of these is just as valid a post-
-    // deletion insertion point, letting a multi-selection `c` type the
-    // same replacement into every one of them instead of only the first.
+    // Returns each selection's resulting position, ascending. Removing
+    // highest first keeps every lower one valid, so `c` can type into all
+    // of them.
     pub fn delete_selections(&mut self, registers: &mut Registers, register: Option<char>) -> Vec<(usize, usize)> {
         if self.selections.is_empty() {
             return Vec::new();
@@ -1009,10 +777,8 @@ impl TextBuffer {
         }
         registers.record_delete(register, RegisterValue { text, shape });
 
-        // One resume position per range -- except a block, which leaves
-        // one *per row*. That is what makes `c` in block mode type into
-        // every row at once rather than only the first: the positions
-        // this returns become Insert mode's own cursor list.
+        // One position per range, but a block leaves one per row, so `c` in
+        // block mode types into every row.
         let mut froms: Vec<(usize, usize)> = self
             .selections
             .iter()
@@ -1035,17 +801,10 @@ impl TextBuffer {
         froms
     }
 
-    // Visual mode's own `p`/`P`: replaces every selection with the
-    // register's content, broadcasting the same replacement to each
-    // (see `editor.rs`'s own `put_over_selections` for why: no vim
-    // precedent for multi-selection paste, and "replace every one of
-    // these with that" is the more useful behavior). Unlike that
-    // single-line version, this uses the register's *raw* text, embedded
-    // newlines and all -- `insert_text` already understands them, so a
-    // linewise yank pasted over a charwise selection correctly splits
-    // the surrounding line around the inserted lines, matching real
-    // vim's own visual-`p` shape for that case, with no special-casing
-    // needed here.
+    // Visual `p`/`P`: replaces every selection with the register's content
+    // (see editor.rs's `put_over_selections`). Uses the raw text, newlines
+    // and all: `insert_text` splits the line around a linewise yank put
+    // over a charwise selection, as vim's visual `p` does.
     pub fn put_over_selections(&mut self, registers: &mut Registers, register: Option<char>) -> bool {
         if self.selections.is_empty() {
             return false;
@@ -1101,8 +860,7 @@ impl Buffer for TextBuffer {
     }
 
     fn set_viewport_top(&mut self, line: usize) {
-        // A sub-row offset belongs to whichever line was on top; moving
-        // the top line means it no longer names anything.
+        // A sub-row offset belongs to the old top line.
         if line != self.vtop {
             self.vtop_sub = 0;
         }
@@ -1150,9 +908,8 @@ impl Buffer for TextBuffer {
     }
 }
 
-// The buffer half of a live snippet -- see bishedit::snippet's own
-// `SnippetHost` doc comment for why one line is always enough. Mirrors
-// editor.rs's own impl for the single-line prompt buffer.
+// The buffer half of a live snippet (see `snippet::SnippetHost`).
+// Mirrors editor.rs's impl for the prompt buffer.
 impl snippet::SnippetHost for TextBuffer {
     fn replace_span(&mut self, from: (usize, usize), to: (usize, usize), text: &str) {
         if to > from {
@@ -1166,11 +923,9 @@ impl snippet::SnippetHost for TextBuffer {
     }
 }
 
-// Which line ending a file uses. `\r\n` anywhere wins, since a file
-// with even one is a CRLF file to every tool that reads it; a lone
-// `\r` with no `\n` at all is the old Mac ending. Everything else,
-// including an empty file, is Unix -- which is also the right default
-// for a file with no line breaks to judge by.
+// A file's line ending. Any `\r\n` makes it CRLF, as every tool reading
+// it will see; a lone `\r` with no `\n` is the old Mac ending. Everything
+// else, an empty file included, is Unix.
 fn detect_eol(text: &str) -> crate::editorconfig::Eol {
     if text.contains("\r\n") {
         return crate::editorconfig::Eol::Crlf;
@@ -1181,14 +936,9 @@ fn detect_eol(text: &str) -> crate::editorconfig::Eol {
     crate::editorconfig::Eol::Lf
 }
 
-// FNV-1a over a file's bytes, for telling "the same file" from "a
-// different file" cheaply.
-//
-// A hash rather than the text itself because the alternative is keeping
-// a second copy of every open file in memory forever, to answer a
-// question asked once per `:w`. Not a cryptographic hash and it does not
-// need to be: what is on the other side of this comparison is a
-// formatter or a branch switch, not an adversary building a collision.
+// FNV-1a over a file's bytes, to tell the same file from a different one
+// without keeping a second copy of every open file. Not cryptographic: the
+// other side is a formatter or a branch switch, not an adversary.
 fn disk_hash(path: &Path) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1388,8 +1138,8 @@ mod tests {
         let mut buf = TextBuffer::open(&path, 10).unwrap();
         assert!(!buf.changed_on_disk());
 
-        // Rewritten with the *same* bytes: a `touch`, or a formatter
-        // that changed nothing. Not a change.
+        // Rewritten with the same bytes (a `touch`, a no-op formatter): not a
+        // change.
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&path, "one\n").unwrap();
         assert!(!buf.changed_on_disk(), "same content is not a change, whatever the timestamp says");
@@ -1397,12 +1147,11 @@ mod tests {
         std::fs::write(&path, "someone else\n").unwrap();
         assert!(buf.changed_on_disk());
 
-        // Saving takes ownership of what is there again.
+        // Saving takes ownership of what's there again.
         buf.save(None).unwrap();
         assert!(!buf.changed_on_disk());
 
-        // ...and so does reloading, which also brings the other side's
-        // content in.
+        // ...and so does reloading, which also takes the new content.
         std::fs::write(&path, "third\n").unwrap();
         assert!(buf.changed_on_disk());
         buf.reload().unwrap();
@@ -1410,7 +1159,6 @@ mod tests {
         assert!(!buf.changed_on_disk());
         assert!(!buf.is_dirty(), "a reload is not an unsaved change");
 
-        // A buffer that is not a view of a file has nothing to compare.
         let unnamed = TextBuffer::new_unnamed(10);
         assert!(!unnamed.changed_on_disk());
 
@@ -1426,8 +1174,7 @@ mod tests {
         assert_eq!(buf.text(), "111\n222\n333\nddd444\n", "the rows stay; only the rectangle goes");
         assert_eq!(buf.cursor(), (0, 0));
 
-        // A row too short to reach the block loses nothing and is not
-        // padded either -- deleting never adds characters.
+        // A row too short to reach the block loses nothing and isn't padded.
         let mut buf = TextBuffer::new_unnamed(10);
         buf.insert_text((0, 0), "aaa111\nb\nccc333");
         buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Blockwise, from: (0, 3), to: (2, 5) });
@@ -1447,8 +1194,8 @@ mod tests {
     #[test]
     fn delete_range_spanning_two_lines_joins_them() {
         let mut buf = make("foo bar\nbaz qux");
-        // From the space before "bar" through the space before "qux" --
-        // removes "bar\nbaz " and joins "foo " with "qux".
+        // From the space before `bar` to the space before `qux`: removes
+        // `bar\nbaz ` and joins `foo ` with `qux`.
         let range = motion::MotionRange { shape: motion::MotionShape::Exclusive, from: (0, 4), to: (1, 4) };
         let deleted = buf.delete_range(&range);
         assert_eq!(deleted, "bar\nbaz ");
@@ -1568,11 +1315,8 @@ mod tests {
         assert_eq!(text_of(&buf), "one two three");
     }
 
-    // The whole point of `version` existing alongside `dirty`: `dirty`
-    // answers "does this differ from disk," which undo and save both
-    // move in *both* directions, while `version` only ever counts
-    // forward. Anything holding an answer computed from an older
-    // revision needs the second question, not the first.
+    // `dirty` moves both ways under undo and save; `version` only counts
+    // forward, which is what an answer about an older revision needs.
     #[test]
     fn version_counts_forward_through_edits_undo_and_save_alike() {
         let mut buf = TextBuffer::new_unnamed(10);
@@ -1586,18 +1330,15 @@ mod tests {
         let after_delete = buf.version();
         assert!(after_delete > after_insert);
 
-        // Undo puts the *content* back, so `dirty` can go backwards --
-        // but the revision must not, or a reply about `after_delete`
-        // would be indistinguishable from one about whatever comes next.
+        // Undo restores the content, so `dirty` can go back, but the revision
+        // mustn't.
         buf.checkpoint_undo();
         assert!(buf.undo(), "nothing to undo -- the checkpoint above didn't take");
         assert!(buf.version() > after_delete);
     }
 
-    // A file's encoding is its own, and an editor asked to change one
-    // line must not change every accented character in it as well.
-    // `caf\xe9` is latin-1, is not valid UTF-8, and used to make
-    // `TextBuffer::open` fail outright.
+    // `caf\xe9` is latin-1, not valid UTF-8, and must open and save
+    // unchanged.
     #[test]
     fn a_latin1_file_opens_as_text_and_saves_as_latin1() {
         let dir = std::env::temp_dir().join(format!("bish-encoding-test-{}", std::process::id()));
@@ -1616,9 +1357,8 @@ mod tests {
         assert_eq!(saved, b"caf\xe9s\nna\xefve\n", "still latin-1, and only the edit changed");
     }
 
-    // The save fails and the file is left as it was -- not written with
-    // a `?` where the character should be. Half a file is worse than no
-    // save, because the save is the part you can retry.
+    // A character the encoding can't hold fails the save and leaves the file
+    // as it was, rather than writing a `?`.
     #[test]
     fn a_character_the_files_encoding_cannot_hold_fails_the_save() {
         let dir = std::env::temp_dir().join(format!("bish-encoding-refuse-{}", std::process::id()));
@@ -1652,9 +1392,8 @@ mod tests {
         assert_eq!(saved, b"\xff\xfeh\x00i\x00!\x00\n\x00");
     }
 
-    // A BOM is not a character in the file, and it is not something an
-    // editor gets to drop either: whatever reads the file next may be
-    // looking for it.
+    // A BOM isn't a character in the buffer, and it isn't dropped on save:
+    // whatever reads the file next may look for it.
     #[test]
     fn a_utf8_bom_survives_a_save_without_becoming_text() {
         let dir = std::env::temp_dir().join(format!("bish-encoding-bom-{}", std::process::id()));
@@ -1748,8 +1487,7 @@ mod tests {
         registers.write(None, RegisterValue { text: "X\nY".to_string(), shape: RegisterShape::Char });
         assert!(buf.put_over_selections(&mut registers, None));
         assert_eq!(text_of(&buf), "X\nY bar\nX\nY qux");
-        // Register itself untouched -- same broadcast reasoning as
-        // editor.rs's own put_over_selections.
+        // The register itself is untouched.
         assert_eq!(registers.read(None).text, "X\nY");
     }
 
@@ -1778,9 +1516,8 @@ mod tests {
         buf.checkpoint_undo();
         assert_eq!(text_of(&buf), "foobar");
 
-        // One undo restores the state after the *first* checkpoint, not
-        // all the way back to empty -- proves grouping is per checkpoint
-        // call, not per mutation.
+        // One undo goes back to the first checkpoint, not to empty:
+        // grouping is per checkpoint, not per edit.
         assert!(buf.undo());
         assert_eq!(text_of(&buf), "foo");
         assert!(buf.undo());
@@ -1808,9 +1545,7 @@ mod tests {
         let mut buf = make("foo");
         buf.insert_text((0, 0), "x");
         buf.checkpoint_undo();
-        // Diagnostics computed for the *current* (post-edit) content --
-        // set directly, since insert_text/checkpoint_undo themselves don't
-        // touch this field.
+        // Diagnostics for the current content, set directly.
         buf.diagnostics = vec![lint::Diagnostic {
             start: 0,
             end: 1,
@@ -1865,23 +1600,19 @@ mod tests {
         buf.save(None).unwrap();
         assert!(!buf.is_dirty());
 
-        // Undoing away from the just-saved content is dirty again...
+        // Undoing away from the saved content is dirty again...
         assert!(buf.undo());
         assert!(buf.is_dirty());
-        // ...and redoing back onto it clears dirty again, without a
-        // second save -- this is exactly what a plain `dirty = true` on
-        // every undo/redo (the pre-existing simplification) couldn't do.
+        // ...and redoing onto it clears dirty without a second save.
         assert!(buf.redo());
         assert!(!buf.is_dirty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Read-only is enforced where the write happens, not at the command
-    // that asked for it, so nothing can route around it -- and `:w
-    // ELSEWHERE` deliberately still works, which is how content that
-    // can't be written back (a zip member, a gzip'd file) gets out as an
-    // ordinary file.
+    // Read-only is enforced where the write happens, so nothing can route
+    // around it. `:w ELSEWHERE` still works, which is how a zip member or a
+    // gzipped file gets out as an ordinary file.
     #[test]
     fn a_readonly_buffer_refuses_to_overwrite_its_own_file_but_writes_elsewhere() {
         let dir = std::env::temp_dir().join(format!("bish-textbuffer-ro-{}", std::process::id()));
@@ -1907,8 +1638,7 @@ mod tests {
     fn from_text_names_the_buffer_without_reading_that_path() {
         let buf = TextBuffer::from_text(std::path::Path::new("/nonexistent/thing.txt"), "one\ntwo\n", 10);
         assert_eq!(buf.path(), Some(std::path::Path::new("/nonexistent/thing.txt")));
-        // `text()` re-adds the trailing newline `from_text` stripped --
-        // the buffer holds two lines either way.
+        // `text()` adds back the trailing newline `from_text` stripped.
         assert_eq!(buf.text(), "one\ntwo\n");
         assert_eq!(buf.line_count(), 2);
         assert!(!buf.is_dirty());
@@ -1923,20 +1653,17 @@ mod tests {
         assert_eq!(buf.on_disk_text(), "one\r\ntwo\r\n");
     }
 
-    // A file of no lines and a file of one empty line are different
-    // files -- zero bytes and one -- and a buffer that always keeps a
-    // line to put the cursor on cannot tell them apart from `lines`
-    // alone. See `empty`'s own doc comment.
+    // A file of no lines (zero bytes) and one empty line (one byte) differ;
+    // see `empty`.
     #[test]
     fn an_empty_file_stays_empty_and_only_a_linewise_delete_empties_one() {
         let path = Path::new("/tmp/x");
-        // Opened and saved untouched: still zero bytes, not a newline
-        // that nobody typed.
+        // Opened and saved untouched: still zero bytes.
         let buf = TextBuffer::from_text(path, "", 10);
         assert!(buf.empty);
         assert_eq!(buf.on_disk_text(), "");
 
-        // Typing into it makes it a real line again.
+        // Typing into it makes it a real line.
         let mut buf = TextBuffer::from_text(path, "", 10);
         buf.insert_text((0, 0), "hi");
         assert!(!buf.empty);
@@ -1949,8 +1676,8 @@ mod tests {
         assert!(buf.empty);
         assert_eq!(buf.on_disk_text(), "");
 
-        // Emptying the only line is not the same thing: the line is
-        // still there, and still ends in a newline.
+        // Emptying the only line leaves the line, which still ends in a
+        // newline.
         let mut buf = TextBuffer::from_text(path, "a\n", 10);
         buf.delete_range(&motion::MotionRange { shape: motion::MotionShape::Inclusive, from: (0, 0), to: (0, 0) });
         assert!(!buf.empty);
@@ -1974,7 +1701,7 @@ mod tests {
         assert_eq!(buf.on_disk_text(), "one\ntwo\n");
     }
 
-    // The old Mac ending, and the one case a lone `\r` means it.
+    // The old Mac ending, the one case where a lone `\r` means it.
     #[test]
     fn a_cr_only_file_round_trips() {
         let buf = TextBuffer::from_text(Path::new("/tmp/x"), "one\rtwo\r", 10);
