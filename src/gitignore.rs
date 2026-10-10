@@ -1,36 +1,22 @@
 // `.gitignore` pattern matching, per gitignore(5).
 //
-// Built on `glob::matches` rather than beside it: a gitignore pattern is
-// a *path* pattern, and the one thing that separates it from the shell
-// glob this repo already has is that `*` and `?` must not cross a `/`.
-// That falls out for free by splitting both the pattern and the path on
-// `/` and matching one segment at a time -- so bracket classes,
-// backslash escapes and the rest keep exactly the meaning they already
-// have everywhere else in bish, and there is no second glob engine to
-// drift from the first. (One consequence worth naming: `glob::matches`
-// also recognizes extglob `@(a|b)`, which real git does not. That is the
-// same strict-superset stance glob.rs already documents for bash.)
+// Built on `glob::matches`: a gitignore pattern is a path pattern whose
+// `*` and `?` don't cross `/`, which follows from matching segment by
+// segment, so classes and escapes mean what they do elsewhere in bish.
+// `glob::matches` also takes extglob `@(a|b)`, which git doesn't. `**`
+// segments are handled here, being meaningful only between slashes.
 //
-// The `**` segment is the piece a shell glob has no equivalent for, and
-// is handled here rather than in glob.rs, since it is only meaningful
-// between slashes.
-//
-// What this module does *not* do is walk a directory tree or read a file
-// off disk. That belongs to whoever is doing the walking -- and the walk
-// isn't incidental: git's "it is not possible to re-include a file if a
-// parent directory of that file is excluded" is a property of *not
-// descending*, not of the patterns. `matched_path_or_any_parents` is
-// here for callers that have a path but no walk, and implements that
-// rule explicitly.
+// No directory walking or file reading, except `Stack::for_directory`.
+// git's rule that a file under an excluded directory can't be re-included
+// comes from not descending; `matched_path_or_any_parents` implements it
+// for callers with a path but no walk.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
-/// What a set of patterns says about one path. `Whitelisted` is a `!`
-/// pattern winning, which is not the same as no pattern matching at all
-/// -- a caller stacking several ignore files needs to tell those apart,
-/// since a whitelist in a deeper file has to stop a shallower file's
-/// exclusion from applying.
+/// What patterns say about one path. `Whitelisted` (a `!` pattern won)
+/// differs from no match: a whitelist in a deeper file stops a shallower
+/// file's exclusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Match {
     None,
@@ -53,49 +39,45 @@ pub struct Pattern {
     /// ignore file's own directory instead of matching at any depth.
     anchored: bool,
     segments: Vec<Segment>,
-    /// The line this came from, so a caller can say *which* rule
-    /// excluded a file the way `git check-ignore -v` does.
+    /// The line this came from, so a caller can say which rule excluded a
+    /// file, as `git check-ignore -v` does.
     source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
-    /// A `**` segment: any run of directories. Zero or more in the
-    /// middle of a pattern (`a/**/b` matches `a/b`), but one or more at
-    /// the end, since `abc/**` means everything *inside* `abc`.
+    /// A `**` segment: any run of directories, zero or more in the middle
+    /// (`a/**/b` matches `a/b`) but one or more at the end (`abc/**` is
+    /// everything inside `abc`).
     AnyDirs,
     /// Anything else, matched against one path segment by `glob`.
     Glob(String),
 }
 
 impl Pattern {
-    /// One line of a `.gitignore`. `None` for a line that is not a
-    /// pattern at all: blank, a `#` comment, or a `/` with nothing left
-    /// after the trailing-slash strip.
+    /// One `.gitignore` line, or `None` for a blank line, a `#` comment, or
+    /// a lone `/`.
     pub fn parse(line: &str) -> Option<Pattern> {
         let source = line.to_string();
-        // Trailing spaces are ignored unless backslash-escaped -- so
-        // `foo\ ` really does mean a name ending in a space.
+        // Trailing spaces are dropped unless escaped: `foo\ ` ends in a
+        // space.
         let line = strip_trailing_spaces(line);
         if line.is_empty() || line.starts_with('#') {
             return None;
         }
         let (negated, line) = match line.strip_prefix('!') {
             Some(rest) => (true, rest),
-            // `\#` and `\!` are the escapes that let a pattern start
-            // with either character literally. The backslash is dropped
-            // here rather than left for `glob`, which would otherwise
-            // treat it as an escape a second time and change nothing --
-            // correct by luck, not by design.
+            // `\#` and `\!` start a pattern with that character. The
+            // backslash is dropped here rather than left for `glob` to
+            // interpret.
             None => (false, line.strip_prefix('\\').filter(|r| r.starts_with(['#', '!'])).unwrap_or(line)),
         };
         let (dir_only, line) = match line.strip_suffix('/') {
             Some(rest) => (true, rest),
             None => (false, line),
         };
-        // A `/` anywhere but the (already removed) end anchors the
-        // pattern; a leading one anchors it and is otherwise not part of
-        // the pattern.
+        // A `/` anywhere but the end anchors the pattern; a leading one isn't
+        // part of it.
         let anchored = line.contains('/');
         let line = line.strip_prefix('/').unwrap_or(line);
         let segments: Vec<Segment> =
@@ -118,8 +100,8 @@ impl Pattern {
         &self.source
     }
 
-    /// Whether this pattern matches `path` -- a path relative to the
-    /// directory the ignore file lives in, `/`-separated.
+    /// Whether this matches `path`, `/`-separated and relative to the ignore
+    /// file's directory.
     pub fn matches(&self, path: &str, is_dir: bool) -> bool {
         if self.dir_only && !is_dir {
             return false;
@@ -131,8 +113,8 @@ impl Pattern {
         if self.anchored {
             return match_segments(&self.segments, &segments);
         }
-        // Unanchored: `foo` is a name, not a location, so it matches at
-        // any depth. Trying every starting segment is what says that.
+        // Unanchored, `foo` is a name, matching at any depth: try every
+        // starting segment.
         (0..segments.len()).any(|i| match_segments(&self.segments, &segments[i..]))
     }
 }
@@ -142,8 +124,8 @@ fn match_segments(pattern: &[Segment], path: &[&str]) -> bool {
         None => path.is_empty(),
         Some(Segment::AnyDirs) => {
             let rest = &pattern[1..];
-            // A trailing `**` has to consume something: `abc/**` is
-            // "everything inside abc", which does not include `abc`.
+            // A trailing `**` must consume something: `abc/**` doesn't
+            // include `abc`.
             let least = if rest.is_empty() { 1 } else { 0 };
             (least..=path.len()).any(|i| match_segments(rest, &path[i..]))
         }
@@ -166,24 +148,21 @@ impl Ignore {
         self.patterns.is_empty()
     }
 
-    /// The last pattern to match wins -- which is the whole reason a `!`
-    /// line has to come *after* the rule it is undoing.
+    /// The last matching pattern wins, which is why a `!` line comes after
+    /// the rule it undoes.
     pub fn matched(&self, path: &str, is_dir: bool) -> Match {
         self.matched_pattern(path, is_dir).map_or(Match::None, |p| if p.negated { Match::Whitelisted } else { Match::Ignored })
     }
 
-    /// The same decision, but handing back the rule that made it, for a
-    /// caller that wants to explain itself the way `git check-ignore -v`
-    /// does.
+    /// The same, returning the deciding rule, as for `git check-ignore -v`.
     pub fn matched_pattern(&self, path: &str, is_dir: bool) -> Option<&Pattern> {
         self.patterns.iter().rev().find(|p| p.matches(path, is_dir))
     }
 
-    /// For a caller holding a path but no directory walk. Git excludes a
-    /// file under an excluded directory by never descending into it,
-    /// which is also why a `!` line inside cannot rescue it -- there is
-    /// nothing to re-include. Checking the ancestors from the top down,
-    /// and stopping at the first excluded one, is that rule written out.
+    /// For a caller with a path but no walk. git never descends into an
+    /// excluded directory, so a `!` line can't rescue anything under it:
+    /// checking ancestors top down and stopping at the first excluded one is
+    /// that rule.
     pub fn matched_path_or_any_parents(&self, path: &str, is_dir: bool) -> Match {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         for i in 1..segments.len() {
@@ -195,10 +174,9 @@ impl Ignore {
     }
 }
 
-/// Several ignore files at once, each rooted at the directory it was
-/// found in. The deepest file that applies to a path decides it, which
-/// is how a `.gitignore` in a subdirectory overrides the one at the top
-/// of the repository.
+/// Several ignore files, each rooted where it was found. The deepest
+/// applicable file decides, as a subdirectory's `.gitignore` overrides
+/// the top one.
 #[derive(Debug, Clone, Default)]
 pub struct Stack {
     files: Vec<(PathBuf, Ignore)>,
@@ -209,8 +187,7 @@ impl Stack {
         Stack::default()
     }
 
-    /// `base` is the directory the file was found in; patterns in it are
-    /// relative to that.
+    /// `base` is where the file was found; its patterns are relative to it.
     pub fn push(&mut self, base: impl Into<PathBuf>, ignore: Ignore) {
         self.files.push((base.into(), ignore));
     }
@@ -219,18 +196,11 @@ impl Stack {
         self.files.iter().all(|(_, i)| i.is_empty())
     }
 
-    /// Every ignore file that applies inside `dir`, read off disk in
-    /// the order git itself consults them.
-    ///
-    /// Outside a repository this is empty and everything is visible:
-    /// `.gitignore` files only mean anything relative to a repository
-    /// root, and honouring a stray one in some unrelated directory
-    /// would be inventing a rule git doesn't have.
-    ///
-    /// Sources, shallowest first (so the deepest still wins, per
-    /// `matched`): `core.excludesFile`, `.git/info/exclude`, then a
-    /// `.gitignore` in every directory from the root down to `dir`.
-    /// The first two are repository-wide, so both are based at the root.
+    /// Every ignore file that applies inside `dir`, in git's order. Empty
+    /// outside a repository: a stray `.gitignore` there isn't a rule.
+    /// Sources, shallowest first (the deepest wins): `core.excludesFile`
+    /// and `.git/info/exclude`, both based at the root, then each
+    /// `.gitignore` from the root down to `dir`.
     pub fn for_directory(dir: &Path) -> Stack {
         let mut stack = Stack::new();
         let Some(root) = repo_root(dir) else { return stack };
@@ -238,9 +208,8 @@ impl Stack {
             stack.push_file(&root, &excludes);
         }
         stack.push_file(&root, &root.join(".git/info/exclude"));
-        // Root first, then each directory on the way down -- `matched`
-        // orders by depth itself, but reading in this order keeps the
-        // stack legible to anyone printing it.
+        // Root first, then down. `matched` orders by depth itself; this order
+        // just reads well.
         let mut here = PathBuf::new();
         for component in dir.strip_prefix(&root).unwrap_or(Path::new("")).components() {
             stack.push_file(&root.join(&here), &root.join(&here).join(".gitignore"));
@@ -250,8 +219,7 @@ impl Stack {
         stack
     }
 
-    // Reads one ignore file if it is there, and says nothing if it
-    // isn't -- a missing `.gitignore` is the normal case, not an error.
+    // Reads one ignore file if present; a missing one is normal.
     fn push_file(&mut self, base: &Path, file: &Path) {
         if let Ok(text) = std::fs::read_to_string(file) {
             let ignore = Ignore::parse(&text);
@@ -261,9 +229,9 @@ impl Stack {
         }
     }
 
-    /// Deepest base first, and the first file with anything to say
-    /// decides -- including when what it says is `Whitelisted`, which is
-    /// exactly how a nested `!` line overrides an exclusion from above.
+    /// Deepest base first, and the first file with anything to say decides,
+    /// `Whitelisted` included, which is how a nested `!` overrides an
+    /// exclusion from above.
     pub fn matched(&self, path: &Path, is_dir: bool) -> Match {
         let mut applicable: Vec<&(PathBuf, Ignore)> = self.files.iter().filter(|(base, _)| path.starts_with(base)).collect();
         crate::sort::sort_by_key(&mut applicable, |(base, _)| std::cmp::Reverse(base.components().count()));
@@ -279,9 +247,8 @@ impl Stack {
     }
 }
 
-/// The nearest ancestor of `dir` holding a `.git` -- a directory
-/// normally, but a *file* in a worktree or submodule, which is why this
-/// only asks whether the name exists.
+/// The nearest ancestor of `dir` holding `.git`, a directory or, in a
+/// worktree or submodule, a file; so only the name is checked.
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     let mut here = dir;
     loop {
@@ -292,8 +259,8 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-// git's `core.excludesFile`, from the repository config and then the
-// user's, falling back to the location git uses when nobody set one.
+// `core.excludesFile` from the repository config, then the user's, then
+// git's default location.
 fn excludes_file(root: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".config")));
@@ -303,14 +270,13 @@ fn excludes_file(root: &Path) -> Option<PathBuf> {
             return Some(expand_tilde(&value, home.as_deref()));
         }
     }
-    // What git uses with no configuration at all.
+    // git's default with no configuration.
     xdg.map(|x| x.join("git/ignore"))
 }
 
-// One value out of a git config file, which is INI -- so this is
-// `ini::parse` and nothing more. Section and key names are compared
-// case-insensitively, as git compares them; `section` and `key` are
-// expected already lowercased.
+// One value from a git config file, which is INI, via `ini::parse`.
+// Section and key names compare case-insensitively, as in git; pass
+// them lowercased.
 fn git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut in_section = false;
@@ -320,8 +286,8 @@ fn git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
                 in_section = slice(&text, name).to_lowercase() == section;
             }
             crate::ini::Item::Entry { key: k, value: Some(v), .. } if in_section && slice(&text, k).to_lowercase() == key => {
-                // A quoted value is the same string without its quotes;
-                // nothing here needs git's escapes.
+                // A quoted value without its quotes; git's escapes aren't
+                // needed.
                 return Some(slice(&text, &v.span).trim_matches('"').to_string());
             }
             _ => {}
@@ -330,7 +296,7 @@ fn git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
     None
 }
 
-// ini's spans are char offsets, so this can't be a byte slice.
+// ini's spans are char offsets, not bytes.
 fn slice(text: &str, span: &std::ops::Range<usize>) -> String {
     text.chars().skip(span.start).take(span.end - span.start).collect()
 }
@@ -342,9 +308,8 @@ fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
     }
 }
 
-// Walks back over trailing spaces, stopping at one that is escaped: a
-// space is escaped when an *odd* number of backslashes precede it, so
-// `a\\ ` (an escaped backslash, then a space) still strips.
+// Strips trailing spaces up to an escaped one: a space is escaped after
+// an odd number of backslashes, so `a\\ ` still strips.
 fn strip_trailing_spaces(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut end = bytes.len();
@@ -380,7 +345,7 @@ mod tests {
         assert!(!ignored("foo", "foobar"));
     }
 
-    // The rule that makes a pattern a location rather than a name.
+    // A `/` makes a pattern a location rather than a name.
     #[test]
     fn a_slash_anywhere_but_the_end_anchors_the_pattern() {
         assert!(ignored("/foo", "foo"));
@@ -389,7 +354,7 @@ mod tests {
         assert!(!ignored("a/foo", "x/a/foo"), "an internal slash anchors it just as a leading one does");
     }
 
-    // The whole reason this isn't just `glob::matches` on the full path.
+    // Why this isn't `glob::matches` on the whole path.
     #[test]
     fn a_star_does_not_cross_a_slash() {
         assert!(ignored("*.o", "a.o"));
@@ -421,7 +386,6 @@ mod tests {
         assert!(ignored("**/foo/bar", "x/foo/bar"));
     }
 
-    // `abc/**` is everything *inside* abc, so it must not match abc.
     #[test]
     fn trailing_double_star_matches_what_is_inside_but_not_the_directory() {
         assert!(ignored("abc/**", "abc/x"));
@@ -437,8 +401,7 @@ mod tests {
         assert!(!ignored("a/**/b", "b"));
     }
 
-    // wildmatch's rule: asterisks not surrounded by slashes are just a
-    // star, which falls out of handing the segment to `glob` unchanged.
+    // wildmatch: a `*` not between slashes is a plain star.
     #[test]
     fn a_double_star_inside_a_segment_is_an_ordinary_star() {
         assert!(ignored("a**b", "axxb"));
@@ -475,21 +438,18 @@ mod tests {
         assert_eq!(ignore.matched("debug.log", false), Match::Ignored);
         assert_eq!(ignore.matched("keep.log", false), Match::Whitelisted);
         assert_eq!(ignore.matched("notes.txt", false), Match::None);
-        // Order really is what decides it.
+        // Order decides.
         let reversed = Ignore::parse("!keep.log\n*.log\n");
         assert_eq!(reversed.matched("keep.log", false), Match::Ignored);
     }
 
-    // `Whitelisted` has to be distinct from `None`, or a stack couldn't
-    // tell "a rule said keep this" from "no rule mentioned it".
     #[test]
     fn a_whitelist_is_not_the_same_answer_as_no_match() {
         let ignore = Ignore::parse("*.log\n!keep.log\n");
         assert_ne!(ignore.matched("keep.log", false), ignore.matched("keep.txt", false));
     }
 
-    // git's own rule, and the one place where matching a path in
-    // isolation differs from walking a tree.
+    // git's rule, where matching a path alone differs from walking a tree.
     #[test]
     fn a_file_under_an_excluded_directory_cannot_be_re_included() {
         let ignore = Ignore::parse("build/\n!build/keep.txt\n");
@@ -524,17 +484,10 @@ mod tests {
         assert_eq!(ignore.matched_pattern("keep.log", false).unwrap().source(), "!keep.log");
     }
 
-    // The strongest check available: ask real git the same questions and
-    // require the same answers. Skipped when git isn't installed, the
-    // same way anything else here that shells out to it is -- a missing
-    // git is not a failing test.
-    //
-    // Each case gets its own directory tree, because `check-ignore`
-    // consults the working tree to decide what is a directory and one
-    // tree can't hold both a file `foo` and a directory `foo/`. Within a
-    // case, any path that is a prefix of another is created as a
-    // directory and the rest as files, which is the only arrangement
-    // that can exist at all.
+    // Asks real git the same questions, skipping without git. Each case
+    // gets its own tree, since `check-ignore` looks at the working tree and
+    // one tree can't hold a file `foo` and a directory `foo/`; a path that's
+    // a prefix of another is a directory, the rest files.
     #[test]
     fn the_answers_agree_with_real_git() {
         if !crate::git::available() {
@@ -572,8 +525,6 @@ mod tests {
             let case = root.join(format!("case{n}"));
             std::fs::create_dir_all(&case).unwrap();
             std::fs::write(case.join(".gitignore"), format!("{pattern}\n")).unwrap();
-            // A path that another path continues through has to be a
-            // directory; everything else is a file.
             let is_dir = |p: &str| paths.iter().any(|other| other.starts_with(&format!("{p}/")));
             for path in *paths {
                 let full = case.join(path);
@@ -587,9 +538,8 @@ mod tests {
 
             let ignore = Ignore::parse(pattern);
             for path in *paths {
-                // `check-ignore` answers as git's own walk would,
-                // ancestors included -- which is what
-                // matched_path_or_any_parents is for.
+                // `check-ignore` answers as git's walk would, ancestors
+                // included, which is `matched_path_or_any_parents`.
                 let git_says = run(&["check-ignore", "-q", "--no-index", path], &case).status.success();
                 let we_say = ignore.matched_path_or_any_parents(path, is_dir(path)).is_ignored();
                 if git_says != we_say {
@@ -627,8 +577,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
-        // A `.gitignore` with no repository above it is not a rule -- it
-        // is a file that happens to be named that.
+        // A `.gitignore` with no repository above it isn't a rule.
         assert!(Stack::for_directory(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -651,8 +600,7 @@ mod tests {
         assert_eq!(Stack::for_directory(&t.0).matched(&t.0.join("secrets.txt"), false), Match::Ignored);
     }
 
-    // The payoff from the INI parser: `core.excludesFile` is a git
-    // config value, and a git config is an INI file.
+    // `core.excludesFile` read from a git config, which is INI.
     #[test]
     fn core_excludes_file_is_read_out_of_the_git_config() {
         let t = Tmp::new("excludesfile");
@@ -667,8 +615,7 @@ mod tests {
         t.write(".git/config", "[CORE]\n\tExcludesFile = \"/tmp/x y\"\n");
         assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "excludesfile").as_deref(), Some("/tmp/x y"));
         assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "missing"), None);
-        // A key of the same name in a different section is a different
-        // key.
+        // The same key in another section is a different key.
         t.write(".git/config", "[other]\n\texcludesfile = /tmp/x\n");
         assert_eq!(git_config_value(&t.0.join(".git/config"), "core", "excludesfile"), None);
     }
