@@ -236,6 +236,10 @@ pub(crate) enum PaneLayout {
     Split { horizontal: bool, children: Vec<SplitChild> },
 }
 
+// A window: panes arranged by `layout`, `focused_pane` taking input.
+// `stack()`/`stack_mut()` resolve to the focused pane's frame stack. A
+// session can top several panes' stacks, so it's dropped only when no pane
+// references it at any depth (`close_orphaned_sessions`).
 pub(crate) struct WindowEntry {
     pub(crate) id: u32,
     // What this window is called, if anything -- `window create --name`
