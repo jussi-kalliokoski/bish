@@ -1,38 +1,16 @@
-// `e DIR` -- a real file browser, drawn into the focused pane so files
-// can be picked out of it and opened. A top-level module, the same tier
-// as fileeditor.rs/debugger.rs: a concrete interactive view, not
-// reusable headless logic.
+// `e DIR`: a file browser drawn into the focused pane, for picking files
+// to open. This module owns the model (listing, cursor, selection,
+// filter), the layout and the rendering, all testable without a terminal;
+// repl.rs's `run_browse_frame` drives it, as with the diagnostics list.
 //
-// Split the same way every other interactive view in this codebase
-// already is: *this* module owns the model (what's in the directory,
-// where the cursor is, what's selected, what the filter matches), the
-// layout arithmetic, and the rendering -- all of it pure enough to unit
-// test without a terminal -- while repl.rs owns the small driving loop
-// (`run_browse_frame`: a RawGuard, `read_key_idle`, and the same
-// `service_background_jobs` idle callback every other blocking loop
-// here already threads through). Same shape as
-// `render_diagnostics_list_frame`/`run_diagnostics_frame`.
+// The grid is filled column-major, item 1 below item 0, so an alphabetical
+// listing reads down a column. Overflow scrolls sideways by whole columns.
+// So `hjkl` and the arrows move within the grid; Enter descends, and
+// Backspace or Alt-Up goes to the parent.
 //
-// The layout is a real grid, filled *column-major* -- item 0 top-left,
-// item 1 directly below it, wrapping to the top of the next column --
-// which is exactly what `ls` and Midnight Commander's panel do, and
-// what makes an alphabetical listing read naturally down a column.
-// Overflow scrolls sideways by whole columns rather than wrapping to a
-// second page.
-//
-// Because the layout is a grid, `hjkl`/arrows are *grid* movement (left/
-// right step a whole column, up/down step one row within it), not
-// ranger's "h = parent, l = child" -- that vocabulary only makes sense
-// in ranger's stacked-column view, where there's no second axis to
-// navigate. Directory navigation lives on Enter (descend) and
-// Backspace/Alt-Up (parent) instead, matching a graphical browser.
-//
-// `Outcome::Accepted` carries paths rather than performing anything with
-// them: the browser is a *chooser*, and its one caller today (`e DIR`,
-// which opens each chosen path as an editor frame -- see repl.rs's
-// expand_browse_targets) is not the only thing that shape can serve.
-// Cancelling with Esc/`q` chooses nothing, so `e DIR` then opens
-// nothing, rather than falling back to some arbitrary file.
+// `Outcome::Accepted` carries paths rather than acting on them: the
+// browser is a chooser, and `e DIR` opens each chosen path (see repl.rs's
+// `expand_browse_targets`). Esc or `q` chooses nothing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -43,32 +21,24 @@ use crate::bishedit::unicode_width::{char_width, str_width};
 use crate::editor::Key;
 use crate::window::Rect;
 
-// One listing entry. `path` is always absolute (joined against the
-// browser's own cwd, which itself is canonicalized on open) so the
-// selection set stays meaningful across directory changes and across
-// the fuzzy filter narrowing/widening under it.
+// One listing entry. `path` is absolute (joined to the canonicalized
+// `cwd`), so the selection holds across directory changes and filtering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
-    // A zip archive, which this browser navigates *into* exactly like a
-    // directory (see `navigable`) -- the whole point of the feature, and
-    // the reason "can I descend into this" is a question of its own
-    // rather than just `is_dir`. Kept separate from `is_dir` so an
-    // archive can still be told apart on screen and, unlike a real
-    // directory, still has a size worth showing.
+    // An archive, which Enter navigates into like a directory (see
+    // `navigable`). Separate from `is_dir` so it's drawn differently and
+    // still shows a size.
     pub(crate) is_archive: bool,
     pub(crate) is_symlink: bool,
     pub(crate) is_exec: bool,
-    // The synthetic ".." row -- always first, never selectable (there's
-    // no sensible thing to hand back for "the parent directory" as part
-    // of a multi-selection), and skipped entirely once a filter query is
-    // typed, since it isn't a real match for anything.
+    // The synthetic `..` row: always first, never selectable (it can't be
+    // part of a multi-selection), and dropped while a filter is typed.
     pub(crate) is_parent: bool,
-    // Excluded by a `.gitignore` that covers this directory. Hidden by
-    // default and shown dimmed once `i` asks for them, so "ignored" is
-    // visible as a property rather than only as an absence.
+    // Excluded by a `.gitignore` covering this directory. Hidden by default,
+    // and dimmed once `i` shows them.
     pub(crate) is_ignored: bool,
     pub(crate) size: u64,
 }
@@ -85,24 +55,21 @@ impl Entry {
 pub(crate) enum Outcome {
     // Stay in the browser and redraw.
     Continue,
-    // Esc (outside search) or `q` -- the pane goes back to whatever it
-    // was showing before, nothing chosen.
+    // Esc (outside a search) or `q`: back to what the pane showed before,
+    // nothing chosen.
     Cancelled,
-    // Enter on a file, or on a non-empty multi-selection. Paths are
-    // absolute, and in a stable order (selection order is the set's own
-    // sorted order, not click order -- see `selected`'s type).
+    // Enter on a file, or on a non-empty selection. Absolute paths, in the
+    // selection set's sorted order.
     Accepted(Vec<PathBuf>),
-    // Ctrl-Y: leave the browser and make *this* directory the shell's
-    // own. Only ever produced when the caller said it has a shell to
-    // change (see `set_can_change_directory`) -- browsing from `bish
-    // tool edit` is a one-shot command line with no session to move.
+    // Ctrl-Y: leave and make this directory the shell's. Only offered when
+    // the caller has a shell to move (`set_can_change_directory`); `bish tool
+    // edit` doesn't.
     ChangeDirectory(PathBuf),
 }
 
-// The visible grid's own shape, resolved from a pane rect and whatever
-// the current listing's widest label happens to be. `cols` is how many
-// columns *fit on screen*, not how many the listing needs -- see
-// `total_cols`.
+// The visible grid's shape for a pane and the listing's widest label.
+// `cols` is how many fit on screen, not how many the listing needs (see
+// `total_cols`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub(crate) rows: usize,
@@ -112,86 +79,69 @@ pub(crate) struct Layout {
 
 // Blank columns between one grid column's text and the next.
 const GUTTER: usize = 2;
-// A column narrower than this is more annoying than useful (every name
-// truncated to a couple of characters), so a very narrow pane gets
-// fewer, wider columns instead -- possibly just one.
+// Narrower columns truncate every name to a few characters, so a narrow
+// pane gets fewer, wider columns instead, possibly one.
 const MIN_COL_WIDTH: usize = 18;
-// ...and a column wider than this is where `ls`'s uniform-column model
-// stops being what you want: one 45-character filename in a directory
-// of 8-character ones would otherwise set the width for *every* column,
-// collapsing a 100-column pane to a single column. Found interactively
-// -- the unit tests all passed with no cap at all, because none of them
-// mixed one pathological name in with ordinary ones. Past this, the
-// outliers get truncated (with an ellipsis) instead of the grid getting
-// destroyed.
+// Wider than this, one long name would set every column's width and
+// collapse a wide pane to one column, so outliers are truncated with an
+// ellipsis instead.
 const MAX_COL_WIDTH: usize = 32;
-// `mark` (1) + icon (2) + separating space (1). Fixed, so every name in
-// a column starts at the same screen column regardless of its icon.
+// Mark (1), icon (2) and a space (1), fixed so names in a column line up.
 const PREFIX_WIDTH: usize = 4;
 
 pub(crate) struct Browser {
     cwd: PathBuf,
-    // Everything in `cwd` (plus the synthetic ".." row), already sorted
-    // -- directories first, then files, each case-insensitively by name.
+    // Everything in `cwd`, plus the `..` row, sorted: directories first, then
+    // files, each case-insensitively.
     entries: Vec<Entry>,
-    // Indices into `entries`, in display order: the fuzzy filter's own
-    // ranking when `query` is non-empty, otherwise just `0..entries.len()`.
+    // Indices into `entries` in display order: ranked by the filter when
+    // `query` is set, otherwise `0..entries.len()`.
     view: Vec<usize>,
-    // Per-`view`-entry matched character positions (indices into that
-    // entry's `name`), straight from `fuzzy::fuzzy_match` -- empty for
-    // every entry while no query is typed.
+    // Per `view` entry, the matched character positions from
+    // `fuzzy::fuzzy_match`; empty without a query.
     matches: Vec<Vec<usize>>,
     // Index into `view`, not `entries`.
     cursor: usize,
     // Leftmost grid column currently on screen.
     scroll_col: usize,
-    // Keyed by absolute path rather than by index so it survives both
-    // the filter narrowing under it and a directory change -- selecting
-    // files from several directories and then hitting Enter is a real
-    // file-browser gesture, not an accident to guard against. `BTreeSet`
-    // (not `HashSet`) so `Accepted`'s own path list comes out in a
-    // stable, reproducible order.
+    // By absolute path, so it survives filtering and directory changes:
+    // selecting files across directories, then Enter, is intended. A
+    // `BTreeSet` so `Accepted` comes out in a stable order.
     selected: BTreeSet<PathBuf>,
     query: String,
-    // `/` puts the keyboard into the filter input; Esc backs out of it
-    // (clearing the query) rather than leaving the browser entirely.
+    // `/` moves the keyboard to the filter; Esc leaves it, clearing the
+    // query, rather than leaving the browser.
     searching: bool,
     show_hidden: bool,
-    // The gitignore rules covering `cwd`, reloaded whenever it changes.
-    // Empty outside a repository, which is also what makes this cost
-    // nothing anywhere else.
+    // The gitignore rules covering `cwd`, reloaded when it changes; empty
+    // outside a repository.
     ignore: crate::gitignore::Stack,
-    // Whether ignored entries are listed at all. Off by default: the
-    // whole value of knowing about `.gitignore` here is not having to
-    // scroll past `target/` and `node_modules/` to reach your own files.
+    // Whether ignored entries are listed. Off by default, so `target/` and
+    // `node_modules/` stay out of the way.
     show_ignored: bool,
-    // The `gitignore` bishopt. Off means there is no such thing as an
-    // ignored file here -- `i` stops doing anything, and nothing is
-    // dimmed, because nothing was ever hidden.
+    // The `gitignore` bishopt. Off, nothing counts as ignored, and `i` does
+    // nothing.
     honor_gitignore: bool,
-    // This session's resolved `ui_col_*` colours -- see theme.rs. `None`
-    // for a caller with no shell to read them from, which draws the
+    // This session's `ui_col_*` colours (see theme.rs); `None` draws the
     // defaults.
     colors: Option<crate::theme::UiColors>,
-    // Back/forward stacks for Alt-Left/Alt-Right, mirroring the
-    // vocabulary the ordinary shell prompt's own directory navigation
-    // already uses (editor::DirNav).
+    // Back and forward stacks for Alt-Left/Alt-Right, as at the prompt
+    // (`editor::DirNav`).
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
-    // Whatever went wrong on the last attempted directory read, shown
-    // in the status row until the next successful action.
+    // The last failed directory read, shown in the status row until the next
+    // successful action.
     error: Option<String>,
-    // What the last command run from the colon line had to say. Same
-    // row, no warning sign -- see set_message.
+    // What the last colon-line command printed; the same row, without a
+    // warning sign (see `set_message`).
     message: Option<String>,
-    // Whether Ctrl-Y is offered at all -- see Outcome::ChangeDirectory.
+    // Whether Ctrl-Y is offered; see `Outcome::ChangeDirectory`.
     can_change_directory: bool,
 }
 
 impl Browser {
-    // Opens `start` (or its nearest readable ancestor is *not* attempted
-    // -- an unreadable start directory is a plain error, same as any
-    // other failed `:` command).
+    // Opens `start`. An unreadable directory is an error; no ancestor is
+    // tried instead.
     pub(crate) fn open(start: &Path) -> Result<Self, String> {
         if !cfg!(feature = "browser") {
             return Err("the file browser is not part of this build".to_string());
@@ -222,17 +172,15 @@ impl Browser {
         Ok(b)
     }
 
-    // Turns Ctrl-Y on. Off by default so a caller that has no shell to
-    // move can't accidentally offer a key that would do nothing.
+    // Enables Ctrl-Y; off by default, so a caller without a shell can't offer
+    // a key that does nothing.
     pub(crate) fn set_can_change_directory(&mut self, allow: bool) {
         self.can_change_directory = allow;
     }
 
-    // Something to say in the status row until the next action clears
-    // it -- what a command run from the browser's own colon line
-    // printed. Its own slot rather than `error`'s: `bishopt wrap`
-    // answering "off" is not a warning, and drawing it with one would
-    // say it was.
+    // A message for the status row until the next action: what a colon-line
+    // command printed. Not `error`, since `bishopt wrap` answering `off`
+    // isn't a warning.
     pub(crate) fn set_message(&mut self, message: String) {
         self.message = Some(message);
     }
@@ -241,8 +189,8 @@ impl Browser {
         self.colors = Some(colors);
     }
 
-    // The `gitignore` bishopt, from whichever shell opened this. Must be
-    // set before the first listing is used, so it reloads.
+    // The `gitignore` bishopt from the opening shell. Set before the first
+    // listing is used; it reloads.
     pub(crate) fn set_honor_gitignore(&mut self, honor: bool) -> Result<(), String> {
         if self.honor_gitignore == honor {
             return Ok(());
@@ -251,26 +199,20 @@ impl Browser {
         self.reload()
     }
 
-    // Re-reads `cwd` from disk and rebuilds the filtered view. Keeps the
-    // cursor's *position* only in so far as it still exists -- callers
-    // that want it on a specific name (going up to a parent, say) call
-    // `focus_name` right after.
+    // Re-reads `cwd` and rebuilds the view. The cursor keeps its position if
+    // it still exists; callers wanting a specific name use `focus_name`.
     fn reload(&mut self) -> Result<(), String> {
-        // Before `read_here`, which is what consults it. Skipped for a
-        // virtual archive path: nothing inside a zip is on disk for a
-        // `.gitignore` to be about.
+        // Before `read_here`, which consults it. Not for a path inside an
+        // archive, where nothing is on disk.
         let inside_archive = crate::archive::split(&self.cwd.to_string_lossy()).is_some();
         self.ignore = match self.honor_gitignore && !inside_archive {
             true => crate::gitignore::Stack::for_directory(&self.cwd),
             false => crate::gitignore::Stack::new(),
         };
         let mut entries = self.read_here()?;
-        // `Path::parent` already understands a virtual path: the parent
-        // of `/a/b.zip!/dir` is `/a/b.zip!` and the parent of the
-        // archive root `/a/b.zip!` is the real directory `/a`, which is
-        // exactly the walk out of an archive this needs -- no separate
-        // case, because `!` sits inside a path component rather than
-        // acting as one.
+        // `Path::parent` already walks out of a virtual path:
+        // `/a/b.zip!/dir` to `/a/b.zip!` to `/a`, since `!` sits inside a
+        // component.
         if let Some(parent) = self.cwd.parent() {
             entries.insert(
                 0,
@@ -287,10 +229,9 @@ impl Browser {
                 },
             );
         }
-        // Directories first (the ".." row is a directory too, and sorts
-        // above everything by its own name), then case-insensitive by
-        // name with a case-sensitive tiebreak so the order is total and
-        // reproducible rather than read_dir's arbitrary one.
+        // Directories first (`..` is one, and sorts first by name), then
+        // case-insensitively with a case-sensitive tiebreak, so the order
+        // is total.
         crate::sort::sort_by(&mut entries, |a, b| {
             b.is_parent
                 .cmp(&a.is_parent)
@@ -303,12 +244,9 @@ impl Browser {
         Ok(())
     }
 
-    // Everything in `cwd`, from whichever of the two things `cwd` can be.
-    // The archive half is where `e some.zip` ends up: `cwd` is a virtual
-    // path (archive::split), and the listing comes from the central
-    // directory rather than from `read_dir`. Everything downstream of
-    // here -- the grid, the filter, the selection set, Enter -- works on
-    // `Entry` and never learns the difference.
+    // Everything in `cwd`: from `read_dir`, or for a virtual path
+    // (`archive::split`) from the archive's member list. Everything
+    // downstream works on `Entry` and never learns which.
     fn read_here(&self) -> Result<Vec<Entry>, String> {
         let here = self.cwd.to_string_lossy().into_owned();
         if let Some((archive, inner)) = crate::archive::split(&here) {
@@ -320,8 +258,8 @@ impl Browser {
                     path: PathBuf::from(crate::archive::join(&archive, &join_inner(&inner, &m.name))),
                     name: m.name,
                     is_dir: m.is_dir,
-                    // Nesting isn't supported (see archive::split), so an
-                    // archive inside an archive is an ordinary file here.
+                    // Archives don't nest (see `archive::split`), so one
+                    // inside is a file.
                     is_archive: false,
                     is_symlink: false,
                     is_exec: false,
@@ -332,10 +270,8 @@ impl Browser {
                 .collect());
         }
         let read = std::fs::read_dir(&self.cwd).map_err(|e| format!("{}: {e}", self.cwd.display()))?;
-        // If `cwd` is itself ignored, nothing in it is filtered. You
-        // walked in here on purpose, and a directory that answered an
-        // Enter with an empty listing would be a worse answer than a
-        // full one.
+        // If `cwd` itself is ignored, nothing in it is filtered: you walked
+        // in on purpose.
         let filtering = !self.ignore.matched(&self.cwd, true).is_ignored();
         let mut entries = Vec::new();
         for dirent in read.flatten() {
@@ -353,13 +289,10 @@ impl Browser {
         Ok(entries)
     }
 
-    // Rebuilds `view`/`matches` from `entries` + `query`, then clamps
-    // the cursor. An empty query keeps the on-disk sort order (see
-    // `fuzzy_match`'s own "empty query matches everything with score 0"
-    // contract, plus a stable sort); a non-empty one re-ranks by score,
-    // fzf-style, which deliberately breaks the directories-first
-    // grouping -- when you're searching, rank is what you want, not
-    // taxonomy.
+    // Rebuilds `view` and `matches` from `entries` and `query`, then clamps
+    // the cursor. An empty query keeps the listing order; a query ranks by
+    // score, which breaks the directories-first grouping, since when
+    // searching rank is what matters.
     fn refilter(&mut self) {
         self.view.clear();
         self.matches.clear();
@@ -387,9 +320,8 @@ impl Browser {
         }
     }
 
-    // Puts the cursor on the entry with this name, if it's still in the
-    // filtered view -- used when going up to a parent, so the directory
-    // just left is the one highlighted on arrival.
+    // Puts the cursor on the entry with this name if it's in the view, so
+    // going up lands on the directory just left.
     fn focus_name(&mut self, name: &str) {
         if let Some(pos) = self.view.iter().position(|&i| self.entries[i].name == name) {
             self.cursor = pos;
@@ -400,12 +332,9 @@ impl Browser {
         self.view.get(self.cursor).map(|&i| &self.entries[i])
     }
 
-    // The grid that fits in `rect`: one header row is reserved at the
-    // top, everything below it is grid. Column width comes from the
-    // widest label actually present (`ls`'s own uniform-column model),
-    // clamped so one pathological filename can't collapse the grid to a
-    // single column in a wide pane, and so a narrow pane still gets
-    // usable columns.
+    // The grid for `rect`: a header row, then the grid. Column width is the
+    // widest label present, clamped so one long name can't collapse a wide
+    // pane to one column and a narrow pane still gets usable columns.
     pub(crate) fn layout(&self, rect: Rect) -> Layout {
         let rows = rect.rows.saturating_sub(1).max(1);
         let widest = self
@@ -420,16 +349,14 @@ impl Browser {
         Layout { rows, cols, col_width }
     }
 
-    // How many grid columns the whole (filtered) listing needs -- which
-    // is usually more than `Layout::cols`, the number that fit.
+    // How many columns the filtered listing needs, usually more than
+    // `Layout::cols`.
     fn total_cols(&self, rows: usize) -> usize {
         self.view.len().div_ceil(rows.max(1))
     }
 
-    // Scrolls the minimum amount needed to bring the cursor's own grid
-    // column on screen. Called after every cursor move, and again at the
-    // top of `render` so a resize that shrank the pane between two
-    // keystrokes can't leave the cursor stranded off-screen.
+    // Scrolls just enough to show the cursor's column. Also called from
+    // `render`, so a resize between keys can't strand the cursor off-screen.
     fn ensure_visible(&mut self, layout: Layout) {
         let col = self.cursor / layout.rows.max(1);
         if col < self.scroll_col {
@@ -453,8 +380,7 @@ impl Browser {
         };
         let saved = std::mem::replace(&mut self.cwd, target);
         if let Err(e) = self.reload() {
-            // Failed reads leave the browser exactly where it was rather
-            // than stranding it in a directory it can't list.
+            // A failed read leaves the browser where it was.
             self.cwd = saved;
             self.error = Some(e);
             let _ = self.reload();
@@ -471,10 +397,9 @@ impl Browser {
         self.cursor = 0;
         self.scroll_col = 0;
         self.refilter();
-        // Coming *up* from a child: land on the child that was just
-        // left. Stepping out of an archive root arrives here with
-        // `some.zip!`, whose trailing separator is part of the virtual
-        // path rather than of the filename it's listed under.
+        // Coming up from a child, land on it. Leaving an archive root
+        // arrives with `some.zip!`, whose trailing separator isn't part of
+        // the listed name.
         if previous.parent() == Some(self.cwd.as_path())
             && let Some(name) = previous.file_name().map(|n| n.to_string_lossy().into_owned())
         {
@@ -499,20 +424,14 @@ impl Browser {
         }
     }
 
-    // Enter's own contract. Navigation wins over accepting whenever the
-    // cursor is on a directory -- otherwise, once anything at all was
-    // selected, Enter could never descend again, which would make
-    // building a selection that spans several directories (the whole
-    // point of keying `selected` by path) impossible. On a *file*, an
-    // existing multi-selection is what gets returned -- that's what the
-    // user built it for -- and only an empty selection falls back to
-    // "just the one under the cursor".
+    // Enter: on a directory it descends, even with a selection, or a
+    // selection could never span directories. On a file, an existing
+    // selection is returned, else just the file under the cursor.
     fn accept(&mut self) -> Outcome {
         let selection = || -> Outcome { Outcome::Accepted(self.selected.iter().cloned().collect()) };
         let Some(entry) = self.current() else {
-            // Nothing under the cursor at all (an empty directory, or a
-            // filter matching nothing) -- a selection built elsewhere is
-            // still worth handing back.
+            // Nothing under the cursor (an empty directory or filter); a
+            // selection made elsewhere is still returned.
             return if self.selected.is_empty() { Outcome::Continue } else { selection() };
         };
         if entry.navigable() {
@@ -533,11 +452,9 @@ impl Browser {
         self.error = None;
         self.message = None;
 
-        // The filter input owns every printable key while it's active,
-        // so only the keys that *aren't* text fall through to the
-        // navigation vocabulary below. Arrows/Ctrl-N/Ctrl-P still move
-        // the grid cursor while typing, fzf-style -- filtering and
-        // picking are one gesture, not two modes.
+        // While filtering, printable keys go to the query, and the rest
+        // fall through. Arrows, Ctrl-N and Ctrl-P still move the cursor, so
+        // filtering and picking are one gesture.
         if self.searching {
             match key {
                 Key::Char(c) => {
@@ -556,9 +473,8 @@ impl Browser {
                     self.refilter();
                     return Outcome::Continue;
                 }
-                // Esc backs out of the filter (clearing it) rather than
-                // out of the browser -- one Esc per level, matching how
-                // command mode's own Esc handling already behaves.
+                // Esc leaves the filter, clearing it, not the browser: one
+                // Esc per level.
                 Key::Escape => {
                     self.searching = false;
                     self.query.clear();
@@ -567,10 +483,9 @@ impl Browser {
                     self.refilter();
                     return Outcome::Continue;
                 }
-                // Commits the filter and hands the keyboard back to the
-                // grid, *keeping* what's typed -- so `/` `r` `s` Enter
-                // leaves a narrowed listing to navigate, rather than
-                // immediately opening the top hit.
+                // Commits the filter and returns the keyboard to the grid,
+                // keeping the query, so `/rs<Enter>` leaves a narrowed
+                // listing rather than opening the top hit.
                 Key::Enter => {
                     self.searching = false;
                     return Outcome::Continue;
@@ -598,14 +513,10 @@ impl Browser {
         match key {
             Key::Escape | Key::Char('q') | Key::CtrlC => Outcome::Cancelled,
             Key::Enter => self.accept(),
-            // Ctrl-Y: take the shell here. The directory is the one
-            // being *browsed*, not whatever the cursor happens to be on
-            // -- Enter already descends, so you walk to where you want
-            // and then bring the shell along.
+            // Ctrl-Y: take the shell to the directory being browsed, not
+            // the entry under the cursor; Enter already descends.
             Key::CtrlY if self.can_change_directory => {
                 if crate::archive::split(&self.cwd.to_string_lossy()).is_some() {
-                    // An archive member is not a directory anything can
-                    // have as its working directory.
                     self.error = Some("inside an archive -- nothing to cd into".to_string());
                     return Outcome::Continue;
                 }
@@ -615,9 +526,8 @@ impl Browser {
                 self.searching = true;
                 Outcome::Continue
             }
-            // Toggle-and-advance, the gesture every file browser with
-            // multi-selection uses (ranger's Space, fzf's Tab): holding
-            // Tab down walks a run of files into the selection.
+            // Toggle and advance, so holding Tab walks a run of files into
+            // the selection.
             Key::Tab | Key::Char(' ') => {
                 self.toggle_selection();
                 self.cursor = (self.cursor + 1).min(last);
@@ -645,9 +555,7 @@ impl Browser {
                 }
                 Outcome::Continue
             }
-            // Clears the selection without leaving -- Esc is already
-            // spoken for (leave/exit-search), so this gets its own key
-            // rather than overloading that further.
+            // Clears the selection without leaving; Esc is already taken.
             Key::Char('u') => {
                 self.selected.clear();
                 Outcome::Continue
@@ -735,11 +643,9 @@ impl Browser {
                 Outcome::Continue
             }
             Key::Mouse(ev) => {
-                // Either wheel moves the same way here, because this
-                // grid *is* horizontal: it fills column-major, so the
-                // vertical wheel has always scrolled it sideways. A
-                // terminal that sends the horizontal wheel now says the
-                // same thing more literally.
+                // Both wheels move the same way: the grid fills
+                // column-major, so even the vertical wheel scrolls it
+                // sideways.
                 if ev.is_scroll_down() || ev.is_scroll_right() {
                     self.scroll_col = (self.scroll_col + 1).min(self.total_cols(layout.rows).saturating_sub(1));
                 } else if ev.is_scroll_up() || ev.is_scroll_left() {
@@ -756,10 +662,9 @@ impl Browser {
         }
     }
 
-    // Which view index a 1-indexed terminal cell belongs to, if any.
-    // Rejects the header row and any cell past the end of the listing,
-    // so clicking empty space is a no-op rather than snapping the cursor
-    // somewhere arbitrary.
+    // The view index under a 1-indexed terminal cell, if any. The header row
+    // and cells past the listing give `None`, so clicking empty space does
+    // nothing.
     fn hit_test(&self, term_row: usize, term_col: usize, rect: Rect, layout: Layout) -> Option<usize> {
         let row0 = term_row.checked_sub(1)?;
         let col0 = term_col.checked_sub(1)?;
@@ -772,12 +677,9 @@ impl Browser {
         (idx < self.view.len()).then_some(idx)
     }
 
-    // The whole frame: the pane's own header + grid, plus the terminal's
-    // one global status row (`repl::render_global_status_row` -- the
-    // same row the file editor's own status line uses, and the row
-    // command mode's `:browse` text is still sitting on until this
-    // overwrites it). Ends by parking the real cursor: inside the filter
-    // input while searching (visible, so typing has somewhere to look),
+    // The whole frame: the pane's header and grid, plus the terminal's
+    // global status row (`repl::render_global_status_row`, shared with the
+    // file editor). The cursor is left in the filter input while searching,
     // hidden otherwise.
     pub(crate) fn render(&mut self, rect: Rect, term_rows: usize, term_cols: usize) -> String {
         let layout = self.layout(rect);
@@ -809,8 +711,8 @@ impl Browser {
 
         out.push_str(&crate::repl::render_global_status_row(&pad_to(&self.status_text(term_cols), term_cols), term_rows));
         if self.searching {
-            // The `/` and the query both live in the status row, so the
-            // cursor goes right after the last typed character.
+            // The `/` and the query are in the status row; the cursor goes
+            // after the query.
             let col = 2 + str_width(&self.query);
             out.push_str(&format!("\x1b[{};{}H\x1b[?25h", term_rows.saturating_sub(1), col.min(term_cols)));
         }
@@ -825,14 +727,11 @@ impl Browser {
         let selected = self.selected.contains(&entry.path);
         let focused = idx == self.cursor;
 
-        // A directory's `/` and an archive's `!` are the same hint:
-        // Enter goes *into* this. `!` because that's exactly what the
-        // path gains when you do (archive::SEPARATOR).
-        // A name is drawn here as raw SGR text, not as cells, so it
-        // does not pass through `render_linked`'s own gate -- and a file
-        // called `evil<ESC>[2J.txt` is a listing that clears the screen.
-        // One character in, one out, so `self.matches`' own positions
-        // still line up with it.
+        // A directory's `/` and an archive's `!` both mean Enter goes into
+        // it; `!` is what the path gains (`archive::SEPARATOR`). Names are
+        // drawn as raw SGR text, bypassing `render_linked`'s gate, so
+        // control characters are made safe here, one character for one so
+        // `self.matches` still lines up.
         let label = crate::term::safe_text(&match entry {
             e if e.is_parent => e.name.clone(),
             e if e.is_dir => format!("{}/", e.name),
@@ -846,19 +745,14 @@ impl Browser {
 
         let mut out = String::new();
         out.push_str(&color_for(entry, self.colors.as_ref()));
-        // On top of the type colour rather than instead of it: it is
-        // still a directory or an executable, it is just also ignored.
+        // Over the type colour, not instead of it: an ignored directory is
+        // still a directory.
         if entry.is_ignored {
             out.push_str("\x1b[2m");
         }
-        // After the colour, never before it. A themed colour is a whole
-        // SGR run that begins with a reset (vt100::sgr_codes), so a `7`
-        // set ahead of it was turned straight back off again -- and the
-        // cursor became invisible on every entry that has a colour of
-        // its own: directories, symlinks, archives, executables. A plain
-        // file kept its highlight, because its colour is a bare
-        // `\x1b[39m` with no reset in it, which is what made this look
-        // like the browser refusing to select a directory.
+        // After the colour: a themed colour is an SGR run starting with a
+        // reset, which would switch reverse video off again and hide the
+        // cursor on every coloured entry.
         if focused {
             out.push_str("\x1b[7m");
         }
@@ -882,14 +776,11 @@ impl Browser {
         out
     }
 
-    // `📁 ~/bish/src` on the left, counts on the right. The path is
-    // truncated from the *left* (keeping the leaf, which is what
-    // identifies where you are) rather than from the right like every
-    // other truncation here.
+    // `📁 ~/bish/src` left, counts right. The path is truncated from the
+    // left, keeping the leaf, which says where you are.
     fn header_text(&self, cols: usize) -> String {
-        // While a filter is active the raw count on its own is
-        // misleading ("5 items" in a directory of 22) -- say what it's
-        // five *of*.
+        // While filtering, "5 items" in a directory of 22 would mislead, so
+        // it says what it's five of.
         let shown = self.view.len();
         let mut right = if self.query.is_empty() {
             format!("{shown} item{}", if shown == 1 { "" } else { "s" })
@@ -930,8 +821,7 @@ impl Browser {
                 }
             }
         };
-        // The `i` hint is left out when `gitignore` is off -- there is
-        // nothing for it to reveal, so offering it would be a lie.
+        // No `i` hint when `gitignore` is off: nothing to reveal.
         let hints = match (self.can_change_directory, self.honor_gitignore) {
             (true, true) => "enter open  ^y cd here  tab select  / filter  . hidden  i ignored  : cmd  bksp up  esc back",
             (true, false) => "enter open  ^y cd here  tab select  / filter  . hidden  : cmd  bksp up  esc back",
@@ -943,14 +833,10 @@ impl Browser {
     }
 }
 
-// Everything below is `Browser`-independent helper machinery.
 
-// Where a browse should start: the argument if there is one (relative
-// paths resolved against the *session's* own cwd, not the process's --
-// each window/pane tracks its own), otherwise that cwd itself. `~`/
-// `~/...` expand here too, which is redundant for an `e` argument the
-// shell already expanded but harmless, and keeps this usable by any
-// caller with a raw path in hand.
+// Where a browse starts: the argument, if any (relative to the session's
+// cwd, not the process's: each pane has its own), otherwise that cwd.
+// `~` and `~/...` expand here too, for callers with a raw path.
 pub(crate) fn resolve_start(cwd: &Path, arg: Option<&str>) -> PathBuf {
     let Some(arg) = arg else { return cwd.to_path_buf() };
     let expanded = if arg == "~" || arg.starts_with("~/") {
@@ -964,14 +850,10 @@ pub(crate) fn resolve_start(cwd: &Path, arg: Option<&str>) -> PathBuf {
     if expanded.is_absolute() { expanded } else { cwd.join(expanded) }
 }
 
-// The absolute, symlink-free spelling of wherever the browser is about
-// to sit -- extended to the two archive cases, since neither names
-// anything `fs::canonicalize` could resolve on its own.
-//
-// Naming an archive *file* lands at its root rather than failing: `e
-// some.zip` and Enter on `some.zip` both arrive here, and both mean
-// "show me what's inside", so the normalization belongs in one place
-// rather than at each of them.
+// The absolute, symlink-free spelling of where the browser will sit,
+// including inside archives, which `fs::canonicalize` can't resolve. An
+// archive file lands at its root: `e some.zip` and Enter on it both mean
+// "show what's inside".
 fn canonical(path: &Path) -> Result<PathBuf, String> {
     let raw = path.to_string_lossy().into_owned();
     if let Some((archive, inner)) = crate::archive::split(&raw) {
@@ -986,29 +868,24 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn describe(path: PathBuf, name: String) -> Entry {
-    // `symlink_metadata` first (does *this* name point at a link?), then
-    // the followed `metadata` for what it actually resolves to -- a
-    // symlink to a directory should still navigate like a directory, it
-    // just gets the link icon.
+    // `symlink_metadata` says whether this name is a link, and `metadata`
+    // what it points at: a link to a directory navigates like one, with the
+    // link icon.
     let link = std::fs::symlink_metadata(&path).ok();
     let meta = std::fs::metadata(&path).ok();
     let is_symlink = link.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false);
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
     let is_exec = meta.as_ref().map(crate::platform::has_execute_bit).unwrap_or(false) && !is_dir;
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    // By magic bytes, not by name (crate::archive::kind_of) -- so a zip
-    // called `.jar`, `.whl` or nothing at all still opens, and a `.zip`
-    // that isn't one doesn't pretend to. That's an open and a 4-byte
-    // read per file on top of the two stats this already does, which is
-    // fine for the directories a person browses and would be worth
-    // revisiting only if listing something like /usr/bin ever felt slow.
+    // By magic bytes, not name (`archive::kind_of`), so a `.jar` or `.whl`
+    // opens and a fake `.zip` doesn't. One more open and 4-byte read per
+    // file.
     let is_archive = !is_dir && crate::archive::looks_like_archive(&path);
     Entry { name, path, is_dir, is_archive, is_symlink, is_exec, is_parent: false, is_ignored: false, size }
 }
 
-// Joins a directory path inside an archive with one of its children --
-// plain string work, since these are archive member names ('/'-separated
-// by the format's own definition) rather than host paths.
+// Joins an archive directory and a child name: archive member names are
+// `/`-separated by definition, not host paths.
 fn join_inner(dir: &str, name: &str) -> String {
     if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
 }
@@ -1018,30 +895,26 @@ fn color_for(e: &Entry, colors: Option<&crate::theme::UiColors>) -> String {
     let element = if e.is_symlink {
         Ui::Symlink
     } else if e.is_archive {
-        // Its own colour rather than a directory's blue: it navigates
-        // like one, but it's still a single file on disk and everything
-        // inside it is read-only.
+        // Its own colour: it navigates like a directory but is one read-only
+        // file on disk.
         Ui::Archive
     } else if e.is_dir {
         Ui::Directory
     } else if e.is_exec {
         Ui::Executable
     } else {
-        // An ordinary file is drawn in the terminal's own foreground --
-        // the thing most entries are shouldn't be the thing that stands
-        // out.
+        // Ordinary files use the terminal's foreground, so the common case
+        // doesn't stand out.
         return "\x1b[39m".to_string();
     };
     crate::theme::sgr(element, colors)
 }
 
-// Every icon here is drawn from U+1F300..=U+1FAFF on purpose -- that's
-// the one block `unicode_width::char_width` reports as width 2, which is
-// what this module's whole column arithmetic assumes. Picking a
-// pictograph from, say, Miscellaneous Symbols (U+2600..) instead would
-// measure as 1 column here while most terminals still draw it as 2, and
-// every column to its right would land one cell off. Enforced by
-// `every_icon_is_two_columns_wide` below rather than left to care.
+// Every icon is from U+1F300..=U+1FAFF, the block
+// `unicode_width::char_width` reports as width 2, which the column
+// arithmetic assumes. One from Miscellaneous Symbols (U+2600..) would
+// measure 1 here but draw as 2, shifting every column after it.
+// `every_icon_is_two_columns_wide` enforces this.
 const BY_EXTENSION: &[(&[&str], char)] = &[
     (&["rs"], '\u{1F980}'),
     (&["md", "markdown", "rst", "adoc", "org"], '\u{1F4DD}'),
@@ -1069,7 +942,7 @@ const BY_EXTENSION: &[(&[&str], char)] = &[
     (&["ttf", "otf", "woff", "woff2"], '\u{1F524}'),
 ];
 
-// Extension-less files that are still instantly recognizable by name.
+// Files without an extension that are recognizable by name.
 const BY_NAME: &[(&str, char)] = &[("makefile", '\u{1F528}'), ("dockerfile", '\u{1F433}'), ("license", '\u{1F4DC}'), ("readme", '\u{1F4DD}')];
 
 fn icon_for(e: &Entry) -> char {
@@ -1082,9 +955,8 @@ fn icon_for(e: &Entry) -> char {
     if e.is_dir {
         return '\u{1F4C1}';
     }
-    // Ahead of the name-based tables below, since is_archive comes from
-    // the file's actual magic bytes -- a zip called `plugin.vsix` should
-    // still look like the archive it is.
+    // Before the name tables, since `is_archive` comes from magic bytes: a
+    // zip called `plugin.vsix` looks like an archive.
     if e.is_archive {
         return '\u{1F4E6}';
     }
@@ -1104,9 +976,8 @@ fn icon_for(e: &Entry) -> char {
     '\u{1F4C4}'
 }
 
-// Display text only, so the control-character guard lives here: this is
-// what the browser's own header prints, and a directory can be named
-// anything at all.
+// Display text, so control characters are made safe here: a directory
+// can be named anything.
 fn shorten_home(path: &Path) -> String {
     crate::term::safe_text(&shorten_home_raw(path))
 }
@@ -1134,19 +1005,16 @@ fn human_size(bytes: u64) -> String {
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1}{}", UNITS[unit]) }
 }
 
-// Pad with spaces to exactly `width` display columns (truncating first
-// if it's already wider). Display columns, not chars -- an emoji icon or
-// a CJK filename is two of them.
+// Pads to exactly `width` display columns, truncating first if wider.
+// Columns, not chars: an icon or a CJK name takes two.
 fn pad_to(s: &str, width: usize) -> String {
     let fitted = fit(s, width);
     let used = str_width(&fitted);
     format!("{fitted}{}", " ".repeat(width.saturating_sub(used)))
 }
 
-// Truncate to `width` display columns, marking the cut with an ellipsis.
-// Cluster-aware (`grapheme::next_boundary`), so this can't slice a ZWJ
-// emoji sequence or a combining-mark cluster in half the way a plain
-// `chars().take(n)` would.
+// Truncates to `width` columns with an ellipsis, by grapheme cluster, so a
+// ZWJ sequence or combining mark is never split.
 fn fit(s: &str, width: usize) -> String {
     if str_width(s) <= width {
         return s.to_string();
@@ -1175,8 +1043,7 @@ fn fit(s: &str, width: usize) -> String {
     out
 }
 
-// Same, but keeping the *tail* -- for a path, the leaf identifies where
-// you are far better than the root does.
+// Like `fit`, keeping the tail: for a path, the leaf matters most.
 fn fit_left(s: &str, width: usize) -> String {
     if str_width(s) <= width {
         return s.to_string();
@@ -1199,12 +1066,10 @@ fn fit_left(s: &str, width: usize) -> String {
     format!("\u{2026}{}", chars[start..].iter().collect::<String>())
 }
 
-// Truncate `s` to `width` columns like `fit`, but returning it broken
-// into (cluster, is-a-fuzzy-match) pieces so the renderer can underline
-// exactly the characters the query matched. `positions` are char indices
-// into `s` (`fuzzy::FuzzyMatch::positions`' own convention); a cluster
-// counts as matched when its own first char is one of them. Returns the
-// pieces plus the display width they actually consumed.
+// Truncates like `fit`, returning (cluster, matched) pieces so the
+// renderer can underline what the query matched. `positions` are char
+// indices (`fuzzy::FuzzyMatch::positions`); a cluster is matched if its
+// first char is. Also returns the width used.
 pub(crate) fn fit_marked(s: &str, positions: &[usize], width: usize) -> (Vec<(String, bool)>, usize) {
     let chars: Vec<char> = s.chars().collect();
     let truncating = str_width(s) > width;
@@ -1231,9 +1096,8 @@ pub(crate) fn fit_marked(s: &str, positions: &[usize], width: usize) -> (Vec<(St
 
 #[cfg(test)]
 mod tests {
-    // A listing is drawn as raw SGR text, so a name is spliced into the
-    // terminal's escape stream directly. `evil<ESC>[2J.txt` cleared the
-    // screen just by being in the directory you opened.
+    // Names are spliced into the escape stream as raw SGR text, so a file
+    // named `evil<ESC>[2J.txt` must not clear the screen.
     #[test]
     fn a_hostile_filename_cannot_paint_with_the_terminals_own_escapes() {
         let dir = std::env::temp_dir().join(format!("bish-browser-escapes-{}", std::process::id()));
@@ -1257,9 +1121,7 @@ mod tests {
         Rect { row: 0, col: 0, rows, cols }
     }
 
-    // A throwaway directory tree under the crate's own target dir --
-    // same "no external crate, no /tmp assumptions beyond std" spirit as
-    // the rest of this codebase's filesystem tests.
+    // A throwaway tree under the crate's target dir.
     struct Tmp(PathBuf);
     impl Tmp {
         fn new(tag: &str) -> Tmp {
@@ -1285,13 +1147,9 @@ mod tests {
         }
     }
 
-    // The invariant the whole column layout rests on: every icon must
-    // measure exactly two columns by *this* codebase's own width table,
-    // because that's what the cell arithmetic assumes. A pictograph from
-    // outside the wide block would measure 1 here while terminals draw
-    // it as 2, shifting every column to its right by one cell -- exactly
-    // the class of silent, spot-check-proof table bug the grapheme
-    // module's own sortedness test exists to catch.
+    // Every icon measures two columns by this codebase's width table, which
+    // the layout assumes; one that measures 1 but draws as 2 would shift
+    // every column after it.
     #[test]
     fn every_icon_is_two_columns_wide() {
         let mut icons: Vec<char> = vec!['\u{1F4C1}', '\u{1F4C2}', '\u{1F517}', '\u{1F4C4}', '\u{1F680}', '\u{1F50D}'];
@@ -1346,13 +1204,12 @@ mod tests {
         all.retain(|n| n != "..");
         all.sort();
         assert_eq!(all, vec!["debug.log", "keep.log", "main.rs", "target"]);
-        // ...and shown *as* ignored, not just shown.
+        // ...and marked as ignored.
         let ignored: Vec<&str> = b.entries.iter().filter(|e| e.is_ignored).map(|e| e.name.as_str()).collect();
         assert_eq!(ignored, vec!["target", "debug.log"]);
     }
 
-    // With the `gitignore` bishopt off there is no such thing as an
-    // ignored file: nothing hidden, and nothing marked either.
+    // With `gitignore` off, nothing is hidden or marked.
     #[test]
     fn the_gitignore_bishopt_turns_the_whole_thing_off() {
         let t = Tmp::new("optout");
@@ -1364,14 +1221,13 @@ mod tests {
         b.set_honor_gitignore(false).unwrap();
         assert!(names(&b).contains(&"debug.log".to_string()));
         assert!(b.entries.iter().all(|e| !e.is_ignored), "nothing is marked ignored either");
-        // ...and `i` has nothing left to reveal.
+        // ...and `i` has nothing to reveal.
         b.handle_key(Key::Char('i'), rect(10, 80));
         assert!(names(&b).contains(&"debug.log".to_string()));
     }
 
-    // Outside a repository there is no root for a `.gitignore` to be
-    // relative to, so nothing is ignored -- including by a stray file
-    // that happens to be sitting there.
+    // Outside a repository there's no root for a `.gitignore`, so nothing is
+    // ignored, even by a stray one.
     #[test]
     fn nothing_is_ignored_outside_a_repository() {
         let t = Tmp::new("norepo");
@@ -1381,8 +1237,7 @@ mod tests {
         assert!(names(&b).contains(&"debug.log".to_string()));
     }
 
-    // Walking into an ignored directory on purpose should show what is
-    // in it, not an empty listing.
+    // Walking into an ignored directory on purpose shows its contents.
     #[test]
     fn an_ignored_directory_still_lists_its_contents_once_you_are_in_it() {
         let t = Tmp::new("intarget");
@@ -1407,9 +1262,7 @@ mod tests {
         assert!(names(&b).contains(&"a.log".to_string()), "the nested `!` line re-includes it");
     }
 
-    // This grid fills column-major, so the vertical wheel has always
-    // scrolled it sideways -- the horizontal one now says the same thing
-    // more literally, and both have to agree.
+    // The vertical and horizontal wheels agree: both scroll sideways.
     #[test]
     fn either_wheel_scrolls_the_grid_sideways() {
         let t = Tmp::new("hwheel");
@@ -1432,8 +1285,7 @@ mod tests {
         assert_eq!(b.scroll_col, 0, "and it stops rather than going negative");
     }
 
-    // Column-major fill: with 4 grid rows, `l` from the first item lands
-    // on the fifth -- the top of the next column -- not the second.
+    // Column-major: with 4 rows, `l` from the first item goes to the fifth.
     #[test]
     fn right_moves_a_whole_column_not_one_item() {
         let t = Tmp::new("grid");
@@ -1452,10 +1304,8 @@ mod tests {
         assert_eq!(b.cursor, 1);
     }
 
-    // The bug the MAX_COL_WIDTH cap exists for, found interactively:
-    // one very long name among ordinary ones used to set the uniform
-    // column width for the whole grid, leaving a single column in a
-    // pane wide enough for three.
+    // One very long name among ordinary ones mustn't set every column's width
+    // (see `MAX_COL_WIDTH`).
     #[test]
     fn one_long_filename_does_not_collapse_the_grid_to_one_column() {
         let t = Tmp::new("longname");
@@ -1494,7 +1344,7 @@ mod tests {
             t.file(&format!("file{i:02}.txt"), "");
         }
         let mut b = Browser::open(&t.0).unwrap();
-        // Narrow enough that only a couple of columns fit at once.
+        // Narrow enough that only a couple of columns fit.
         let r = rect(5, 40);
         let layout = b.layout(r);
         assert_eq!(b.scroll_col, 0);
@@ -1531,8 +1381,7 @@ mod tests {
         assert!(!b.searching);
     }
 
-    // Esc has two levels: out of the filter first, out of the browser
-    // only once there's no filter left to back out of.
+    // Esc leaves the filter first, then the browser.
     #[test]
     fn escape_leaves_the_filter_before_it_leaves_the_browser() {
         let t = Tmp::new("escape");
@@ -1544,9 +1393,8 @@ mod tests {
         assert_eq!(b.handle_key(Key::Escape, r), Outcome::Cancelled);
     }
 
-    // Whether reverse video is still in effect by the time the entry's
-    // own text starts -- which is what makes the row under the cursor
-    // look like the row under the cursor.
+    // Whether reverse video is still on when the entry's text starts, which
+    // is what marks the cursor's row.
     fn reverse_survives(prefix: &str) -> bool {
         let mut on = false;
         for esc in prefix.split('\u{1b}').skip(1) {
@@ -1563,13 +1411,8 @@ mod tests {
         on
     }
 
-    /// The cursor has to be visible on every kind of entry, not just on
-    /// the ones without a colour of their own.
-    ///
-    /// A themed colour is a full SGR run starting with a reset, so
-    /// setting reverse *before* it turned reverse off again: with the
-    /// cursor on a directory the row looked exactly like a row without
-    /// it, which reads as the browser refusing to select directories.
+    /// The cursor shows on every kind of entry, including those with colours
+    /// of their own, whose SGR runs start with a reset.
     #[test]
     fn the_cursor_is_visible_on_an_entry_that_has_its_own_colour() {
         let t = Tmp::new("cursorcolour");
@@ -1599,7 +1442,7 @@ mod tests {
         assert!(b.current().unwrap().is_parent);
         b.handle_key(Key::Tab, r);
         assert!(b.selected.is_empty());
-        // ...but it did advance, so the next Tab selects a real file.
+        // ...but it advanced, so the next Tab selects a real file.
         b.handle_key(Key::Tab, r);
         assert_eq!(b.selected.len(), 1);
     }
@@ -1657,7 +1500,7 @@ mod tests {
         assert_eq!(b.cwd.file_name().unwrap(), "nested");
         b.handle_key(Key::Backspace, r);
         assert_eq!(b.cwd, fs::canonicalize(&t.0).unwrap());
-        // Landed back *on* the directory just left, not at the top.
+        // Back on the directory just left, not at the top.
         assert_eq!(b.current().unwrap().name, "nested");
     }
 
@@ -1693,10 +1536,8 @@ mod tests {
         assert_eq!(b.cwd.file_name().unwrap(), "alpha");
     }
 
-    // Rendering is mostly escape sequences, but the one thing worth
-    // asserting directly is that no row it emits is wider than the rect
-    // it was given -- an over-wide row wraps and corrupts every pane
-    // below it.
+    // No row is wider than its rect: an over-wide row wraps and corrupts
+    // every pane below.
     #[test]
     fn no_rendered_row_overflows_the_pane_rect() {
         let t = Tmp::new("width");
@@ -1713,9 +1554,8 @@ mod tests {
         }
     }
 
-    // Splits a rendered frame into the plain text painted at each
-    // cursor-position escape, dropping SGR codes -- enough to measure
-    // row widths without reimplementing a terminal.
+    // The plain text painted at each cursor-position escape, without SGR
+    // codes: enough to measure row widths.
     fn visible_rows(frame: &str) -> Vec<String> {
         let mut rows = Vec::new();
         let mut current = String::new();
@@ -1736,8 +1576,7 @@ mod tests {
                     if !current.is_empty() {
                         rows.push(std::mem::take(&mut current));
                     }
-                    // A move to the global status row ends the pane's
-                    // own rows -- that row is terminal-wide by design.
+                    // A move to the global status row ends the pane's rows.
                     if params.split(';').next().map(|r| r.parse::<usize>().unwrap_or(0)).unwrap_or(0) > 20 {
                         break;
                     }
@@ -1758,8 +1597,7 @@ mod tests {
         let s = format!("a{family}bcdef");
         let out = fit(&s, 4);
         assert!(str_width(&out) <= 4, "{out:?}");
-        // Either the whole cluster made it or none of it did -- never a
-        // lone ZWJ or half a joined sequence.
+        // Either the whole cluster or none of it: never a lone ZWJ.
         assert!(!out.contains('\u{200D}') || out.contains('\u{1F467}'), "{out:?}");
     }
 
@@ -1789,11 +1627,8 @@ mod tests {
         assert_eq!(human_size(5 * 1024 * 1024), "5.0M");
     }
 
-    // The archive tests below all browse this one real zip (the same
-    // fixture archive.rs's own tests use, so what it contains is
-    // documented in one place): notes.txt at the root, dir/inner.json,
-    // and dir/deep/leaf.txt, with no explicit entries for the
-    // directories.
+    // The zip fixture archive.rs's tests use: notes.txt, dir/inner.json and
+    // dir/deep/leaf.txt, with no entries for the directories.
     fn zip_in(tmp: &Tmp) -> PathBuf {
         let path = tmp.0.join("sample.zip");
         fs::write(&path, include_bytes!("testdata/sample.zip")).unwrap();
@@ -1814,13 +1649,12 @@ mod tests {
         assert!(zip.is_archive, "detected by magic bytes");
         assert!(!zip.is_dir, "still a file on disk");
         assert!(!b.entries.iter().find(|e| e.name == "plain.txt").unwrap().is_archive);
-        // Archives sort with the directories, since that's how they
-        // behave on Enter.
+        // Archives sort with directories, since they behave like them on
+        // Enter.
         assert_eq!(names(&b), vec!["..", "sample.zip", "plain.txt"]);
     }
 
-    // Opening the archive directly, the way `e sample.zip` does: the
-    // browser lands *inside* it rather than failing on a non-directory.
+    // Opened directly, as `e sample.zip` does: the browser lands inside.
     #[test]
     fn opening_an_archive_lists_its_root() {
         let tmp = Tmp::new("archive-root");
@@ -1841,8 +1675,7 @@ mod tests {
         assert_eq!(b.handle_key(Key::Enter, r), Outcome::Continue, "Enter on an archive descends, it doesn't choose");
         assert_eq!(names(&b), vec!["..", "dir", "notes.txt"]);
 
-        // `dir` exists only because members are named under it -- the
-        // archive has no entry of its own for it.
+        // `dir` exists only because members are named under it.
         b.focus_name("dir");
         b.handle_key(Key::Enter, r);
         assert_eq!(names(&b), vec!["..", "deep", "inner.json"]);
@@ -1854,7 +1687,7 @@ mod tests {
                 assert_eq!(paths.len(), 1);
                 let picked = paths[0].to_string_lossy().into_owned();
                 assert!(picked.ends_with("sample.zip!/dir/inner.json"), "{picked}");
-                // And it round-trips back to the archive and the member.
+                // And it round-trips to the archive and member.
                 let (archive, inner) = crate::archive::split(&picked).unwrap();
                 assert_eq!(crate::archive::read_member(&archive, &inner).unwrap(), b"{\"a\": 1}\n");
             }
@@ -1862,9 +1695,8 @@ mod tests {
         }
     }
 
-    // Backspace walks back out the way Enter came in, ending on real
-    // disk again -- and lands on the archive it just left, the same as
-    // leaving any directory does.
+    // Backspace walks back out to real disk, landing on the archive just
+    // left.
     #[test]
     fn backspace_walks_back_out_of_an_archive_onto_disk() {
         let tmp = Tmp::new("archive-out");
@@ -1883,8 +1715,7 @@ mod tests {
         assert_eq!(b.current().map(|e| e.name.as_str()), Some("sample.zip"), "lands on what it came out of");
     }
 
-    // Ctrl-Y hands the shell the directory being *browsed* -- not
-    // whatever the cursor is on, since Enter already descends.
+    // Ctrl-Y hands over the directory being browsed, not the cursor's entry.
     #[test]
     fn ctrl_y_offers_the_directory_being_browsed() {
         let tmp = Tmp::new("cd-here");
@@ -1894,15 +1725,14 @@ mod tests {
 
         let mut b = Browser::open(&tmp.0).unwrap();
         b.set_can_change_directory(true);
-        // With the cursor on a subdirectory, it is still *this*
-        // directory that gets handed over.
+        // With the cursor on a subdirectory, it's still this directory.
         b.focus_name("sub");
         match b.handle_key(Key::CtrlY, r) {
             Outcome::ChangeDirectory(dir) => assert_eq!(dir, fs::canonicalize(&tmp.0).unwrap()),
             other => panic!("expected a directory change, got {other:?}"),
         }
 
-        // ...and after descending, it is the one descended into.
+        // ...and after descending, the one descended into.
         b.handle_key(Key::Enter, r);
         match b.handle_key(Key::CtrlY, r) {
             Outcome::ChangeDirectory(dir) => assert_eq!(dir, fs::canonicalize(&sub).unwrap()),
@@ -1910,8 +1740,7 @@ mod tests {
         }
     }
 
-    // Off unless the caller says it has a shell to move: `bish tool
-    // edit` has none.
+    // Only when the caller has a shell to move: `bish tool edit` has none.
     #[test]
     fn ctrl_y_does_nothing_when_the_caller_has_no_shell() {
         let tmp = Tmp::new("cd-not-offered");
@@ -1920,7 +1749,7 @@ mod tests {
         assert_eq!(b.handle_key(Key::CtrlY, rect(20, 80)), Outcome::Continue);
     }
 
-    // An archive member is not a directory anything can sit in.
+    // An archive member isn't a directory anything can sit in.
     #[test]
     fn ctrl_y_inside_an_archive_says_so_rather_than_offering_a_path() {
         let tmp = Tmp::new("cd-archive");
