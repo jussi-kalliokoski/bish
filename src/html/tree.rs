@@ -1,14 +1,10 @@
-// HTML tree construction, §13.2.6 -- the half of the parser that turns a
-// flat token stream into a tree, and the half that makes real-world HTML
-// work. One insertion mode per mode in the spec, named the same way.
-//
-// See the module comment in mod.rs for why this exists rather than a
-// tag-finding shortcut. The three algorithms worth knowing by name,
-// because nearly every surprising-but-correct result comes from one of
-// them: `reconstruct_active_formatting_elements` (which re-opens `<b>`
-// inside a new paragraph so `<b>a<p>b` bolds both), `adoption_agency`
-// (which un-crosses `<b>1<i>2</b>3</i>`), and `foster_parent` (which
-// moves stray content out in front of a table instead of into it).
+// HTML tree construction (§13.2.6): a flat token stream into a tree,
+// one insertion mode per spec mode, named the same. Most surprising but
+// correct results come from three algorithms:
+// `reconstruct_active_formatting_elements` (re-opens `<b>` in a new
+// paragraph, so `<b>a<p>b` bolds both), `adoption_agency` (un-crosses
+// `<b>1<i>2</b>3</i>`) and `foster_parent` (moves stray content in front
+// of a table).
 
 use super::tokenizer::{Attr, ContentState, Tag, Token, Tokenizer};
 use super::{Document, Namespace, Node, NodeData, NodeId, QuirksMode};
@@ -40,15 +36,15 @@ enum Mode {
     AfterAfterFrameset,
 }
 
-// An entry in the list of active formatting elements. A Marker is what
-// `<td>`, `<caption>` and the like push so that formatting can't leak
-// out of a cell -- see `clear_afe_to_marker`.
+// An entry in the list of active formatting elements. `<td>`,
+// `<caption>` and the like push a Marker so formatting can't leak out of
+// a cell (`clear_afe_to_marker`).
 #[derive(Debug, Clone)]
 enum Formatting {
     Marker,
-    // The tag is kept alongside the node because reconstruction has to
-    // create a *new* element "for the token for which this entry was
-    // created", attributes and all, long after that token is gone.
+    // The tag is kept because reconstruction creates a new element "for the
+    // token for which this entry was created", long after the token is
+    // gone.
     Element { node: NodeId, tag: Tag },
 }
 
@@ -151,7 +147,7 @@ const SCOPE_BASE: &[&str] = &["applet", "caption", "html", "table", "td", "th", 
 const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
 
 // SVG element names that are camelCase in the SVG DOM but lowercased by
-// the tokenizer -- §13.2.6.5's "adjust SVG tag name" table.
+// the tokenizer: §13.2.6.5's "adjust SVG tag name" table.
 const SVG_TAG_NAMES: &[(&str, &str)] = &[
     ("altglyph", "altGlyph"),
     ("altglyphdef", "altGlyphDef"),
@@ -192,8 +188,7 @@ const SVG_TAG_NAMES: &[(&str, &str)] = &[
     ("textpath", "textPath"),
 ];
 
-// §13.2.6.5's SVG attribute-name table (the same camelCase problem, for
-// attributes).
+// §13.2.6.5's SVG attribute-name table, for the same problem.
 const SVG_ATTRS: &[(&str, &str)] = &[
     ("attributename", "attributeName"),
     ("attributetype", "attributeType"),
@@ -280,9 +275,8 @@ pub struct TreeBuilder {
     // `Some` when parsing a fragment: the element the fragment is
     // notionally inside, which decides most of the rules that apply.
     fragment_context: Option<(String, Namespace)>,
-    // A newline immediately after `<pre>`/`<textarea>`/`<listing>` is
-    // dropped, so that writing the content on its own line doesn't add
-    // one.
+    // A newline right after `<pre>`, `<textarea>` or `<listing>` is
+    // dropped, so content on its own line adds none.
     ignore_lf: bool,
     done: bool,
 }
@@ -354,8 +348,6 @@ impl TreeBuilder {
         self.doc.errors.push(what.to_string());
     }
 
-    // ---- tree primitives -------------------------------------------
-
     fn new_element(&mut self, name: &str, ns: Namespace, attrs: Vec<Attr>) -> NodeId {
         self.doc.nodes.push(Node { data: NodeData::Element { name: name.to_string(), ns, attrs }, parent: None, children: Vec::new() });
         self.doc.nodes.len() - 1
@@ -408,10 +400,9 @@ impl TreeBuilder {
         (target, None)
     }
 
-    // "Foster parenting": text and elements that show up where only rows
-    // and cells are allowed go *before* the table rather than inside it,
-    // which is what makes `<table><b>x</b></table>` put the `<b>` in
-    // front of the table like every browser does.
+    // Foster parenting: text and elements where only rows and cells are
+    // allowed go before the table, so `<table><b>x</b></table>` puts the
+    // `<b>` in front, as browsers do.
     fn foster_parent(&mut self) -> (NodeId, Option<usize>) {
         let last_table = self.open.iter().rposition(|&id| self.is_html(id, "table"));
         match last_table {
@@ -477,8 +468,6 @@ impl TreeBuilder {
         }
     }
 
-    // ---- stack and scope -------------------------------------------
-
     fn has_in_scope_with(&self, name: &str, extra: &[&str]) -> bool {
         for &id in self.open.iter().rev() {
             if self.is_html(id, name) {
@@ -541,9 +530,8 @@ impl TreeBuilder {
         HEADINGS.iter().any(|h| self.has_in_scope(h))
     }
 
-    // "Generate implied end tags": the elements that close themselves
-    // when something else starts, which is what makes `<li>a<li>b` two
-    // items rather than nested ones.
+    // "Generate implied end tags": elements that close when something
+    // else starts, so `<li>a<li>b` is two items.
     fn generate_implied_end_tags(&mut self, except: &str) {
         while let Some(&id) = self.open.last() {
             let name = self.name_of(id);
@@ -613,9 +601,8 @@ impl TreeBuilder {
         }
     }
 
-    // §13.2.6.3: what mode to be in, derived from the stack -- used
-    // whenever a mode is left behind (a cell closing, a table closing)
-    // and by the fragment case at startup.
+    // §13.2.6.3: the mode derived from the stack, whenever a mode is left
+    // (a cell or table closing) and at the start of a fragment parse.
     fn reset_insertion_mode(&mut self) {
         for i in (0..self.open.len()).rev() {
             let id = self.open[i];
@@ -669,12 +656,10 @@ impl TreeBuilder {
         self.mode = Mode::InBody;
     }
 
-    // ---- active formatting elements --------------------------------
-
     fn push_afe(&mut self, node: NodeId, tag: Tag) {
-        // The "Noah's Ark clause": at most three entries with the same
-        // tag name and attributes may be in the list at once, or deeply
-        // repeated formatting would grow the tree without bound.
+        // The "Noah's Ark clause": at most three entries with the same tag
+        // and attributes, or repeated formatting would grow the tree
+        // without bound.
         let mut matches = Vec::new();
         for (i, entry) in self.afe.iter().enumerate().rev() {
             match entry {
@@ -705,9 +690,9 @@ impl TreeBuilder {
         self.afe.iter().position(|e| matches!(e, Formatting::Element { node: n, .. } if *n == node))
     }
 
-    // §13.2.6.4.7's own "reconstruct" step: re-open any formatting
-    // element that is still active but no longer on the stack. This is
-    // what makes `<b>a<p>b</p>` bold the second paragraph too.
+    // §13.2.6.4.7's "reconstruct": re-open formatting elements still
+    // active but no longer on the stack, so `<b>a<p>b</p>` bolds the second
+    // paragraph too.
     fn reconstruct_afe(&mut self) {
         let Some(last) = self.afe.last() else { return };
         match last {
@@ -734,7 +719,7 @@ impl TreeBuilder {
                 _ => {}
             }
         }
-        // ...then re-create every entry from there on.
+        // Then re-create every entry from there on.
         while i < self.afe.len() {
             let Formatting::Element { tag, .. } = self.afe[i].clone() else {
                 i += 1;
@@ -746,11 +731,10 @@ impl TreeBuilder {
         }
     }
 
-    // §13.2.6.4.7, the adoption agency algorithm: the one that
-    // un-crosses misnested formatting, so `<p>1<b>2<i>3</b>4</i>5` ends
-    // up with the `<i>` split across two parents rather than the tree
-    // simply being wrong. Returns false when the caller should fall
-    // through to "any other end tag".
+    // §13.2.6.4.7's adoption agency algorithm, which un-crosses misnested
+    // formatting: `<p>1<b>2<i>3</b>4</i>5` splits the `<i>` across two
+    // parents. False when the caller should fall through to "any other end
+    // tag".
     fn adoption_agency(&mut self, subject: &str) -> bool {
         // Step 2: the simple case, where the element is current and not
         // being tracked as formatting.
@@ -789,8 +773,8 @@ impl TreeBuilder {
                 self.error("formatting element is not the current node");
             }
 
-            // Step 10: the furthest block -- the first *special* element
-            // below the formatting element.
+            // Step 10: the furthest block, the first special element below
+            // the formatting element.
             let furthest = (stack_index + 1..self.open.len()).find(|&i| {
                 let id = self.open[i];
                 self.ns_of(id) == Namespace::Html && SPECIAL.contains(&self.name_of(id))
@@ -893,25 +877,15 @@ impl TreeBuilder {
         true
     }
 
-    // ---- token dispatch --------------------------------------------
-
     fn process(&mut self, token: Token) {
-        // Past this many open elements a start tag is dropped on the
-        // floor, the same thing browsers do (Blink's own limit is 512)
-        // and for the same two reasons. The spec's algorithms are
-        // written against the stack of open elements -- "have an element
-        // in scope", "reconstruct the active formatting elements" --
-        // so per-token work grows with depth and a file of nothing but
-        // `<div>` is quadratic: 8000 of them take 6.7s here, 50000 take
-        // eight minutes. And every consumer of the finished tree walks
-        // it recursively (see markdown::render::html_runs), which a
-        // depth nothing bounds turns into a stack overflow.
-        //
-        // Dropping the token rather than the element keeps the parser's
-        // own invariants intact: nothing further down ever sees it, so
-        // no rule has to cope with an element that was inserted but not
-        // opened. Content inside still parses; it just attaches to the
-        // deepest element that fit.
+        // Past this many open elements a start tag is dropped, as browsers
+        // do (Blink's limit is 512). The spec's algorithms scan the stack
+        // of open elements, so a file of nothing but `<div>` is quadratic,
+        // and every consumer walks the tree recursively
+        // (`markdown::render::html_runs`), so unbounded depth would
+        // overflow the stack. Dropping the token, not the element, keeps
+        // the parser's invariants: its content attaches to the deepest
+        // element that fit.
         const MAX_OPEN_ELEMENTS: usize = 512;
         if self.open.len() >= MAX_OPEN_ELEMENTS && matches!(token, Token::StartTag(_)) {
             return;
@@ -1018,10 +992,9 @@ pub(super) fn adjust_foreign_attrs(ns: Namespace, attrs: &mut [Attr]) {
     }
 }
 
-// The insertion modes themselves. Each returns `true` when the spec says
-// to reprocess the token in the (now changed) mode -- the one control-
-// flow idea that makes these read like the spec instead of like a pile
-// of nested conditions.
+// The insertion modes. Each returns `true` when the spec says to
+// reprocess the token in the now-changed mode, which keeps them
+// reading like the spec.
 impl TreeBuilder {
     fn initial(&mut self, token: &Token) -> bool {
         match token {
@@ -1047,9 +1020,8 @@ impl TreeBuilder {
                 false
             }
             _ => {
-                // A document with no doctype is a quirks-mode document,
-                // which is the rule that keeps decades of pages
-                // rendering the way they were written.
+                // No doctype means quirks mode, which keeps old pages
+                // rendering as written.
                 self.doc.quirks = QuirksMode::Quirks;
                 self.mode = Mode::BeforeHtml;
                 true
@@ -1152,10 +1124,9 @@ impl TreeBuilder {
                 self.generic_rawtext(tag);
                 false
             }
-            // Scripting is disabled here (there is no script host), so
-            // `<noscript>` in the head is parsed rather than treated as
-            // raw text -- which is the branch a browser with JavaScript
-            // turned off takes too.
+            // No script host, so scripting is off and `<noscript>` in the
+            // head is parsed, not raw text, as in a browser with JavaScript
+            // disabled.
             Token::StartTag(tag) if tag.name == "noscript" => {
                 self.insert_element(tag, Namespace::Html);
                 self.mode = Mode::InHeadNoscript;
@@ -1272,9 +1243,8 @@ impl TreeBuilder {
                 self.mode = Mode::InFrameset;
                 false
             }
-            // Head content that turned up after the head closed: the
-            // head is temporarily pushed back so it lands in the right
-            // place, then removed again.
+            // Head content after the head closed: the head is pushed back
+            // temporarily so it lands there.
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
@@ -1347,9 +1317,8 @@ impl TreeBuilder {
     }
 }
 
-// "In body", by a wide margin the largest mode -- most of a document is
-// parsed here, and most of the interesting recovery behaviour lives in
-// it.
+// "In body", the largest mode: most of a document and most recovery
+// behaviour.
 impl TreeBuilder {
     fn in_body(&mut self, token: &Token) -> bool {
         match token {
@@ -1358,9 +1327,9 @@ impl TreeBuilder {
                 false
             }
             Token::Char(c) => {
-                // A newline right after <pre>/<listing>/<textarea> is
-                // dropped, so writing the content on its own line
-                // doesn't add a blank one.
+                // A newline right after `<pre>`, `<listing>` or
+                // `<textarea>` is dropped, so content on its own line adds
+                // no blank one.
                 if self.ignore_lf {
                     self.ignore_lf = false;
                     if *c == '\n' {
@@ -1519,9 +1488,9 @@ impl TreeBuilder {
                 }
                 false
             }
-            // `<li>` closing the previous `<li>` -- and the search
-            // stopping at a *special* element, so a list item inside a
-            // `<div>` inside a list item doesn't close the outer one.
+            // `<li>` closes the previous `<li>`, the search stopping at a
+            // special element, so an item in a `<div>` in an item doesn't
+            // close the outer one.
             Token::StartTag(tag) if tag.name == "li" => {
                 self.frameset_ok = false;
                 for i in (0..self.open.len()).rev() {
@@ -1587,9 +1556,8 @@ impl TreeBuilder {
                 self.frameset_ok = false;
                 false
             }
-            // `<a>` inside `<a>`: the outer one is closed by the
-            // adoption agency first, which is why nested links never
-            // nest in a real tree.
+            // `<a>` inside `<a>`: the adoption agency closes the outer one
+            // first, so links never nest.
             Token::StartTag(tag) if tag.name == "a" => {
                 let existing = self.afe.iter().rev().find_map(|e| match e {
                     Formatting::Marker => None,
@@ -1848,8 +1816,8 @@ impl TreeBuilder {
                 }
                 false
             }
-            // A `</p>` with no `<p>` open creates an empty one, which is
-            // the spec's own recovery and not a mistake here.
+            // A `</p>` with no `<p>` open creates an empty one: the spec's
+            // recovery.
             Token::EndTag(tag) if tag.name == "p" => {
                 if !self.has_in_button_scope("p") {
                     self.error("</p> with no open paragraph");
@@ -1927,10 +1895,9 @@ impl TreeBuilder {
         }
     }
 
-    // §13.2.6.4.7's "any other end tag": walk down the stack looking for
-    // a match, stopping at the first *special* element -- which is what
-    // makes a stray `</div>` inside a `<p>` do nothing rather than close
-    // something it shouldn't.
+    // §13.2.6.4.7's "any other end tag": walk down the stack for a match,
+    // stopping at the first special element, so a stray `</div>` in a `<p>`
+    // does nothing.
     fn any_other_end_tag(&mut self, name: &str) -> bool {
         for i in (0..self.open.len()).rev() {
             let id = self.open[i];
@@ -1960,8 +1927,8 @@ impl TreeBuilder {
         }
     }
 
-    // The spec's own list of elements that may still be open when a
-    // document ends without complaint; anything else is a parse error.
+    // The elements that may be open at the end of a document without a
+    // parse error.
     fn check_open_at_eof(&mut self) {
         let bad = self.open.iter().any(|&id| {
             !matches!(
@@ -1991,9 +1958,8 @@ impl TreeBuilder {
     }
 }
 
-// The table modes. Tables have their own modes at all because a table's
-// content model is strict enough that browsers had to agree on where
-// everything *else* goes -- which is foster parenting, below.
+// The table modes. A table's content model is strict, so where
+// everything else goes had to be agreed: foster parenting.
 impl TreeBuilder {
     fn clear_stack_to(&mut self, names: &[&str]) {
         while let Some(&id) = self.open.last() {
@@ -2101,8 +2067,8 @@ impl TreeBuilder {
                 false
             }
             Token::Eof => self.in_body(token),
-            // Anything a table has no place for is foster parented: it
-            // ends up immediately *before* the table in the tree.
+            // Anything a table has no place for is foster parented, just
+            // before the table.
             _ => {
                 self.error("content in a table that cannot go there");
                 self.foster = true;
@@ -2113,9 +2079,8 @@ impl TreeBuilder {
         }
     }
 
-    // Character data inside a table is buffered, because whether it may
-    // stay depends on whether the whole run turns out to be whitespace
-    // -- which isn't known until the run ends.
+    // Text in a table is buffered: whether it may stay depends on whether
+    // the whole run is whitespace.
     fn in_table_text(&mut self, token: &Token) -> bool {
         match token {
             Token::Char('\0') => {
@@ -2477,8 +2442,7 @@ impl TreeBuilder {
                 self.reset_insertion_mode();
                 false
             }
-            // A nested `<select>` closes the outer one instead of
-            // nesting -- select elements cannot contain each other.
+            // A nested `<select>` closes the outer one; selects can't nest.
             Token::StartTag(tag) if tag.name == "select" => {
                 self.error("nested <select>");
                 if !self.has_in_select_scope("select") {
@@ -2738,9 +2702,8 @@ impl TreeBuilder {
         }
     }
 
-    // §13.2.6.5, "the rules for parsing tokens in foreign content":
-    // inside `<svg>` or `<math>`, HTML's own element rules don't apply,
-    // and a tag that clearly belongs to HTML breaks back out to it.
+    // §13.2.6.5, foreign content: inside `<svg>` or `<math>`, HTML's
+    // element rules don't apply, and a clearly HTML tag breaks back out.
     fn foreign_content(&mut self, token: &Token) -> bool {
         match token {
             Token::Char('\0') => {
@@ -2763,8 +2726,7 @@ impl TreeBuilder {
                 self.error("doctype in foreign content");
                 false
             }
-            // An unmistakably-HTML tag inside foreign content closes out
-            // of it rather than being treated as an SVG/MathML element.
+            // A clearly HTML tag closes out of foreign content.
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
@@ -2879,10 +2841,8 @@ impl TreeBuilder {
     }
 }
 
-// §13.2.6.4.1's quirks-mode table, trimmed to the prefixes that actually
-// occur: a doctype that isn't plain `<!DOCTYPE html>` puts the document
-// in quirks or limited-quirks mode, which is a property of the parse
-// even though nothing here lays out CSS.
+// §13.2.6.4.1's quirks table, trimmed to prefixes that occur: a doctype
+// other than `<!DOCTYPE html>` gives quirks or limited-quirks mode.
 fn quirks_for(force: bool, name: &str, public_id: &str, system_id: &str) -> QuirksMode {
     if force || name != "html" {
         return QuirksMode::Quirks;
@@ -2933,13 +2893,9 @@ fn quirks_for(force: bool, name: &str, public_id: &str, system_id: &str) -> Quir
 
 #[cfg(test)]
 mod tests {
-    // The spec's algorithms are written against the stack of open
-    // elements -- "have an element in scope" walks it, "reconstruct the
-    // active formatting elements" walks it -- so per-token work grows
-    // with depth and a document of nothing but `<div>` is quadratic:
-    // 8000 of them measured 6.7s before this cap, 38ms after. The tree
-    // it produced was also deeper than any recursive consumer could
-    // walk (markdown::render::html_runs overflowed the stack on it).
+    // The stack depth cap: a document of nothing but `<div>` would be
+    // quadratic, and too deep for recursive consumers
+    // (`markdown::render::html_runs`).
     #[test]
     fn nesting_stops_deepening_past_the_open_element_limit() {
         let src = format!("{}x{}", "<div>".repeat(20000), "</div>".repeat(20000));
@@ -2947,7 +2903,7 @@ mod tests {
         let (doc, roots) = crate::html::parse_fragment(&src, "div");
         assert!(started.elapsed().as_secs() < 10, "20k nested divs must not be quadratic");
 
-        // Depth measured without recursing, which is the whole point.
+        // Depth measured without recursing.
         let mut deepest = 0;
         let mut stack: Vec<(crate::html::NodeId, usize)> = roots.iter().map(|&r| (r, 1)).collect();
         while let Some((node, depth)) = stack.pop() {
@@ -2959,17 +2915,15 @@ mod tests {
 
     use super::super::{parse, parse_fragment};
 
-    // Trees are compared in html5lib-tests' own indented format (see
-    // Document::to_test_format), so an expectation reads as the tree it
-    // describes rather than as a chain of index lookups.
+    // Trees are compared in html5lib-tests' format
+    // (`Document::to_test_format`), so an expectation reads as a tree.
     fn assert_tree(input: &str, expected: &str) {
         let doc = parse(input);
         let got = doc.to_test_format();
-        // The expectations are written indented to sit nicely in the
-        // source; the common leading indent is removed rather than all
-        // leading space, since the *relative* indent is the tree shape.
-        // Blank lines are the raw string's own framing, not part of the
-        // tree -- every real line starts with `|`.
+        // The expectations are indented to sit in the source, so the common
+        // indent is removed, keeping the relative indent that is the tree's
+        // shape. Blank lines are the raw string's framing; real lines start
+        // with `|`.
         let lines: Vec<&str> = expected.lines().filter(|l| !l.trim().is_empty()).collect();
         let dedent = lines.iter().map(|l| l.len() - l.trim_start_matches(' ').len()).min().unwrap_or(0);
         let want: String = lines.iter().map(|l| format!("{}\n", &l[dedent..])).collect();
@@ -3006,9 +2960,8 @@ mod tests {
         );
     }
 
-    // The adoption agency algorithm's own headline case: the `<i>` has
-    // to end up split across two parents, one inside the `<b>` and one
-    // after it.
+    // The adoption agency's headline case: the `<i>` split across two
+    // parents, inside the `<b>` and after it.
     #[test]
     fn misnested_formatting_is_un_crossed() {
         assert_tree(
@@ -3030,10 +2983,8 @@ mod tests {
         );
     }
 
-    // Reconstruction: `</p>` pops the `<b>` off the stack but leaves it
-    // in the list of active formatting elements, so the next paragraph
-    // gets a fresh `<b>` of its own and is bold too -- without the
-    // document ever saying so.
+    // `</p>` pops the `<b>` but leaves it in the active formatting list, so
+    // the next paragraph gets its own `<b>` and is bold too.
     #[test]
     fn active_formatting_is_reconstructed_in_the_next_block() {
         assert_tree(
@@ -3052,9 +3003,8 @@ mod tests {
         );
     }
 
-    // A `<p>` does not close an open `<b>`: the paragraph opens *inside*
-    // it, which is the counterpart to the reconstruction case above and
-    // the reason that one needs the `</p>`.
+    // A `<p>` doesn't close an open `<b>`: the paragraph opens inside it,
+    // which is why the case above needs the `</p>`.
     #[test]
     fn a_paragraph_opens_inside_an_open_formatting_element() {
         assert_tree(
@@ -3071,8 +3021,6 @@ mod tests {
         );
     }
 
-    // Foster parenting: content a table has no place for is moved out in
-    // front of the table rather than into it.
     #[test]
     fn stray_content_in_a_table_is_foster_parented_before_it() {
         assert_tree(
@@ -3088,8 +3036,6 @@ mod tests {
         );
     }
 
-    // Implied end tags: a new `<li>` closes the previous one instead of
-    // nesting inside it.
     #[test]
     fn a_list_item_closes_the_previous_one() {
         assert_tree(
@@ -3107,10 +3053,10 @@ mod tests {
         );
     }
 
-    // The search up the stack stops at a special element -- except for
-    // `address`, `div` and `p`, which it steps straight through. So a
-    // list item inside a `div` still closes the outer item (leaving the
-    // div behind, empty), while one inside a `<table>` would not.
+    // The search up the stack stops at a special element, except
+    // `address`, `div` and `p`, which it passes: an item inside a `div`
+    // still closes the outer item (leaving the div empty), one inside a
+    // `<table>` doesn't.
     #[test]
     fn the_list_item_search_steps_through_a_div_but_not_a_table() {
         assert_tree(
@@ -3160,7 +3106,6 @@ mod tests {
         );
     }
 
-    // Implied end tags again, in a table: `<td>a<td>b` is two cells.
     #[test]
     fn cells_and_rows_close_themselves() {
         assert_tree(
@@ -3199,8 +3144,6 @@ mod tests {
         );
     }
 
-    // A stray end tag stops at the first special element rather than
-    // closing something it has no business closing.
     #[test]
     fn a_stray_end_tag_closes_nothing() {
         assert_tree(
@@ -3215,9 +3158,8 @@ mod tests {
         );
     }
 
-    // `</p>` with nothing open creates an empty paragraph -- the spec's
-    // own recovery, not a bug here. (Before the body has started it is
-    // simply dropped instead, which the second case pins.)
+    // `</p>` with nothing open makes an empty paragraph; before the body
+    // starts it's dropped, as the second case pins.
     #[test]
     fn an_unmatched_paragraph_end_tag_creates_an_empty_paragraph() {
         assert_tree(
@@ -3305,8 +3247,6 @@ mod tests {
         );
     }
 
-    // An unmistakably-HTML tag inside foreign content breaks back out of
-    // it rather than becoming an SVG element.
     #[test]
     fn an_html_block_inside_svg_breaks_out_of_it() {
         assert_tree(
@@ -3336,8 +3276,7 @@ mod tests {
         );
     }
 
-    // The fragment case, which is what markdown actually uses: no
-    // synthetic html/head/body, just the nodes that were written.
+    // The fragment case markdown uses: no synthetic html, head or body.
     #[test]
     fn a_fragment_parses_without_the_document_scaffolding() {
         let (doc, roots) = parse_fragment("<b>bold</b> and <i>italic</i>", "div");
@@ -3353,15 +3292,14 @@ mod tests {
         assert_eq!(doc.text_content(roots[2]), "italic");
     }
 
-    // A fragment's context element decides the rules: rows only make
-    // sense inside a table.
+    // The context element decides: rows only belong in a table.
     #[test]
     fn a_fragment_is_parsed_in_the_context_it_was_given() {
         let (doc, roots) = parse_fragment("<tr><td>a</td></tr>", "tbody");
         assert_eq!(roots.len(), 1);
         assert_eq!(doc.node(roots[0]).name(), Some("tr"));
 
-        // The same markup in a div context has nowhere to put a row.
+        // In a div context there's nowhere for a row.
         let (doc, roots) = parse_fragment("<tr><td>a</td></tr>", "div");
         assert_eq!(roots.len(), 1);
         assert_eq!(doc.text_content(roots[0]), "a");
@@ -3382,8 +3320,8 @@ mod tests {
         assert_eq!(parse(r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">"#).quirks, QuirksMode::Quirks);
     }
 
-    // Malformed input has to terminate and produce *something*: every
-    // prefix of a document with every kind of nesting mistake in it.
+    // Malformed input terminates and produces something: every prefix of a
+    // document with every kind of nesting mistake.
     #[test]
     fn every_truncation_of_a_gnarly_document_terminates() {
         let doc = "<!DOCTYPE html><table><b>x<tr><td><p>1<b>2<i>3</b>4</i><select><option>o</table><svg><foreignObject><ul><li>a<li>b</svg></p>";
@@ -3401,13 +3339,9 @@ mod tests {
 mod real_world_tests {
     use super::super::parse;
 
-    // Every HTML file this machine happens to have documentation in,
-    // parsed and sanity-checked. Not a conformance suite -- these are
-    // real documents, not tricky ones -- but it is real markup written
-    // by real tools, which is what catches a parser that only works on
-    // the examples it was written against. Skipped where there's no such
-    // directory, the same "quietly unavailable" contract the git and
-    // archive tests use.
+    // Every HTML documentation file on this machine, parsed and checked:
+    // not tricky input, but real markup from real tools. Skipped without
+    // the directory.
     #[test]
     fn parses_every_html_document_this_machine_has() {
         let mut checked = 0;
@@ -3425,14 +3359,12 @@ mod real_world_tests {
                         continue;
                     }
                     let doc = parse(&text);
-                    // Every document ends up with the three elements it
-                    // is required to have, whatever it actually wrote.
+                    // Every document has its three required elements.
                     assert!(doc.find("html").is_some(), "{}", path.display());
                     assert!(doc.find("head").is_some(), "{}", path.display());
                     assert!(doc.find("body").is_some(), "{}", path.display());
-                    // Every node reachable from the root has that root
-                    // as an ancestor -- the parent/child links can't
-                    // have come apart during reparenting.
+                    // Every node reachable from the root has it as an
+                    // ancestor: reparenting kept the links consistent.
                     check_links(&doc, doc.root);
                     checked += 1;
                 }
