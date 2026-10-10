@@ -10286,13 +10286,8 @@ impl Shell {
         } else {
             snap.insert("COLORTERM".to_string(), colorterm.to_string());
         }
-        // And into the variables, which is what a spawned command now
-        // reads (see `Shell::command`). Reattaching a session to a
-        // different terminal used to reach a child through the real
-        // process environment, which this wrote by way of
-        // `sync_real_state_in`; children no longer read that, so a
-        // `TERM` updated only there would have been invisible to every
-        // program the session went on to run.
+        // And into the variables, which is what a spawned command reads (see
+        // `Shell::command`).
         if !term.is_empty() {
             self.assign_var("TERM", term.to_string());
             Rc::make_mut(&mut self.exported_names).insert("TERM".to_string());
@@ -10305,18 +10300,9 @@ impl Shell {
         }
     }
 
-    // `set -u`: only a *bare* $VAR/${VAR} reference to a truly-unset name
-    // triggers this -- ${VAR:-default}/${VAR-default}/${VAR?msg} etc are
-    // explicitly exempt in bash (checking for unset is their whole point),
-    // so this is only called from the plain Chunk::Var expansion sites, not
-    // from eval_var_op/eval_array_var_op.
-    // xorshift64* -- simple, fast, no external RNG crate. Bash's $RANDOM
-    // range is 0..32767.
-    // `command -v`/`-V name`: reports what `name` resolves to (function,
-    // builtin, or a PATH-resolved executable) without running it. Prints
-    // nothing and returns 1 if it doesn't resolve to anything, matching
-    // bash -- this is what makes `command -v foo >/dev/null` work as an
-    // existence check.
+    // `command -v`/`-V`: what `name` resolves to (function, builtin or PATH
+    // executable), without running it. Prints nothing and returns 1 when
+    // nothing matches, which makes `command -v foo >/dev/null` a test.
     fn command_v(&mut self, name: &str, verbose: bool) -> i32 {
         if self.functions.contains_key(name) {
             sh_println!(self, "{}", if verbose { format!("{} is a function", name) } else { name.to_string() });
@@ -10335,6 +10321,7 @@ impl Shell {
         }
     }
 
+    // `$RANDOM`: xorshift64, 0 to 32767 as in bash.
     fn next_random(&mut self) -> u32 {
         let mut x = self.rng_state;
         x ^= x << 13;
@@ -10344,16 +10331,8 @@ impl Shell {
         ((x >> 33) % 32768) as u32
     }
 
-    // `${x!y}`, `${1bad}`, `${a[}`: brace content that is not a
-    // parameter name at all. The lexer hands it here as an ordinary
-    // name because that is what it looks like from outside; nothing
-    // could ever set it, so reading it as an unset variable turns a
-    // typo into an empty string. Reports it and marks the command
-    // failed, which is what bash does.
-    // Fatal in a script, the way bash has it -- `${x!y}` is a typo, and
-    // every line after it was written expecting the value it did not
-    // get. An interactive session just fails the command, as with a
-    // refused readonly write.
+    // A script stops on a failed expansion, as in bash; an interactive
+    // session only fails the command.
     fn take_expansion_failure(&mut self) -> Option<ExecResult> {
         if !std::mem::take(&mut self.expansion_failed) {
             return None;
@@ -10365,6 +10344,9 @@ impl Shell {
         Some(ExecResult::Exit(1))
     }
 
+    // `${x!y}`, `${1bad}`, `${a[}`: brace content that isn't a parameter
+    // name. The lexer passes it as a name; reading it as unset would turn a
+    // typo into an empty string, so it's reported and fails, as in bash.
     fn check_param_name(&mut self, name: &str) {
         if is_parameter_name(name) {
             return;
@@ -10373,6 +10355,8 @@ impl Shell {
         self.expansion_failed = true;
     }
 
+    // `set -u`, for a bare `$VAR`: the operators (`${VAR:-x}`, `${VAR?}`)
+    // exist to test for unset, so `eval_var_op` doesn't call this.
     fn check_nounset(&mut self, name: &str) {
         if !self.opt_nounset {
             return;
@@ -10380,22 +10364,18 @@ impl Shell {
         if self.var_is_set(name) {
             return;
         }
-        // bash names a positional with its `$`, and an ordinary
-        // variable without one.
+        // bash shows a positional with its `$`, a variable without.
         let shown = match name.chars().all(|c| c.is_ascii_digit()) {
             true => format!("${}", name),
             false => name.to_string(),
         };
         sh_eprintln!(self, "bish: {}: unbound variable", shown);
-        // 127, the status bash uses for an unbound variable under
-        // `set -u` -- not 1. Checked against bash 5.3.
+        // 127, as in bash 5.3.
         self.pending_exit = Some(127);
     }
 
-    // Whether `name` is a variable that's actually been assigned, as
-    // opposed to merely evaluating to an empty string -- the distinction
-    // `${V-x}`/`${V+x}` (unset only) need vs. `${V:-x}`/`${V:+x}` (unset OR
-    // empty). Special/positional parameters always count as set.
+    // Whether `name` has been assigned, as opposed to being empty: `${V-x}`
+    // asks this, `${V:-x}` asks about either.
     pub(crate) fn var_is_set(&self, name: &str) -> bool {
         let resolved;
         let name = if self.nameref_names.contains(name) {
@@ -10404,10 +10384,8 @@ impl Shell {
         } else {
             name
         };
-        // Special/positional parameters and the magic variables
-        // lookup_var computes on demand (RANDOM, SECONDS, PPID, ...) are
-        // always considered set, even under `set -u` -- matching bash,
-        // which never treats these as unbound.
+        // Special parameters and the computed variables (`RANDOM`, `SECONDS`,
+        // `PPID`, ...) are always set, even under `set -u`, as in bash.
         let is_special = matches!(
             name,
             "?" | "0"
@@ -10437,18 +10415,15 @@ impl Shell {
         if is_special {
             return true;
         }
-        // A positional is set only when there is one at that position:
-        // `$1` with no arguments is exactly what `set -u` exists to
-        // catch, and treating every digit as always-set exempted the
-        // whole family from it. (`$0` is in the list above -- it is the
-        // shell's own name and always there.)
+        // A positional is set only when there is an argument at that
+        // position: `$1` with no arguments is what `set -u` is for. (`$0`
+        // is above.)
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             let index: usize = name.parse().unwrap_or(0);
             return index <= self.arg_frames.last().map(Vec::len).unwrap_or(0);
         }
-        // The innermost scope holding the name decides: a `local x`
-        // with no value shadows as *unset*, so the search stops there
-        // rather than falling through to whatever the caller had.
+        // The innermost scope holding the name decides: a valueless `local x`
+        // shadows as unset.
         for scope in self.var_scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return v.is_some();
@@ -10457,23 +10432,16 @@ impl Shell {
         self.global_get(name).is_some() || self.inherited_var(name).is_some()
     }
 
-    // Plain assignment targets the global (process-env) variable, unless it
-    // shadows an existing `local` of the same name in the current function
-    // scope -- matching bash, where functions don't auto-localize vars.
-    // Returns false when the name is readonly and the write was
-    // refused -- the message is already printed by then. Most callers
-    // have nothing to do with that; the ones that owe the shell an
-    // exit status (a bare `x=2` command, `declare`, `local`) check it.
+    // Assigns to the innermost local of that name, else the global: bash
+    // functions don't localize. False when the name is readonly and the
+    // write was refused, after the message.
     pub(crate) fn assign_var(&mut self, name: &str, value: String) -> bool {
         self.assign_var_impl(name, value, false)
     }
 
-    // What `name+=v` assigns. Concatenation, except for a name carrying
-    // the integer attribute, where bash makes it addition:
-    // `declare -i n=3; n+=2` is 5, not "32". Every `+=` on a scalar
-    // goes through here -- the prefix-assignment form (`n+=2 cmd`) and
-    // the environment a child is built with included, since those read
-    // the same variable.
+    // What `name+=v` assigns: concatenation, or addition with the integer
+    // attribute (`declare -i n=3; n+=2` is 5). Every scalar `+=` goes
+    // through here, prefix assignments included.
     pub(crate) fn appended_value(&mut self, name: &str, v: &str) -> String {
         if self.integer_names.contains(name) {
             let current = self.lookup_var(name);
@@ -10484,32 +10452,24 @@ impl Shell {
         self.lookup_var(name) + v
     }
 
-    /// Assigns and marks exported, the way `export NAME=value` does --
-    /// without going through the lexer and parser to say so.
+    /// `export NAME=value` without going through the parser.
     pub fn export_var(&mut self, name: &str, value: String) {
         Rc::make_mut(&mut self.exported_names).insert(name.to_string());
         self.assign_var(name, value.clone());
         self.export_to_environment(name, &value);
     }
 
-    // `declare -g`/`local -g`: same readonly guard, SECONDS/RANDOM
-    // specials, integer/case-fold attributes, and export mirroring as
-    // assign_var, but always writes straight to the true global
-    // (process-env) scope, bypassing any same-named local shadow in the
-    // current function -- unlike assign_var/raw_var_write, which target
-    // whichever scope already shadows the name.
+    // `declare -g`/`local -g`: `assign_var`, but always to the global,
+    // past any local of the same name.
     pub(crate) fn assign_var_global(&mut self, name: &str, value: String) -> bool {
         self.assign_var_impl(name, value, true)
     }
 
     fn assign_var_impl(&mut self, name: &str, value: String, force_global: bool) -> bool {
-        // Assigning OPTIND puts `getopts` back at the start of a word,
-        // even when the value assigned is the one already there. bash
-        // resets on the assignment rather than on the value, so
-        // `OPTIND=1` restarts a scan that was halfway through `-ab`
-        // -- and there is nowhere else to notice that happening.
-        // `getopts` therefore records its own position *after* it
-        // assigns, never before. See run_getopts.
+        // Assigning OPTIND restarts `getopts`, even with the same value: bash
+        // resets on the assignment, so `OPTIND=1` restarts a scan halfway
+        // through `-ab`. `getopts` records its position after assigning. See
+        // `run_getopts`.
         if name == "OPTIND" {
             self.getopts_offset = 0;
         }
@@ -10524,27 +10484,23 @@ impl Shell {
             sh_eprintln!(self, "bish: {}: readonly variable", name);
             return false;
         }
-        // `SECONDS=n` resets the elapsed-time counter to start counting
-        // from n, matching bash -- lookup_var computes it live rather
-        // than storing it, so the assignment records an offset instead of
-        // writing a var_scopes/env entry.
+        // `SECONDS=n` restarts the count from n: `lookup_var` computes it, so
+        // this records an offset.
         if name == "SECONDS" {
             if let Ok(n) = value.trim().parse::<i64>() {
                 self.seconds_offset = n - self.shell_start.elapsed().as_secs() as i64;
             }
             return true;
         }
-        // `RANDOM=n` reseeds the generator, matching bash (rather than
-        // making $RANDOM a static value forever).
+        // `RANDOM=n` reseeds the generator, as in bash.
         if name == "RANDOM" {
             if let Ok(n) = value.trim().parse::<u64>() {
                 self.rng_state = if n == 0 { 0x2545F4914F6CDD1D } else { n };
             }
             return true;
         }
-        // `declare -i`/`local -i`: the assigned text is evaluated as an
-        // arithmetic expression rather than stored literally (bash: `n="2+3"`
-        // on an integer-attribute variable stores 5, not the string "2+3").
+        // `declare -i`: the value is evaluated as arithmetic (`n="2+3"`
+        // stores 5).
         let value = if self.integer_names.contains(name) { arith::eval(&value, self).unwrap_or(0).to_string() } else { value };
         // `declare -u`/`-l`: case-fold on every assignment.
         let value = if self.upper_names.contains(name) {
@@ -10554,10 +10510,8 @@ impl Shell {
         } else {
             value
         };
-        // `declare -a b; b=x` writes element 0, not a scalar `b` that
-        // shadows the array -- the attribute decides, so it applies to a
-        // name that was declared and never assigned as much as to one
-        // that already holds values.
+        // `declare -a b; b=x` writes element 0 rather than a scalar shadowing
+        // the array, whether or not the array holds anything yet.
         if self.assoc_names.contains(name) {
             self.assoc_arrays.entry(name.to_string()).or_default().insert("0".to_string(), value);
             return true;
@@ -10567,8 +10521,8 @@ impl Shell {
             return true;
         }
         if force_global {
-            // Bypass any local shadow entirely -- raw_var_write would
-            // just update that shadow instead, same as plain assignment.
+            // Past any local shadow, which `raw_var_write` would update
+            // instead.
             self.global_set(name, value.clone());
             self.export_to_environment(name, &value);
             return true;
@@ -10581,53 +10535,33 @@ impl Shell {
         self.resolve_redirect_list(&cmd.redirects)
     }
 
-    // Installs an OutputSink::Builtin override for the duration of one
-    // dispatch_builtin_or_external call (see that wrapper and OutputSink::
-    // Builtin's own doc comment). Returns Ok(false) -- sink left untouched
-    // -- when `redirects` has nothing touching fd 1 or 2 at all, the
-    // overwhelming common case: only Out/Err/Both/DupErrToOut and their
-    // explicit `1>`/`2>`/`1>&2`/`2>&1` numbered-fd spellings count, since no
-    // builtin ever writes to any other fd (an external spawn already
-    // handles the rest in full via resolve_redirect_list/apply_fd_redirects,
-    // untouched by this). Ok(true) means the sink was swapped and the
-    // caller must call pop_builtin_output_sink when done; Err surfaces a
-    // failed `open_out` (e.g. `> /no/such/dir/f`) the same way every other
-    // redirect failure already does.
+    // Points the sink at a builtin's `>`, `2>`, `&>`, `1>&2`, `2>&1` for
+    // one dispatch; builtins write to no other fd. `Ok(false)` when nothing
+    // redirects fd 1 or 2 and the sink is untouched; after `Ok(true)` the
+    // caller must call `pop_builtin_output_sink`. `Err` is a failed open.
     fn push_builtin_output_sink(&mut self, redirects: &[Redirect], who: &str) -> Result<bool, String> {
-        // A left-to-right simulation of the command's whole redirect
-        // list. Order is the point, and so is *when* a destination is
-        // captured:
+        // The redirect list, simulated left to right. Order matters, and so
+        // does when a destination is captured:
         //
         //     echo x 3>&1 >&2 2>&3 3>&-     the stdout/stderr swap
         //
-        // `2>&3` copies whatever fd 3 names at that moment; the `3>&-`
-        // after it closes fd 3 and must not touch fd 2. And in
-        // `>file 2>&1` the two streams have to end up on *one* open
-        // file, or their write positions diverge and they overwrite
-        // each other.
+        // `2>&3` copies whatever fd 3 names then, and the later `3>&-` must
+        // not touch fd 2. In `>file 2>&1` both streams must share one open
+        // file, or they overwrite each other.
         //
-        // Both fall out of giving each destination an identity: a
-        // redirect that creates one appends to `dests`, a dup copies
-        // the *id*, and a later rebinding of the source fd creates a
-        // new id and leaves the old one alone. Two descriptors share
-        // exactly when they hold the same id.
-        //
-        // Only fds 1 and 2 reach the builtin -- it writes nowhere else
-        // -- but every fd has to be tracked, because 1 and 2 can be
-        // defined in terms of them.
+        // So each destination has an id: a redirect that opens one appends
+        // to `dests`, a dup copies the id, and rebinding an fd makes a new
+        // id. Two descriptors share exactly when they hold the same id.
+        // Only fds 1 and 2 reach the builtin, but every fd is tracked since
+        // 1 and 2 can be defined in terms of others.
         enum Dest {
-            // The *process's* fd N, as this command found it. `echo e
-            // >&2 2>/dev/null` prints on the terminal in bash, because
-            // `>&2` names fd 2 as it stood then.
+            // The process's fd N as this command found it:
+            // `echo e >&2 2>/dev/null` prints on the terminal.
             ProcessFd(i32),
-            // Opened as the redirect is *read*, not when the sink is
-            // built at the end. A redirect creates and truncates its
-            // file whether or not anything ends up writing to it:
-            // `echo x > a > b` creates both and writes to `b`, and
-            // `echo x 3>f` creates `f` though no builtin writes to fd
-            // 3. Opening only the two destinations the sink needed
-            // meant neither happened, and an error opening a
-            // superseded path went unreported.
+            // Opened as the redirect is read: a redirect creates and
+            // truncates its file even if nothing writes to it
+            // (`echo x > a > b` creates both, `echo x 3>f` creates `f`),
+            // and a failure to open any of them is reported.
             File(Rc<Capture>),
             Closed,
         }
@@ -10639,8 +10573,8 @@ impl Shell {
                 table.insert($fd, dests.len() - 1);
             }};
         }
-        // The id fd `n` holds right now -- creating one for the
-        // process's own descriptor if this command has not touched it.
+        // The id fd `n` holds now, made for the process's own descriptor if
+        // this command hasn't touched it.
         macro_rules! id_of {
             ($fd:expr) => {{
                 let fd = $fd;
@@ -10682,12 +10616,7 @@ impl Shell {
                     let id = id_of!(*target as i32);
                     table.insert(*fd as i32, id);
                 }
-                // `>&$var` -- how a script writes to a coproc's own
-                // descriptor. Only the literal-number spelling was
-                // matched before, so the redirect was dropped and the
-                // builtin wrote to stdout; an external command in the
-                // same position worked, which is what made it look like
-                // the co-process's descriptors were wrong.
+                // `>&$var`, how a script writes to a coproc's descriptor.
                 Redirect::FdDupWord { fd, word, .. } => {
                     let text = self.expand_word(word);
                     let Ok(target) = text.trim().parse::<i32>() else {
@@ -10697,18 +10626,12 @@ impl Shell {
                     table.insert(*fd as i32, id);
                 }
                 Redirect::FdClose { fd } => define!(*fd as i32, Dest::Closed),
-                // An input redirect a builtin will never read is still
-                // a redirect, and a redirect that cannot be performed
-                // fails the command before it runs. `echo z <nosuch`
-                // printed `z` and returned 0, and `echo z <nosuch >out`
-                // created `out` -- bash reaches neither, because it
-                // performs them in order and stops at the first that
-                // will not open.
-                //
-                // Opened and dropped: nothing here wants the contents.
-                // A builtin that *does* read (`read`, `mapfile`) opens
-                // the redirect itself, when it reads -- see
-                // read_input_source.
+                // An input redirect fails the command if it can't be
+                // opened, even for a builtin that won't read it: bash
+                // performs redirects in order and stops at the first
+                // failure, so `echo z <nosuch >out` neither prints nor
+                // creates `out`. Opened and dropped; `read` and `mapfile`
+                // open their own (`read_input_source`).
                 Redirect::In(word) | Redirect::FdIn { word, .. } => {
                     let p = self.expand_word(word);
                     if opening_would_consume_it(&p) {
@@ -10738,8 +10661,8 @@ impl Shell {
         };
         let stderr = match err_dest {
             None => SinkStream::OuterErr,
-            // One destination for both, opened once -- so the two share
-            // a write position instead of overwriting each other.
+            // One destination for both, opened once, so they share a write
+            // position.
             Some(_) if shared => stdout.clone(),
             Some(d) => open_dest(d, who)?,
         };
@@ -10750,18 +10673,14 @@ impl Shell {
         fn open_dest(dest: &Dest, who: &str) -> Result<SinkStream, String> {
             match dest {
                 Dest::File(f) => Ok(SinkStream::File(Rc::clone(f))),
-                // For a *builtin*, fd 1 and fd 2 are not the process's
-                // own: they are the enclosing sink, which may already
-                // be a capture, a grid, or an outer command's redirect.
-                // So these resolve to "whatever this sink's parent does
-                // with them" rather than to a dup of the real
-                // descriptor. Any other descriptor is a real one and
-                // really is duped.
+                // For a builtin, fds 1 and 2 are the enclosing sink (a
+                // capture, a grid, an outer redirect), so they resolve to
+                // whatever the parent sink does. Any other descriptor is
+                // real and is duped.
                 Dest::ProcessFd(1) => Ok(SinkStream::OuterOut),
                 Dest::ProcessFd(2) => Ok(SinkStream::OuterErr),
-                // A dup of a descriptor nothing has open is an error,
-                // not a silent fallback to stdout: `echo x >&9` reports
-                // and fails, the way it does for an external command.
+                // A dup of a closed descriptor is an error: `echo x >&9`
+                // reports and fails, as for an external command.
                 Dest::ProcessFd(fd) => match dup_existing_fd(*fd) {
                     Some(f) => Ok(SinkStream::File(Capture::file(f))),
                     None => Err(format!("{}: Bad file descriptor", fd)),
@@ -10771,19 +10690,16 @@ impl Shell {
         }
     }
 
-    // Restores whatever sink push_builtin_output_sink saved -- a no-op if
-    // the sink isn't currently an OutputSink::Builtin (push returned false
-    // or was never called), so callers can invoke this unconditionally.
+    // Restores what `push_builtin_output_sink` saved; a no-op if the sink
+    // isn't a builtin one, so it can be called unconditionally.
     fn pop_builtin_output_sink(&mut self) {
         if let OutputSink::Builtin { previous, .. } = &mut self.sink {
             self.sink = *std::mem::replace(previous, Box::new(OutputSink::Real));
         }
     }
 
-    // Diagnostics for a command that never got to inherit its own stdio
-    // (e.g. spawn() failing with "not found") would otherwise bypass a
-    // `2>` redirect entirely -- real bash routes them through it too. Falls
-    // back to the shell's real stderr when there's no stderr redirect.
+    // Errors for a command that never started ("not found") still go
+    // through its `2>`, as in bash, or to the shell's stderr without one.
     fn write_command_error(&mut self, cmd: &SimpleCommand, msg: &str) {
         let target = self.peek_stderr_target(&cmd.redirects);
         write_diagnostic(&target, msg, self.sink.clone());
@@ -10809,34 +10725,16 @@ impl Shell {
         target
     }
 
-    // The plain-fd-0/1/2 half of `exec`'s redirect-only form (`exec >
-    // file`, `exec 2>> file`, `exec < file`, `exec &> file`) -- a
-    // dedicated resolver rather than reusing resolve_redirect_list's
-    // Option<Stdio> output because Stdio doesn't expose its underlying fd
-    // for this function's caller (apply_fds_to_self) to dup2 onto 0/1/2 of
-    // *this* process; it needs the raw File instead. Mirrors
-    // resolve_redirect_list's In/Out/Err/Both handling (last-one-wins per
-    // fd, matching real bash), skipping the numbered-fd/DupErrToOut forms
-    // since those are already covered by resolve_redirects' own
-    // extra_fds/dup_stderr_to_stdout, computed separately by the caller
-    // from the same redirect list.
-    // The one place every redirect that opens a file for *writing*
-    // funnels through (`>`/`>>`, `2>`/`2>>`, `&>`/`&>>`, `N>file`) --
-    // restricted mode's "cannot redirect output" check lives here so it
-    // covers all of them at once, rather than duplicated at each
-    // Redirect variant's own resolution site.
-    /// A path as *this shell* sees it.
-    ///
-    /// A relative name resolves against the shell's own cwd rather than
-    /// the process's. The two agree while only one shell is running, and
-    /// stop agreeing the moment two of them share a process and one of
-    /// them runs `cd` -- which is what an in-process pipeline stage is.
-    /// Every path a script can name goes through here for that reason.
+    /// A path as this shell sees it: relative to the shell's cwd, not the
+    /// process's. They differ when two shells share the process and one runs
+    /// `cd`, as an in-process pipeline stage does.
     pub(crate) fn resolve_path(&self, path: &str) -> std::path::PathBuf {
         let given = std::path::Path::new(path);
         if given.is_absolute() { given.to_path_buf() } else { self.cwd.join(given) }
     }
 
+    // Every redirect that opens a file for writing comes here, so the
+    // restricted-mode check covers them all.
     fn open_out(&self, path: &str, append: bool, clobber: bool) -> Result<std::fs::File, String> {
         if self.opt_restricted {
             return Err(format!("{}: restricted: cannot redirect output", path));
@@ -10844,12 +10742,9 @@ impl Shell {
         if let Some(result) = dev_socket_file(path) {
             return result;
         }
-        // `set -C`. Only a truncating `>` is refused, and only over an
-        // existing *regular* file -- `> /dev/null` and `> fifo` stay
-        // legal in real bash, which is what makes noclobber usable at
-        // all. Deliberately a stat-then-open rather than O_EXCL: bash
-        // does the same, and O_EXCL would also reject the /dev/null
-        // case. The race that leaves is bash's too.
+        // `set -C` refuses only a truncating `>` over an existing regular
+        // file; `> /dev/null` and `> fifo` stay legal. Stat, then open, as
+        // bash does: `O_EXCL` would refuse `/dev/null` too.
         let resolved = self.resolve_path(path);
         if self.opt_noclobber && !append && !clobber && std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
             return Err(format!("{}: cannot overwrite existing file", path));
@@ -10863,19 +10758,9 @@ impl Shell {
             .map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
-    // The one place every redirect that opens a file for *reading*
-    // funnels through (`<`, numbered-fd `N<`; here-strings/heredocs go
-    // through here_string_file instead, they're never a real path) --
-    // mirrors open_out's own shape/doc comment, just above. `/dev/tcp/
-    // HOST/PORT` and `/dev/udp/HOST/PORT` (see dev_socket_file) are
-    // recognized here too, not just in open_out -- real bash's own
-    // /dev/tcp works with any redirect direction, not just `<`, and
-    // `exec 3<>/dev/tcp/host/80`'s bidirectional form is actually the
-    // most common real-world shape. No restricted-mode check here,
-    // unlike open_out -- restricted mode only blocks *output*
-    // redirection (see open_out's own doc comment), reading a file is
-    // always allowed.
-
+    // Every redirect that opens a file for reading (`<`, `N<`) comes here.
+    // `/dev/tcp/HOST/PORT` and `/dev/udp/...` work in any direction (see
+    // `dev_socket_file`). Reading is allowed in restricted mode.
     fn open_in(&self, path: &str) -> Result<std::fs::File, String> {
         if let Some(result) = dev_socket_file(path) {
             return result;
@@ -10883,20 +10768,11 @@ impl Shell {
         std::fs::File::open(self.resolve_path(path)).map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
-    // The read+write counterpart to open_in/open_out -- bare `<>`/`N<>`'s
-    // own target (real bash: "opened for reading and writing on file
-    // descriptor n, or on file descriptor 0 if n is not specified").
-    // `/dev/tcp`/`/dev/udp` (see dev_socket_file) are recognized here
-    // too -- `<>` is in fact the operator real /dev/tcp usage actually
-    // needs (one connection used for both the request and the
-    // response), not `<`/`>` on their own, which would each open an
-    // independent, unrelated connection to the same address.
+    // `<>`, open for both. `/dev/tcp` and `/dev/udp` are recognized too;
+    // `<>` is how they're normally used, one connection for request and
+    // response.
     fn open_in_out(&self, path: &str) -> Result<std::fs::File, String> {
-        // `<>` writes, so a restricted shell may not have it -- the same
-        // answer `open_out` gives, in the same words bash uses. It had
-        // been grouped with the reads, which are always allowed, so
-        // `exec 3<>file` was a way to create and write any file from a
-        // shell that had been told it could write none.
+        // `<>` writes, so a restricted shell refuses it as `open_out` does.
         if self.opt_restricted {
             return Err(format!("{}: restricted: cannot redirect output", path));
         }
@@ -10911,45 +10787,26 @@ impl Shell {
             .map_err(|e| format!("{}: {}", path, os_message(&e)))
     }
 
-    // Restricted mode: SHELL/PATH/ENV/BASH_ENV can't be set or unset --
-    // real bash enforces this by reporting exactly the same "readonly
-    // variable"/"cannot unset: readonly variable" errors a genuinely
-    // `readonly`'d name would, so this rides the same two existing
-    // readonly_names checks (assign_var_impl/run_unset) rather than a
-    // separate error path, without actually inserting these into
-    // readonly_names itself (that would make them readonly forever,
-    // including outside restricted mode, and would wrongly show up as
-    // `-r` in declare -p/${v@a}).
-    // Whether a write to this name will be refused -- `readonly`'s own
-    // list plus restricted mode's. The refusal and its message live in
-    // assign_var_impl/apply_array_literal/array_set_index; this is for
-    // a caller that needs to know one happened without printing a
-    // second message about it.
+    // Whether a write to this name will be refused: `readonly`'s list
+    // plus restricted mode's. For a caller that needs to know without
+    // printing a second message.
     pub(crate) fn name_is_readonly(&self, name: &str) -> bool {
         self.readonly_names.contains(name) || self.is_restricted_readonly_name(name)
     }
 
+    // Restricted mode's SHELL/PATH/ENV/BASH_ENV, refused with the same
+    // errors as a readonly name but kept out of `readonly_names`, which
+    // would show them as `-r` in `declare -p` and keep them past restricted
+    // mode.
     pub(crate) fn is_restricted_readonly_name(&self, name: &str) -> bool {
         self.opt_restricted && matches!(name, "SHELL" | "PATH" | "ENV" | "BASH_ENV")
     }
 
-    // Restricted mode: "cannot specify `/' in command names" -- blocks
-    // running an external command by an explicit path, whether it's an
-    // ordinary command word containing '/' or `command NAME`'s own
-    // bypass-spawn. Prints bash's own exact error text and returns true
-    // when blocked, so a call site can just
-    // `if self.check_restricted_command_name(name) { return ...; }`.
-    /// The same rule `check_restricted_command_name` enforces, for the
-    /// two places a program name reaches `Command::new` without going
-    /// through this shell's own dispatch at all: a language server
-    /// registered by `::bish lsp add`, and a debug adapter named by
-    /// `:dbg launch --adapter=`. Both are spawned later, from code with
-    /// no `Shell` in reach, so the name is checked where it is *given*.
-    ///
-    /// A bare name is still allowed, exactly as it is for a command --
-    /// restriction is about naming a path, not about refusing to run
-    /// anything. Blocking a path here is what stops a restricted shell
-    /// turning `--adapter=/tmp/mine` into arbitrary execution.
+    /// `check_restricted_command_name`'s rule, for the program names that
+    /// reach `Command::new` outside dispatch: a language server from
+    /// `::bish lsp add` and a debug adapter from `:dbg launch --adapter=`.
+    /// They're spawned where no `Shell` is in reach, so the name is checked
+    /// where it's given. A bare name is allowed, as for a command.
     pub(crate) fn restricted_program_refused(&mut self, what: &str, name: &str) -> bool {
         if self.opt_restricted && name.contains('/') {
             sh_eprintln!(self, "bish: {}: {}: restricted: cannot specify `/' in command names", what, name);
@@ -10958,6 +10815,9 @@ impl Shell {
         false
     }
 
+    // Restricted mode refuses a command named by path, as a command word
+    // or through `command NAME`. Prints bash's error and returns true when
+    // refused.
     fn check_restricted_command_name(&mut self, name: &str) -> bool {
         if self.opt_restricted && name.contains('/') {
             sh_eprintln!(self, "bish: {}: restricted: cannot specify `/' in command names", name);
@@ -10967,14 +10827,9 @@ impl Shell {
         }
     }
 
-    // Pure classification, no expansion/side effects: whether every
-    // redirect in `redirects` is one run_compound_redirected's in-process
-    // path (resolve_simple_redirects_for_compound) can actually handle --
-    // checked *before* attempting that resolution (rather than having it
-    // fail/fall back partway through) so a redirect target with a side
-    // effect (`{ ...; } > "$(side_effect)"`) is never expanded twice, once
-    // by a "trial" resolve and again by the re-exec fallback's own
-    // resolve_redirect_list.
+    // Whether every redirect is one `resolve_simple_redirects_for_compound`
+    // handles. Checked before resolving, so a target with a side effect
+    // (`{ ...; } > "$(cmd)"`) isn't expanded twice by a fallback.
     fn compound_redirects_are_simple(redirects: &[Redirect]) -> bool {
         redirects.iter().all(|r| {
             matches!(
@@ -10994,19 +10849,13 @@ impl Shell {
         })
     }
 
-    // Resolves `redirects` into real Files for run_compound_redirected's
-    // foreground (in-process, via run_in_child_shell) path -- the same
-    // "plain fd 0/1/2" subset push_builtin_output_sink already scopes a
-    // single builtin's own redirects to. Only ever called after
-    // compound_redirects_are_simple has already confirmed every redirect
-    // here is one of those kinds. A stream that ends up on the other
-    // one's destination records that it follows it, rather than opening
-    // the same path a second time -- two separate opens would track
-    // their own, unshared write positions, letting stdout and stderr
-    // overwrite each other.
+    // Resolves a compound's plain fd 0/1/2 redirects to files, for
+    // `run_compound_redirected`'s in-process path. A stream on the other's
+    // destination follows it instead of opening the path again, so they
+    // share a write position.
     fn resolve_simple_redirects_for_compound(&mut self, redirects: &[Redirect]) -> Result<ChildStdio, String> {
         let mut stdio = ChildStdio::default();
-        // path, append, clobber (`>|`) -- as in open_out's signature.
+        // Path, append, clobber (`>|`), as `open_out` takes them.
         let mut stdout_target: Option<(String, bool, bool)> = None;
         let mut stderr_target: Option<(String, bool, bool)> = None;
         for r in redirects {
@@ -11049,9 +10898,8 @@ impl Shell {
         if let Some((p, append, clobber)) = &stdout_target {
             stdio.stdout = Some(Capture::file(self.open_out(p, *append, *clobber)?));
         }
-        // A stream that follows the other one opens nothing of its own
-        // -- and a `2>file` the dup came *after* named a descriptor that
-        // has since been rebound, so its target is stale.
+        // A following stream opens nothing; a `2>file` before the dup was
+        // superseded.
         if stdio.err_follows_out.is_none() {
             if let Some((p, append, clobber)) = &stderr_target {
                 stdio.stderr = Some(self.open_out(p, *append, *clobber)?);
@@ -11060,22 +10908,11 @@ impl Shell {
         Ok(stdio)
     }
 
-    /// Every redirect this command carries, in source order, as the
-    /// actions to perform on the descriptors it has already inherited.
-    ///
-    /// Source order is the whole of it. A redirect names a descriptor
-    /// *as it stands at that point*, so `3>&1 1>&2 2>&3` swaps the two
-    /// streams -- and doing fds 0, 1 and 2 first, through the Command
-    /// builder, and only then the numbered ones meant `3>&1` copied
-    /// stdout's *final* destination rather than the one it had when the
-    /// dup was written. That is also why every file the list names is
-    /// opened, even one a later redirect supersedes: `> a > b` creates
-    /// both, and only `b` survives.
-    ///
-    /// This is what a real shell does after forking, and the reason it
-    /// can be expressed the same way here is that these all run in the
-    /// child (a `pre_exec` hook, or this process itself for `exec`),
-    /// after it has the descriptors it inherits.
+    /// Every redirect, in source order, as actions on the descriptors the
+    /// child inherits. A redirect names a descriptor as it stands at that
+    /// point, so `3>&1 1>&2 2>&3` swaps the streams, and every file named is
+    /// opened even if superseded (`> a > b` creates both). They run in the
+    /// child (a `pre_exec` hook, or this process for `exec`).
     fn resolve_redirect_list(&mut self, redirects: &[Redirect]) -> Result<ResolvedRedirs, String> {
         let mut actions: Vec<FdAction> = Vec::new();
         for r in redirects {
@@ -11096,7 +10933,7 @@ impl Shell {
                     actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
                 }
                 Redirect::HereDoc(w, _) => {
-                    // Body already ends in '\n' from capture_heredoc_body.
+                    // The body already ends in a newline.
                     let content = self.expand_word(w);
                     actions.push(FdAction::Open { fd: 0, file: here_string_file(&content)? });
                 }
@@ -11119,8 +10956,7 @@ impl Shell {
                     let file = self.open_out(&p, *append, *clobber)?;
                     actions.push(FdAction::Open { fd: 2, file });
                 }
-                // `&>file`: one open file, both descriptors on it, so
-                // they share a write position.
+                // `&>file`: both descriptors on one open file.
                 Redirect::Both { word, append } => {
                     let p = self.expand_word(word);
                     let file = self.open_out(&p, *append, false)?;
@@ -11133,15 +10969,13 @@ impl Shell {
                     let file = self.open_out(&p, *append, *clobber)?;
                     actions.push(FdAction::Open { fd: *fd as i32, file });
                 }
-                // `{name}>file`: the descriptor is chosen here, in the
-                // shell, because the *variable* has to be set here --
-                // the child only ever sees the number.
+                // `{name}>file`: the descriptor is chosen here, where the
+                // variable is set; the child only sees the number.
                 Redirect::VarFd { var, kind, word } => {
                     let p = self.expand_word(word);
                     if *kind == crate::lexer::VarFdKind::Dup {
-                        // `{v}>&-` closes the descriptor `v` already
-                        // names; `{v}>&N` opens a fresh one duplicating
-                        // N and names *that*.
+                        // `{v}>&-` closes the descriptor `v` names;
+                        // `{v}>&N` names a new dup of N.
                         if p.trim() == "-" {
                             match self.lookup_var(var).trim().parse::<i32>() {
                                 Ok(fd) => actions.push(FdAction::Close(fd)),
@@ -11203,10 +11037,9 @@ impl arith::VarContext for Shell {
             Some((base, index)) => self.array_element(base, &index),
             None => self.lookup_var(name),
         };
-        // A name whose value is itself an expression is evaluated, not
-        // parsed: bash's `x=y; y=2; echo $((x))` is 2. A plain number
-        // takes the fast path; anything else recurses, capped by the
-        // evaluator's own depth limit.
+        // A name whose value is an expression is evaluated: `x=y; y=2;
+        // echo $((x))` is 2. Recursion is capped by the evaluator's depth
+        // limit.
         match text.trim().parse::<i64>() {
             Ok(n) => n,
             Err(_) if text.trim().is_empty() => 0,
@@ -11215,12 +11048,9 @@ impl arith::VarContext for Shell {
     }
 
     fn set(&mut self, name: &str, value: i64) {
-        // An arithmetic assignment is an effect wherever it appears --
-        // `(( i++ ))`, `let`, `$(( x = 1 ))`. Counted here rather than
-        // at the `(( ))` command, because only some of those are
-        // commands: `f() { ((i++)); f; }` makes progress every time
-        // round and was being reported as a fixed point, which is the
-        // one thing the recursion proof must never do.
+        // Counted here, not at `(( ))`, because `let` and `$(( x = 1 ))`
+        // assign too: `f() { ((i++)); f; }` makes progress and mustn't be
+        // called a fixed point.
         self.effects += 1;
         match split_subscript(name) {
             Some((base, index)) => {
@@ -11234,10 +11064,8 @@ impl arith::VarContext for Shell {
     }
 }
 
-// `a[1]` -> ("a", "1"). The subscript arrives unevaluated (it may be an
-// expression, or an associative array's key), so it is handed back as
-// text for array_element/array_set_index to resolve the way a `${a[i]}`
-// expansion already does.
+// `a[1]` -> ("a", "1"). The subscript stays text (an expression or a
+// key) for `array_element`/`array_set_index` to resolve.
 fn split_subscript(name: &str) -> Option<(&str, String)> {
     let (base, rest) = name.split_once('[')?;
     let index = rest.strip_suffix(']')?;
@@ -11245,29 +11073,20 @@ fn split_subscript(name: &str) -> Option<(&str, String)> {
 }
 
 struct ResolvedRedirs {
-    /// The command's whole redirect list, in source order -- see
-    /// resolve_redirect_list. Nothing is pre-applied to the Command
-    /// builder's stdin/stdout/stderr: those carry only what the command
-    /// *inherits* (a pipeline's pipe, a capture, the shell's own), and
-    /// these run on top of it in the child.
+    /// The whole redirect list in source order (see `resolve_redirect_list`),
+    /// run in the child on top of what it inherits: a pipe, a capture, the
+    /// shell's own stdio.
     actions: Vec<FdAction>,
 }
 
-/// Moves every file this list opened above the descriptors the list
-/// itself rebinds.
+/// Moves every file the list opened above the descriptors it rebinds.
 ///
-/// The files are opened in the *shell* and inherited at whatever
-/// numbers they happened to get -- which can be numbers the list then
-/// dups over. `3>&1 1>&2 2>&3 3>&- 2>/dev/null` opens /dev/null in the
-/// shell, and if that landed on fd 3, the `3>&1` overwrote the handle
-/// before `2>/dev/null` could install it: the redirect either pointed
-/// at the wrong file or failed outright with EBADF.
-///
-/// `F_DUPFD_CLOEXEC` asks for the lowest free descriptor at or above a
-/// floor, which is exactly the primitive for this. Close-on-exec is
-/// right for the copy: it is only ever the *source* of a dup2 that
-/// happens before the exec, and the descriptor it is duplicated onto
-/// gets its own flags.
+/// The files are opened in the shell, at whatever numbers were free, and
+/// the list may dup over them: in `3>&1 1>&2 2>&3 3>&- 2>/dev/null`,
+/// /dev/null opened on fd 3 would be overwritten by `3>&1` before
+/// `2>/dev/null` installs it. `F_DUPFD_CLOEXEC` picks the lowest free fd
+/// above a floor; close-on-exec is fine since the copy is only ever a
+/// dup2 source.
 fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
     let mut floor = 3;
     for a in actions.iter() {
@@ -11284,17 +11103,16 @@ fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
             continue;
         }
         if let Some(moved) = crate::platform::duplicate_above(raw, floor) {
-            // SAFETY: a fresh descriptor, owned by nothing else -- and the
-            // old `file` is dropped (closed) by this assignment, which is
-            // what moving it out of the way means.
+            // SAFETY: a fresh descriptor owned by nothing else. The old
+            // `file` is closed by this assignment.
             *file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(moved) };
         }
     }
 }
 
-/// One step in a command's redirect list, to be performed on the
-/// descriptors a child has already inherited: point `fd` at an open
-/// file, at another descriptor as it stands right now, or close it.
+/// One redirect step on the descriptors a child has inherited: point
+/// `fd` at an open file, at another descriptor as it stands now, or
+/// close it.
 enum FdAction {
     Open { fd: i32, file: std::fs::File },
     Dup { fd: i32, source: i32 },
@@ -11302,7 +11120,6 @@ enum FdAction {
 }
 
 impl FdAction {
-    // The descriptor this action moves.
     fn target(&self) -> i32 {
         match self {
             FdAction::Open { fd, .. } | FdAction::Dup { fd, .. } | FdAction::Close(fd) => *fd,
@@ -11310,17 +11127,9 @@ impl FdAction {
     }
 }
 
-// Associative-array storage (`declare -A`). Iterates in insertion order --
-// confirmed via a clean probe against real bash that its own iteration
-// order is neither insertion order nor alphabetical, but its internal
-// hash-table bucket order (stable across updates/delete-then-reinsert on a
-// given key, but not derivable without literally reimplementing bash's
-// specific hash function and bucket-growth behavior). Insertion order is
-// the more useful, predictable choice for a new implementation even though
-// it won't byte-match bash's own output for a script that happens to
-// depend on the exact order -- a genuinely rare thing to depend on, since
-// bash's own order isn't something a script author could reliably predict
-// either.
+// Associative-array storage (`declare -A`), in insertion order. bash
+// iterates in its hash table's bucket order, which isn't worth
+// reproducing and which no script can predict anyway.
 #[derive(Default, Clone)]
 pub(crate) struct OrderedMap {
     order: Vec<String>,
@@ -11368,13 +11177,9 @@ impl OrderedMap {
     }
 }
 
-// A background job (`cmd &`), one or more children (a whole pipeline when
-// backgrounded together). `children` are kept so `wait`/`jobs`/`fg` can
-// A coproc pipe half the shell keeps open. The read side is wrapped in a
-// persistent BufReader (not a fresh one per `read -u` call) for the same
-// reason read_input_source avoids `BufReader::new(stdin())`: a throwaway
-// wrapper's internal read-ahead buffer would silently discard whatever it
-// over-read past the first line every time it's dropped.
+// A coproc pipe end the shell keeps open. The read side keeps one
+// `BufReader` across `read -u` calls: a fresh one would discard what it
+// read ahead past the first line.
 enum KeptFd {
     Read(std::io::BufReader<std::io::PipeReader>),
     Write(std::io::PipeWriter),
@@ -11389,76 +11194,51 @@ impl std::os::fd::AsRawFd for KeptFd {
     }
 }
 
-// poll/block on them directly -- earlier this shell just spawned a thread
-// that blindly `.wait()`d and dropped the result, which meant nothing else
-// could ever observe a background job's completion or exit status.
+// A background job (`cmd &`): one child, or a pipeline's. The children
+// are kept so `wait`, `jobs` and `fg` can poll or block on them.
 pub(crate) struct Job {
     pub(crate) id: u32,
     pub(crate) pids: Vec<u32>,
     children: Vec<std::process::Child>,
     pub(crate) cmd_text: String,
-    // The pty (M7) this background job's stdio is attached to instead of
-    // inheriting the real terminal's fds -- set for every background job
-    // spawned while promoted, whatever shape it is: a single external
-    // command, a subshell, a pipeline, or any of those with redirects of
-    // their own (the redirected streams still go where they were told;
-    // only the ones nothing claimed land here). `None` when the session
-    // wasn't promoted at spawn time, which is also when there's no grid
-    // to render into and inherited stdio is already going to the right
-    // place.
+    // The pty this job's stdio goes to, for a job started while the
+    // session was promoted. Streams the job redirected still go where they
+    // were told. `None` when the session wasn't promoted: there's no grid,
+    // and inherited stdio already reaches the terminal.
     //
-    // Two things read it: `fg` (see run_fg) drives poll-based rendering
-    // into the fg-ing session's grid instead of blocking on Job::wait(),
-    // and drain_background_output keeps the job's output flowing into
-    // `sink_screen` while it stays in the background.
+    // `fg` (`run_fg`) renders it into the session's grid, and
+    // `drain_background_output` keeps it flowing into `sink_screen` while
+    // the job stays in the background.
     pub(crate) pty_master: Option<std::fs::File>,
-    // The grid this job's own output belongs in: the sink of whichever
-    // session spawned it, captured at that moment (see push_job_full).
-    // Recorded on the *job* rather than looked up later because the job
-    // table is shared by every session (see the `jobs` field's own doc
-    // comment) -- there is no "the current session" to ask by the time
-    // the output actually shows up. `None` when that session wasn't
-    // promoted, which is also exactly when there's no grid to feed and
-    // inherited stdio is already going to the right place.
+    // The grid this job's output belongs in, captured at spawn (see
+    // `push_job_full`). Kept on the job because the job table is shared by
+    // every session, so later there is no current session to ask. `None`
+    // when the session wasn't promoted.
     sink_screen: Option<Rc<RefCell<crate::vt100::Screen>>>,
-    // Set to true once this job's pty master has had O_NONBLOCK applied
-    // -- done lazily on the first drain rather than at spawn, so every
-    // spawn site stays free of it.
+    // Set once the pty master is non-blocking, done on the first drain so
+    // spawn sites don't have to.
     nonblocking: bool,
-    // Real job control (M11): Some(pid) for a single external command
-    // spawned via run_single's plain (non-pty) path, where the pre_exec
-    // hook there gave it its own process group seeded from its own pid --
-    // run_fg/run_bg use this to tcsetpgrp the real terminal at it and
-    // SIGCONT it. None for everything else: a pty-attached job doesn't
-    // need this (spawn_attached's setsid already isolates it into its
-    // own session, and drive_fg_job's raw-byte forwarding lets its own
-    // pty's line discipline generate SIGTSTP/SIGINT correctly without
-    // any of this machinery). A backgrounded pipeline sets one too (see
-    // run_multi -- every stage shares the first one's group, so `kill
-    // %N`/`bg` reach the whole job), which is why its own pty is wired as
-    // plain fds rather than through spawn_attached: that setsid would
-    // undo exactly this.
+    // The job's process group, with monitor mode on: a single command from
+    // `run_single`'s plain path, or a background pipeline whose stages all
+    // join the first one's group (so `kill %N` and `bg` reach all of them).
+    // `run_fg` and `run_bg` give it the terminal and SIGCONT it. A pty job
+    // started through `spawn_attached` doesn't need one: `setsid` already
+    // isolates it, and its pty generates SIGTSTP and SIGINT.
     pub(crate) pgid: Option<u32>,
-    // True once this job has been observed stopped (via a WUNTRACED-
-    // aware wait -- see waitpid_untraced) rather than exited. Checked by
-    // `jobs`/`wait` before touching Job::poll/wait, neither of which can
-    // ever observe a stop (Child::try_wait/wait never pass WUNTRACED, so
-    // a stopped child just looks like it's still running to them --
-    // correct for every *other* caller, since only run_fg's real-job-
-    // control path and run_single's own foreground wait ever use
-    // waitpid_untraced directly). Cleared by `fg`/`bg` resuming it.
+    // Seen stopped by a `WUNTRACED` wait (`waitpid_untraced`). `jobs` and
+    // `wait` check it first: `Job::poll`/`wait` can't see a stop, since
+    // `Child::try_wait` doesn't pass `WUNTRACED`. Cleared when `fg` or `bg`
+    // resumes it.
     pub(crate) stopped: bool,
 }
 
-// Backs Shell.jobs (see that field's doc comment for why this lives behind
-// Rc<RefCell<_>> instead of being owned directly).
+// `Shell::jobs`; see that field for why it's shared.
 pub(crate) struct JobTable {
     pub(crate) jobs: Vec<Job>,
     next_job_id: u32,
-    // $!: PID of the most recently backgrounded command (the last stage,
-    // for a backgrounded pipeline -- matches bash). Mirrors `jobs.last()`'s
-    // PID; kept as its own field since it needs to keep reporting the same
-    // PID even after that job is reaped out of the table by `wait`/`jobs`.
+    // `$!`: the last backgrounded command (a pipeline's last stage, as in
+    // bash). Kept separately from the table so it survives the job being
+    // reaped.
     last_bg_pid: Option<u32>,
 }
 
@@ -11469,12 +11249,9 @@ impl JobTable {
 }
 
 impl Job {
-    // Non-blocking: reaps any children that have already exited without
-    // blocking on ones that haven't. Returns the job's exit status once
-    // *every* child has exited (bash: a job composed of a pipeline is
-    // "done" when its last stage exits; this shell reports done once the
-    // whole pipeline has, and uses the last child's code, matching the
-    // pipeline exit-status convention used elsewhere in this file).
+    // Reaps whichever children have exited, without blocking. The job's
+    // status once all have, the last child's, as for a pipeline. (bash
+    // calls a pipeline job done when its last stage exits.)
     pub(crate) fn poll(&mut self) -> Option<i32> {
         let mut all_done = true;
         let mut last_code = 0;
@@ -11488,17 +11265,11 @@ impl Job {
         if all_done { Some(last_code) } else { None }
     }
 
-    // Blocking wait for every child in the job.
-    /// Waits for this job, emptying its pty into the screen it was
-    /// started from as it goes.
-    ///
-    /// `wait` takes a job out of the table and then blocks on it, so
-    /// `drain_background_output` -- which walks the table -- can no
-    /// longer see it, and repl.rs's idle tick is not running while a
-    /// builtin blocks anyway. Either way the output was still sitting
-    /// in the pty when the job was reaped, and `f() { echo a; }; f &
-    /// wait` printed nothing in a pane. Draining here is the only
-    /// moment that covers both.
+    /// Waits for this job, emptying its pty into its screen as it goes.
+    /// `wait` takes the job out of the table before blocking, so
+    /// `drain_background_output` can't see it, and repl.rs's idle tick isn't
+    /// running meanwhile: without this, `f() { echo a; }; f & wait` printed
+    /// nothing in a pane.
     pub(crate) fn wait_draining(&mut self) -> i32 {
         if self.pty_master.is_none() || self.sink_screen.is_none() {
             return self.wait();
@@ -11510,14 +11281,13 @@ impl Job {
                 _ => break,
             }
         }
-        // Whatever landed between the last read and the child exiting.
+        // Whatever arrived between the last read and the exit.
         self.drain_into_sink();
         self.wait()
     }
 
-    /// This one job's pending pty output, into the grid it belongs to
-    /// -- `drain_background_output`'s inner loop, for a job that is no
-    /// longer in the table to be walked.
+    /// This job's pending pty output into its grid, for a job no longer in
+    /// the table (`drain_background_output` walks the table).
     fn drain_into_sink(&mut self) {
         use std::io::Read;
         use std::os::fd::AsRawFd;
@@ -11545,6 +11315,7 @@ impl Job {
         }
     }
 
+    // Blocks until every child has exited; the last one's status.
     pub(crate) fn wait(&mut self) -> i32 {
         let mut last_code = 0;
         for c in &mut self.children {
