@@ -1,20 +1,11 @@
-//! A signal ignored when bish starts cannot be trapped or reset.
+//! A signal ignored when bish starts can't be trapped or reset.
 //!
-//! POSIX's rule, and bash's behaviour. It exists so that immunity handed
-//! down from outside survives: a script backgrounded from another script
-//! has INT and QUIT ignored precisely so a Ctrl-C aimed at the terminal's
-//! process group does not take it down along with everything else, and
-//! `nohup`'s promise about HUP works the same way. A shell whose `trap`
-//! could override that would hand back the very thing the caller went out
-//! of its way to take away.
+//! POSIX's rule, and bash's behaviour, so immunity handed down survives: a
+//! script backgrounded by another has INT and QUIT ignored so a Ctrl-C at
+//! the terminal doesn't kill it, and `nohup` relies on the same for HUP.
 //!
-//! **Not in `bashdiff.rs`, and it cannot be.** That corpus is one script
-//! string run through two shells, which is the right shape for almost
-//! everything -- but this is not about what a script says, it is about
-//! the state the shell was *entered* in. Only the thing that spawns the
-//! shell can set that up, so the test has to be out here where it can be
-//! the parent: `pre_exec` runs between fork and exec, which is the one
-//! moment where the disposition can be made to arrive already ignored.
+//! Not in `bashdiff.rs`: this is about the state bish is entered in, which
+//! only its parent can set up, in `pre_exec` between fork and exec.
 
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -30,9 +21,8 @@ const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 
-/// A bish running `script`, optionally entered with `sig` already
-/// ignored -- which is the whole point, and why this is a `pre_exec`
-/// rather than anything the script itself could arrange.
+/// A bish running `script`, optionally entered with `sig` ignored, which
+/// only a `pre_exec` can arrange.
 fn spawn(script: &str, ignore: Option<i32>) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bish"));
     command.arg("-c").arg(script).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -47,8 +37,7 @@ fn spawn(script: &str, ignore: Option<i32>) -> Child {
     command.spawn().expect("bish could not be run")
 }
 
-/// Waits up to `limit` for it to exit. `None` means it outlived that,
-/// and the caller has to deal with it.
+/// Waits up to `limit` for it to exit; `None` if it's still running.
 fn wait_for(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
@@ -60,7 +49,7 @@ fn wait_for(child: &mut Child, limit: Duration) -> Option<std::process::ExitStat
     None
 }
 
-/// Long enough for the shell to have reached its loop and be running it.
+/// Long enough for the shell to reach its loop.
 fn settle() {
     std::thread::sleep(Duration::from_millis(400));
 }
@@ -71,8 +60,8 @@ fn script_for(name: &str) -> String {
     LOOPS_FOREVER.replace("SIGNAL", name)
 }
 
-/// The control, and it matters as much as the case below: without it,
-/// a `trap` that never worked at all would pass just as well.
+/// The control: without it, a `trap` that never worked would pass as
+/// well.
 #[test]
 fn a_signal_left_alone_on_entry_is_trapped_normally() {
     for (name, sig) in [("TERM", SIGTERM), ("INT", SIGINT), ("HUP", SIGHUP)] {
@@ -90,29 +79,26 @@ fn a_signal_left_alone_on_entry_is_trapped_normally() {
     }
 }
 
-/// And the rule itself.
+/// The rule itself.
 #[test]
 fn a_signal_ignored_on_entry_cannot_be_trapped() {
     for (name, sig) in [("TERM", SIGTERM), ("INT", SIGINT), ("HUP", SIGHUP)] {
         let mut child = spawn(&script_for(name), Some(sig));
         settle();
         assert_eq!(unsafe { kill(child.id() as i32, sig) }, 0, "{name}: could not signal");
-        // Deliberately short: this is asserting that *nothing* happens,
-        // and a test which asserts nothing happens should not spend long
-        // proving it. A `trap` that wrongly took effect fires at once.
+        // Short, as this asserts nothing happens, and a wrongly effective
+        // `trap` fires at once.
         if let Some(status) = wait_for(&mut child, Duration::from_millis(600)) {
             panic!("{name}: the trap took effect on a signal ignored before bish started ({status:?})");
         }
-        // It cannot die of the signal either, so it needs taking down.
+        // It can't die of the signal either, so it's killed.
         let _ = child.kill();
         let _ = child.wait();
     }
 }
 
-/// `trap` still *succeeds* -- it is accepted and simply has no effect.
-/// bash reports success here, and a script writing `trap ... INT`
-/// defensively should not start failing because somebody upstream was
-/// careful on its behalf.
+/// `trap` still succeeds, with no effect, as in bash: a script trapping
+/// INT defensively shouldn't fail because its parent was careful.
 #[test]
 fn trapping_an_ignored_signal_is_not_an_error() {
     let child = spawn("trap 'echo X' TERM; echo status=$?", Some(SIGTERM));
