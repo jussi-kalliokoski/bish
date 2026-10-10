@@ -104,8 +104,7 @@ pub fn is_trusted(dir: &Path, capability: &str, owned_default: &str) -> bool {
 /// directory bish cannot stat is not owned -- the check fails closed, so
 /// an unreadable or vanished path grants nothing.
 fn owned_by_this_user(dir: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(dir).map(|m| m.uid() == crate::platform::effective_user()).unwrap_or(false)
+    std::fs::metadata(dir).map(|m| crate::platform::file_owner(&m) == crate::platform::effective_user()).unwrap_or(false)
 }
 
 /// Records `dir` as trusted for `capabilities`, replacing any entry for
@@ -139,10 +138,9 @@ pub fn untrust(dir: &Path) -> std::io::Result<bool> {
 /// anybody else's business -- and the directory `0700` for the same
 /// reason, matching how the session code treats its own.
 fn save(entries: &[Entry]) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let path = store_path().ok_or_else(|| std::io::Error::other("no config directory (set HOME or XDG_CONFIG_HOME)"))?;
     if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        crate::platform::create_dir_all_with_mode(parent, 0o700)?;
     }
     let mut body = String::new();
     for entry in entries {
@@ -160,7 +158,7 @@ fn save(entries: &[Entry]) -> std::io::Result<()> {
         body.push_str(&dir);
         body.push('\n');
     }
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    let mut file = crate::platform::create_private_file(&path, false)?;
     file.write_all(body.as_bytes())
 }
 

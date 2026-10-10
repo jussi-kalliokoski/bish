@@ -59,7 +59,15 @@ mod sys;
 #[path = "sys_darwin.rs"]
 mod sys;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// A target that is not a Unix at all -- WASI, and the browser builds
+// that run on top of it -- is the case the file comments above call out:
+// it replaces `unix.rs` with `web.rs` and brings its own `sys`/`os`/
+// `watch` arm, none of which talk to a kernel because there is none.
+#[cfg(target_family = "wasm")]
+#[path = "sys_wasm.rs"]
+mod sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_family = "wasm")))]
 compile_error!(
     "bish has no table of this OS's own numbers yet -- add src/platform/sys_<os>.rs beside the two that are there, \
      and see src/platform/mod.rs for what belongs in it"
@@ -73,6 +81,10 @@ mod os;
 #[path = "darwin.rs"]
 mod os;
 
+#[cfg(target_family = "wasm")]
+#[path = "wasm.rs"]
+mod os;
+
 #[cfg(target_os = "linux")]
 #[path = "watch_linux.rs"]
 mod watch;
@@ -81,7 +93,17 @@ mod watch;
 #[path = "watch_darwin.rs"]
 mod watch;
 
+#[cfg(target_family = "wasm")]
+#[path = "watch_wasm.rs"]
+mod watch;
+
+#[cfg(unix)]
 mod unix;
+
+#[cfg(target_family = "wasm")]
+#[path = "web.rs"]
+mod unix;
+
 pub(crate) use os::*;
 pub(crate) use unix::*;
 pub(crate) use watch::DirWatch;
@@ -111,6 +133,10 @@ pub(crate) struct RawEvent {
     pub(crate) change: RawChange,
 }
 
+// On a target whose directory watch reports nothing (`watch_wasm`),
+// none of these are ever constructed -- the type still has to exist, as
+// the shape a `RawEvent` carries.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawChange {
     /// It appeared, or it was written to, or it is not the file it was.

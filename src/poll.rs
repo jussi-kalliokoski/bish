@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::fd::RawFd;
 
 use crate::platform::{self, PollFd};
 

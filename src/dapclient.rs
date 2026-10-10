@@ -33,7 +33,8 @@ use crate::dap::{self, Message};
 use crate::json::{self, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -127,9 +128,14 @@ impl Session {
         let stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let stdout = child.stdout.take().ok_or("no stdout pipe")?;
         let stderr = child.stderr.take().ok_or("no stderr pipe")?;
-        crate::pty::set_nonblocking(stdout.as_raw_fd());
-        crate::pty::set_nonblocking(stderr.as_raw_fd());
-        crate::pty::set_nonblocking(stdin.as_raw_fd());
+        // A child's pipes only have descriptors where a child can be
+        // spawned; where it cannot, the spawn above already failed.
+        #[cfg(unix)]
+        {
+            crate::pty::set_nonblocking(stdout.as_raw_fd());
+            crate::pty::set_nonblocking(stderr.as_raw_fd());
+            crate::pty::set_nonblocking(stdin.as_raw_fd());
+        }
 
         let mut session = Session {
             child,

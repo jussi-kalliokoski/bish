@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -476,10 +477,15 @@ impl Server {
         let stdout = child.stdout.take().ok_or("no stdout pipe")?;
         let stderr = child.stderr.take().ok_or("no stderr pipe")?;
         // Every pipe non-blocking, including stdin: see this module's
-        // own header for why that is what replaces a writer thread.
-        crate::pty::set_nonblocking(stdout.as_raw_fd());
-        crate::pty::set_nonblocking(stderr.as_raw_fd());
-        crate::pty::set_nonblocking(stdin.as_raw_fd());
+        // own header for why that is what replaces a writer thread. A
+        // child's pipes only have descriptors on a platform that can
+        // spawn one; where it cannot, the spawn above already failed.
+        #[cfg(unix)]
+        {
+            crate::pty::set_nonblocking(stdout.as_raw_fd());
+            crate::pty::set_nonblocking(stderr.as_raw_fd());
+            crate::pty::set_nonblocking(stdin.as_raw_fd());
+        }
 
         let mut server = Server {
             id,
@@ -528,7 +534,7 @@ impl Server {
         let uri = url::from_file_path(&self.root);
         let encodings = PositionEncoding::PREFERRED.iter().map(|e| Value::Str(e.wire_name().to_string())).collect();
         Value::Object(vec![
-            ("processId".to_string(), Value::Number(std::process::id() as f64)),
+            ("processId".to_string(), Value::Number(crate::platform::process_id() as f64)),
             (
                 "clientInfo".to_string(),
                 Value::Object(vec![

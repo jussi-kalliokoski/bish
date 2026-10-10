@@ -983,7 +983,6 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn describe(path: PathBuf, name: String) -> Entry {
-    use std::os::unix::fs::PermissionsExt;
     // `symlink_metadata` first (does *this* name point at a link?), then
     // the followed `metadata` for what it actually resolves to -- a
     // symlink to a directory should still navigate like a directory, it
@@ -992,7 +991,7 @@ fn describe(path: PathBuf, name: String) -> Entry {
     let meta = std::fs::metadata(&path).ok();
     let is_symlink = link.as_ref().map(|m| m.file_type().is_symlink()).unwrap_or(false);
     let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-    let is_exec = meta.as_ref().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) && !is_dir;
+    let is_exec = meta.as_ref().map(crate::platform::has_execute_bit).unwrap_or(false) && !is_dir;
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     // By magic bytes, not by name (crate::archive::kind_of) -- so a zip
     // called `.jar`, `.whl` or nothing at all still opens, and a `.zip`

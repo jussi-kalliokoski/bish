@@ -1,8 +1,48 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+
+// Shims over the `std::process` plumbing that only exists where a child
+// can be spawned. On a target that cannot (WASI, and the browser on top
+// of it) the spawn fails on its own; these keep the code that *builds*
+// the command compiling, standing in a null stream or an "unsupported"
+// error for the conversion that is no longer available.
+#[cfg(unix)]
+fn stdio_from_owned(fd: std::os::fd::OwnedFd) -> Stdio {
+    Stdio::from(fd)
+}
+#[cfg(not(unix))]
+fn stdio_from_owned(_fd: std::os::fd::OwnedFd) -> Stdio {
+    Stdio::null()
+}
+
+#[cfg(unix)]
+fn child_stdout_as_owned(out: Option<std::process::ChildStdout>) -> Option<std::os::fd::OwnedFd> {
+    out.map(std::os::fd::OwnedFd::from)
+}
+#[cfg(not(unix))]
+fn child_stdout_as_owned(_out: Option<std::process::ChildStdout>) -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
+#[cfg(unix)]
+fn set_command_arg0(command: &mut Command, argv0: &str) {
+    command.arg0(argv0);
+}
+#[cfg(not(unix))]
+fn set_command_arg0(_command: &mut Command, _argv0: &str) {}
+
+#[cfg(unix)]
+fn exec_replacing_process(command: &mut Command) -> std::io::Error {
+    command.exec()
+}
+#[cfg(not(unix))]
+fn exec_replacing_process(_command: &mut Command) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Unsupported, "exec is not available on this platform")
+}
 
 use crate::arith;
 use crate::bishedit::highlight;
@@ -2315,7 +2355,7 @@ impl Shell {
         // become an ordinary exported variable -- visible to `env`,
         // and inherited by a *new* `bish -c` further down, which would
         // then report its parent's `$$` instead of its own.
-        let shell_pid = inherited_shell_pid().unwrap_or_else(std::process::id);
+        let shell_pid = inherited_shell_pid().unwrap_or_else(crate::platform::process_id);
         let mut inherited: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k != REEXEC_SHELL_PID).collect();
         // `PS4` is a real variable with a default, not a fallback used
         // when it is missing. The difference shows the moment a script
@@ -2440,7 +2480,7 @@ impl Shell {
             // A continuation of some other shell -- a background job, a
             // pipeline stage, anything else re-executed -- is told that
             // shell's `$$`, which is how it can tell it is one.
-            forked_subshell: shell_pid != std::process::id(),
+            forked_subshell: shell_pid != crate::platform::process_id(),
             interactive: false,
             started_as_login: false,
             login_shell: false,
@@ -3121,7 +3161,7 @@ impl Shell {
     // its own destination rather than this trying to work one out.
     pub(crate) fn drain_background_output(&self) -> bool {
         use std::io::Read;
-        use std::os::unix::io::AsRawFd;
+        use std::os::fd::AsRawFd;
         // Bounded per call, the same way repl.rs's own job-pty drain is:
         // a firehose in the background must not be able to hold up
         // whichever interactive loop called this.
@@ -3228,7 +3268,7 @@ impl Shell {
     /// one being sat in front of.
     fn drive_pending_fg_inline(&mut self) -> i32 {
         use std::io::Read;
-        use std::os::unix::io::AsRawFd;
+        use std::os::fd::AsRawFd;
         let Some(mut job) = self.pending_fg.take() else { return self.last_status };
         let screen = self.sink_grid();
         if let Some(master) = job.pty_master.as_mut() {
@@ -6218,6 +6258,7 @@ impl Shell {
         // no tcsetpgrp/stop-handling machinery here to keep a foreground
         // Ctrl-C routing to it once isolated.
         if background && self.opt_monitor {
+            #[cfg(unix)]
             unsafe {
                 command.pre_exec(|| {
                     crate::platform::set_process_group(0, 0);
@@ -6426,7 +6467,7 @@ impl Shell {
             Some(argv) => {
                 let mut command = self.command(&argv[0]);
                 command.args(&argv[1..]);
-                command.stdout(Stdio::from(write_end));
+                command.stdout(stdio_from_owned(write_end));
                 command.stdin(self.spawn_stdin_stdio());
                 match command.spawn() {
                     Ok(child) => self.proc_sub_children.push((child, true)),
@@ -6573,7 +6614,7 @@ impl Shell {
             Some(argv) => {
                 let mut command = self.command(&argv[0]);
                 command.args(&argv[1..]);
-                command.stdin(Stdio::from(read_end));
+                command.stdin(stdio_from_owned(read_end));
                 command.stdout(self.spawn_stdout_stdio());
                 match command.spawn() {
                     Ok(child) => self.proc_sub_children.push((child, false)),
@@ -8285,6 +8326,7 @@ impl Shell {
                 // See apply_fd_redirects' pre_exec comment: without this,
                 // `command foo` would inherit bish's own ignored SIGINT
                 // and never respond to Ctrl-C.
+                #[cfg(unix)]
                 unsafe {
                     ext.pre_exec(|| {
                         crate::platform::default_signal(crate::platform::SIGINT);
@@ -8354,7 +8396,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: suspend: cannot suspend: no job control");
                     return ExecResult::Status(1);
                 }
-                send_signal(std::process::id(), 19);
+                send_signal(crate::platform::process_id(), 19);
                 return ExecResult::Status(0);
             }
             "cd" => return ExecResult::Status(crate::builtins::dirs::run_cd(self, &argv[1..])),
@@ -9583,7 +9625,7 @@ impl Shell {
                 // without touching the real process.
                 if self.subshell_depth > 0 {
                     let mut command = self.command(prog);
-                    command.arg0(&argv0);
+                    set_command_arg0(&mut command, &argv0);
                     if opts.clear_env {
                         command.env_clear();
                     }
@@ -9611,7 +9653,7 @@ impl Shell {
                     return ExecResult::Exit(status);
                 }
                 let mut command = self.command(prog);
-                command.arg0(&argv0);
+                set_command_arg0(&mut command, &argv0);
                 if opts.clear_env {
                     command.env_clear();
                 }
@@ -9630,7 +9672,7 @@ impl Shell {
                     sh_eprintln!(self, "bish: exec: {}", e);
                     return ExecResult::Status(1);
                 }
-                let err = command.exec();
+                let err = exec_replacing_process(&mut command);
                 // bash's own wording for this one is just "not found",
                 // shorter than the message anywhere else.
                 let text = match err.kind() == std::io::ErrorKind::NotFound {
@@ -9885,6 +9927,7 @@ impl Shell {
         // control race where either side might run first -- setpgid(pid,
         // pid) is idempotent, so redundantly calling it twice is safe.
         if self.opt_monitor {
+            #[cfg(unix)]
             unsafe {
                 command.pre_exec(|| {
                     crate::platform::set_process_group(0, 0);
@@ -10078,7 +10121,7 @@ impl Shell {
             (Some(p), Some(screen)) => {
                 p.master.try_clone().ok().zip(std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok()).map(
                     |(master, keepalive)| {
-                        pty::set_nonblocking(std::os::unix::io::AsRawFd::as_raw_fd(&master));
+                        pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
                         PaneOutput { master, screen, _keepalive: keepalive }
                     },
                 )
@@ -10110,11 +10153,11 @@ impl Shell {
                     command.env(k, v);
                 }
                 command.stdin(match stdin_end {
-                    Some(fd) => Stdio::from(fd),
+                    Some(fd) => stdio_from_owned(fd),
                     None => self.spawn_stdin_stdio(),
                 });
                 command.stdout(match stdout_end {
-                    Some(fd) => Stdio::from(fd),
+                    Some(fd) => stdio_from_owned(fd),
                     None => pane_slave(&pane_pty).unwrap_or_else(|| self.spawn_stdout_stdio()),
                 });
                 if let Some(slave) = pane_slave(&pane_pty) {
@@ -10408,7 +10451,7 @@ impl Shell {
             (Some(p), Some(screen)) => {
                 p.master.try_clone().ok().zip(std::fs::OpenOptions::new().read(true).write(true).open(&p.slave_path).ok()).map(
                     |(master, keepalive)| {
-                        pty::set_nonblocking(std::os::unix::io::AsRawFd::as_raw_fd(&master));
+                        pty::set_nonblocking(std::os::fd::AsRawFd::as_raw_fd(&master));
                         PaneOutput { master, screen, _keepalive: keepalive }
                     },
                 )
@@ -10446,7 +10489,7 @@ impl Shell {
             // Only the first stage takes the pty as stdin -- every other
             // one reads the previous stage's pipe, exactly as before.
             let default_stdin = match prev_stdout.take() {
-                Some(prev) => Stdio::from(prev),
+                Some(prev) => stdio_from_owned(prev),
                 None => bg_slave(&bg_pty).unwrap_or_else(|| self.spawn_stdin_stdio()),
             };
             let default_stdout = match is_last {
@@ -10587,7 +10630,9 @@ impl Shell {
             // classic job-control race -- same reasoning/idempotency as
             // run_single's own identical pre_exec hook.
             if background && self.opt_monitor {
+                #[cfg(unix)]
                 let join_pgid = pgid;
+                #[cfg(unix)]
                 unsafe {
                     command.pre_exec(move || {
                         crate::platform::set_process_group(0, join_pgid.unwrap_or(0));
@@ -10617,7 +10662,7 @@ impl Shell {
                         }
                     }
                     if !is_last {
-                        prev_stdout = child.stdout.take().map(std::os::fd::OwnedFd::from);
+                        prev_stdout = child_stdout_as_owned(child.stdout.take());
                     }
                     children.push((i, child));
                 }
@@ -12337,7 +12382,7 @@ impl Shell {
                     // not a process -- see run_in_child_shell.
                     // The real one, not a remembered one: a subshell
                     // that is in fact this process still reports its own.
-                    "BASHPID" => std::process::id().to_string(),
+                    "BASHPID" => crate::platform::process_id().to_string(),
                     "BASH_SUBSHELL" => self.subshell_depth.to_string(),
                     "BASH_COMMAND" => self.bash_command.to_string(),
                     // The `set -o` and `shopt` options currently on,
@@ -13461,7 +13506,7 @@ fn move_opened_files_out_of_the_way(actions: &mut [FdAction]) {
     }
     for a in actions.iter_mut() {
         let FdAction::Open { file, .. } = a else { continue };
-        let raw = std::os::unix::io::AsRawFd::as_raw_fd(file);
+        let raw = std::os::fd::AsRawFd::as_raw_fd(file);
         if raw >= floor {
             continue;
         }
@@ -13702,7 +13747,7 @@ impl Job {
     /// longer in the table to be walked.
     fn drain_into_sink(&mut self) {
         use std::io::Read;
-        use std::os::unix::io::AsRawFd;
+        use std::os::fd::AsRawFd;
         let (Some(master), Some(screen)) = (&mut self.pty_master, &self.sink_screen) else {
             return;
         };
@@ -15134,8 +15179,7 @@ fn child_cpu_times() -> (f64, f64) {
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    status.code().unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
+    status.code().unwrap_or_else(|| crate::platform::exit_signal(&status).map(|s| 128 + s).unwrap_or(1))
 }
 
 // Shared by the `read` builtin's two sources (a Box<dyn BufRead> from
@@ -15909,7 +15953,7 @@ fn apply_fds_to_self(actions: Vec<FdAction>) -> Result<(), String> {
     for ef in actions {
         match ef {
             FdAction::Open { fd, file } => {
-                let srcfd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+                let srcfd = std::os::fd::AsRawFd::as_raw_fd(&file);
                 if !crate::platform::duplicate_onto(srcfd, fd) {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
@@ -16026,6 +16070,12 @@ fn spawn_failure(name: &str, e: &std::io::Error) -> (String, i32) {
 }
 
 fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
+    // A child's descriptors are arranged in a `pre_exec` hook, which only
+    // a platform that forks has. Where none does, the spawn this prepares
+    // fails on its own, so there is nothing to arrange.
+    #[cfg(not(unix))]
+    let _ = (command, actions);
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(move || {
             // bish ignores SIGINT for itself (term::ignore_sigint, called
@@ -16040,7 +16090,7 @@ fn apply_fd_redirects(command: &mut Command, actions: Vec<FdAction>) {
             for ef in &actions {
                 match ef {
                     FdAction::Open { fd, file } => {
-                        if !crate::platform::duplicate_onto(std::os::unix::io::AsRawFd::as_raw_fd(file), *fd) {
+                        if !crate::platform::duplicate_onto(std::os::fd::AsRawFd::as_raw_fd(file), *fd) {
                             return Err(std::io::Error::last_os_error());
                         }
                         clear_cloexec(*fd);
@@ -16327,7 +16377,7 @@ fn dup_existing_fd(fd: i32) -> Option<std::fs::File> {
 }
 
 fn connect_dev_socket(proto: &str, host: &str, port: &str) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    use std::os::fd::{FromRawFd, IntoRawFd};
     let addr = format!("{host}:{port}");
     if proto == "tcp" {
         let stream = std::net::TcpStream::connect(&addr)?;

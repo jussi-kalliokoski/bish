@@ -39,7 +39,7 @@
 use crate::platform::{DirWatch, RawChange, WatchId};
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 /// What happened to a path.

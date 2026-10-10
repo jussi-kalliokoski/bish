@@ -124,6 +124,10 @@ fn budget() -> usize {
 /// coroutine gets a fixed allocation rather than whatever `ulimit -s`
 /// says. `Coroutine::resume` swaps both in on the way into a stage and
 /// back out on the way home.
+///
+/// Only the coroutine machinery calls this, and that machinery does not
+/// exist on a target that cannot switch stacks -- hence unused there.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 pub fn swap_stack(base: usize, budget_bytes: usize) -> (usize, usize) {
     let previous_base = BASE.with(|b| b.replace(base));
     let previous_budget = BUDGET.with(|b| b.replace(budget_bytes));

@@ -44,6 +44,7 @@
 //   page below it, so overrunning it is a fault at the guard rather than
 //   silent corruption of whatever was mapped next.
 
+#[cfg(not(target_family = "wasm"))]
 use std::cell::Cell;
 
 /// The callee-saved state of a suspended execution: everything the
@@ -52,6 +53,7 @@ use std::cell::Cell;
 /// Only the stack pointer is named here. Everything else lives *on* that
 /// stack, pushed by the switch itself -- which is what makes this one
 /// word wide and the switch a dozen instructions.
+#[cfg(not(target_family = "wasm"))]
 #[repr(C)]
 #[derive(Default)]
 struct Context {
@@ -62,6 +64,7 @@ struct Context {
 // call but nothing outside it can see. ELF and Mach-O spell that
 // differently, and Mach-O also puts an underscore in front of every C
 // symbol name, so the extern below only finds it under `_bish...`.
+#[cfg(not(target_family = "wasm"))]
 #[cfg(target_vendor = "apple")]
 macro_rules! switch_context_label {
     () => {
@@ -69,6 +72,7 @@ macro_rules! switch_context_label {
     };
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_vendor = "apple"))]
 macro_rules! switch_context_label {
     () => {
@@ -140,6 +144,7 @@ std::arch::global_asm!(
     "ret",
 );
 
+#[cfg(not(target_family = "wasm"))]
 unsafe extern "C" {
     /// Saves the current execution into `from` and resumes `to`.
     ///
@@ -157,18 +162,22 @@ unsafe extern "C" {
 /// for the shallow ones. It is virtual address space, not memory: pages
 /// are faulted in as they are touched, so an unused megabyte costs a
 /// page-table entry and nothing else.
+#[cfg(not(target_family = "wasm"))]
 const STACK_SIZE: usize = 2 * 1024 * 1024;
 
 /// An unreadable page below the stack, so an overrun faults there
 /// instead of running into whatever the allocator put next.
+#[cfg(not(target_family = "wasm"))]
 const GUARD_SIZE: usize = 4096;
 
 /// One coroutine's stack: `mmap`ed, guarded, and unmapped on drop.
+#[cfg(not(target_family = "wasm"))]
 struct Stack {
     base: *mut u8,
     total: usize,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Stack {
     fn new() -> std::io::Result<Stack> {
         // The guard goes at the *low* end: stacks grow downward, so
@@ -184,6 +193,7 @@ impl Stack {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for Stack {
     fn drop(&mut self) {
         unsafe { crate::platform::unmap(self.base, self.total) };
@@ -203,6 +213,59 @@ pub enum State {
     Done,
 }
 
+// ---------------------------------------------------------------------
+// The wasm stub. There is no second stack to switch onto in WASI, so a
+// coroutine here cannot suspend: `resume` runs the body straight through
+// (a `yield_now` inside it is a no-op) and `in_coroutine` is always
+// false. Nothing drives the scheduler that would use this yet, so it is
+// never reached -- it exists so `scheduler.rs` still compiles for the
+// web target. The real stack-switching machinery below is compiled for
+// every other target.
+// ---------------------------------------------------------------------
+
+#[cfg(target_family = "wasm")]
+pub struct Coroutine {
+    state: State,
+    body: Option<Box<dyn FnOnce()>>,
+    panicked: bool,
+}
+
+#[cfg(target_family = "wasm")]
+impl Coroutine {
+    pub fn new(body: impl FnOnce() + 'static) -> std::io::Result<Box<Coroutine>> {
+        Ok(Box::new(Coroutine { state: State::Fresh, body: Some(Box::new(body)), panicked: false }))
+    }
+
+    pub fn resume(&mut self) -> State {
+        if let Some(body) = self.body.take() {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            self.panicked = outcome.is_err();
+        }
+        self.state = State::Done;
+        self.state
+    }
+
+    pub fn panicked(&self) -> bool {
+        self.panicked
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+}
+
+/// A no-op: a wasm coroutine cannot suspend, so there is nothing to
+/// yield to.
+#[cfg(target_family = "wasm")]
+pub fn yield_now() {}
+
+/// Always false: there is no coroutine to be inside on this platform.
+#[cfg(target_family = "wasm")]
+pub fn in_coroutine() -> bool {
+    false
+}
+
+#[cfg(not(target_family = "wasm"))]
 thread_local! {
     /// Where to switch back to when the running coroutine yields.
     ///
@@ -221,6 +284,7 @@ thread_local! {
 }
 
 /// A separately-stacked execution that can be stopped and restarted.
+#[cfg(not(target_family = "wasm"))]
 pub struct Coroutine {
     context: Context,
     /// The high end of this coroutine's own stack, and how much of it a
@@ -242,6 +306,7 @@ pub struct Coroutine {
     panicked: bool,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Coroutine {
     /// Creates a coroutine that will run `body` when first resumed.
     ///
@@ -359,6 +424,7 @@ impl Coroutine {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Drop for Coroutine {
     fn drop(&mut self) {
         // A coroutine dropped mid-yield never runs again, so whatever it
@@ -378,6 +444,7 @@ impl Drop for Coroutine {
 ///
 /// `extern "C"` and never called directly: it is reached by the `ret` at
 /// the end of the first switch into this stack.
+#[cfg(not(target_family = "wasm"))]
 extern "C" fn trampoline() -> ! {
     let co = CURRENT.with(|c| c.get());
     unsafe {
@@ -403,6 +470,7 @@ extern "C" fn trampoline() -> ! {
 ///
 /// A no-op when nothing is running as a coroutine, so code that can run
 /// either way does not have to know which it is.
+#[cfg(not(target_family = "wasm"))]
 pub fn yield_now() {
     let current = CURRENT.with(|c| c.get());
     let back = RETURN_TO.with(|r| r.get());
@@ -413,6 +481,7 @@ pub fn yield_now() {
 }
 
 /// Whether this thread is currently inside a coroutine.
+#[cfg(not(target_family = "wasm"))]
 pub fn in_coroutine() -> bool {
     !CURRENT.with(|c| c.get()).is_null()
 }

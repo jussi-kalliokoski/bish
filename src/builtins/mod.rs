@@ -32,9 +32,6 @@ pub(crate) mod limits;
 pub(crate) mod shell;
 pub(crate) mod vars;
 
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
-
 pub fn break_loop(args: &[String]) -> crate::exec::ExecResult {
     let n = args.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
     crate::exec::ExecResult::Break(n)
@@ -296,10 +293,10 @@ pub(crate) fn unary(op: &str, a: &str) -> bool {
         "-n" => !a.is_empty(),
         "-s" => std::fs::metadata(a).map(|m| m.len() > 0).unwrap_or(false),
         "-L" | "-h" => std::fs::symlink_metadata(a).map(|m| m.file_type().is_symlink()).unwrap_or(false),
-        "-p" => file_type_is(a, |ft| ft.is_fifo()),
-        "-S" => file_type_is(a, |ft| ft.is_socket()),
-        "-b" => file_type_is(a, |ft| ft.is_block_device()),
-        "-c" => file_type_is(a, |ft| ft.is_char_device()),
+        "-p" => file_type_is(a, crate::platform::is_fifo),
+        "-S" => file_type_is(a, crate::platform::is_socket),
+        "-b" => file_type_is(a, crate::platform::is_block_device),
+        "-c" => file_type_is(a, crate::platform::is_char_device),
         "-g" => mode_has(a, 0o2000),
         "-u" => mode_has(a, 0o4000),
         "-k" => mode_has(a, 0o1000),

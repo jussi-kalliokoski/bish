@@ -21,7 +21,8 @@ use crate::platform;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 
@@ -72,6 +73,10 @@ pub fn spawn_attached(mut cmd: Command, slave_path: &str) -> io::Result<Child> {
 /// its own targets for the streams it did.
 pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
     let path = CString::new(slave_path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // A pty is a controlling-terminal concept with no meaning on a
+    // target that cannot fork-exec; there the slave path is simply
+    // dropped, and the spawn that follows fails on its own terms.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(move || {
             // bish ignores SIGINT for itself (term::ignore_sigint, called
@@ -86,6 +91,10 @@ pub fn attach_on_exec(cmd: &mut Command, slave_path: &str) -> io::Result<()> {
             platform::default_signal(platform::SIGINT);
             platform::attach_to_pty_slave(&path)
         });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (&mut *cmd, path);
     }
     Ok(())
 }

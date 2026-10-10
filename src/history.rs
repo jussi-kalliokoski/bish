@@ -42,7 +42,6 @@
 // clone), so every fork still appends to the identical file, just with
 // an independently-diverging in-memory view.
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -117,12 +116,7 @@ pub struct History {
 /// Failure is ignored on purpose -- a history file on a filesystem that
 /// cannot represent the mode is still worth appending to.
 fn tighten_history_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else { return };
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700));
-    }
+    crate::platform::restrict_to_owner(path);
 }
 
 impl History {
@@ -238,7 +232,7 @@ impl History {
         // nobody chose 0644, a umask did, and leaving it would mean
         // the fix only ever helped new installs.
         if let Some(p) = &self.path
-            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p)
+            && let Ok(mut f) = crate::platform::create_private_file(p, true)
         {
             tighten_history_permissions(p);
             // One `write_all` of one line, deliberately -- not a
@@ -533,7 +527,7 @@ fn history_path(filename: &str) -> Option<PathBuf> {
 // treats a missing entry as an error.
 fn compact(path: &Path, limit: usize) {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
     let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else { return };
     let fd = file.as_raw_fd();
     if crate::platform::lock_exclusive(fd).is_err() {

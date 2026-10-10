@@ -348,7 +348,7 @@ fn query_term_size() -> (usize, usize) {
 // to this same screen resize (see its own doc comment) rather than
 // polling WINCH a second time.
 fn poll_and_apply_resize(app: &mut App) -> bool {
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
     if !exec::take_winch() {
         return false;
     }
@@ -4404,7 +4404,7 @@ fn sync_bracketed_paste(enabled: &mut bool, screen: &Rc<RefCell<vt100::Screen>>)
 // geometry built around the old size (see FgOutcome::Resized's own doc
 // comment) instead of silently continuing.
 fn sync_pty_size(last: &mut (u16, u16), job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>) -> bool {
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
     let (rows, cols) = screen.borrow().size();
     let (rows, cols) = (rows as u16, cols as u16);
     if (rows, cols) == *last {
@@ -4480,7 +4480,7 @@ fn decode_fg_click(seq: &[u8]) -> Option<editor::MouseEvent> {
 // sync_bracketed_paste's own doc comment.
 fn drive_fg_job(job: &mut exec::FgJob, screen: &Rc<RefCell<vt100::Screen>>, mut redraw: impl FnMut(), mut on_idle: impl FnMut()) -> FgOutcome {
     use std::io::{Read, Write};
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsRawFd;
 
     pty::set_nonblocking(job.pty_master().as_raw_fd());
     let _raw_guard = term::RawGuard::enable(0).ok();

@@ -530,6 +530,16 @@ pub(crate) fn effective_user() -> u32 {
     unsafe { geteuid() }
 }
 
+/// The owner of a file, as its metadata records it. The one place
+/// bish's ownership checks read a uid off a file, so they do it through
+/// the platform layer rather than reaching for `MetadataExt` themselves
+/// -- which is what lets a non-Unix target answer the question its own
+/// way (see `web.rs`).
+pub(crate) fn file_owner(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid()
+}
+
 pub(crate) fn effective_group() -> u32 {
     unsafe { getegid() }
 }
@@ -1096,6 +1106,101 @@ pub(crate) fn create_dir_with_mode(path: &std::path::Path, mode: u32) -> std::io
     match unsafe { mkdir(c_path.as_ptr(), mode) } {
         0 => Ok(()),
         _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// `path` and every missing parent, created `mode` -- the recursive
+/// counterpart to `create_dir_with_mode`, for a private config directory
+/// whose parents may not exist yet.
+pub(crate) fn create_dir_all_with_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(mode).create(path)
+}
+
+/// A file only its owner can read or write (`0600`), created fresh for
+/// writing. `append` keeps what is there; otherwise it is truncated.
+///
+/// The one place bish writes a private file -- history, the trust store
+/// -- so the mode is set here rather than reached for with
+/// `OpenOptionsExt` at each call, which is what lets a target without
+/// permission bits (`web.rs`) simply open the file.
+pub(crate) fn create_private_file(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).mode(0o600);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    options.open(path)
+}
+
+/// This process's own id. Behind the platform layer because a target
+/// with no processes (`web.rs`) has no real one and `std::process::id`
+/// aborts there -- it answers a fixed value instead.
+pub(crate) fn process_id() -> u32 {
+    std::process::id()
+}
+
+/// The signal that killed a process, if one did. Behind the platform
+/// layer because `ExitStatusExt` is Unix-only; where processes cannot be
+/// signalled (`web.rs`) the answer is always `None`.
+pub(crate) fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+/// Forces `path` to exactly `mode`. Behind the platform layer because
+/// the bits are Unix's; a target without them (`web.rs`) does nothing.
+pub(crate) fn set_file_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Whether a file's mode has any execute bit set. Behind the platform
+/// layer because the permission bits are Unix's; a target without them
+/// (`web.rs`) has no notion of an executable file and answers `false`.
+pub(crate) fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// The four special file kinds `test`/`[` can ask about (`-p -S -b
+/// -c`). Behind the platform layer because the trait that answers them,
+/// `FileTypeExt`, is Unix-only -- a target without these kinds (`web.rs`)
+/// answers `false`, which is what `test` should say where they cannot
+/// exist.
+pub(crate) fn is_fifo(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_fifo()
+}
+
+pub(crate) fn is_socket(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_socket()
+}
+
+pub(crate) fn is_block_device(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_block_device()
+}
+
+pub(crate) fn is_char_device(file_type: &std::fs::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    file_type.is_char_device()
+}
+
+/// Takes group and other off an existing file, if they are set. Failure
+/// is ignored: a file on a filesystem that cannot represent the mode is
+/// still the file, and a target without modes at all (`web.rs`) does
+/// nothing here.
+pub(crate) fn restrict_to_owner(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700));
     }
 }
 

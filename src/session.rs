@@ -37,10 +37,118 @@
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(not(unix))]
+use wasm_socket::{UnixListener, UnixStream};
+
+// On a target without UNIX-domain sockets, detachable sessions cannot
+// work: there is no socket to bind, connect or accept on. These stubs
+// stand in for `std::os::unix::net`'s two types so the whole session
+// module still compiles -- every operation returns "unsupported", and
+// the callers (all behind a `bish session ...` subcommand or the
+// interactive bridge) surface that rather than a link failure. The one
+// user of a target like this is the browser build, which has no second
+// process to detach from in the first place.
+#[cfg(not(unix))]
+mod wasm_socket {
+    use std::io;
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::path::Path;
+
+    fn unsupported<T>() -> io::Result<T> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "detachable sessions are not available on this platform"))
+    }
+
+    pub struct UnixStream;
+
+    impl UnixStream {
+        pub fn connect<P: AsRef<Path>>(_path: P) -> io::Result<UnixStream> {
+            unsupported()
+        }
+
+        pub fn pair() -> io::Result<(UnixStream, UnixStream)> {
+            unsupported()
+        }
+
+        pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+            unsupported()
+        }
+
+        pub fn try_clone(&self) -> io::Result<UnixStream> {
+            unsupported()
+        }
+
+        pub fn set_read_timeout(&self, _timeout: Option<std::time::Duration>) -> io::Result<()> {
+            unsupported()
+        }
+    }
+
+    impl AsRawFd for UnixStream {
+        fn as_raw_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    impl io::Read for UnixStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            unsupported()
+        }
+    }
+
+    impl io::Write for UnixStream {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            unsupported()
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The protocol writes through a shared reference too (`(&*stream)`),
+    // so the borrowed form needs the same two traits.
+    impl io::Read for &UnixStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            unsupported()
+        }
+    }
+
+    impl io::Write for &UnixStream {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            unsupported()
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub struct UnixListener;
+
+    impl UnixListener {
+        pub fn bind<P: AsRef<Path>>(_path: P) -> io::Result<UnixListener> {
+            unsupported()
+        }
+
+        /// Matches `std::os::unix::net::UnixListener::accept`'s shape --
+        /// the second element is the peer address, which callers ignore.
+        pub fn accept(&self) -> io::Result<(UnixStream, ())> {
+            unsupported()
+        }
+
+        pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+            unsupported()
+        }
+    }
+
+    impl AsRawFd for UnixListener {
+        fn as_raw_fd(&self) -> RawFd {
+            -1
+        }
+    }
+}
 
 // SIGTERM is 15 on every Unix bish targets, unlike the job-control
 // numbers; it is here rather than in the layer's tables for that reason.
@@ -53,7 +161,7 @@ const SIGTERM: i32 = 15;
 // misconfigured or shared runtime directory could otherwise let another
 // local user's process connect at all; this is what actually refuses to
 // speak to it once it has.
-pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     crate::platform::peer_user(stream.as_raw_fd())
 }
 
@@ -119,7 +227,7 @@ fn acquire_pidfile_lock(name: &str) -> io::Result<std::fs::File> {
     crate::platform::lock_exclusive(file.as_raw_fd())?;
     use std::io::Write as _;
     let mut f = &file;
-    write!(f, "{}", std::process::id())?;
+    write!(f, "{}", crate::platform::process_id())?;
     Ok(file)
 }
 
@@ -174,7 +282,7 @@ fn read_attached(name: &str) -> Option<usize> {
 /// a running daemon and this keeps writing to the same inode.
 fn write_status(pidfile: &mut std::fs::File, attached: usize) {
     use std::io::{Seek, SeekFrom};
-    let text = format!("{}\nattached {}\n", std::process::id(), attached);
+    let text = format!("{}\nattached {}\n", crate::platform::process_id(), attached);
     let _ = pidfile.seek(SeekFrom::Start(0));
     let _ = pidfile.set_len(0);
     let _ = pidfile.write_all(text.as_bytes());
@@ -242,13 +350,13 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
         //
         // symlink_metadata does not follow, so this sees the entry
         // itself: it must be a real directory, and it must be ours.
-        use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(&dir)?;
         if !meta.is_dir() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists and is not a directory", dir.display())));
         }
-        if meta.uid() != current_uid() {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by uid {}, not by you", dir.display(), meta.uid())));
+        let owner = crate::platform::file_owner(&meta);
+        if owner != current_uid() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is owned by uid {}, not by you", dir.display(), owner)));
         }
     }
     // Belt-and-suspenders: force the mode even if the directory already
@@ -257,8 +365,7 @@ pub fn ensure_socket_dir() -> io::Result<PathBuf> {
     // install) -- cheap, and closes exactly the class of gap GNU
     // screen's own socket-directory CVE history warns against (see
     // ../bish-detachable-sessions.md's tmux/screen research).
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    crate::platform::set_file_mode(&dir, 0o700)?;
     Ok(dir)
 }
 
@@ -1265,7 +1372,7 @@ pub fn run_daemon(name: &str) -> io::Result<i32> {
 pub fn listen_here() -> io::Result<PathBuf> {
     let dir = ensure_socket_dir()?;
     remove_unanswered_ide_sockets(&dir);
-    let path = ide_socket_path(std::process::id());
+    let path = ide_socket_path(crate::platform::process_id());
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     install_bridge(SessionBridge::without_terminal(listener)?);
@@ -1282,7 +1389,7 @@ pub fn ide_socket_path(pid: u32) -> PathBuf {
 pub fn stop_listening() {
     let plain = ACTIVE_BRIDGE.with(|b| b.borrow().as_ref().is_some_and(|bridge| bridge.pty_master.is_none()));
     if plain {
-        let _ = std::fs::remove_file(ide_socket_path(std::process::id()));
+        let _ = std::fs::remove_file(ide_socket_path(crate::platform::process_id()));
     }
 }
 
