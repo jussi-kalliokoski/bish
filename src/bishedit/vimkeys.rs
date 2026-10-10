@@ -856,60 +856,39 @@ impl VimKeys {
         std::mem::take(&mut self.pending_revert)
     }
 
-    /// Whether a key is already waiting to be delivered, from a macro
-    /// replay or a mapping's expansion.
-    ///
-    /// Every loop that waits for input polls *stdin* before reading, so
-    /// each one has to ask this first: a queued key is not a byte on
-    /// stdin and the poll will never see it. Without the check the loop
-    /// blocks with keys in hand, and they come out one per real
-    /// keystroke -- which is what made a multi-key macro appear to
-    /// replay only its first key.
+    /// Whether a key is queued for delivery, from a macro replay or a
+    /// mapping. Every input loop polls stdin before reading, and a queued
+    /// key isn't on stdin, so each loop must ask this first or it blocks
+    /// with keys in hand.
     pub fn has_pending_keys(&self) -> bool {
         !self.replay_queue.is_empty()
     }
 
-    /// Takes whatever a mapping has queued but not yet delivered.
-    ///
-    /// Needed where a mapped key hands control to a loop that does not
-    /// read through this machine at all: `:` opens command mode, which
-    /// is `read_line` on raw stdin and has no idea a replay queue
-    /// exists. Without handing the rest over, a right-hand side like
-    /// `<Esc>:w<CR>` would fire its `<Esc>` and `:` and then silently
-    /// drop the `w<CR>` -- the mapping doing half its job, which is
-    /// worse than doing none.
+    /// Takes what a mapping has queued but not delivered, for when a mapped
+    /// key hands control to a loop that doesn't read through here: `:` opens
+    /// command mode, `read_line` on raw stdin. Otherwise `<Esc>:w<CR>` would
+    /// fire `<Esc>` and `:` and drop `w<CR>`.
     pub fn take_replay_queue(&mut self) -> Vec<Key> {
         self.replay_queue.drain(..).collect()
     }
 
-    /// Reads the next key *as a command*, applying `::bish map` to it.
+    /// Reads the next key as a command, applying `::bish map`. Separate from
+    /// `next_key`, which also serves Insert mode and single-character reads,
+    /// which mapping would corrupt.
     ///
-    /// Deliberately separate from `next_key` rather than folded into it.
-    /// `next_key` also serves Insert mode and the several places that
-    /// read one raw character for their own purposes; running those
-    /// through the keymap would remap text being typed and arguments
-    /// being collected. Only a key that is about to be interpreted as a
-    /// command belongs here.
-    ///
-    /// Mapped keys go out through `replay_queue`, which is popped at the
-    /// top *before* the matcher runs -- so a mapping's own output can
-    /// never be mapped again, and the non-recursion holds without a flag
-    /// to get wrong. It is also why a macro replaying through this is
-    /// unaffected: those keys were already resolved when recorded.
-    ///
-    /// The loop is the buffering: while a multi-key mapping is still
-    /// being decided nothing is returned yet, so the caller simply waits
-    /// on the next keystroke the way it waits on any other.
+    /// Mapped keys go out through `replay_queue`, which is popped before the
+    /// matcher runs, so a mapping's output is never mapped again, and a
+    /// replayed macro, already resolved when recorded, is unaffected. While a
+    /// multi-key mapping is undecided this keeps reading, so the caller just
+    /// waits.
     pub fn next_command_key(&mut self, read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         let mode = self.keymap_mode();
         self.next_mapped_key(mode, read)
     }
 
-    /// The same, for a mode that is not this machine's own -- Insert
-    /// mode passes "insert", command mode "command". Kept explicit
-    /// rather than inferred, because those modes are driven by other
-    /// loops entirely and `keymap_mode` only knows about normal and
-    /// visual.
+    /// The same for a mode that isn't this machine's (Insert passes
+    /// `"insert"`, command mode `"command"`), whose loops `keymap_mode` can't
+    /// see.
     pub fn next_mapped_key(&mut self, mode: &str, mut read: impl FnMut() -> io::Result<Option<Key>>) -> io::Result<Option<Key>> {
         loop {
             if let Some(key) = self.replay_queue.pop_front() {
@@ -917,14 +896,13 @@ impl VimKeys {
             }
             let Some(key) = read()? else { return Ok(None) };
             self.record_key(key);
-            // An argument-pending state takes the next keystroke as a
-            // literal (`fx` finds an `x`), so it must not be remapped.
+            // An argument-pending key is a literal (`fx` finds an `x`).
             if self.matcher.is_empty() || self.wants_raw_key() {
                 return Ok(Some(self.capture_insert_key(key)));
             }
-            // Insert mode can take a printable key back off the screen,
-            // so it lets the matcher type one speculatively rather than
-            // holding it; every other mode holds. See `Matcher::feed`.
+            // Insert mode can take a printable key back off the screen, so
+            // the matcher may type one speculatively; other modes hold it.
+            // See `Matcher::feed`.
             let mut out = self.matcher.feed(key, mode, mode == "insert");
             self.pending_revert += out.revert;
             if out.keys.is_empty() {
@@ -936,25 +914,18 @@ impl VimKeys {
         }
     }
 
-    /// Adds `key` to the change `.` will repeat, if an Insert-mode
-    /// excursion is open, and closes that excursion out when the key is
-    /// the one that ends it.
-    ///
-    /// Called from both read seams because Insert mode uses
-    /// `next_mapped_key` (so that `::bish map -m insert` applies to what
-    /// gets typed) while Normal-mode lookaheads use `next_key`, and the
-    /// text typed during a change arrives through whichever one the host
-    /// happens to be in. Normal-mode keys are recorded in `feed`, not
-    /// here -- `capturing_insert` is false then, which is what keeps
-    /// them from being counted twice.
+    /// Adds `key` to the change `.` repeats while an Insert excursion is
+    /// open, and closes the excursion on the key that ends it. Called from
+    /// both read seams, since Insert mode reads through `next_mapped_key`
+    /// and Normal-mode lookaheads through `next_key`. Normal-mode keys are
+    /// recorded in `feed`, where `capturing_insert` is false, so nothing
+    /// counts twice.
     fn capture_insert_key(&mut self, key: Key) -> Key {
-        // The escape that closes a counted excursion (`3ihi<Esc>`). The
-        // text goes in again first, count - 1 more times, while the host
-        // is still in Insert mode to type it -- after a line break each
-        // time for `o`/`O` -- and the escape that really ends the
-        // excursion comes last. The change `.` repeats is what was
-        // typed, count included, so it is recorded here and the copies
-        // are not. `Ctrl-C` leaves without repeating, as vim's does.
+        // The escape closing a counted excursion (`3ihi<Esc>`): the text
+        // goes in `count - 1` more times while the host is still in Insert
+        // mode, after a line break each time for `o`/`O`, then the real
+        // escape. `.` records what was typed with its count, not the
+        // copies. `Ctrl-C` leaves without repeating, as in vim.
         if self.capturing_insert
             && key == Key::Escape
             && let Some((count, new_line)) = self.insert_repeat.take()
@@ -1006,10 +977,9 @@ impl VimKeys {
         Ok(key.map(|key| self.capture_insert_key(key)))
     }
 
-    /// Whether `outcome` changed the buffer, and so is what `.` should
-    /// repeat. Motions, scrolls, visual-mode bookkeeping and undo are
-    /// not changes; vim draws the same line, and `u` in particular must
-    /// not become the thing `.` repeats.
+    /// Whether `outcome` changed the buffer, so `.` should repeat it.
+    /// Motions, scrolls, Visual bookkeeping and undo aren't changes; `u`
+    /// mustn't become what `.` repeats.
     fn outcome_is_a_change(outcome: &KeyOutcome) -> bool {
         match outcome {
             KeyOutcome::Operator(op, ..) | KeyOutcome::OperatorLines(op, ..) => *op != Op::Yank,
@@ -1029,8 +999,8 @@ impl VimKeys {
         }
     }
 
-    /// Whether `outcome` leaves the host in Insert mode, so that the
-    /// keys it is about to read are still part of this change.
+    /// Whether `outcome` leaves the host in Insert mode, so the keys it reads
+    /// next are still part of this change.
     fn outcome_opens_insert(outcome: &KeyOutcome) -> bool {
         match outcome {
             KeyOutcome::Operator(op, ..) | KeyOutcome::OperatorLines(op, ..) => *op == Op::Change,
@@ -1040,32 +1010,27 @@ impl VimKeys {
     }
 
     pub fn feed(&mut self, key: Key) -> KeyOutcome {
-        // A key arriving with nothing typed toward a command yet starts
-        // a new one, which is where the previous command's keys stop
-        // being interesting -- unless Insert mode is still open, in
-        // which case they are not a new command at all.
+        // A key with nothing typed toward a command starts a new one, unless
+        // Insert mode is still open.
         if self.current_input.is_empty() && !self.capturing_insert {
             self.current_change.clear();
         }
-        // A count to repeat an excursion's text by belongs to the command
-        // that opens it, which the emitters below set as they resolve.
+        // A repeat count belongs to the command that opens the excursion; the
+        // emitters below set it.
         if !self.capturing_insert {
             self.insert_repeat = None;
         }
         self.current_change.push(key);
-        // Wrapped rather than inlined below, because what a key resolves
-        // to is not settled until every one of `feed_resolving`'s own
-        // returns has been taken: `dd` leaves through an early
-        // double-tap return near the top, and `dw` is still a bare
-        // `Motion` until the armed-operator block at the very bottom
-        // turns it into one. Asking anywhere but out here would record
-        // some changes and miss others.
+        // Wrapped because what a key resolves to isn't settled until every
+        // return in `feed_resolving` is taken: `dd` returns early through
+        // the doubled-key check, and `dw` is a bare `Motion` until the
+        // armed-operator block at the end. Asked anywhere else, some
+        // changes would be missed.
         let outcome = self.feed_resolving(key);
         if Self::outcome_is_a_change(&outcome) {
             if Self::outcome_opens_insert(&outcome) {
-                // Not finished yet: the text still has to be typed, and
-                // it arrives through `next_key`, which closes this out
-                // on the escape.
+                // Not finished: the text arrives through `next_key`, which
+                // closes this on the escape.
                 self.capturing_insert = true;
                 self.insert_text_start = self.current_change.len();
             } else {
@@ -1079,20 +1044,13 @@ impl VimKeys {
         if let Some(label) = key_label(key) {
             self.current_input.push_str(&label);
         }
-        // A second press of the *active* operator's own trigger key, seen
-        // at a fresh dispatch point (not mid sub-prefix) -- vim's
-        // double-tap shorthand (`yy`). Entirely orthogonal to feed_inner's
-        // normal motion-resolution dispatch below, so it's checked first
-        // and short-circuits it entirely.
+        // The active operator's key again, at a fresh dispatch point: the
+        // doubled form (`yy`), checked before motion resolution.
         if matches!(self.pending, Pending::None) {
-            // `ys{motion}`/`yss`: `s`, seen right where `y`'s own
-            // double-tap or a motion would otherwise be expected. First
-            // press arms `surround_armed` (still `Op::Yank` underneath,
-            // so nothing else changes yet); a second `s` right after
-            // that is `yss` itself, resolved immediately here since it
-            // has no motion to wait for. See `surround_armed`'s own doc
-            // comment for how this and the resolution path below (after
-            // an ordinary motion resolves instead) connect.
+            // `s` where a motion or the doubled `y` would go: the first
+            // arms `surround_armed` (still `Op::Yank`), and a second right
+            // after is `yss`, resolved here since it needs no motion (see
+            // `surround_armed`).
             if let (Some(Op::Yank), Key::Char('s')) = (self.active_operator, key) {
                 if self.surround_armed {
                     let count = combine_counts(self.operator_count.take(), self.count.take());
@@ -1106,10 +1064,8 @@ impl VimKeys {
                 self.surround_armed = true;
                 return KeyOutcome::Pending;
             }
-            // `ds`/`cs`: `s`, seen right after `d`/`c` armed -- unlike
-            // `ys`, these never take a motion at all, so they resolve
-            // straight into their own dedicated `Pending` states instead
-            // of reusing the active-operator machinery any further.
+            // `ds`/`cs`: `s` right after `d` or `c`. These take no motion,
+            // so they go straight to their own `Pending` states.
             if let (Some(Op::Delete), Key::Char('s')) = (self.active_operator, key) {
                 self.active_operator = None;
                 self.operator_count = None;
@@ -1137,25 +1093,16 @@ impl VimKeys {
         let outcome = self.feed_inner(key);
         if let Some(op) = self.active_operator {
             return match outcome {
-                // The motion that resolves an operator: fold in the count
-                // that had accumulated before the operator was armed and
-                // whatever register was selected, then hand back an
-                // Operator instead of a bare Motion. Note this doesn't
-                // check whether `m` is actually a valid operator target
-                // (see motion::motion_shape) -- an invalid one (e.g.
-                // Ctrl-D) still becomes an `Operator`, just one that
-                // later resolves to nothing when motion::motion_range
-                // rejects it, which is behaviorally identical to
-                // aborting here (no register write, no cursor move
-                // either way) without vimkeys.rs needing to reach into
-                // motion.rs's own classification.
+                // A motion resolving the operator: fold in the earlier
+                // count and the register, and return an `Operator`.
+                // Validity isn't checked here: an invalid target (Ctrl-D)
+                // becomes an `Operator` that `motion_range` later rejects,
+                // which behaves exactly like aborting.
                 KeyOutcome::Motion(m, motion_count) => {
                     self.active_operator = None;
                     let count = combine_counts(self.operator_count.take(), motion_count);
-                    // `ys{motion}`: the motion just resolved the *target*,
-                    // not the whole command -- one more raw key (the
-                    // delimiter) is still needed, so this becomes a
-                    // `Pending::SurroundChar` instead of an `Operator`.
+                    // `ys{motion}`: the motion resolved the target, and the
+                    // delimiter key is still needed.
                     if self.surround_armed {
                         self.surround_armed = false;
                         self.pending_register = None;
@@ -1165,14 +1112,11 @@ impl VimKeys {
                     let register = self.pending_register.take();
                     KeyOutcome::Operator(op, m, count, register)
                 }
-                // A sub-prefix (f/F/t/T/g/`/'/...) is still resolving --
-                // stay armed, nothing to reinterpret yet.
+                // A sub-prefix is still resolving; stay armed.
                 KeyOutcome::Pending => KeyOutcome::Pending,
-                // Anything else (None/EnterInsert/Window) isn't a valid
-                // motion for an operator -- cancel it, matching vim's own
-                // "invalid operator continuation beeps and does nothing"
-                // behavior (consumed, not forwarded: whatever that key
-                // would have done standalone doesn't happen either).
+                // Anything else isn't a motion an operator can take:
+                // cancel, consuming the key, as vim does on an invalid
+                // continuation.
                 _ => {
                     self.active_operator = None;
                     self.operator_count = None;
@@ -1182,16 +1126,11 @@ impl VimKeys {
                 }
             };
         }
-        // No operator was pending, so `outcome` is whatever feed_inner
-        // resolved on its own. A register prefix in front of a bare
-        // motion/window-cmd/insert-entry is simply irrelevant (matches
-        // vim silently ignoring it) -- but only once something actually
-        // resolved: a `Pending` result means a sub-prefix (or the
-        // register selection itself) is still being typed, and dropping
-        // the register mid-sequence would lose it before it ever had a
-        // chance to reach an operator or put. `emit_put` already
-        // consumes it itself on the Put path, so this is a no-op there,
-        // not a second, conflicting clear.
+        // No operator was pending. A register before a bare motion, window
+        // command or insert entry is ignored, as in vim, but only once
+        // something resolved: `Pending` means a prefix (or the register
+        // itself) is still being typed. `emit_put` consumes it on its own
+        // path.
         if !matches!(outcome, KeyOutcome::Pending) {
             self.pending_register = None;
         }
@@ -1225,13 +1164,9 @@ impl VimKeys {
     fn emit(&mut self, motion: Motion) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
-        // pending_register is deliberately *not* cleared here -- this
-        // resolves a Motion, but `feed` (the only caller of feed_inner,
-        // which is what actually calls this) doesn't yet know whether an
-        // operator is waiting to fold this Motion into an Operator, which
-        // still needs the register. `feed` itself drops a leftover
-        // register after any outcome that turns out *not* to have been
-        // claimed by an operator or put.
+        // `pending_register` isn't cleared here: `feed` doesn't know yet
+        // whether an operator will claim this motion, and drops a leftover
+        // register afterwards.
         self.last_completed = std::mem::take(&mut self.current_input);
         KeyOutcome::Motion(motion, count)
     }
@@ -1243,9 +1178,9 @@ impl VimKeys {
         KeyOutcome::Window(cmd, count)
     }
 
-    // Unlike emit()/emit_window(), the count is not handed to the host:
-    // for `i`/`a`/`I`/`A` it repeats what gets typed, and `VimKeys` does
-    // that itself -- see KeyOutcome::EnterInsert's own doc comment.
+    // Unlike `emit()`, the count isn't handed to the host: for
+    // `i`/`a`/`I`/`A` it repeats the typed text, which `VimKeys` does
+    // itself (see `KeyOutcome::EnterInsert`).
     fn emit_insert(&mut self, cmd: InsertCmd) -> KeyOutcome {
         let count = self.count.take();
         if matches!(cmd, InsertCmd::Before | InsertCmd::After | InsertCmd::LineStart | InsertCmd::LineEnd) {
@@ -1256,11 +1191,8 @@ impl VimKeys {
         KeyOutcome::EnterInsert(cmd)
     }
 
-    // `v`/`V`: same shape as emit_insert -- but a count typed before
-    // entering Visual mode has no effect yet. Doesn't touch
-    // `self.visual` itself -- that only happens once the caller calls
-    // `begin_visual` back with the anchor, which this function has no way
-    // to know (see `KeyOutcome::EnterVisual`'s own doc comment).
+    // `v`/`V`: a count before Visual mode has no effect. `self.visual` is set
+    // only when the caller calls `begin_visual` with the anchor.
     fn emit_visual(&mut self, shape: RegisterShape) -> KeyOutcome {
         self.count = None;
         self.pending = Pending::None;
@@ -1268,7 +1200,7 @@ impl VimKeys {
         KeyOutcome::EnterVisual(shape)
     }
 
-    // `2Rab<Esc>`: what is typed replaces, and then replaces again.
+    // `2Rab<Esc>`: what's typed replaces, then replaces again.
     fn emit_replace(&mut self) -> KeyOutcome {
         let count = self.count.take();
         self.insert_repeat = count.filter(|n| *n > 1).map(|n| (n, false));
@@ -1277,21 +1209,11 @@ impl VimKeys {
         KeyOutcome::EnterReplace
     }
 
-    // Same shape as emit_insert, and a count the same: `3oX<Esc>` opens a
-    // line three times, with `X` on each.
-    //
-    // In Visual mode neither `o` nor `O` is "open a line" at all: both
-    // swap which end of the selection is being held. Deciding that here
-    // rather than in the caller is what keeps it right for all four of
-    // them -- `o` in Visual used to fall through as an ordinary
-    // open-line, which left Visual mode, opened a line, and typed the
-    // rest of the keys into it.
-    //
-    // `O` differs from `o` only in Blockwise Visual, where vim swaps the
-    // corner horizontally rather than diagonally. Treating it as the
-    // plain swap is exactly right for Charwise and Linewise, and for a
-    // block it moves to a corner rather than opening a line, which is
-    // the nearer of the two wrong answers by a distance.
+    // Like `emit_insert`, count included: `3oX<Esc>` opens three lines with
+    // `X` on each. In Visual mode `o` and `O` swap which end of the selection
+    // is held instead, decided here so every caller gets it right. vim's `O`
+    // differs only in Blockwise, swapping the corner horizontally; the plain
+    // swap is the nearer answer there.
     fn emit_open_line(&mut self, above: bool) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
@@ -1352,22 +1274,17 @@ impl VimKeys {
         KeyOutcome::Jump { forward }
     }
 
-    // `y{motion}`'s first half: stashes whatever count had already
-    // accumulated (the `[count1]` in vim's `[count1]op[count2]motion`)
-    // and arms `active_operator` -- the actual resolution (into
-    // `Operator`/`OperatorLines`) happens in `feed`, above, once a motion
-    // or the double-tap shorthand resolves.
+    // `y{motion}`'s first half: stashes the count so far (vim's `[count1]`)
+    // and arms `active_operator`; `feed` resolves it once a motion or the
+    // doubled key arrives.
     fn emit_operator(&mut self, op: Op) -> KeyOutcome {
         self.operator_count = self.count.take();
         self.active_operator = Some(op);
         KeyOutcome::Pending
     }
 
-    // `D`/`X`'s own shape: an operator applied to a *fixed* motion
-    // (`LineEnd`/`Left`), resolved immediately rather than arming a
-    // pending operator -- the same "direct emission" shortcut `Y` already
-    // uses for `yy`, just carrying an explicit `Motion` instead of going
-    // through `OperatorLines`.
+    // `D`/`X`: an operator on a fixed motion (`LineEnd`/`Left`), emitted at
+    // once, as `Y` is for `yy`.
     fn emit_operator_direct(&mut self, op: Op, motion: Motion) -> KeyOutcome {
         let count = self.count.take();
         let register = self.pending_register.take();
@@ -1397,11 +1314,9 @@ impl VimKeys {
         KeyOutcome::Redo(count)
     }
 
-    // `g-`/`g+` -- called from `feed_g`, which is why `self.count` still
-    // holds whatever was typed *before* the leading `g` (`3g-`): entering
-    // `Pending::G` never touches `self.count`, same as every other
-    // `g`-prefixed command that reads a count this way (`gJ`, `gu{motion}`,
-    // ...).
+    // `g-`/`g+`, called from `feed_g`: entering `Pending::G` leaves
+    // `self.count` alone, so it still holds the count typed before `g`
+    // (`3g-`).
     fn emit_undo_seq(&mut self, forward: bool) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
@@ -1417,19 +1332,11 @@ impl VimKeys {
         KeyOutcome::Put { before, count, register }
     }
 
-    /// `.`: replays the keys of the last change through the same queue
-    /// `@{reg}` uses, so the repeat is the original command happening
-    /// again rather than a second implementation of it.
-    ///
-    /// Returns `None` rather than an outcome of its own: nothing has
-    /// happened yet at this point, and nothing needs to -- the host's
-    /// next read comes out of the replay queue and drives the command
-    /// through the ordinary path, which is also what leaves `.` itself
-    /// repeatable afterwards.
-    ///
-    /// `[count].` repeats the change with its count in place of the one
-    /// it was made with, as vim's does: `3dd` then `2.` deletes two lines,
-    /// where a plain `.` would delete three again.
+    /// `.`: replays the last change's keys through the `@{reg}` queue, so the
+    /// repeat is the original command running again. Returns `None`: the
+    /// host's next read drives the command through the ordinary path, which
+    /// also leaves `.` repeatable. `[count].` swaps in the new count, as in
+    /// vim: `3dd` then `2.` deletes two lines.
     fn emit_repeat_change(&mut self) -> KeyOutcome {
         let count = self.count.take();
         self.pending = Pending::None;
@@ -1454,16 +1361,14 @@ impl VimKeys {
         KeyOutcome::None
     }
 
-    /// Starts a `/` or `?` search, remembering where its pattern begins
-    /// in the transcript.
+    /// Starts a `/` or `?` search, noting where its pattern begins.
     fn open_search(&mut self, forward: bool) -> KeyOutcome {
         self.search_input_start = self.current_input.chars().count();
         self.show_search(forward, String::new())
     }
 
-    /// Holds `text` as the pending search and makes the transcript show
-    /// it, which for a search is the whole of what the status line has to
-    /// say: whatever opened the search, then the pattern as it stands.
+    /// Holds `text` as the pending search and shows it in the transcript:
+    /// whatever opened the search, then the pattern.
     fn show_search(&mut self, forward: bool, text: String) -> KeyOutcome {
         let opened: String = self.current_input.chars().take(self.search_input_start).collect();
         self.current_input = opened + &text;
@@ -1519,8 +1424,7 @@ impl VimKeys {
             Key::Char('L') => self.emit(Motion::ScreenBottom),
             Key::CtrlD => self.emit(Motion::HalfPageDown),
             Key::CtrlU => self.emit(Motion::HalfPageUp),
-            // The physical PageDown/PageUp keys are plain synonyms for
-            // Ctrl-F/Ctrl-B, matching real vim's own convention.
+            // PageDown/PageUp are Ctrl-F/Ctrl-B, as in vim.
             Key::CtrlF | Key::PageDown => self.emit(Motion::PageDown),
             Key::CtrlB | Key::PageUp => self.emit(Motion::PageUp),
             Key::CtrlE => self.emit(Motion::ScrollLineDown),
@@ -1531,9 +1435,8 @@ impl VimKeys {
             Key::Char(')') => self.emit(Motion::SentenceForward),
             Key::Char('+') | Key::Enter => self.emit(Motion::NextLineNonBlank),
             Key::Char('-') => self.emit(Motion::PrevLineNonBlank),
-            // A count in front of '%' means "go to that percentage of the
-            // file" instead of vim's bare bracket-matching -- distinct
-            // motions since they have nothing in common beyond the key.
+            // A count before `%` goes to that percentage of the file: a
+            // different motion from bracket matching, sharing only the key.
             Key::Char('%') if self.count.is_some() => self.emit(Motion::GotoPercent),
             Key::Char('%') => self.emit(Motion::MatchPair),
             Key::Char('m') => {
@@ -1556,9 +1459,8 @@ impl VimKeys {
                 self.pending = Pending::BracketClose;
                 KeyOutcome::Pending
             }
-            // The `/` or `?` is already in the transcript (every key is,
-            // before it is dispatched), so the pattern starts right after
-            // it -- and a count typed before it stays where it is.
+            // The `/` or `?` is already in the transcript, so the pattern
+            // starts after it, and a count before it stays.
             Key::Char('/') => self.open_search(true),
             Key::Char('?') => self.open_search(false),
             Key::Char('n') => self.emit_last_search(true),
@@ -1587,31 +1489,18 @@ impl VimKeys {
             }
             Key::CtrlT => self.emit_opener(),
             Key::CtrlO => self.emit_jump(false),
-            // `Ctrl-I` is indistinguishable from Tab at the raw-byte level
-            // in a standard terminal (both are 0x09 -- editor.rs's own key
-            // decoder maps that byte to `Key::Tab` unconditionally, same
-            // as real vim treats them as the same key), so this claims
-            // `Key::Tab` for jump-forward here. Safe: Tab only means
-            // completion-cycling in the shell's own *typing* loop
-            // (editor.rs's `read_line`), a separate code path this
-            // Normal-mode dispatch is never reached from -- see
-            // `run_line_normal_mode`'s own doc comment for how Ctrl-E's
-            // excursion into here relates to that loop.
+            // `Ctrl-I` and Tab are the same byte (editor.rs decodes it as
+            // `Key::Tab`, and vim treats them as one key), so Tab is
+            // jump-forward here. Tab cycles completions only in
+            // `read_line`'s typing loop, which never reaches this dispatch
+            // (see `run_line_normal_mode`).
             Key::Tab => self.emit_jump(true),
-            // `i`/`a` while an operator is armed (`diw`, `ca(`, ...) *or*
-            // while in Visual mode (`viw`, `va(`, ...) name a text object
-            // instead of entering insert mode -- vim's own dual meaning for
-            // these two keys. Gated rather than checked inside
-            // `feed_text_object` itself, so a bare `i`/`a` at a fresh
-            // dispatch point keeps meaning insert-entry exactly as it
-            // always has (this arm must stay ahead of the plain
-            // `emit_insert` arms below -- first match wins). The Visual-mode
-            // case still resolves to a plain `KeyOutcome::Motion` here (this
-            // crate has no notion of "re-anchor the selection" -- see
-            // `KeyOutcome::Motion`'s own doc comment); the caller is
-            // responsible for special-casing `Motion::TextObject` while
-            // `is_visual()` to move *both* ends instead of calling
-            // `apply_motion` (which only moves the cursor).
+            // `i`/`a` with an operator armed (`diw`, `ca(`) or in Visual
+            // mode (`viw`) name a text object, vim's double meaning;
+            // otherwise they enter insert, so this arm must stay ahead of
+            // those. In Visual mode it's still a plain `Motion`; the caller
+            // has to move both ends for a `Motion::TextObject` instead of
+            // calling `apply_motion`.
             Key::Char('i') if self.active_operator.is_some() || self.visual.is_some() => {
                 self.pending = Pending::TextObject { around: false };
                 KeyOutcome::Pending
@@ -1635,11 +1524,8 @@ impl VimKeys {
             Key::Char('o') => self.emit_open_line(false),
             Key::Char('O') => self.emit_open_line(true),
             Key::Char('y') => self.emit_operator(Op::Yank),
-            // `Y` is vim's own direct synonym for `yy` -- not "yank to end
-            // of line" the way `D`/`C` work relative to their lowercase
-            // motion-based forms, so it's resolved the same way the `yy`
-            // double-tap is (in `feed`, above) rather than via
-            // `emit_operator`, which only arms a *pending* operator.
+            // `Y` is vim's synonym for `yy`, not "yank to end of line" as
+            // `D` and `C` are, so it resolves like the doubled `y`.
             Key::Char('Y') => {
                 let count = self.count.take();
                 let register = self.pending_register.take();
@@ -1649,35 +1535,21 @@ impl VimKeys {
             }
             Key::Char('d') => self.emit_operator(Op::Delete),
             Key::Char('c') => self.emit_operator(Op::Change),
-            // `>{motion}`/`>>`, `<{motion}`/`<<`: arms the same way any
-            // other operator does -- the double-tap shorthand (`>>`/`<<`)
-            // is already handled generically by `feed`'s own check above
-            // (`c == op.trigger_char()`), nothing extra needed here.
+            // Armed like any operator; `>>` and `<<` are handled by
+            // `feed`'s doubled key check.
             Key::Char('>') => self.emit_operator(Op::Indent),
             Key::Char('<') => self.emit_operator(Op::Outdent),
-            // `u`/`Ctrl-R`: undo/redo -- see KeyOutcome::Undo/Redo's own
-            // doc comments. `Key::CtrlR` already exists as an editor::Key
-            // variant, but only ever handled by editor::read_line's own
-            // Insert-mode typing loop today (real vim's own
-            // `<C-r>{register}` paste-while-typing, a different context
-            // entirely from Normal-mode redo) -- no conflict.
+            // `u`/`Ctrl-R` (see `KeyOutcome::Undo`). `Key::CtrlR` is also
+            // Insert mode's register paste in `read_line`, a separate loop.
             Key::Char('u') => self.emit_undo(),
             Key::Char('.') => self.emit_repeat_change(),
             Key::CtrlR => self.emit_redo(),
-            // `D`: delete from the cursor through end of line, staying in
-            // Normal mode -- vim's own `d$` shorthand. Unlike `C` (the
-            // same range, but entering insert afterward), nothing already
-            // handled this, so it's new rather than a redirect onto an
-            // existing command.
+            // `D`: `d$`, staying in Normal mode.
             Key::Char('D') => self.emit_operator_direct(Op::Delete, Motion::LineEnd),
-            // `X`: delete backward -- vim's own `d{count}h` shorthand.
-            // `Motion::Left` already clamps at column 0 exactly the way
-            // `X` needs (a no-op there), so this needs no special casing
-            // the way `x` (below) does.
+            // `X`: `d{count}h`. `Motion::Left` already stops at column 0.
             Key::Char('X') => self.emit_operator_direct(Op::Delete, Motion::Left),
-            // `x`: delete forward -- *not* `emit_operator_direct(Delete,
-            // Right)`. See `KeyOutcome::DeleteCharForward`'s own doc
-            // comment on why `Motion::Right` can't stand in for this.
+            // `x`: not `d` with `Motion::Right`; see
+            // `KeyOutcome::DeleteCharForward`.
             Key::Char('x') => {
                 let count = self.count.take();
                 let register = self.pending_register.take();
@@ -1710,18 +1582,12 @@ impl VimKeys {
                 self.pending = Pending::Register;
                 KeyOutcome::Pending
             }
-            // Guarded on `self.visual.is_none()`: pressing `v`/`V` again
-            // while already in Visual mode is simply ignored in this pass
-            // (falls to `_ => self.abort()` below, same as any other
-            // unrecognized key -- clears a stray count/prefix, leaves
-            // Visual mode itself untouched) -- no shape-switch/re-anchor
-            // vim nuance yet.
+            // `v`/`V` again in Visual mode is ignored (aborted like an
+            // unknown key); no switching shape.
             Key::Char('v') if self.visual.is_none() => self.emit_visual(RegisterShape::Char),
             Key::Char('V') if self.visual.is_none() => self.emit_visual(RegisterShape::Line),
-            // `Ctrl-V`: a rectangle rather than a run. The third visual
-            // shape, and the one that makes a column edit -- commenting
-            // a block, stripping a prefix off twenty lines -- one
-            // gesture instead of twenty.
+            // `Ctrl-V`: a rectangle, which makes a column edit (commenting
+            // a block, stripping a prefix off twenty lines) one gesture.
             Key::CtrlV if self.visual.is_none() => self.emit_visual(RegisterShape::Block),
             _ => self.abort(),
         }
@@ -1731,13 +1597,10 @@ impl VimKeys {
         match key {
             Key::Char(c @ ('a'..='z' | 'A'..='Z' | '0'..='9' | '+' | '"' | '_' | '.' | '%' | ':')) => {
                 self.pending_register = Some(c);
-                // Deliberately *not* an `emit*` call: a register selection
-                // isn't itself a resolved command, it's a modifier waiting
-                // for whatever operator or put comes next. `self.pending`
-                // is already `Pending::None` (set by the `mem::replace` in
-                // `feed_inner` before this ran), so the very next key
-                // dispatches through `feed_fresh` as if nothing happened,
-                // except now with `pending_register` armed.
+                // Not an `emit`: a register selection is a modifier
+                // awaiting the operator or put that follows. `self.pending`
+                // is already `None`, so the next key dispatches fresh with
+                // `pending_register` set.
                 KeyOutcome::Pending
             }
             _ => self.abort(),
@@ -1761,17 +1624,11 @@ impl VimKeys {
                 self.emit(Motion::SearchWordBackwardUnbounded)
             }
             Key::Char('d') => self.emit_goto_definition(GotoKind::Definition),
-            // The two questions next to "where is this defined" whose
-            // keys were free to take. `gy` is unused in vim and is what
-            // helix, VS Code and neovim all reach for; `gD` in vim
-            // already means "find where this was declared", just by
-            // scanning the file backwards rather than by asking someone
-            // who knows -- the same relationship `gd` and `K` already
-            // have with their own vim meanings.
-            //
-            // `textDocument/implementation`'s own settled binding is
-            // `gi`, which is not free: it means "resume insert where I
-            // left off" here and in vim. Not taken without asking.
+            // Two more "where is this" questions on free keys. `gy` is
+            // unused in vim; `gD` in vim finds the declaration by scanning
+            // back, as `gd` and `K` relate to their vim meanings.
+            // Implementation's usual key is `gi`, which here and in vim
+            // resumes insert, so it has no key.
             Key::Char('y') => self.emit_goto_definition(GotoKind::TypeDefinition),
             Key::Char('D') => self.emit_goto_definition(GotoKind::Declaration),
             Key::Char('r') => self.emit_goto_references(),
@@ -1780,17 +1637,13 @@ impl VimKeys {
             Key::Char('J') => self.emit_join(false),
             Key::Char('v') => self.emit_reselect_visual(),
             Key::Char('i') => self.emit_insert(InsertCmd::LastInsertPos),
-            // `gu`/`gU`/`g~`: arms a case-transform operator, resolved
-            // exactly like `y`/`d`/`c` from here on (an ordinary motion,
-            // a text object, or the double-tap line shorthand via each
-            // one's own `trigger_char`) -- `feed`'s own active-operator
-            // handling neither knows nor cares that these three don't
-            // write a register, so no changes were needed there.
+            // `gu`/`gU`/`g~` arm a case operator, resolved like
+            // `y`/`d`/`c`. `feed` doesn't care that these write no
+            // register.
             Key::Char('u') => self.emit_operator(Op::Lowercase),
             Key::Char('U') => self.emit_operator(Op::Uppercase),
             Key::Char('~') => self.emit_operator(Op::CaseToggle),
-            // `g-`/`g+`: undo-tree time travel -- see KeyOutcome::
-            // UndoSeq's own doc comment.
+            // `g-`/`g+`: undo-tree time travel (see `KeyOutcome::UndoSeq`).
             Key::Char('-') => self.emit_undo_seq(false),
             Key::Char('+') => self.emit_undo_seq(true),
             _ => self.abort(),
@@ -1812,23 +1665,18 @@ impl VimKeys {
             (Key::Char(c), MarkKind::Set) if c.is_ascii_lowercase() => self.emit(Motion::SetMark(c)),
             (Key::Char(c), MarkKind::GotoExact) if c.is_ascii_lowercase() => self.emit(Motion::GotoMark(c)),
             (Key::Char(c), MarkKind::GotoLine) if c.is_ascii_lowercase() => self.emit(Motion::GotoMarkLine(c)),
-            // `^` -- vim's own last-insert-position mark (set
-            // automatically, e.g. by fileeditor.rs's `run_insert_mode` --
-            // see `gi`'s own doc comment); not settable by name (`m^`
-            // isn't a thing in real vim either), so this only appears in
-            // the two Goto arms.
+            // `^`: vim's last-insert mark, set automatically (by
+            // `run_insert_mode`), not settable by name, so only in the Goto
+            // arms.
             (Key::Char('^'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('^')),
             (Key::Char('^'), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('^')),
-            // `.` -- vim's own last-change-position mark, set
-            // automatically by every real mutation (see textbuffer.rs's
-            // own `insert_text`/`delete_range`/`join_lines`); same
-            // not-settable-by-name treatment as `^`.
+            // `.`: vim's last-change mark, set by every edit (textbuffer.rs's
+            // `insert_text` and friends); not settable by name either.
             (Key::Char('.'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('.')),
             (Key::Char('.'), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('.')),
-            // ``` ``` / `''` -- vim's own "position before the last jump"
-            // -- see `VimKeys::push_jump`'s own doc comment for who
-            // writes it (a plain `Buffer` mark, keyed by an apostrophe a
-            // user can never set by name either).
+            // ``
+            // ` `` and `'`: vim's position before the last jump, a mark keyed by an apostrophe that `push_jump`
+            // writes.
             (Key::Char('`'), MarkKind::GotoExact) => self.emit(Motion::GotoMark('\'')),
             (Key::Char('\''), MarkKind::GotoLine) => self.emit(Motion::GotoMarkLine('\'')),
             _ => self.abort(),
@@ -1857,9 +1705,8 @@ impl VimKeys {
         }
     }
 
-    // `ys{motion}`/`yss`'s own final key: the delimiter character. Any
-    // character `motion::surround_delims` doesn't recognize aborts, same
-    // as an invalid operator continuation elsewhere in this file.
+    // `ys{motion}`/`yss`'s delimiter key. Anything
+    // `motion::surround_delims` doesn't know aborts.
     fn feed_surround_char(&mut self, key: Key, target: SurroundTarget) -> KeyOutcome {
         let Key::Char(c) = key else {
             return self.abort();
@@ -1872,8 +1719,7 @@ impl VimKeys {
         KeyOutcome::AddSurround { target, ch: c }
     }
 
-    // `ds{ch}`'s own target character -- see `motion::surround_target_kind`
-    // for which characters are valid here.
+    // `ds{ch}`'s target (see `motion::surround_target_kind`).
     fn feed_delete_surround_target(&mut self, key: Key) -> KeyOutcome {
         let Key::Char(c) = key else {
             return self.abort();
@@ -1886,9 +1732,7 @@ impl VimKeys {
         KeyOutcome::DeleteSurround { ch: c }
     }
 
-    // `cs{ch}...`'s own target character -- same validity rule as `ds`'s,
-    // but stays pending for one more key (the replacement) instead of
-    // resolving immediately.
+    // `cs{ch}...`'s target, valid as for `ds`, then one more key.
     fn feed_change_surround_target(&mut self, key: Key) -> KeyOutcome {
         let Key::Char(c) = key else {
             return self.abort();
@@ -1900,7 +1744,7 @@ impl VimKeys {
         KeyOutcome::Pending
     }
 
-    // `cs{ch}{replacement}`'s own final key.
+    // `cs{ch}{replacement}`'s last key.
     fn feed_change_surround_char(&mut self, key: Key, ch: char) -> KeyOutcome {
         let Key::Char(replacement) = key else {
             return self.abort();
@@ -1913,8 +1757,7 @@ impl VimKeys {
         KeyOutcome::ChangeSurround { ch, replacement }
     }
 
-    // `r{ch}` -- any character (no validity restriction, unlike the
-    // surround targets above: `r` can replace with literally anything).
+    // `r{ch}`: any character.
     fn feed_replace_char(&mut self, key: Key) -> KeyOutcome {
         let Key::Char(c) = key else {
             return self.abort();
@@ -1925,12 +1768,9 @@ impl VimKeys {
         KeyOutcome::ReplaceChar { ch: c, count }
     }
 
-    // The object character after `i`/`a` while an operator is armed --
-    // resolves to `Motion::TextObject`, folded into an `Operator` by
-    // `feed`'s own existing active-operator handling exactly like any other
-    // motion (nothing new needed there). `b`/`B` are vim's own aliases for
-    // `(`/`{`; tag objects (`it`/`at`) aren't supported (see
-    // `TextObjectKind`'s own doc comment).
+    // The object character after `i`/`a`, as a `Motion::TextObject` that
+    // `feed` folds into the `Operator` like any motion. `b` and `B` alias `(`
+    // and `{`; no tag objects (see `TextObjectKind`).
     fn feed_text_object(&mut self, key: Key, around: bool) -> KeyOutcome {
         let kind = match key {
             Key::Char('w') => TextObjectKind::Word,
@@ -1954,8 +1794,8 @@ impl VimKeys {
             Key::Char('z') => self.emit(Motion::ScrollCenter),
             Key::Char('t') => self.emit(Motion::ScrollTop),
             Key::Char('b') => self.emit(Motion::ScrollBottom),
-            // Folds. `zf` is the one that takes a motion, except in
-            // Visual mode, where the selection already says which lines.
+            // `zf` takes a motion, except in Visual mode, where the
+            // selection says which lines.
             Key::Char('f') if self.visual.is_some() => self.emit_fold(FoldCmd::CreateFromSelection),
             Key::Char('f') => {
                 self.pending = Pending::None;
@@ -1990,11 +1830,8 @@ impl VimKeys {
 
     fn feed_window(&mut self, key: Key) -> KeyOutcome {
         match key {
-            // Unlike a bare `<C-w>`-less count (accumulated in feed_fresh,
-            // which only applies to *repeating* a command), digits typed
-            // here -- inside the leader, before its resolving key -- are
-            // for `<C-w>{N}gg`/`<C-w>{N}G`'s absolute tab position. Stays
-            // pending, mirroring feed_fresh's own digit arm.
+            // Digits inside the leader are `<C-w>{N}gg`/`<C-w>{N}G`'s tab
+            // position, not a repeat count.
             Key::Char(c) if c.is_ascii_digit() => {
                 let d = (c as u8 - b'0') as usize;
                 self.count = Some(self.count.unwrap_or(0) * 10 + d);
@@ -2011,17 +1848,15 @@ impl VimKeys {
             Key::Char('j') => self.emit_window(WindowCmd::FocusDown),
             Key::Char('k') => self.emit_window(WindowCmd::FocusUp),
             Key::Char('l') => self.emit_window(WindowCmd::FocusRight),
-            // Two letters, one command, because two vocabularies reach
-            // for it: `z` is what tmux binds zoom to, and `o` is what
-            // vim binds "make this the only window" to -- which is what
-            // zoom looks like, except nothing is closed and the next
-            // press puts it all back.
+            // `z` and `o` both zoom. vim's `<C-w>o` makes this the only
+            // window, which is what zoom looks like, except nothing closes
+            // and the next press restores it.
             Key::Char('z') | Key::Char('o') => self.emit_window(WindowCmd::Zoom),
             Key::Char(' ') => self.emit_window(WindowCmd::NextLayout),
             Key::Char('x') => self.emit_window(WindowCmd::SwapPane),
             Key::Char('T') => self.emit_window(WindowCmd::BreakPane),
             Key::Char('=') => self.emit_window(WindowCmd::Balance),
-            // vim spells "make this pane as small as it goes" the same way.
+            // vim's key for making a window as small as it goes.
             Key::Char('_') => self.emit_window(WindowCmd::Minimize),
             Key::Char('g') => {
                 self.pending = Pending::WindowG;
@@ -2048,10 +1883,8 @@ impl VimKeys {
                 self.emit(if forward { Motion::SearchForward(text) } else { Motion::SearchBackward(text) })
             }
             Key::Escape => self.abort(),
-            // Cancels only the search, same as Escape -- callers gate
-            // their own outer Ctrl-C/D/Z interception on
-            // `is_search_pending()` precisely so this arm gets a chance
-            // to run instead of the whole mode exiting first.
+            // Cancels just the search, like Escape; callers check
+            // `is_search_pending()` before taking Ctrl-C themselves.
             Key::CtrlC => self.abort(),
             Key::Backspace if text.is_empty() => self.abort(),
             Key::Backspace => {
@@ -2063,11 +1896,8 @@ impl VimKeys {
                 self.show_search(forward, text)
             }
             _ => {
-                // Ignore anything else while typing a search string rather
-                // than aborting it -- a stray unrecognized key shouldn't
-                // discard what's already been typed. It leaves no mark on
-                // the transcript either, which `show_search` is what makes
-                // true.
+                // Other keys are ignored while typing a search rather than
+                // discarding it, and leave nothing in the transcript.
                 self.show_search(forward, text)
             }
         }
@@ -2084,10 +1914,8 @@ impl VimKeys {
     }
 
     fn emit_last_search(&mut self, same_direction: bool) -> KeyOutcome {
-        // `n`/`N` reuse the last search rather than setting a new one, so
-        // they need their own clear -- and they must have it: vim brings
-        // the highlight back on `n` after a `:noh`, which is most of what
-        // makes `:noh` safe to press.
+        // `n`/`N` reuse the last search without setting one, so they turn the
+        // highlight back on here, as vim does after `:noh`.
         self.search_highlight_off = false;
         match self.last_search {
             Some(LastSearch::Pattern { forward }) => {
@@ -2122,19 +1950,14 @@ enum MarkKind {
     GotoLine,
 }
 
-/// Resolves a mapping's right-hand side against the *default* bindings
-/// and names what it does, or says why it is not a usable right-hand
-/// side.
+/// Resolves a mapping's right-hand side against the default bindings and
+/// names what it does, or says why it can't be used. A fresh `VimKeys` has
+/// no keymap, so the resolution can't chain through another mapping:
+/// that's what makes mappings noremap. Used when a mapping is defined, to
+/// reject a bad right-hand side and describe it for `::bish map`.
 ///
-/// A fresh `VimKeys` is the whole of what makes this noremap: it has no
-/// keymap of its own to consult, so the resolution cannot chain through
-/// another mapping however the table is arranged. Called when a mapping
-/// is defined, both to reject a bad right-hand side up front and to
-/// produce the description `::bish map` lists.
-///
-/// A sequence may resolve to more than one action -- `jj` is two -- and
-/// is named as such, joined with " then ". Ending mid-action is an
-/// error rather than a mapping that swallows keys and does nothing.
+/// A sequence can resolve to several actions (`jj` is two), joined with
+/// " then ". Ending mid-action is an error.
 pub fn describe_key_sequence(keys: &[Key]) -> Result<String, String> {
     let mut vk = VimKeys::new();
     let mut actions = Vec::new();
@@ -2156,23 +1979,13 @@ pub fn describe_key_sequence(keys: &[Key]) -> Result<String, String> {
     Ok(actions.join(" then "))
 }
 
-/// The canonical name of a resolved key outcome, as `::bish map` prints
-/// it.
-///
-/// Kebab-case of the variant, with whatever it carries appended -- the
-/// same mechanical rule `motion::describe_motion` follows, and for the
-/// same reason: a predictable vocabulary beats a memorable one, and a
-/// derived name cannot drift from the variant it names.
-///
-/// A count is printed where it came from the mapping's own right-hand
-/// side (`10j` lists as `down 10`). It is not the whole story at
-/// dispatch -- a count typed before the mapped key composes with it,
-/// because a mapping replays its keys into the live state rather than
-/// producing a frozen outcome -- but it is what the mapping itself says.
+/// A resolved outcome's canonical name, as `::bish map` prints it: the
+/// variant in kebab-case with what it carries appended, as
+/// `motion::describe_motion` does. A count from the right-hand side is
+/// shown (`10j` is `down 10`); a count typed before the mapped key combines
+/// with it at dispatch.
 pub fn describe_outcome(outcome: &KeyOutcome) -> String {
     use KeyOutcome::*;
-    // `Some(3)` prints as " 3", `None` as nothing -- so every arm below
-    // can append a count without repeating the match.
     fn n(count: &Option<usize>) -> String {
         count.map(|c| format!(" {c}")).unwrap_or_default()
     }
@@ -2217,11 +2030,9 @@ pub fn describe_outcome(outcome: &KeyOutcome) -> String {
         OpenLine { above } => format!("open-line-{}", if *above { "above" } else { "below" }),
         SwapVisualEnds => "visual-swap-ends".to_string(),
         Fold(cmd, count) => format!("fold-{}{}", describe_fold_cmd(cmd), n(count)),
-        // Neither is a resolved action: `Pending` means the sequence
-        // wants more keys, `None` that nothing recognized it. `::bish
-        // map` refuses a right-hand side that ends on either rather than
-        // storing a mapping that does nothing, so these are here for
-        // exhaustiveness and to make the refusal message say which.
+        // Not actions: `Pending` wants more keys and `None` matched
+        // nothing. `::bish map` refuses a right-hand side ending on either;
+        // these name the reason.
         Pending => "(incomplete)".to_string(),
         None => "(unrecognized)".to_string(),
     }
