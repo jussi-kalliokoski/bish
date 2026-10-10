@@ -46,6 +46,26 @@ pub(crate) fn sort_by_key<T, K: Ord>(items: &mut [T], mut key: impl FnMut(&T) ->
     sort_by(items, |a, b| key(a).cmp(&key(b)));
 }
 
+/// A `BTreeMap` built by inserting, rather than by `collect()`.
+///
+/// Collecting into a `BTreeMap` sorts the input first -- with the slice
+/// sort, instantiated for that element type -- and only then builds the
+/// tree. Inserting one at a time keeps the map ordered anyway and never
+/// sorts anything; for the sizes bish builds maps of, the difference in
+/// speed is not measurable.
+pub(crate) fn btree_map<K: Ord, V>(items: impl IntoIterator<Item = (K, V)>) -> std::collections::BTreeMap<K, V> {
+    let mut map = std::collections::BTreeMap::new();
+    map.extend(items);
+    map
+}
+
+/// A `BTreeSet` built by inserting, for the same reason as `btree_map`.
+pub(crate) fn btree_set<T: Ord>(items: impl IntoIterator<Item = T>) -> std::collections::BTreeSet<T> {
+    let mut set = std::collections::BTreeSet::new();
+    set.extend(items);
+    set
+}
+
 /// The one instantiation of the standard sort: positions, compared
 /// through whatever the caller says about the elements at them.
 #[inline(never)]
@@ -127,9 +147,15 @@ mod tests {
 
     /// The point of this module is that there is one copy of the sort in
     /// the binary; a slice sort anywhere else brings its own back. Read
-    /// as text, like `platform::os_guard`, and only the part of each file
-    /// before its tests -- test code is not in the binary, and may sort
-    /// however it likes.
+    /// as text, like `platform::os_guard`, skipping test modules wherever
+    /// they sit in a file -- test code is not in the binary, and may sort
+    /// however it likes. (An earlier version stopped at a file's *first*
+    /// test module, and three sorts after one in exec.rs and repl.rs went
+    /// unseen.)
+    ///
+    /// What this cannot see is a `collect()` into a `BTreeMap` or
+    /// `BTreeSet`, which sorts too but names no sort at the call site --
+    /// those go through `btree_map` / `btree_set` above by convention.
     ///
     /// `self.sort()` is not a slice method in this codebase (it is
     /// `Folds::sort`, which itself sorts through here), so a call on
@@ -151,9 +177,21 @@ mod tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("a source file is readable");
-                let shipped = source.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
-                for (number, line) in shipped.lines().enumerate() {
-                    if line.trim_start().starts_with("//") {
+                let mut in_tests = false;
+                let mut previous = "";
+                for (number, line) in source.lines().enumerate() {
+                    // A test module's body runs from `#[cfg(test)]` /
+                    // `mod name {` to the `}` rustfmt puts alone in the
+                    // first column -- skipped, wherever in the file it is.
+                    if !in_tests && previous.trim() == "#[cfg(test)]" && line.trim_start().starts_with("mod ") && line.trim_end().ends_with('{') {
+                        in_tests = true;
+                    }
+                    let skip = in_tests || line.trim_start().starts_with("//");
+                    if in_tests && line == "}" {
+                        in_tests = false;
+                    }
+                    previous = line;
+                    if skip {
                         continue;
                     }
                     for method in methods {

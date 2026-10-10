@@ -71,7 +71,7 @@ pub(crate) fn run_compgen(sh: &mut Shell, args: &[String]) -> i32 {
     if let Some(var) = varname {
         sh.assoc_names.remove(&var);
         sh.array_names.insert(var.clone());
-        sh.arrays.insert(var, candidates.into_iter().enumerate().collect());
+        sh.arrays.insert(var, crate::sort::btree_map(candidates.into_iter().enumerate()));
     } else {
         for c in &candidates {
             sh_println!(sh, "{c}");

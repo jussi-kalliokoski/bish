@@ -2377,7 +2377,10 @@ impl Shell {
             // Scripts branch on `${BASH_VERSINFO[0]}` far more often
             // than they parse `$BASH_VERSION`, so the taken-apart form
             // has to exist too.
-            arrays: HashMap::from([("BASH_VERSINFO".to_string(), BASH_VERSINFO.iter().enumerate().map(|(i, v)| (i, (*v).to_string())).collect())]),
+            arrays: HashMap::from([(
+                "BASH_VERSINFO".to_string(),
+                crate::sort::btree_map(BASH_VERSINFO.iter().enumerate().map(|(i, v)| (i, (*v).to_string()))),
+            )]),
             assoc_arrays: HashMap::new(),
             invocation_flag: None,
             unset_names: std::collections::HashSet::new(),
@@ -2424,7 +2427,7 @@ impl Shell {
             descriptors_to_follow: None,
             parse_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
             underscore: None,
-            globals: Rc::new(inherited.iter().cloned().collect()),
+            globals: Rc::new(crate::sort::btree_map(inherited.iter().cloned())),
             effects: 0,
             proc_sub_cleanup: Vec::new(),
             rng_state: fresh_rng_seed(shell_pid),
@@ -4408,7 +4411,7 @@ impl Shell {
     // this only needs the names, not the whole compgen::ActionContext
     // shape.
     fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> = self.global_names().cloned().collect();
+        let mut names: std::collections::BTreeSet<String> = crate::sort::btree_set(self.global_names().cloned());
         for scope in &self.var_scopes {
             names.extend(scope.keys().cloned());
         }
@@ -4652,7 +4655,7 @@ impl Shell {
     }
 
     fn set_array(&mut self, name: &str, values: Vec<String>) {
-        self.arrays.insert(name.to_string(), values.into_iter().enumerate().collect());
+        self.arrays.insert(name.to_string(), crate::sort::btree_map(values.into_iter().enumerate()));
     }
 
     /// Whether `name` is a builtin that would actually run.
@@ -5291,7 +5294,7 @@ impl Shell {
             }
             return;
         }
-        let map: std::collections::BTreeMap<usize, String> = codes.iter().enumerate().map(|(i, c)| (i, c.to_string())).collect();
+        let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(codes.iter().enumerate().map(|(i, c)| (i, c.to_string())));
         self.arrays.insert("PIPESTATUS".to_string(), map);
     }
 
@@ -7508,7 +7511,7 @@ impl Shell {
                     // case at all there was nothing for it to do.
                     match crate::regex::match_captures(&a, &pattern, self.shopt_is_on("nocasematch")) {
                         Some(groups) => {
-                            let map: std::collections::BTreeMap<usize, String> = groups.into_iter().enumerate().collect();
+                            let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(groups.into_iter().enumerate());
                             self.arrays.insert("BASH_REMATCH".to_string(), map);
                             true
                         }
@@ -9074,7 +9077,7 @@ impl Shell {
                         let mask = if raw { vec![false; chars.len()] } else { mask };
                         if let Some(arr) = array_name {
                             let parts = ifs_tokenize_masked(&chars, &mask, &ifs);
-                            let map: std::collections::BTreeMap<usize, String> = parts.into_iter().enumerate().collect();
+                            let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(parts.into_iter().enumerate());
                             self.arrays.insert(arr.to_string(), map);
                             self.array_names.insert(arr.to_string());
                         } else if names.is_empty() {
@@ -15570,7 +15573,7 @@ fn ignored_at_entry_list() -> &'static [i32] {
 fn trap_signal_listing(traps: &std::collections::HashMap<i32, TrapAction>, ignored: &[i32]) -> Vec<(i32, TrapAction)> {
     let mut entries: Vec<(i32, TrapAction)> = traps.iter().map(|(k, v)| (*k, v.clone())).collect();
     entries.extend(ignored.iter().filter(|n| !traps.contains_key(n)).map(|n| (*n, TrapAction::Ignore)));
-    entries.sort_by_key(|(n, _)| *n);
+    crate::sort::sort_by_key(&mut entries, |(n, _)| *n);
     entries
 }
 
@@ -15704,7 +15707,7 @@ pub(crate) fn all_signals() -> Vec<(String, i32)> {
     if let Some((first, last)) = realtime_range() {
         all.extend((first..=last).filter_map(|n| realtime_signal_name(n).map(|name| (name, n))));
     }
-    all.sort_by_key(|(_, n)| *n);
+    crate::sort::sort_by_key(&mut all, |(_, n)| *n);
     all
 }
 

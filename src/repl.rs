@@ -13572,7 +13572,7 @@ fn run_command_mode(
                             redeliver_language_server_diagnostics(&mut app.sessions, session_id, tb);
                             let mut merged = fileeditor::diagnose_buffer(tb);
                             merged.extend(tb.diagnostics.iter().filter(|d| d.source.is_some()).cloned());
-                            merged.sort_by_key(|d| (d.start, d.end));
+                            crate::sort::sort_by_key(&mut merged, |d| (d.start, d.end));
                             tb.diagnostics = merged;
                             let n = tb.diagnostics.len();
                             let output = if n == 0 {
