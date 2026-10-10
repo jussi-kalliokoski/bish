@@ -1,29 +1,16 @@
-// Godoc-style doc comments for bash scripts -- a `#`-commented block
-// immediately above a function definition or a top-level variable
-// declaration becomes that symbol's own documentation, the same
-// adjacency rule godoc itself uses for `// Comment` above a Go
-// declaration (no blank line allowed between the two). This is the
-// precursor to an LSP-style hover story bish will eventually want (real
-// symbol resolution, go-to-definition, ...) -- built with bish's own
-// existing lexer/parser rather than any actual language-server protocol
-// machinery, scoped narrowly to what debugger.rs's own `K` hover needs
-// right now.
+// Doc comments for bash scripts: a `#` comment block directly above a
+// function or top-level variable, with no blank line between, documents
+// it, as godoc does for Go. Used by `K` hover and the outline, with bish's
+// own parser.
 //
-// `source PATH`/`. PATH` is followed automatically when PATH is a
-// *static* literal (no `$var`/`$(...)`/backticks/etc. -- see
-// word_as_literal) so hovering a symbol defined in a sourced library
-// works the same as hovering one defined in the entry script itself. A
-// dynamically-built source path (`source "$LIB_DIR/util.sh"`, `source
-// "$(dirname "$0")/lib.sh"`) can't be resolved without actually running
-// the script, so those are simply not followed -- an accepted, sensible
-// scope boundary given this is static analysis, not execution.
+// `source PATH` is followed when PATH is a static literal (see
+// `word_as_literal`), so a symbol from a sourced library hovers the same.
+// A computed path (`source "$LIB_DIR/util.sh"`) can't be resolved without
+// running the script, so it isn't followed.
 //
-// Deliberately shallow, matching every other "build the practical
-// subset" feature in this codebase: only top-level statements are
-// scanned (a function/variable declared *inside* an `if`/`while`/`case`
-// body is invisible to this, however doc-commented) -- covers the
-// overwhelming majority of real scripts, where library functions and
-// constants sit at a file's top level.
+// Only top-level statements are scanned: a declaration inside an `if` or
+// loop body isn't seen, while library functions usually sit at the top
+// level.
 
 use crate::lexer::{Chunk, Lexer};
 use crate::parser::{AndOr, Command, Parser, Program, Word};
@@ -38,10 +25,9 @@ pub enum SymbolKind {
 
 pub struct SymbolDoc {
     pub kind: SymbolKind,
-    // One entry per source comment line, with its leading `#` and (at
-    // most) one following space already stripped -- render as separate
-    // lines, not rejoined into prose, so an author's own line breaks
-    // (e.g. an "Args:" list) survive into the hover popup.
+    // One entry per comment line, `#` and one following space stripped,
+    // kept as separate lines so the author's line breaks (an "Args:" list)
+    // survive into the popup.
     pub doc: Vec<String>,
     pub file: PathBuf,
     pub line: usize,
@@ -52,22 +38,14 @@ pub struct DocIndex {
 }
 
 impl DocIndex {
-    // Scans `src` (the entry script's own text -- both callers already
-    // have this in memory: debugger.rs reads the file once up front,
-    // repl.rs's live file editor takes it straight from the buffer, an
-    // unsaved edit included) and, recursively, every file it statically
-    // `source`s (those genuinely are read fresh off disk -- there's no
-    // live buffer for them to prefer) -- see this module's own doc
-    // comment. Best-effort throughout: a file that can't be read or
-    // fails to parse just contributes nothing rather than aborting the
-    // whole scan. `entry_path` is what any `source` the script itself
-    // makes gets resolved relative to, and what the entry file's own
-    // symbols are attributed to -- it doesn't need to actually exist on
-    // disk with matching content for that (a brand new, not-yet-saved
-    // buffer). Pre-seeds the visited-set with `entry_path` itself so a
-    // `source` that happens to point back at the very file being scanned
-    // re-uses `src` (and doesn't re-read what might be stale disk
-    // content, if it's actually a live buffer with unsaved changes).
+    // Scans `src`, the entry script's text (debugger.rs reads it once;
+    // the file editor passes its buffer, unsaved edits included), and
+    // recursively every file it statically sources, read from disk. A file
+    // that can't be read or parsed contributes nothing. `entry_path` is what
+    // the script's own `source`s resolve against and what its symbols are
+    // attributed to; it needn't exist on disk yet. It's marked visited up
+    // front, so a `source` of itself reuses `src` rather than stale disk
+    // content.
     pub fn build_from_source(src: &str, entry_path: &Path) -> DocIndex {
         let mut symbols = HashMap::new();
         let mut visited = HashSet::new();
@@ -90,18 +68,15 @@ fn scan_file(path: &Path, symbols: &mut HashMap<String, SymbolDoc>, visited: &mu
     scan_source(&src, path, symbols, visited);
 }
 
-// The shared "given source text and the path it's attributed to" half
-// of scan_file/build_from_source -- the only difference between reading
-// a file fresh off disk and scanning an already-in-memory buffer is
-// where `src` came from.
+// The shared half of `scan_file` and `build_from_source`, which differ
+// only in where `src` came from.
 fn scan_source(src: &str, path: &Path, symbols: &mut HashMap<String, SymbolDoc>, visited: &mut HashSet<PathBuf>) {
     let Ok(toks) = Lexer::new(src).tokenize() else { return };
     let Ok(program) = Parser::new(toks).parse_program() else { return };
     let lines: Vec<&str> = src.lines().collect();
 
-    // Collected rather than followed inline: keeps the entry file's own
-    // top-level symbols recorded (and so entry()-preferred over anything
-    // a sourced file might redeclare) before any recursive scan can run.
+    // Collected rather than followed now, so the entry file's symbols are
+    // recorded first and win over a sourced file's redeclaration.
     let mut sources_to_follow: Vec<PathBuf> = Vec::new();
     scan_program(&program, &lines, path, symbols, &mut sources_to_follow);
     for source_path in sources_to_follow {
@@ -118,9 +93,8 @@ fn scan_program(program: &Program, lines: &[&str], file: &Path, symbols: &mut Ha
                 }
                 Command::Simple(sc) => {
                     if sc.words.is_empty() {
-                        // A bare assignment statement -- `NAME=value`,
-                        // `arr=(1 2 3)`, `arr[i]=value` -- with no
-                        // command word at all.
+                        // A bare assignment (`NAME=value`, `arr=(1 2 3)`,
+                        // `arr[i]=value`), with no command word.
                         for (name, _, _) in &sc.assigns {
                             record_symbol(symbols, name.clone(), SymbolKind::Variable, file, item.line, doc_comment_above(lines, item.line));
                         }
@@ -160,10 +134,8 @@ fn scan_program(program: &Program, lines: &[&str], file: &Path, symbols: &mut Ha
     }
 }
 
-// Every command in every stage of every pipeline an AndOr chains
-// together (`a && b | c || d`) -- flattened since a doc-commented
-// declaration could in principle sit anywhere in such a chain, not just
-// as the first, unchained command.
+// Every command in every stage of an AndOr chain (`a && b | c || d`),
+// since a documented declaration could sit anywhere in it.
 fn pipeline_commands(and_or: &AndOr) -> Vec<&Command> {
     let mut out: Vec<&Command> = and_or.first.commands.iter().collect();
     for (_, pipeline) in &and_or.rest {
@@ -172,21 +144,9 @@ fn pipeline_commands(and_or: &AndOr) -> Vec<&Command> {
     out
 }
 
-// Only records a symbol when it actually has an adjacent comment block
-// (a name with nothing above it has nothing for this feature to show --
-// see debugger.rs's own hover fallthrough to a man-page snippet for that
-// case) and only the *first* one seen wins, so the entry script's own
-// declarations always take precedence over a same-named one pulled in
-// from a `source`d file.
-/// Every function `src` defines at the top level, in source order,
-/// each with the line it starts on (1-based) and its doc comment when
-/// it has one.
-///
-/// Not `DocIndex`, deliberately, even though the scan is the same walk:
-/// that index records only *documented* symbols, because a hover with
-/// nothing to say is not a hover. An outline is the other question --
-/// it wants every function, and an undocumented one is exactly the one
-/// somebody is looking for the definition of.
+/// Every function `src` defines at the top level, in order, with its
+/// 1-based start line and doc comment if any. Not `DocIndex`, which only
+/// records documented symbols: an outline wants every function.
 pub fn functions_in(src: &str) -> Vec<(String, usize, Vec<String>)> {
     let Ok(toks) = Lexer::new(src).tokenize() else { return Vec::new() };
     let Ok(program) = Parser::new(toks).parse_program() else { return Vec::new() };
@@ -202,6 +162,9 @@ pub fn functions_in(src: &str) -> Vec<(String, usize, Vec<String>)> {
     out
 }
 
+// Records a symbol only if it has a doc comment (an undocumented name
+// falls through to the man-page fallback in hover), and only the first
+// seen, so the entry script's declarations beat a sourced file's.
 fn record_symbol(symbols: &mut HashMap<String, SymbolDoc>, name: String, kind: SymbolKind, file: &Path, line: usize, doc: Vec<String>) {
     if doc.is_empty() {
         return;
@@ -209,12 +172,9 @@ fn record_symbol(symbols: &mut HashMap<String, SymbolDoc>, name: String, kind: S
     symbols.entry(name).or_insert(SymbolDoc { kind, doc, file: file.to_path_buf(), line });
 }
 
-// Walks upward from `decl_line` (1-based) collecting a contiguous run of
-// `#`-commented lines directly above it -- stops at the first blank
-// line or real code, exactly godoc's own "immediately adjacent, no gap"
-// rule for `// Comment` above a Go declaration. Returned top-to-bottom
-// (source order), each entry with its leading `#` and one following
-// space (if present) already stripped.
+// Collects the run of `#` lines directly above `decl_line` (1-based),
+// stopping at a blank line or code, as godoc does. Top to bottom, `#` and
+// one space stripped.
 fn doc_comment_above(lines: &[&str], decl_line: usize) -> Vec<String> {
     let mut collected = Vec::new();
     if decl_line < 2 {
@@ -232,11 +192,8 @@ fn doc_comment_above(lines: &[&str], decl_line: usize) -> Vec<String> {
     collected
 }
 
-// `Some` only when every chunk of `word` is plain literal text (no
-// `$var`/`$(...)`/arithmetic/etc.) -- the "static" half of "follow
-// `source <static_path>` calls automatically": anything with real
-// expansion in it can't be resolved without actually running the
-// script, so this returns `None` for it instead of guessing.
+// `Some` when every chunk of `word` is plain literal text: a path with an
+// expansion can't be resolved without running the script.
 fn word_as_literal(word: &Word) -> Option<String> {
     let mut s = String::new();
     for chunk in &word.chunks {
@@ -248,11 +205,9 @@ fn word_as_literal(word: &Word) -> Option<String> {
     Some(s)
 }
 
-// The identifier prefix of a `declare`/`local`/etc. word -- `NAME` from
-// bare `NAME`, or from `NAME=value`/`NAME+=value`. `None` if the word
-// doesn't start with a valid identifier at all (a stray flag-looking
-// word that wasn't caught by the caller's own `starts_with('-')` check,
-// or similar).
+// The identifier at the start of a `declare`/`local` word: `NAME` from
+// `NAME`, `NAME=value` or `NAME+=value`. `None` without a valid
+// identifier.
 fn leading_identifier(s: &str) -> Option<String> {
     let end = s.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(s.len());
     let ident = &s[..end];
@@ -262,15 +217,11 @@ fn leading_identifier(s: &str) -> Option<String> {
     }
 }
 
-// Resolves a literal `source`/`.` argument against the file that
-// contains it -- real bash resolves a slash-less relative path against
-// $PATH if it isn't found relative to the current directory, but this is
-// static analysis with no running shell/cwd to consult, so "relative to
-// the sourcing file's own directory" (by far the common real-world
-// convention for a script's own library files) is tried first, then
-// plain relative-to-this-process's-cwd as a fallback. `None` (rather
-// than guessing) when neither actually exists, so a path this can't
-// really resolve is silently skipped instead of scanning the wrong file.
+// Resolves a literal `source` argument. bash searches $PATH for a
+// relative name not found in the current directory; with no running
+// shell, this tries the sourcing file's directory (the usual convention
+// for a script's libraries), then this process's cwd. `None` if neither
+// exists, so the wrong file is never scanned.
 fn resolve_source_path(raw: &str, from_file: &Path) -> Option<PathBuf> {
     let candidate = PathBuf::from(raw);
     if candidate.is_absolute() {
@@ -285,10 +236,8 @@ fn resolve_source_path(raw: &str, from_file: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-// The identifier (`[A-Za-z0-9_]+`) touching column `col` of `chars` --
-// `K`-hover's own "what's actually under the cursor" target, shared by
-// both `K`'s callers (debugger.rs's own read-only view, repl.rs's real
-// file editor). `None` when the cursor isn't sitting on one at all.
+// The identifier (`[A-Za-z0-9_]+`) touching column `col`: what `K` looks
+// up, in the debugger and the editor. `None` when the cursor isn't on one.
 pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     if col >= chars.len() || !is_ident(chars[col]) {
@@ -299,56 +248,39 @@ pub fn identifier_at(chars: &[char], col: usize) -> Option<String> {
     Some(chars[start..end].iter().collect())
 }
 
-// `K`'s own single entry point: `chars`/`col` locate the cursor on its
-// own line (already split out by the caller -- see identifier_at's own
-// shape), `line_text` is that same line as a plain string (classify_word
-// needs to re-tokenize it), `live_value` is however the caller answers
-// "does this identifier have a live value right now" (debugger.rs asks
-// `Shell::debug_peek_var`; repl.rs's plain file editor has no running
-// script to ask, so it always answers `None`).
-//
-// A doc-commented symbol or a live value wins regardless of *where* the
-// identifier sits (a variable reference is a variable reference whether
-// it's argv[0], a flag's own argument, or buried in `${...}`) -- but
-// once neither applies, this does NOT fall back to an unconditional
-// man-page query the way an earlier version did: `classify_word` decides
-// whether the cursor is actually sitting on a command name, a
-// recognized-shape subcommand, or a flag before ever trying `man` at
-// all. Hovering a plain positional argument -- including, notably, a
-// word that only *looks* identifier-shaped because it's sitting inside
-// a quoted string ("please deploy the app") -- correctly finds nothing
-// rather than spawning a pointless `man` lookup for prose.
-/// What `K` says when `hover_lines_at` found nothing at all. Lives
-/// here so the editor's own hover and the debugger's say it the same
-/// way.
+/// What `K` says when `hover_lines_at` found nothing, shared by the
+/// editor's and the debugger's hover.
 pub const NOTHING_UNDER_THE_CURSOR: &str = "no identifier under the cursor";
 
 /// What a hover says when it looked and found nothing to tell you.
 pub const NO_INFO: &str = "no info available";
 
-/// What it says while a man page is still being fetched in the
-/// background -- advice about a key, which is right for `K` and wrong
-/// for anything the user did not press.
+/// Shown while a man page is fetched in the background: advice about a
+/// key, right for `K` and wrong for anything not pressed.
 pub const STILL_LOOKING: &str = "looking up man page... press K again in a moment";
 
-/// Whether these lines are a placeholder rather than an answer: the
-/// lookup is still in flight, and asking again in a moment will say
-/// something better.
-///
-/// Exists so a caller that is not a keypress can decline to show them.
-/// `K` was asked and answers with whatever it has; a popup that
-/// appears on its own should wait until there is something worth
-/// appearing for.
+/// Whether these lines are a placeholder for a lookup still in flight.
+/// `K` shows them anyway; a popup that appears on its own should wait for
+/// something worth showing.
 pub fn is_still_looking(lines: &[String]) -> bool {
     lines.iter().any(|l| l == STILL_LOOKING)
 }
 
-/// Whether these lines amount to "nothing known" -- a word that was
-/// recognised but has no documentation anywhere.
+/// Whether these lines say "nothing known": a recognized word with no
+/// documentation anywhere.
 pub fn says_nothing(lines: &[String]) -> bool {
     lines.is_empty() || lines.iter().all(|l| l == NO_INFO || l == NOTHING_UNDER_THE_CURSOR) || lines.last().is_some_and(|l| l == NO_INFO)
 }
 
+// `K`'s entry point. `chars` and `col` locate the cursor on its line,
+// `line_text` is the same line for `classify_word` to tokenize, and
+// `live_value` answers whether an identifier has a live value
+// (`Shell::debug_peek_var` in the debugger; always `None` in the editor).
+//
+// A documented symbol or a live value wins wherever the identifier sits.
+// Otherwise `classify_word` decides whether the cursor is on a command
+// name, subcommand or flag before `man` is asked, so a positional
+// argument, or prose in a quoted string, finds nothing.
 pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIndex, live_value: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let identifier = identifier_at(chars, col);
     if let Some(name) = &identifier {
@@ -363,12 +295,10 @@ pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIn
         WordRole::Flag { command, flag } => hover_lines_for_flag(&command, &flag),
         WordRole::Command(name) => hover_lines_for_command(&name),
         WordRole::Subcommand { command, subcommand } => hover_lines_for_subcommand(&command, &subcommand),
-        // Empty means "there is nothing here", which is different
-        // from "there is a word here and nothing is known about it".
-        // `K` turns the first into `NOTHING_UNDER_THE_CURSOR`, because
-        // a keypress deserves an answer; a hover that fires on
-        // mouse-over does not, and `bish tool lsp-server` wants the
-        // silence.
+        // Empty means nothing is here, unlike a word about which nothing is
+        // known. `K` turns it into `NOTHING_UNDER_THE_CURSOR`, since a key
+        // press deserves an answer; a mouse-over hover and
+        // `bish tool lsp-server` want silence.
         WordRole::Other => match identifier {
             Some(name) => vec![name, NO_INFO.to_string()],
             None => Vec::new(),
@@ -376,13 +306,9 @@ pub fn hover_lines_at(chars: &[char], col: usize, line_text: &str, index: &DocIn
     }
 }
 
-// The value/doc-comment half of hover_lines_at, split out so a caller
-// that's already resolved one of the two (hover_lines_at itself) can
-// render it without redoing that work. `live_value` wins outright when
-// present; otherwise `index`'s own doc comment, if any. Never reached
-// with both `None` from hover_lines_at (that falls to classify_word
-// instead) -- kept defensive (a bare name, no second line) rather than
-// assuming that, in case something else ever calls this directly.
+// The value or doc-comment half of `hover_lines_at`: a live value wins,
+// then the index's doc comment. Called with neither only from elsewhere,
+// giving a bare name.
 fn hover_lines(name: &str, live_value: Option<&str>, index: &DocIndex) -> Vec<String> {
     let mut lines = vec![name.to_string()];
     if let Some(value) = live_value {
@@ -398,33 +324,22 @@ fn hover_lines(name: &str, live_value: Option<&str>, index: &DocIndex) -> Vec<St
     lines
 }
 
-// What role the word touching `col` (0-based, in chars) of `line` plays
-// in its own command -- the gate that decides whether a man-page lookup
-// even makes sense for a bare word that isn't a known symbol. Built by
-// re-tokenizing `line` with the real lexer (`tokenize_spanned`, for its
-// byte-range-per-token -- exactly what's needed to tell "is the cursor
-// actually on this token" from plain character-class scanning, which is
-// what let a quoted string's own prose read as command-shaped before
-// this existed) and walking it left to right, tracking which command
-// (reset at every `;`/`&&`/`||`/`&`/newline) the cursor's own token
-// would belong to and how far into its argument list.
+// The role of the word at `col` (0-based chars) in its command, which
+// decides whether a man lookup makes sense. Re-tokenizes `line` with
+// `tokenize_spanned` for per-token byte ranges, so the cursor is known to
+// be on a token (a quoted string's prose isn't command-shaped), tracking
+// which command (reset at `;`, `&&`, `||`, `&`, newline) and argument
+// position the token falls in.
 pub enum WordRole {
-    // The word IS the command name itself (argv[0], skipping over any
-    // leading assignment-prefix words like `FOO=bar`).
+    // The command name itself, after any `FOO=bar` prefix words.
     Command(String),
-    // The word sits at the shape "the argument right after the command
-    // name, and isn't a flag" -- a plausible subcommand *position*,
-    // regardless of whether the command actually has a subcommand by
-    // this name (hover_lines_for_subcommand's own man-page query is what
-    // actually confirms or denies that).
+    // The first non-flag argument: a possible subcommand position, which
+    // `hover_lines_for_subcommand`'s man lookup confirms or not.
     Subcommand { command: String, subcommand: String },
-    // A `-x`/`--long[=value]` word, plus the command it belongs to (if
-    // any could be determined at all).
+    // A `-x` or `--long[=value]` word, with its command if known.
     Flag { command: String, flag: String },
-    // Anything else: a later positional argument, a redirect target, a
-    // separator itself, or a word this couldn't classify at all (an
-    // unparseable line, most often because the cursor's own line is only
-    // half of a multi-line construct still being typed).
+    // Anything else: a later argument, a redirect target, a separator, or an
+    // unclassifiable word (often half of a multi-line construct being typed).
     Other,
 }
 
@@ -432,8 +347,8 @@ pub fn classify_word(line: &str, col: usize) -> WordRole {
     let byte_col: usize = line.chars().take(col).map(|c| c.len_utf8()).sum();
     let spanned = crate::lexer::tokenize_spanned(line);
     let mut command: Option<String> = None;
-    // How many non-flag words have been seen since `command` was set --
-    // 0 means the *next* one is the subcommand-position candidate.
+    // Non-flag words seen since `command` was set; 0 means the next one is
+    // in subcommand position.
     let mut arg_index: usize = 0;
     for item in spanned.items {
         let crate::lexer::SpannedItem::Tok(tok, range) = item else { continue };
@@ -482,16 +397,12 @@ pub fn classify_word(line: &str, col: usize) -> WordRole {
                 }
                 if command.is_none() {
                     if hit {
-                        // `globbable` (Tok::Word's own second field) is
-                        // true only for a word with no quoting/escaping/
-                        // expansion at all -- a fully bareword command
-                        // name. A *quoted* word sitting in this same
-                        // position (rare, but `"$0"`-style indirection
-                        // exists) isn't a literal command name worth a
-                        // man-page lookup for, so it's Other instead --
-                        // still becomes `command` for bookkeeping below,
-                        // since whatever comes after it still needs a
-                        // command context to attribute its own flags to.
+                        // `globbable` (Tok::Word's second field) is true
+                        // only for a bare word with no quoting or
+                        // expansion. A quoted word here (`"$0"`
+                        // indirection) isn't worth a man lookup, so it's
+                        // Other, but still becomes `command` so following
+                        // flags have a command to belong to.
                         return if globbable { WordRole::Command(text) } else { WordRole::Other };
                     }
                     command = Some(text);
@@ -499,13 +410,9 @@ pub fn classify_word(line: &str, col: usize) -> WordRole {
                     continue;
                 }
                 if hit {
-                    // Same reasoning as just above, for the subcommand
-                    // position -- this is exactly what caught a quoted
-                    // argument (`read -p "Your name: " USER_NAME`'s own
-                    // prompt string) being misread as command-shaped
-                    // before this existed: it sits at the "first
-                    // non-flag word after the command" position, but
-                    // it's quoted text, not a bareword subcommand name.
+                    // The same for the subcommand position: a quoted
+                    // argument there, like `read -p "Your name: "`'s
+                    // prompt, isn't a subcommand.
                     return if arg_index == 0 && globbable {
                         WordRole::Subcommand { command: command.clone().unwrap(), subcommand: text }
                     } else {
@@ -549,14 +456,10 @@ fn hover_lines_for_command(name: &str) -> Vec<String> {
     lines
 }
 
-// Same idea, for a `command subcommand` pair -- tries the man page
-// convention git/apt/ip/... use for their own per-subcommand pages
-// (`command-subcommand(N)`, the same naming `bishedit::manpages::
-// parse_subcommands` already recognizes for highlight.rs's own
-// subcommand completion). A command with no such page for this word
-// (most commands, most of the time -- this is a *position*-based guess,
-// not a confirmed subcommand list) just reports "no info available",
-// same as any other miss.
+// A `command subcommand` pair: tries the `command-subcommand(N)` page
+// convention git, apt and ip use (as `manpages::parse_subcommands`
+// recognizes). This guesses by position, so most words find no page and
+// get "no info available".
 fn hover_lines_for_subcommand(command: &str, subcommand: &str) -> Vec<String> {
     use crate::bishedit::manpages::{self, ManStatus};
     let full = format!("{command}-{subcommand}");
@@ -572,13 +475,9 @@ fn hover_lines_for_subcommand(command: &str, subcommand: &str) -> Vec<String> {
     lines
 }
 
-// A flag's own description, from the *enclosing command's* man page --
-// `bishedit::manpages::query(command)` already parses every recognized
-// flag's own description alongside its existing flags/subcommands scan
-// (`ManPageData::flag_descriptions`), so this is just a lookup once
-// that's ready, normalized through the same `extract_flag_token` the
-// man-page parser itself uses (so a script's own `--block-size=1M`
-// looks up the page's own `--block-size` entry, not a literal miss).
+// A flag's description from the command's man page
+// (`ManPageData::flag_descriptions`), normalized with
+// `extract_flag_token`, so `--block-size=1M` finds `--block-size`.
 fn hover_lines_for_flag(command: &str, flag: &str) -> Vec<String> {
     use crate::bishedit::manpages::{self, ManStatus};
     let key = manpages::extract_flag_token(flag).unwrap_or_else(|| flag.to_string());
@@ -598,9 +497,7 @@ fn hover_lines_for_flag(command: &str, flag: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Writes one file into `dir`, which owns it: these tests used to
-    /// share a single directory named after the process and never
-    /// remove it, so every run of the suite left one behind.
+    /// Writes one file into `dir`, which owns it and cleans up.
     fn write_temp(dir: &crate::tempdir::TempDir, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
@@ -676,9 +573,8 @@ mod tests {
 mod classify_word_tests {
     use super::*;
 
-    // `col` locates the character to classify -- tests spell it out via
-    // the byte index of a marker for readability, then convert to a
-    // char index (identical for these all-ASCII fixtures).
+    // `col` is given by the position of a marker character, for readability
+    // (byte and char indices agree for these ASCII fixtures).
     fn role_at(line: &str, marker: char) -> WordRole {
         let col = line.find(marker).expect("marker not found in fixture");
         classify_word(line, col)
@@ -716,18 +612,15 @@ mod classify_word_tests {
 
     #[test]
     fn text_inside_a_quoted_argument_is_not_command_shaped() {
-        // "Your" sits inside one single quoted shell word ("Your name:
-        // "), not as its own bareword -- must not be classified as a
-        // command/subcommand/flag at all, so K-hover never spawns a
-        // pointless `man Your` lookup for ordinary prose.
+        // `Your` is inside a quoted word, so it's not a command, subcommand
+        // or flag, and `K` doesn't look up `man Your`.
         assert!(matches!(role_at("read -p \"Your name: \" USER_NAME", 'Y'), WordRole::Other));
     }
 
     #[test]
     fn a_later_plain_argument_is_not_a_subcommand() {
-        // USER_NAME is the *second* non-flag word after `read` (after
-        // the quoted prompt string), not the first -- must not read as
-        // a subcommand position.
+        // `USER_NAME` is the second non-flag word after `read`, not a
+        // subcommand position.
         assert!(matches!(role_at("read -p \"Your name: \" USER_NAME", 'U'), WordRole::Other));
     }
 
@@ -752,9 +645,8 @@ mod classify_word_tests {
 mod hover_quietness_tests {
     use super::*;
 
-    /// The distinction the two callers turn on: `K` was asked and
-    /// answers whatever it has, while a popup that appears on its own
-    /// should stay quiet unless it has something to say.
+    /// `K` answers with whatever it has; a popup that appears on its own
+    /// stays quiet unless it has something to say.
     #[test]
     fn a_placeholder_is_told_apart_from_an_answer() {
         assert!(is_still_looking(&["grep".to_string(), STILL_LOOKING.to_string()]));
@@ -766,9 +658,8 @@ mod hover_quietness_tests {
         assert!(!says_nothing(&["greet".to_string(), "Greets somebody.".to_string()]));
     }
 
-    // A real answer whose *last* line happens to be about something
-    // else must not be mistaken for silence -- the marker is the whole
-    // line, not a substring of one.
+    // A real answer whose last line is about something else isn't silence:
+    // the marker is the whole line, not a substring.
     #[test]
     fn an_answer_mentioning_the_marker_in_passing_still_counts() {
         assert!(!says_nothing(&["x".to_string(), format!("see also: {NO_INFO}")]));
