@@ -1,39 +1,20 @@
 // Key notation: the `<C-d>`/`<Esc>`/`<Space>` spelling `::bish map`
-// reads and prints, and the parser/formatter pair that turns it into
-// `editor::Key` values and back.
+// reads and prints, parsed to `editor::Key` and formatted back from one
+// table (`NAMED`), so anything typeable is printable and the reverse.
 //
-// Both directions come off ONE table (`NAMED`), so a key that can be
-// typed can always be printed and vice versa -- a formatter and a
-// parser maintained separately drift, and the first symptom is a
-// mapping that lists in a spelling it will not accept back.
+// Not `vimkeys::key_label`, which renders the pending-input hint (`^D`,
+// arrow glyphs): display, lossy, never read back. This is a format that
+// round-trips exactly over every mappable key.
 //
-// This is deliberately *not* `vimkeys::key_label`, which already exists
-// and looks similar. That one renders the pending-input hint in the
-// status line, where `^D` and a real arrow glyph are what a person wants
-// to see mid-keystroke; it is display, it is lossy (`None` for anything
-// it has no glyph for), and it never has to be read back. This one is a
-// wire format, has to round-trip exactly, and covers every key that can
-// carry a mapping. They are different jobs and share no code on purpose.
-//
-// Vim's own spelling is followed wherever vim has one, because the
-// population who will type this already knows it: `<C-d>`, `<Esc>`,
-// `<CR>`, `<BS>`, `<Tab>`, `<S-Tab>`, `<Space>`, `<Del>`, `<Home>`,
-// `<End>`, `<PageUp>`, `<PageDown>`, the arrows, and `<lt>` for a
-// literal `<`.
-//
-// Lands ahead of its consumers -- `::bish map` reads and prints through
-// this, and vimkeys.rs matches against it -- the same "build the seam,
-// wire it in later" pattern history.rs's own `cwd` field and
-// lexer.rs's SpannedItem already follow here. The tests below are the
-// real users until then, and they cover both directions.
+// Vim's spelling wherever vim has one: `<C-d>`, `<Esc>`, `<CR>`, `<BS>`,
+// `<Tab>`, `<S-Tab>`, `<Space>`, `<Del>`, `<Home>`, `<End>`, `<PageUp>`,
+// `<PageDown>`, the arrows, and `<lt>` for a literal `<`.
 #![allow(dead_code)]
 
 use crate::editor::Key;
 
-// Every key that is not `Key::Char`, with its canonical spelling.
-// Ordered roughly as the `Key` enum is, and exhaustive over the
-// mappable variants -- see `is_mappable` for the ones deliberately
-// missing and why.
+// Every key that isn't `Key::Char`, with its canonical spelling, in
+// `Key` order, covering the mappable variants (see `is_mappable`).
 const NAMED: &[(&str, Key)] = &[
     ("<C-Space>", Key::CtrlSpace),
     ("<CR>", Key::Enter),
@@ -77,33 +58,25 @@ const NAMED: &[(&str, Key)] = &[
     ("<C-z>", Key::CtrlZ),
 ];
 
-// A space is spelled `<Space>` rather than written literally, because a
-// mapping's two halves are separated by whitespace on the command line
-// and a bare space would make `::bish map` ambiguous about where the
-// left-hand side ends.
+// A space is `<Space>`, since whitespace separates a mapping's two
+// halves on the command line.
 const SPACE: &str = "<Space>";
 // `<` itself, so a mapping can contain one without opening a name.
 const LT: &str = "<lt>";
-// Vim's own spelling for "do nothing". Only meaningful as a whole
-// right-hand side -- it is the *absence* of keys, so there is nothing
-// for it to sit beside in a sequence.
+// Vim's spelling for doing nothing; only a whole right-hand side, being
+// the absence of keys.
 const NOP: &str = "<Nop>";
 
-// Whether a key can carry a mapping at all.
-//
-// `Mouse` and `Unknown` cannot: one is a coordinate-carrying event
-// rather than a keystroke (and every view that wants it already handles
-// it directly), and the other is by definition the bytes nothing
-// recognized, so binding it would bind "whatever we failed to decode".
-// `PasteStart`/`PasteEnd` cannot either: they are the brackets a
-// terminal puts around pasted text, not something a person presses, and
-// a mapping on one would fire on every paste.
+// Whether a key can carry a mapping. Not `Mouse`, an event with
+// coordinates that views handle directly; not `Unknown`, the bytes
+// nothing decoded; not `PasteStart`/`PasteEnd`, which a terminal puts
+// around pastes, so a mapping would fire on every paste.
 pub fn is_mappable(key: Key) -> bool {
     !matches!(key, Key::Mouse(_) | Key::Unknown | Key::PasteStart | Key::PasteEnd)
 }
 
-// One key's canonical spelling. Total over mappable keys, which is what
-// lets `format_keys` be infallible.
+// One key's canonical spelling, total over mappable keys, so
+// `format_keys` can't fail.
 fn format_key(key: Key) -> String {
     if let Key::Char(c) = key {
         return match c {
@@ -117,56 +90,45 @@ fn format_key(key: Key) -> String {
             return (*name).to_string();
         }
     }
-    // Only reachable for a non-mappable key, which no stored mapping can
-    // contain -- rendered rather than panicking, since a listing is not
-    // somewhere to take the shell down.
+    // Only for a non-mappable key, which no mapping holds; a listing
+    // shouldn't panic.
     "<unknown>".to_string()
 }
 
-/// The canonical spelling of a whole sequence, exactly as `::bish map`
-/// prints it and will read it back.
+/// A sequence's canonical spelling, as `::bish map` prints and reads it.
 pub fn format_keys(keys: &[Key]) -> String {
     keys.iter().map(|k| format_key(*k)).collect()
 }
 
-/// The same, for a right-hand side, where "no keys" is a real answer
-/// and prints as what would produce it.
+/// The same for a right-hand side, where no keys is valid and prints as
+/// `<Nop>`.
 pub fn format_rhs(keys: &[Key]) -> String {
     if keys.is_empty() { NOP.to_string() } else { format_keys(keys) }
 }
 
-/// Every key sequence Normal mode resolves, with the canonical name of
-/// what it does -- the same name `::bish map` prints.
+/// Every key sequence Normal mode resolves, with the name of what it
+/// does, as `::bish map` prints it. Derived by asking
+/// `vimkeys::describe_key_sequence` about every candidate, so it can't
+/// disagree with the implementation (the written help never mentions
+/// `D`).
 ///
-/// Derived by asking rather than by listing: every candidate goes
-/// through `vimkeys::describe_key_sequence`, so this index cannot
-/// disagree with the implementation the way a hand-written one can.
-/// That is the entire point of it. The editor's own written help does
-/// not mention `D` at all, and until this existed the only way to learn
-/// that `D` deletes to end of line was to map a throwaway key to it and
-/// list the mappings.
+/// Two kinds of row, which keep this an index rather than thousands of
+/// lines:
 ///
-/// Two kinds of row, and the difference between them is what keeps this
-/// an index rather than a wall of six thousand lines:
+/// - A sequence that resolves alone: `D`, `dd`, `gg`, `<C-w>s`.
+/// - A pattern, where a key qualifies what follows: `d{motion}`,
+///   `f{char}`, `"{char}`, `/{pattern}<CR>`, recognized mechanically: an
+///   operator's description wraps the motion's in constant text, a
+///   character argument's echoes the typed key, a search's quotes the
+///   text before `<CR>`.
 ///
-/// - A sequence that resolves on its own: `D`, `dd`, `gg`, `<C-w>s`.
-/// - A *pattern*, where a key qualifies whatever follows it rather than
-///   doing anything itself: `d{motion}`, `f{char}`, `"{char}`,
-///   `/{pattern}<CR>`. Every one of those is recognized mechanically --
-///   an operator by its description being the motion's own with
-///   constant text wrapped around it, a character argument by the
-///   description echoing back the very key that was typed, a search by
-///   the description quoting the text typed before `<CR>`.
-///
-/// Counts are left out: `1`-`9` may prefix nearly everything, and
-/// enumerating that is noise rather than an index. `0` stays, because
-/// on its own it is a motion.
+/// Counts are left out (`1`-`9` prefix nearly everything); `0` stays, as
+/// a motion.
 pub fn key_index() -> Vec<(String, String)> {
     let root = root_descriptions();
     let mut out: Vec<(String, String)> = Vec::new();
     let mut frontier: Vec<Vec<Key>> = vec![Vec::new()];
-    // Two levels of ordinary walking. A pattern reaches deeper on its
-    // own, through the handful of extra probes `pattern_rows` makes.
+    // Two levels of walking; patterns reach deeper through `pattern_rows`.
     for _ in 0..2 {
         let mut next = Vec::new();
         for prefix in &frontier {
@@ -181,8 +143,8 @@ pub fn key_index() -> Vec<(String, String)> {
     out
 }
 
-// What a modifier wraps its operand's own description in: ("delete ",
-// "") for `d`, ("", " register 'a'") for `"a`.
+// What a modifier wraps its operand's description in: ("delete ", "")
+// for `d`, ("", " register 'a'") for `"a`.
 #[derive(Clone, PartialEq)]
 struct Affixes {
     before: String,
@@ -198,9 +160,8 @@ impl Affixes {
 enum Shape {
     // Qualifies what follows, and says so in the name.
     Modifier(Affixes),
-    // Qualifies what follows and changes nothing about the name -- the
-    // unnamed register `""` being the case that matters. Nothing to
-    // list, and nothing below it that is not already listed.
+    // Qualifies what follows without changing its name: the unnamed
+    // register `""`. Nothing new to list.
     Transparent,
     // Reads text up to `<CR>` and quotes it back, i.e. `/` and `?`.
     LineArgument(String),
@@ -213,11 +174,9 @@ enum Shape {
 fn walk(prefix: &[Key], root: &[(Key, String)]) -> (Vec<(String, String)>, Vec<Vec<Key>>) {
     let mut rows: Vec<(String, String)> = Vec::new();
     let mut resolved: Vec<(Key, String)> = Vec::new();
-    // Modifier rows, kept apart only so they can go through the same
-    // character-argument collapse: a register is both at once (`"a` is
-    // a modifier, and the `a` is a typed character), and `"{char}
-    // {motion}` is one row where `"a{motion}` through `"z{motion}` are
-    // twenty-six that say the same thing.
+    // Modifier rows, kept apart for the character-argument collapse: a
+    // register is both (`"a` modifies, the `a` is typed), so
+    // `"{char}{motion}` is one row instead of twenty-six.
     let mut patterned: Vec<(Key, String)> = Vec::new();
     let mut expand = Vec::new();
     for key in candidate_keys() {
@@ -227,11 +186,10 @@ fn walk(prefix: &[Key], root: &[(Key, String)]) -> (Vec<(String, String)>, Vec<V
             Err(reason) if reason == "incomplete" => match shape_of(&seq, root) {
                 Shape::Modifier(affixes) => {
                     patterned.push((key, affixes.render()));
-                    // A modifier reached by typing a character -- a
-                    // register -- earns no extra probes: everything
-                    // under `"a` is `"a` applied to something already
-                    // listed on its own. A real operator does, whether
-                    // it is spelled `d` or `gu`.
+                    // A modifier reached by typing a character (a register)
+                    // gets no extra probes: everything under `"a` is `"a`
+                    // applied to something listed. An operator does,
+                    // spelled `d` or `gu`.
                     if !echoes_last_key(&affixes.after, &seq) {
                         rows.extend(pattern_rows(&seq, root));
                     }
@@ -250,10 +208,9 @@ fn walk(prefix: &[Key], root: &[(Key, String)]) -> (Vec<(String, String)>, Vec<V
     (rows, expand)
 }
 
-// An operator is not walked into -- `d{motion}` already says what the
-// ninety rows under it would -- but three things below one are their
-// own facts rather than instances of the pattern: the doubled form
-// (`dd` operates on the line) and the two text-object introducers.
+// An operator isn't walked (`d{motion}` says it), but three things
+// under one are their own facts: the doubled form (`dd`) and the two
+// text-object introducers.
 fn pattern_rows(seq: &[Key], root: &[(Key, String)]) -> Vec<(String, String)> {
     let Some(&last) = seq.last() else { return Vec::new() };
     let mut rows = Vec::new();
@@ -263,12 +220,10 @@ fn pattern_rows(seq: &[Key], root: &[(Key, String)]) -> Vec<(String, String)> {
             Ok(desc) => rows.push((format_keys(&longer), desc)),
             Err(_) => match shape_of(&longer, root) {
                 Shape::Modifier(affixes) => rows.push((format!("{}{{motion}}", format_keys(&longer)), affixes.render())),
-                // A text object is not a motion and is not named like
-                // one -- `diw` is "delete text-object inner word" while
-                // `w` on its own is "word-forward" -- so the operand
-                // test above cannot see it. What it does have is a
-                // family of siblings that all begin the same way, which
-                // is exactly as mechanical and just as hard to fake.
+                // A text object isn't named like a motion (`diw` is "delete
+                // text-object inner word", `w` is "word-forward"), so the
+                // operand test misses it; but it has siblings that all
+                // begin alike, which is as mechanical.
                 _ => rows.extend(family_row(&longer)),
             },
         }
@@ -276,8 +231,8 @@ fn pattern_rows(seq: &[Key], root: &[(Key, String)]) -> Vec<(String, String)> {
     rows
 }
 
-// One row for a group of at least three sequences whose descriptions
-// share everything up to a final word: `di{object}`.
+// One row for at least three sequences whose descriptions share all but
+// a final word: `di{object}`.
 fn family_row(seq: &[Key]) -> Option<(String, String)> {
     let described: Vec<String> =
         candidate_keys().into_iter().filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[key]].concat()).ok()).collect();
@@ -291,28 +246,22 @@ fn family_row(seq: &[Key]) -> Option<(String, String)> {
     }
     let common = first[..first.char_indices().nth(shared).map_or(first.len(), |(i, _)| i)].to_string();
     let common = common.trim_end();
-    // A shared prefix that is the whole of some sibling's description
-    // means these are not one family with an argument, they are just
-    // names that happen to start alike.
+    // If the shared prefix is a sibling's whole description, these are names
+    // that start alike, not one family.
     match common.is_empty() || described.iter().any(|d| d.trim() == common) {
         true => None,
         false => Some((format!("{}{{object}}", format_keys(seq)), format!("{common} {{object}}"))),
     }
 }
 
-// What kind of prefix `seq` is. Every test here is a question put to
-// `describe_key_sequence` about real sequences -- nothing is listed by
-// hand, which is why this cannot drift.
+// What kind of prefix `seq` is, by asking `describe_key_sequence` about
+// real sequences, so it can't drift.
 fn shape_of(seq: &[Key], root: &[(Key, String)]) -> Shape {
-    // Does what follows keep its own name, with constant text wrapped
-    // around it? `dw` is "delete word" and `w` is "word"; `"ap` is
-    // "put-after register 'a'" and `p` is "put-after".
-    //
-    // Tallied rather than decided on the first agreement, because a
-    // modifier does not have to apply to everything: a register
-    // qualifies `p` and `Y` and leaves `J` and `u` alone, so the
-    // empty-affix answers are the majority and the *real* shape is the
-    // most common thing that actually wraps something.
+    // Does what follows keep its name, wrapped in constant text? `dw` is
+    // "delete word" and `w` "word"; `"ap` is "put-after register 'a'".
+    // Tallied rather than decided on the first agreement: a register
+    // qualifies `p` and `Y` but not `J` or `u`, so the real shape is the
+    // most common one that wraps something.
     let mut tried = 0;
     let mut tally: Vec<(Affixes, usize)> = Vec::new();
     for (key, base) in root {
@@ -328,30 +277,20 @@ fn shape_of(seq: &[Key], root: &[(Key, String)]) -> Shape {
     let wrapping = tally.iter().filter(|(a, _)| !(a.before.is_empty() && a.after.is_empty())).max_by_key(|(_, n)| *n);
     if let Some((affixes, count)) = wrapping
         && *count >= 3
-        // An operator applies to *everything* that follows it, so an
-        // overwhelming majority is the test: `d` matches 42 of the 42
-        // keys that resolve after it. `<C-w>` matches 4 of 8 -- it
-        // looks like one because `<C-w>h` is "window focus-left" beside
-        // `h`'s "left" -- and is not one, which is why `<C-w>s` and
-        // `<C-w>v` are still listed individually.
-        //
-        // A register is the exception, and names itself: `"a` only
-        // qualifies the commands that use a register, so it never wins
-        // a majority, but the text it adds echoes the very key that was
-        // typed -- the same signature `f{char}` is recognized by.
+        // An operator applies to everything after it, so the test is a large
+        // majority: `d` matches 42 of 42. `<C-w>` matches 4 of 8 (`<C-w>h` is
+        // "window focus-left" beside `h`'s "left") and isn't one. A register
+        // never wins a majority but echoes the typed key, as `f{char}` does.
         && (count * 4 >= tried * 3 || echoes_last_key(&affixes.after, seq))
     {
         return Shape::Modifier(affixes.clone());
     }
-    // What follows keeps its own name exactly: the unnamed register
-    // `""` is this, and there is nothing under it that is not already
-    // listed on its own.
+    // What follows keeps its name exactly: the unnamed register `""`.
     if tally.iter().any(|(a, n)| a.before.is_empty() && a.after.is_empty() && *n >= 3) && wrapping.is_none() {
         return Shape::Transparent;
     }
-    // Does it read text up to `<CR>` and quote it back? Asked of the
-    // empty text, which is the one case that needs no guessing about
-    // what was typed.
+    // Does it read text up to `<CR>` and quote it back? Asked with empty
+    // text, which needs no guessing.
     if let Ok(desc) = crate::bishedit::vimkeys::describe_key_sequence(&[seq, &[Key::Enter]].concat())
         && let Some(stem) = desc.strip_suffix(" \"\"")
     {
@@ -360,21 +299,19 @@ fn shape_of(seq: &[Key], root: &[(Key, String)]) -> Shape {
     Shape::Prefix
 }
 
-// Whether the text a modifier adds quotes back the key that was typed
-// to reach it -- `"a` adding " register 'a'".
+// Whether a modifier's added text quotes the typed key: `"a` adds
+// " register 'a'".
 fn echoes_last_key(after: &str, seq: &[Key]) -> bool {
     matches!(seq.last(), Some(&last) if echoed_argument(after, last).is_some())
 }
 
-// Every single key that resolves on its own, which is what a modifier's
-// operand is drawn from.
+// Every single key that resolves alone, the operands for modifiers.
 fn root_descriptions() -> Vec<(Key, String)> {
     candidate_keys().into_iter().filter_map(|key| crate::bishedit::vimkeys::describe_key_sequence(&[key]).ok().map(|desc| (key, desc))).collect()
 }
 
-// `f` reads a character and says so: `fa` describes as "find-char 'a'".
-// Ninety-four rows of that is not an index, so any run whose
-// description echoes the key that produced it becomes one row.
+// `f` reads a character and says so (`fa` is "find-char 'a'"), so a run
+// whose descriptions echo their key becomes one row.
 fn collapse_char_arguments(prefix: &[Key], resolved: Vec<(Key, String)>, suffix: &str) -> Vec<(String, String)> {
     let mut groups: Vec<(String, usize)> = Vec::new();
     for (key, desc) in &resolved {
@@ -399,10 +336,9 @@ fn collapse_char_arguments(prefix: &[Key], resolved: Vec<(Key, String)>, suffix:
     out
 }
 
-// The description with the echoed key stripped off, when it ends in
-// exactly the character that was typed. `'` and `\` arrive escaped
-// (`find-char '\''`), which is the describer's own quoting rather than
-// a different answer -- so both spellings count.
+// The description without the echoed key, when it ends in the typed
+// character. `'` and `\` arrive escaped (`find-char '\''`), so both
+// spellings count.
 fn echoed_argument(desc: &str, key: Key) -> Option<&str> {
     let Key::Char(c) = key else { return None };
     let escaped = match c {
@@ -413,8 +349,8 @@ fn echoed_argument(desc: &str, key: Key) -> Option<&str> {
     desc.strip_suffix(&format!(" '{c}'")).or_else(|| escaped.and_then(|e| desc.strip_suffix(&format!(" '{e}'"))))
 }
 
-// What the walk tries at each position: every printable ASCII character
-// and every named key. `1`-`9` are left out -- see `key_index`.
+// Every printable ASCII character and named key, but `1`-`9` (see
+// `key_index`).
 fn candidate_keys() -> Vec<Key> {
     let mut keys: Vec<Key> =
         (0x20u8..0x7f).map(|b| Key::Char(b as char)).filter(|k| !matches!(k, Key::Char(c) if c.is_ascii_digit() && *c != '0')).collect();
@@ -422,22 +358,15 @@ fn candidate_keys() -> Vec<Key> {
     keys
 }
 
-/// Parses `<C-d>`, `<Space>w`, `10j` and so on into the keys they name.
-///
-/// Angle-bracket names are matched case-insensitively (`<esc>`, `<ESC>`
-/// and `<Esc>` are one key, as in vim) but always *print* in the table's
-/// own casing, so a listing has one spelling regardless of how it was
-/// typed. Anything else is a literal character, which is what makes
-/// `10j` three ordinary keys rather than needing an escape.
-///
-/// The error is the message the user sees, so it names the offending
-/// text rather than an offset.
+/// Parses `<C-d>`, `<Space>w`, `10j` into keys. Names in angle brackets
+/// match case-insensitively, as in vim, but print in the table's casing.
+/// Anything else is a literal character, so `10j` is three keys. Errors
+/// name the offending text.
 pub fn parse_keys(text: &str) -> Result<Vec<Key>, String> {
     if text.eq_ignore_ascii_case(NOP) {
-        // No keys at all: `::bish map -m insert '<Left>' '<Nop>'` is how
-        // a key is taken out of service. Only the whole right-hand side,
-        // never part of a sequence -- `a<Nop>b` would be `ab` written
-        // confusingly, so it is rejected below as an unknown name.
+        // No keys: `::bish map -m insert '<Left>' '<Nop>'` takes a key out of
+        // service. Only as the whole right-hand side; `a<Nop>b` is rejected
+        // below as an unknown name.
         return Ok(Vec::new());
     }
     if text.is_empty() {
@@ -453,10 +382,8 @@ pub fn parse_keys(text: &str) -> Result<Vec<Key>, String> {
             continue;
         }
         let Some(close) = chars[i..].iter().position(|c| *c == '>').map(|p| i + p) else {
-            // An unmatched `<` is far more likely a typo in a name than
-            // a deliberate literal, so it is an error rather than being
-            // silently taken as `Key::Char('<')` -- `<lt>` is there for
-            // when a literal is meant.
+            // An unmatched `<` is likely a typo in a name, so it's an error;
+            // `<lt>` is the literal.
             return Err(format!("unterminated key name in '{text}' (a literal < is <lt>)"));
         };
         let name: String = chars[i..=close].iter().collect();
@@ -478,37 +405,25 @@ pub fn parse_keys(text: &str) -> Result<Vec<Key>, String> {
 }
 
 /// The modes a mapping can be scoped to. `--mode`/`-m` is a glob over
-/// these, the same shape and the same engine `abbr --lang` uses, so one
-/// mapping can cover a family (`-m '*al'` is normal and visual) or
-/// everything but one (`-m '!(insert)'`).
+/// them, as `abbr --lang`: `-m '*al'` is normal and visual,
+/// `-m '!(insert)'` all but insert.
 ///
-/// There is deliberately no `terminal`. While a foreground job owns the
-/// keyboard, `drive_fg_job` forwards raw bytes to it and never decodes
-/// keys at all -- which is exactly what keeps a real vim running under
-/// bish receiving its own escape sequences intact. Mapping there would
-/// need a second, parallel key-to-bytes encoder kept in step with the
-/// decoder, on the most fidelity-sensitive path in the codebase; and
-/// because the default scope is `*`, an ordinary global mapping would
-/// then silently apply *inside* every full-screen program, so mapping
-/// `jk` for Insert mode would break `j` in vim. The keyboard belongs to
-/// the program that has it.
+/// No `terminal` mode: while a foreground job has the keyboard,
+/// `drive_fg_job` forwards raw bytes and decodes nothing, so a program
+/// like vim gets its escape sequences intact. Mapping there would need
+/// an encoder kept in step with the decoder, and a global mapping would
+/// apply inside every full-screen program (an Insert-mode `jk` would
+/// break `j` in vim).
 pub const MODES: &[&str] = &["normal", "insert", "visual", "command"];
 
-/// Unscoped: every mode. A mapping with no `--mode` is global, which is
-/// what vim's own `:noremap` (as against `:nnoremap`) means.
+/// Unscoped: every mode, as vim's `:noremap` is to `:nnoremap`.
 pub const DEFAULT_MODE: &str = "*";
 
-/// One `::bish map` entry.
-///
-/// The right-hand side is stored as *keys*, not as the action it
-/// resolves to. Resolution still happens when the mapping is defined --
-/// that is what validates it and produces the canonical description a
-/// listing shows -- but dispatch replays these keys into the live
-/// `VimKeys` with remapping suppressed. That is still exactly noremap,
-/// since a replayed key cannot trigger another mapping, and it is what
-/// lets a typed count compose with a mapped motion: `2<C-d>` where
-/// `<C-d>` is mapped to `j` means two lines down, which a frozen
-/// `Motion(Down, None)` could not express.
+/// One `::bish map` entry. The right-hand side is stored as keys:
+/// resolved at definition to validate it and get its description, then
+/// replayed into the live `VimKeys` with remapping off, which is noremap.
+/// Replaying keys lets a count compose with a mapped motion: with `<C-d>`
+/// mapped to `j`, `2<C-d>` goes down two.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mapping {
     pub modes: String,
@@ -517,20 +432,15 @@ pub struct Mapping {
 }
 
 impl Mapping {
-    /// Whether this mapping is live in `mode`. The shell's own glob
-    /// engine, so `--mode` accepts exactly what a `case` pattern does,
-    /// with no second dialect to learn.
+    /// Whether this mapping is live in `mode`, by the shell's glob engine,
+    /// so `--mode` takes what a `case` pattern does.
     pub fn applies_to(&self, mode: &str) -> bool {
         crate::glob::matches(&self.modes, mode)
     }
 }
 
-/// Whether a `--mode` glob names anything at all.
-///
-/// A glob matching no known mode is always a mistake -- `-m nrmal`
-/// would otherwise be accepted, listed, and never fire, with nothing
-/// anywhere saying why. Checked once when the mapping is defined rather
-/// than being discovered at a keystroke that does not happen.
+/// Whether a `--mode` glob names any mode: `-m nrmal` would otherwise be
+/// accepted and never fire. Checked at definition.
 pub fn mode_glob_is_known(glob: &str) -> bool {
     MODES.iter().any(|m| crate::glob::matches(glob, m))
 }
@@ -540,23 +450,17 @@ pub fn modes_matching(glob: &str) -> Vec<&'static str> {
     MODES.iter().copied().filter(|m| crate::glob::matches(glob, m)).collect()
 }
 
-/// Whether a glob covers a mode driven by `VimKeys`, and so one where a
-/// right-hand side resolves to a *named action* rather than just to
-/// keys. Normal and visual share that machine; insert and command
-/// dispatch on raw keys and have no such vocabulary, which is why both
-/// validation and the listing have to ask.
+/// Whether a glob covers a `VimKeys` mode, where a right-hand side
+/// resolves to a named action. Normal and visual do; insert and command
+/// dispatch raw keys.
 pub fn has_vim_mode(glob: &str) -> bool {
     modes_matching(glob).iter().any(|m| *m == "normal" || *m == "visual")
 }
 
-// Pulls `--mode=GLOB`/`--mode GLOB`/`-m GLOB` out of `::bish map`'s
-// arguments. A free function rather than a method for the same reason
-// `snippet::take_lang_flag` is one: it needs no shell state, and both
-// the add and the list paths have to agree about the spelling.
-//
-// Recognized anywhere before the key, since the flag and the mode
-// flags are order-independent in `abbr` too -- but not after it, so a
-// mapping whose right-hand side is literally `-m` is still possible.
+// Takes `--mode=GLOB`, `--mode GLOB` or `-m GLOB` from `::bish map`'s
+// arguments, a free function like `snippet::take_lang_flag`, so the add
+// and list paths agree. Recognized anywhere before the key, not after,
+// so a right-hand side can be `-m`.
 pub fn take_mode_flag(args: &[String]) -> (Vec<String>, Option<String>) {
     let mut mode = None;
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
@@ -581,8 +485,7 @@ pub fn take_mode_flag(args: &[String]) -> (Vec<String>, Option<String>) {
     (rest, mode)
 }
 
-// `::bish map`'s own usage, shared by `help` and by the error a missing
-// argument prints -- one text, so the two cannot disagree.
+// `::bish map`'s usage, shared by `help` and the missing-argument error.
 pub fn usage() -> Vec<String> {
     vec![
         "::bish map [-m GLOB]                   what is mapped".to_string(),
@@ -597,21 +500,12 @@ pub fn usage() -> Vec<String> {
     ]
 }
 
-/// Keys the Normal-mode *host loop* answers itself, before `VimKeys`
-/// ever sees them -- see `run_normal_mode_navigation`'s own pre-match on
-/// `key`, above its `match vk.feed(key)`.
-///
-/// `VimKeys::feed` returns `None` for every one of these, so validating
-/// a right-hand side against that alone rejected `:`, `K`, `ZZ`, `q` and
-/// `@` -- which is to say every way of reaching command mode, hover,
-/// write-and-quit or a macro from a mapping. Normal mode's key handling
-/// is split across two layers and only one of them was being asked.
-///
-/// A table rather than a query, because that loop is a several-hundred
-/// line match with no seam to ask. The test below checks every entry is
-/// still unknown to `VimKeys`, which catches an entry that has since
-/// moved into the key machine; a *new* host arm has to be added here by
-/// hand.
+/// Keys Normal mode's host loop answers before `VimKeys` sees them (see
+/// `run_normal_mode_navigation`'s pre-match). `VimKeys::feed` returns
+/// `None` for them, so validating against it alone would reject `:`, `K`,
+/// `ZZ`, `q` and `@`. A table, since that loop has no seam to ask; the
+/// test below catches an entry that moved into `VimKeys`, but a new host
+/// arm must be added here.
 const HOST_KEYS: &[(Key, &str)] = &[
     (Key::Char(':'), "command-mode"),
     (Key::Char('K'), "hover"),
@@ -625,14 +519,10 @@ pub fn describe_host_key(key: Key) -> Option<&'static str> {
     HOST_KEYS.iter().find(|(k, _)| *k == key).map(|(_, name)| *name)
 }
 
-/// Names what a right-hand side does, across both layers of Normal
-/// mode.
-///
-/// A sequence *starting* with a host key is named by it, with whatever
-/// follows shown as keys: `:w<CR>` is `command-mode w<CR>`. The tail
-/// cannot be resolved further and should not pretend to be -- once `:`
-/// has opened the colon line, the rest is text for a different reader
-/// entirely.
+/// Names what a right-hand side does across both layers. A sequence
+/// starting with a host key is named by it, the rest shown as keys:
+/// `:w<CR>` is `command-mode w<CR>`, since after `:` the rest is text for
+/// the colon line.
 pub fn describe_rhs(keys: &[Key]) -> Result<String, String> {
     if keys.is_empty() {
         return Ok("nothing".to_string());
@@ -647,11 +537,10 @@ pub fn describe_rhs(keys: &[Key]) -> Result<String, String> {
 /// What a matcher decided about one key.
 #[derive(Debug, PartialEq)]
 pub struct Dispatch {
-    /// Characters to take back off the screen before dispatching
-    /// `keys` -- always 0 unless the caller asked to speculate.
+    /// Characters to take back off the screen before dispatching `keys`;
+    /// 0 unless the caller asked to speculate.
     pub revert: usize,
-    /// Keys to dispatch, in order. Empty while a sequence is still
-    /// being decided.
+    /// Keys to dispatch, in order; empty while undecided.
     pub keys: Vec<Key>,
 }
 
@@ -664,43 +553,28 @@ impl Dispatch {
     }
 }
 
-/// Whether a key can be typed now and taken back later: its whole
-/// effect has to be one character on screen. A letter or digit
-/// qualifies; whitespace does not (Space and Enter trigger `abbr`
-/// expansion, which one backspace would not undo), and nor does
-/// anything that is not a character at all.
+/// Whether a key can be typed now and taken back: its effect must be one
+/// character on screen. Letters and digits; not whitespace (Space and
+/// Enter trigger `abbr`), nor non-characters.
 fn can_speculate(key: Key) -> bool {
     matches!(key, Key::Char(c) if !c.is_whitespace())
 }
 
-/// Translates typed keys into the keys they are mapped to, in front of
-/// `VimKeys` rather than inside it.
-///
-/// Sitting in front is what makes this work. The input loop already
-/// applies exactly one outcome per key it feeds `VimKeys`, so a mapping
-/// that expands to a sequence just feeds several keys and the loop
-/// applies each outcome -- no change to `feed`'s contract, and none of
-/// the "one key in, several actions out" problem that putting the
-/// keymap inside `VimKeys` would have created.
-///
-/// It is also what makes the mapping non-recursive for free: what comes
-/// out goes straight to `VimKeys` and never back through here, so a
-/// right-hand side cannot trigger another mapping however the table is
-/// arranged. There is no flag to get wrong.
+/// Translates typed keys into their mappings, in front of `VimKeys`.
+/// The input loop applies one outcome per key fed, so a mapping to a
+/// sequence feeds several keys, with no change to `feed`. Output goes
+/// straight to `VimKeys`, never back here, so mappings are
+/// non-recursive by construction.
 pub struct Matcher {
     mappings: Vec<Mapping>,
     /// Keys typed so far that are still a live prefix of some mapping.
     buffer: Vec<Key>,
-    /// How many of `buffer`'s keys have already been dispatched on the
-    /// chance that this is not a mapping after all -- see `feed`'s
-    /// `speculative`. Exactly the number of characters to take back if
-    /// it turns out to be one.
+    /// How many of `buffer`'s keys were dispatched speculatively (see
+    /// `feed`): the characters to take back if it's a mapping after all.
     speculated: usize,
-    /// The longest complete mapping the buffer has matched so far, and
-    /// how many keys it consumed -- remembered because a longer mapping
-    /// may still match, and if it does not, this is what fires. See
-    /// `feed` for why the wait is until the next key rather than a
-    /// timer.
+    /// The longest complete mapping matched so far and the keys it took,
+    /// since a longer one may still match; if not, this fires. See `feed`
+    /// for why that waits for the next key, not a timer.
     matched: Option<(Vec<Key>, usize)>,
 }
 
@@ -709,35 +583,26 @@ impl Matcher {
         Matcher { mappings, buffer: Vec::new(), speculated: 0, matched: None }
     }
 
-    /// Whether anything is mapped at all -- lets a caller skip the whole
-    /// mechanism, and keeps a shell with no mappings behaving exactly as
-    /// it did before there were any.
+    /// Whether anything is mapped, so a caller can skip the mechanism and
+    /// an unmapped shell behaves as before.
     pub fn is_empty(&self) -> bool {
         self.mappings.is_empty()
     }
 
-    /// Keys held mid-sequence, for a caller that needs to flush before
-    /// leaving the mode (see `flush`).
+    /// Keys held mid-sequence, for a caller flushing before it leaves the
+    /// mode (see `flush`).
     pub fn pending(&self) -> &[Key] {
         &self.buffer
     }
 
-    /// What to do with `key`.
-    ///
-    /// `speculative` says the caller can take a key back: in Insert mode
-    /// a printable character's whole effect is one character on screen,
-    /// so it can be typed now and removed if the sequence turns out to
-    /// be a mapping. That is what makes `jk` -> `<Esc>` feel right
-    /// without a timer -- `j` appears the instant it is pressed and
-    /// disappears when `k` completes the mapping. Normal mode passes
-    /// false: nothing echoes there so there is no lag to remove, and
-    /// `d` or `x` does real work that "delete one character" could not
-    /// undo.
-    ///
-    /// Longest match wins either way, decided by the next key rather
-    /// than by a clock. Nothing here ever fires because time passed, so
-    /// the same keys always produce the same result however fast they
-    /// were typed.
+    /// What to do with `key`. `speculative` means the caller can take a key
+    /// back: in Insert mode a printable character is just one character on
+    /// screen, so it's typed now and removed if the sequence becomes a
+    /// mapping. So `jk` -> `<Esc>` needs no timer: `j` shows at once and goes
+    /// when `k` completes it. Normal mode passes false: nothing echoes, and
+    /// `d` or `x` can't be undone by deleting a character. The longest match
+    /// wins, decided by the next key, never by time, so the result doesn't
+    /// depend on typing speed.
     pub fn feed(&mut self, key: Key, mode: &str, speculative: bool) -> Dispatch {
         if self.mappings.is_empty() {
             return Dispatch::keys(vec![key]);
@@ -748,14 +613,13 @@ impl Matcher {
         if let Some(exact) = live.iter().find(|m| m.lhs == self.buffer) {
             self.matched = Some((exact.rhs.clone(), self.buffer.len()));
         }
-        // A longer mapping could still match, so hold and see.
+        // A longer mapping could still match: hold.
         if live.iter().any(|m| m.lhs.len() > self.buffer.len() && m.lhs.starts_with(&self.buffer)) {
             if speculative && can_speculate(key) {
-                // Typed now, remembered as takeable. Only printable
-                // non-whitespace: Space and Enter trigger `abbr`
-                // expansion (and Enter autoindents), and removing one
-                // character does not undo an expansion. A control key
-                // does not echo, so holding it costs nothing visible.
+                // Typed now, takeable. Only printable non-whitespace: Space
+                // and Enter trigger `abbr` (and Enter autoindents), which
+                // one deletion can't undo; control keys don't echo, so
+                // holding them shows nothing.
                 self.speculated += 1;
                 return Dispatch::keys(vec![key]);
             }
@@ -763,19 +627,17 @@ impl Matcher {
         }
         match self.matched.take() {
             // The best match fires. Everything speculated is taken back
-            // first -- including any that fell *outside* the match,
-            // since those keys reappear in `leftover` and are
-            // dispatched again.
+            // first, including keys past the match, which come back in
+            // `leftover` and are dispatched again.
             Some((rhs, consumed)) => {
                 let leftover: Vec<Key> = self.buffer.split_off(consumed);
                 self.buffer.clear();
                 let revert = std::mem::take(&mut self.speculated);
                 Dispatch { revert, keys: rhs.into_iter().chain(leftover).collect() }
             }
-            // A false start: nothing this buffer could still become is
-            // mapped, so every key of it stands as itself. Whatever was
-            // speculated is already on screen and must not be sent
-            // twice.
+            // A false start: nothing this could become is mapped, so each
+            // key stands as itself. What was speculated is already on
+            // screen and isn't sent twice.
             None => {
                 let all = std::mem::take(&mut self.buffer);
                 let already = std::mem::take(&mut self.speculated);
@@ -784,8 +646,8 @@ impl Matcher {
         }
     }
 
-    /// Gives back whatever is being held mid-sequence, so a caller
-    /// leaving the mode does not silently swallow it.
+    /// Gives back what's held mid-sequence, so leaving the mode doesn't
+    /// swallow it.
     pub fn flush(&mut self) -> Vec<Key> {
         self.matched = None;
         let already = std::mem::take(&mut self.speculated);
@@ -796,8 +658,7 @@ impl Matcher {
 
 #[cfg(test)]
 mod tests {
-    // The index exists because the written help did not mention `D`,
-    // and nothing could have noticed. This one is asked, not written.
+    // Asked, not written, so it can't miss a key the help forgets.
     #[test]
     fn the_key_index_answers_both_directions() {
         let index = super::key_index();
@@ -808,32 +669,30 @@ mod tests {
         assert_eq!(action("gg"), Some("goto-first-line"));
         assert_eq!(action("<C-w>s"), Some("window split"));
 
-        // The patterns, each recognized by a different mechanical
-        // property -- see `key_index`.
+        // The patterns, each recognized by a different property (see
+        // `key_index`).
         assert_eq!(action("d{motion}"), Some("delete {motion}"));
         assert_eq!(action("di{object}"), Some("delete text-object inner {object}"));
         assert_eq!(action("f{char}"), Some("find-char {char}"));
         assert_eq!(action("\"{char}{motion}"), Some("{motion} register {char}"));
         assert_eq!(action("/{pattern}<CR>"), Some("search-forward {pattern}"));
 
-        // ...and what the patterns replace. Ninety rows of `dw`, `db`,
-        // `d$` say nothing `d{motion}` does not, so they are not there.
+        // And what the patterns replace: `dw`, `db`, `d$` aren't listed.
         assert_eq!(action("dw"), None);
         assert_eq!(action("fa"), None);
         assert_eq!(action("\"ayy"), None);
 
-        // The reverse question, which nothing could answer before.
+        // The reverse question: which keys delete.
         let deletes: Vec<&str> = index.iter().filter(|(_, a)| a.contains("delete")).map(|(k, _)| k.as_str()).collect();
         assert!(deletes.contains(&"D"), "{deletes:?}");
 
-        // Small enough to read, which is the difference between an
-        // index and a dump: the unfiltered walk finds about six
-        // thousand sequences.
+        // Small enough to read: the unfiltered walk finds about six thousand
+        // sequences.
         assert!((100..250).contains(&index.len()), "{} rows", index.len());
     }
 
-    // A row's key column is real notation, not prose: anything without
-    // a `{placeholder}` in it parses back and describes as its own row.
+    // The key column is notation: anything without a `{placeholder}`
+    // parses back and describes as its own row.
     #[test]
     fn every_literal_row_round_trips_through_parse_keys() {
         for (keys, action) in super::key_index() {
@@ -852,9 +711,8 @@ mod tests {
         Mapping { modes: modes.to_string(), lhs: parse_keys(lhs).unwrap(), rhs: parse_keys(rhs).unwrap() }
     }
 
-    // Types `text` a key at a time and collects everything dispatched,
-    // rendered back as notation so the assertion reads like what was
-    // typed.
+    // Types `text` a key at a time and collects what was dispatched, as
+    // notation.
     fn through(matcher: &mut Matcher, text: &str, mode: &str) -> String {
         let mut out = Vec::new();
         for key in parse_keys(text).unwrap() {
@@ -863,9 +721,8 @@ mod tests {
         format_keys(&out)
     }
 
-    // The same, speculating -- returning what was dispatched and how
-    // many characters had to be taken back, which together are the
-    // whole of what Insert mode sees.
+    // The same, speculating: what was dispatched and how many characters
+    // were taken back, which is what Insert mode sees.
     fn speculating(matcher: &mut Matcher, text: &str) -> (String, usize) {
         let (mut out, mut reverted) = (Vec::new(), 0);
         for key in parse_keys(text).unwrap() {
@@ -891,29 +748,26 @@ mod tests {
 
     #[test]
     fn what_comes_out_is_never_mapped_again() {
-        // Non-recursive with no flag to get wrong: the matcher's output
-        // goes to VimKeys, not back through here. `x` -> `y` and
-        // `y` -> `z` must give `y`, never `z`.
+        // Non-recursive: `x` -> `y` and `y` -> `z` give `y`, never `z`.
         let mut m = Matcher::new(vec![mapping("*", "x", "y"), mapping("*", "y", "z")]);
         assert_eq!(through(&mut m, "x", "normal"), "y");
-        // ...and `y` typed directly is still mapped, so this is not just
-        // the second mapping being ignored.
+        // And `y` typed directly is mapped, so the second mapping isn't just
+        // ignored.
         assert_eq!(through(&mut m, "y", "normal"), "z");
     }
 
     #[test]
     fn a_multi_key_sequence_waits_and_then_fires() {
         let mut m = Matcher::new(vec![mapping("*", "<Space>w", "<C-w>s")]);
-        // Nothing is emitted while the sequence is still being decided.
+        // Nothing is emitted while the sequence is undecided.
         assert!(m.feed(Key::Char(' '), "normal", false).keys.is_empty());
         assert_eq!(format_keys(&m.feed(Key::Char('w'), "normal", false).keys), "<C-w>s");
     }
 
     #[test]
     fn a_false_start_gives_every_key_back_rather_than_eating_them() {
-        // The bug this shape exists to avoid: `<Space>` is a real motion
-        // in normal mode, and mapping `<Space>w` must not make
-        // `<Space>x` lose either key.
+        // `<Space>` is a motion in Normal mode, and mapping `<Space>w`
+        // mustn't lose either key of `<Space>x`.
         let mut m = Matcher::new(vec![mapping("*", "<Space>w", "<C-w>s")]);
         assert_eq!(through(&mut m, "<Space>x", "normal"), "<Space>x");
     }
@@ -923,8 +777,8 @@ mod tests {
         let mut m = Matcher::new(vec![mapping("*", "gh", "^"), mapping("*", "ghj", "$")]);
         // The longer one, when it arrives.
         assert_eq!(through(&mut m, "ghj", "normal"), "$");
-        // The shorter one, once the next key rules the longer one out --
-        // and the key that ruled it out is not lost.
+        // The shorter one once the next key rules out the longer, and that
+        // key isn't lost.
         assert_eq!(through(&mut m, "ghk", "normal"), "^k");
     }
 
@@ -937,7 +791,7 @@ mod tests {
 
     #[test]
     fn leaving_mid_sequence_gives_the_held_keys_back() {
-        // Held keys must not vanish because the mode ended.
+        // Held keys don't vanish when the mode ends.
         let mut m = Matcher::new(vec![mapping("*", "<Space>w", "<C-w>s")]);
         assert!(m.feed(Key::Char(' '), "normal", false).keys.is_empty());
         assert_eq!(format_keys(m.pending()), "<Space>");
@@ -947,9 +801,8 @@ mod tests {
 
     #[test]
     fn a_speculated_prefix_is_typed_now_and_taken_back_if_it_completes() {
-        // The whole point: `j` reaches the screen the instant it is
-        // pressed, so there is no lag and no timer -- and comes back off
-        // when `k` turns it into a mapping.
+        // `j` shows the moment it's pressed and comes back off when `k` makes
+        // it a mapping: no lag, no timer.
         let mut m = Matcher::new(vec![mapping("insert", "jk", "<Esc>")]);
         let d = m.feed(Key::Char('j'), "insert", true);
         assert_eq!((format_keys(&d.keys), d.revert), ("j".to_string(), 0), "j is typed immediately");
@@ -959,7 +812,7 @@ mod tests {
 
     #[test]
     fn a_speculated_key_that_leads_nowhere_is_not_sent_twice() {
-        // `jl` must be `jl`, not `jjl`: the `j` is already on screen.
+        // `jl` is `jl`, not `jjl`: the `j` is already on screen.
         let mut m = Matcher::new(vec![mapping("insert", "jk", "<Esc>")]);
         assert_eq!(speculating(&mut m, "jl"), ("jl".to_string(), 0));
         assert_eq!(speculating(&mut m, "jam"), ("jam".to_string(), 0));
@@ -967,9 +820,8 @@ mod tests {
 
     #[test]
     fn whitespace_is_never_speculated() {
-        // Space and Enter trigger `abbr` expansion, and one backspace
-        // does not undo an expansion -- so they hold, like every
-        // non-character key, where holding costs nothing visible.
+        // Space and Enter trigger `abbr`, which a backspace can't undo, so
+        // they hold, like non-character keys.
         let mut m = Matcher::new(vec![mapping("insert", "<Space>w", "<C-w>s")]);
         let d = m.feed(Key::Char(' '), "insert", true);
         assert!(d.keys.is_empty(), "held rather than typed");
@@ -979,8 +831,8 @@ mod tests {
 
     #[test]
     fn normal_mode_never_speculates() {
-        // Nothing echoes there, so there is no lag to remove -- and `d`
-        // or `x` does real work that one backspace could not undo.
+        // Nothing echoes in Normal mode, and `d` or `x` can't be undone by a
+        // backspace.
         let mut m = Matcher::new(vec![mapping("normal", "jk", "<Esc>")]);
         assert!(m.feed(Key::Char('j'), "normal", false).keys.is_empty());
         let d = m.feed(Key::Char('k'), "normal", false);
@@ -1003,23 +855,20 @@ mod tests {
 
     #[test]
     fn a_host_key_is_a_valid_right_hand_side_even_though_vimkeys_never_sees_it() {
-        // Normal mode is handled across two layers and only one of them
-        // resolves keys to actions, so validating against `VimKeys`
-        // alone rejected every way of reaching command mode, hover,
-        // write-and-quit or a macro from a mapping.
+        // Host-loop keys resolve too, or `:`, `K`, `ZZ`, `q` and `@`
+        // couldn't be mapped to.
         assert_eq!(describe_rhs(&parse_keys(":w<CR>").unwrap()), Ok("command-mode w<CR>".to_string()));
         assert_eq!(describe_rhs(&parse_keys("K").unwrap()), Ok("hover".to_string()));
         assert_eq!(describe_rhs(&parse_keys("@a").unwrap()), Ok("replay-macro a".to_string()));
-        // ...and an ordinary action still resolves the ordinary way.
+        // An ordinary action resolves as usual.
         assert_eq!(describe_rhs(&parse_keys("10j").unwrap()), Ok("down 10".to_string()));
         assert_eq!(describe_rhs(&parse_keys("qqq").unwrap()), Ok("record-macro qq".to_string()));
     }
 
     #[test]
     fn every_host_key_is_one_vimkeys_really_does_not_know() {
-        // Half of the drift guard: if one of these moves into the key
-        // machine, the table here is wrong and this catches it. A *new*
-        // host arm still has to be added by hand.
+        // If one of these moves into `VimKeys`, the table is wrong and this
+        // catches it. A new host arm must still be added by hand.
         for (key, name) in HOST_KEYS {
             assert!(
                 crate::bishedit::vimkeys::describe_key_sequence(&[*key]).is_err(),
@@ -1034,18 +883,16 @@ mod tests {
         assert_eq!(parse_keys("<nop>"), Ok(Vec::new()));
         assert_eq!(format_rhs(&[]), "<Nop>");
         assert_eq!(describe_rhs(&[]), Ok("nothing".to_string()));
-        // Only ever the whole right-hand side: inside a sequence it
-        // would be `ab` written confusingly.
+        // Only the whole right-hand side.
         assert!(parse_keys("a<Nop>b").is_err());
-        // An empty left-hand side is still nothing to press.
+        // An empty left-hand side is nothing to press.
         assert!(parse_keys("").is_err());
     }
 
     #[test]
     fn only_the_vim_driven_modes_resolve_keys_to_named_actions() {
-        // What the fourth column of a listing means, and whether a
-        // right-hand side has to resolve at all. `<Esc>` is a fine
-        // insert-mode mapping and no normal-mode action whatsoever.
+        // Whether a right-hand side must resolve: `<Esc>` is a fine Insert
+        // mapping and no Normal action.
         assert!(has_vim_mode("normal"));
         assert!(has_vim_mode("visual"));
         assert!(has_vim_mode(DEFAULT_MODE));
@@ -1058,16 +905,14 @@ mod tests {
     fn a_mode_glob_selects_modes_the_way_abbr_selects_languages() {
         assert_eq!(modes_matching("normal"), vec!["normal"]);
         assert_eq!(modes_matching(DEFAULT_MODE), MODES.to_vec());
-        // The same extglob the shell's own `case` understands, because
-        // it is the same engine -- no second pattern dialect.
+        // The same extglob `case` understands: the same engine.
         assert_eq!(modes_matching("!(insert)"), vec!["normal", "visual", "command"]);
         assert_eq!(modes_matching("*al"), vec!["normal", "visual"]);
     }
 
     #[test]
     fn a_glob_that_names_no_mode_is_a_typo_rather_than_an_empty_scope() {
-        // Accepting it would store a mapping that lists and never fires,
-        // with nothing anywhere saying why.
+        // A mapping that never fires would be accepted silently.
         assert!(mode_glob_is_known("normal"));
         assert!(mode_glob_is_known("*"));
         assert!(!mode_glob_is_known("nrmal"));
@@ -1091,8 +936,7 @@ mod tests {
             assert_eq!(mode.as_deref(), Some("normal"), "{spelling:?}");
             assert_eq!(rest, args(&["x", "j"]), "{spelling:?}");
         }
-        // Not after the key, so a mapping whose right-hand side is
-        // literally `-m` stays possible.
+        // Not after the key, so a right-hand side can be `-m`.
         let (rest, mode) = take_mode_flag(&args(&["x", "-m", "normal"]));
         assert_eq!(mode, Option::None);
         assert_eq!(rest, args(&["x", "-m", "normal"]));
@@ -1100,8 +944,7 @@ mod tests {
 
     #[test]
     fn every_named_key_round_trips_through_its_own_spelling() {
-        // The property the one-table design exists to guarantee: nothing
-        // can be printed in a spelling that will not parse back.
+        // Nothing prints in a spelling that won't parse back.
         for (name, key) in NAMED {
             assert_eq!(parse_keys(name), Ok(vec![*key]), "{name} did not parse");
             assert_eq!(format_keys(&[*key]), *name, "{name} did not format back");
@@ -1110,13 +953,9 @@ mod tests {
 
     #[test]
     fn the_control_keys_bish_binds_to_nothing_are_still_mappable() {
-        // These two have no meaning of their own anywhere in bish --
-        // `<C-g>` and `<C-t>` were on this list until they became the
-        // detach gesture and the opener -- which is exactly why someone
-        // would map them, `<C-s>` for "save" most of all. They used not
-        // to decode at all, so the mapping was refused as an unknown
-        // name and the diagnosis ("flow control eats <C-s>") was wrong
-        // twice over: bish's raw mode already clears IXON.
+        // These mean nothing elsewhere in bish, so people map them, `<C-s>`
+        // for save most of all. bish's raw mode clears IXON, so flow
+        // control doesn't eat `<C-s>`.
         for (spelling, key) in [("<C-q>", Key::CtrlQ), ("<C-s>", Key::CtrlS)] {
             assert_eq!(parse_keys(spelling), Ok(vec![key]), "{spelling}");
             assert_eq!(format_keys(&[key]), spelling);
@@ -1127,7 +966,7 @@ mod tests {
     #[test]
     fn a_plain_character_is_a_key_and_needs_no_escaping() {
         assert_eq!(parse_keys("j"), Ok(vec![Key::Char('j')]));
-        // The reason a count needs no special case: it is just keys.
+        // A count is just keys.
         assert_eq!(parse_keys("10j"), Ok(vec![Key::Char('1'), Key::Char('0'), Key::Char('j')]));
         assert_eq!(format_keys(&parse_keys("10j").unwrap()), "10j");
     }
@@ -1141,8 +980,8 @@ mod tests {
 
     #[test]
     fn a_space_and_a_less_than_have_spellings_rather_than_being_literal() {
-        // A literal space would make `::bish map` unable to tell where
-        // the left-hand side ends; a literal `<` would open a name.
+        // A literal space couldn't be told from the separator; a literal `<`
+        // would open a name.
         assert_eq!(format_keys(&[Key::Char(' ')]), "<Space>");
         assert_eq!(format_keys(&[Key::Char('<')]), "<lt>");
         assert_eq!(parse_keys("<lt>"), Ok(vec![Key::Char('<')]));
@@ -1161,9 +1000,7 @@ mod tests {
     fn a_bad_name_says_what_was_wrong_with_it() {
         assert_eq!(parse_keys("<Nope>"), Err("unknown key name '<Nope>'".to_string()));
         assert!(parse_keys("<C-d").unwrap_err().contains("unterminated"));
-        // Pointing at `<lt>` matters: an unterminated `<` is a typo far
-        // more often than a wanted literal, so the error has to say how
-        // to ask for the literal.
+        // An unterminated `<` is usually a typo, so the error names `<lt>`.
         assert!(parse_keys("a<b").unwrap_err().contains("<lt>"));
         assert!(parse_keys("").is_err());
     }
@@ -1177,8 +1014,7 @@ mod tests {
         assert!(!is_mappable(Key::PasteEnd));
         assert!(is_mappable(Key::Char('j')));
         assert!(is_mappable(Key::CtrlD));
-        // Everything the table names is mappable, or it would be listing
-        // a spelling for something that can never be bound.
+        // Everything the table names is mappable.
         for (name, key) in NAMED {
             assert!(is_mappable(*key), "{name}");
         }
