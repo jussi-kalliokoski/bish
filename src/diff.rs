@@ -1,27 +1,11 @@
-// Myers' O(ND) diff algorithm ("An O(ND) Difference Algorithm and Its
-// Variations", Eugene Myers, 1986) -- the same algorithm real `diff`,
-// git, and most diff libraries use under the hood. No external crate
-// (this is exactly the kind of thing a `similar`/`difflib` crate would
-// normally be reached for), same spirit as glob.rs/regex.rs/csscolor.rs/
-// json.rs.
+// Myers' O(ND) diff ("An O(ND) Difference Algorithm and Its Variations",
+// 1986), the algorithm diff and git use.
 //
-// Operates generically over `&[T]` (`PartialEq`), one element per
-// "line" from the caller's own perspective -- callers diffing text
-// split it into lines themselves first, this module has no opinion on
-// what a "line" is (so it works equally well for a `Vec<&str>` of real
-// lines or a `Vec<char>` of individual characters, for a finer-grained
-// diff). Produces the shortest edit script as a flat, in-order sequence
-// of `DiffOp`.
-//
-// Standard algorithmic complexity for this algorithm: O((N+M)*D) time
-// and O((N+M)*D) memory, where D is the size of the actual edit script
-// (small for two mostly-similar files, up to N+M for two completely
-// different ones) -- the same cost every other Myers-diff
-// implementation has, not a shortcut taken here. Fine for the file/
-// buffer sizes this project's editor actually targets (scripts/
-// configs, not multi-megabyte generated files); a real, very large,
-// very different pair of inputs would be slow the same way it would be
-// for `git diff` itself on the same inputs.
+// Generic over `&[T]` of `PartialEq` elements, so the caller decides what a
+// line is: real lines, or chars for a finer diff. Produces the shortest
+// edit script as an in-order run of `DiffOp`s. O((N+M)D) time and memory,
+// D being the edit script's size: fine for scripts and configs, slow for
+// large, very different inputs, as `git diff` is.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffOp {
@@ -39,23 +23,18 @@ pub fn diff<T: PartialEq>(a: &[T], b: &[T]) -> Vec<DiffOp> {
     coalesce(moves)
 }
 
-// One step of the backtracked edit script, before adjacent steps of the
-// same kind get merged into runs (see `coalesce`) -- `Equal`/`Delete`/
-// `Insert` here always cover exactly one element, unlike the public
-// `DiffOp` (which covers a whole run).
+// One step of the edit script before `coalesce` merges runs: each covers
+// one element, unlike `DiffOp`.
 enum Step {
     Equal,
     Delete,
     Insert,
 }
 
-// The V-array snapshot taken at the start of every "round" `d` (0..=
-// max edits) of Myers' own greedy search -- `trace[d]` is the frontier
-// reached using at most `d-1` edits, needed by `backtrack` to walk
-// back from the end to the start one round at a time. `max` diagonals
-// are impossible to overflow past (the shortest edit script can never
-// exceed len(a)+len(b): delete everything, then insert everything),
-// which is what bounds the outer loop and the V array's own width.
+// The V array at the start of each round `d` of the greedy search:
+// `trace[d]` is the frontier reachable in `d - 1` edits, which `backtrack`
+// walks back through. The edit script can't exceed `len(a) + len(b)`
+// (delete all, insert all), which bounds the loop and the array.
 fn myers_trace<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Vec<i64>> {
     let n = a.len() as i64;
     let m = b.len() as i64;
@@ -89,10 +68,8 @@ fn myers_trace<T: PartialEq>(a: &[T], b: &[T]) -> Vec<Vec<i64>> {
     }
 }
 
-// Walks `trace` from the end (a.len(), b.len()) back to the start
-// (0, 0), one round at a time, emitting one `Step` per element moved
-// along the way -- in *reverse* order (last edit first), flipped back
-// to forward order before returning.
+// Walks `trace` from (a.len(), b.len()) back to (0, 0) a round at a time,
+// one `Step` per element, then reverses into forward order.
 fn backtrack(n: usize, m: usize, trace: &[Vec<i64>]) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut x = n as i64;
@@ -113,9 +90,8 @@ fn backtrack(n: usize, m: usize, trace: &[Vec<i64>]) -> Vec<Step> {
             y -= 1;
         }
         if d > 0 {
-            // Exactly one of these fires: a horizontal move (x changed,
-            // y didn't) is a deletion from `a`; a vertical move is an
-            // insertion from `b`.
+            // Exactly one fires: a move along x deletes from `a`, along y
+            // inserts from `b`.
             if x > prev_x {
                 steps.push(Step::Delete);
             } else {
@@ -129,8 +105,8 @@ fn backtrack(n: usize, m: usize, trace: &[Vec<i64>]) -> Vec<Step> {
     steps
 }
 
-// Merges consecutive same-kind Steps into runs, tracking each run's own
-// starting index into `a`/`b` as it goes.
+// Merges same-kind Steps into runs, tracking each run's start in `a` and
+// `b`.
 fn coalesce(steps: Vec<Step>) -> Vec<DiffOp> {
     let mut out: Vec<DiffOp> = Vec::new();
     let mut ai = 0usize;
@@ -234,10 +210,8 @@ mod tests {
         let a = lines("aaa\nbbb\nccc");
         let b = lines("xxx\nyyy");
         let ops = diff(&a, &b);
-        // Whatever the exact edit script shape, replaying it against
-        // `a` must reconstruct `b` exactly -- the property that
-        // actually matters, checked directly rather than pinning down
-        // one specific (of several equally-short) edit scripts.
+        // Replaying the script against `a` gives `b`: the property that
+        // matters, rather than one of several equally short scripts.
         assert_eq!(replay(&a, &b, &ops), b);
     }
 
@@ -249,10 +223,8 @@ mod tests {
         assert_eq!(replay(&a, &b, &ops), b);
     }
 
-    // Replays an edit script against `a`, asserting every Equal run
-    // actually matches the corresponding slice of `b` too (not just
-    // `a`) along the way -- this is what actually proves the script is
-    // correct, not just shaped right.
+    // Replays a script against `a`, also checking each Equal run against
+    // `b`, which is what proves the script correct.
     fn replay<'a>(a: &[&'a str], b: &[&'a str], ops: &[DiffOp]) -> Vec<&'a str> {
         let mut out = Vec::new();
         for op in ops {
