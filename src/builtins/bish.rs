@@ -26,6 +26,22 @@ fn listed(names: &[&str]) -> String {
     names.join(", ")
 }
 
+// `bishopt [--quiet|-q NAME | --set|-s NAME [VALUE] | --unset|-u NAME |
+// NAME]`. `registry` is a parameter for tests; the real caller passes
+// KNOWN_BISHOPTS.
+//
+// Bare, it lists the names: values don't share one printable format.
+// `bishopt NAME` prints a Bool as on/off, a Str's value, and a Color's
+// text as last set (`cornflowerblue`, not `#6495ed`). `-q` prints nothing;
+// for a Bool the status is the answer (0 on, 1 off), as `shopt -q`.
+//
+// `--set NAME` turns a Bool on, `--set NAME on|off` sets it either way;
+// a Str takes VALUE; a Color takes a comma-separated fallback list
+// (`csscolor::parse_terminal_list`) of CSS colors or `-bish-*` palette
+// slots, the first that suits the terminal winning when drawn
+// (`csscolor::pick`), so `#ff0000, -bish-red` degrades on an old
+// terminal. An unparseable list is a usage error. `--unset` reverts to
+// the registered default (`false` for a Bool).
 pub(crate) fn run_bishopt(sh: &mut Shell, args: &[String], registry: &[(&str, BishOptDefault)]) -> i32 {
     enum Mode<'a> {
         List,
@@ -307,6 +323,9 @@ pub(crate) fn run_trust(sh: &mut Shell, args: &[String]) -> i32 {
     }
 }
 
+// `::bish hook ls|add|rm`: what runs when the editor opens, writes or
+// closes a file, so a config can attach behaviour to a language
+// (`::bish hook add --lang=rust editor:file:open __rust_setup`).
 pub(crate) fn run_hook(sh: &mut Shell, args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("ls") | Some("list") | None => {
