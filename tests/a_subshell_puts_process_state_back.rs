@@ -1,20 +1,14 @@
-//! What a subshell moves about the *process*, it puts back.
+//! What a subshell moves about the process, it puts back.
 //!
-//! The working directory, the umask and fds 0/1/2 belong to the process,
-//! not to a `Shell`. A `( )` or `$( )` is a Shell of its own but not a
-//! process of its own, so it has to restore all three on the way out --
-//! and it used to do that by snapshotting them on the way *in*: a
-//! `getcwd`, two `umask(2)` and three `dup(2)` on every subshell,
-//! whether or not the body went near any of them. That was about 9 of
-//! the 10 microseconds a `( true )` cost more than ksh93's. Each is now
-//! recorded by whatever moves it, and only what moved is put back.
+//! The cwd, the umask and fds 0/1/2 belong to the process, not a `Shell`.
+//! A `( )` or `$( )` is its own Shell but not its own process, so it
+//! restores them on the way out. Each is recorded by whatever moves it,
+//! and only what moved is put back.
 //!
-//! **The cwd and umask halves live in `bashdiff.rs`**, where they are
-//! checked against real bash, and so does most of the fd half. What is
-//! here is the part a corpus case cannot easily say: these assert the
-//! exact bytes of the file afterwards, and one of them asserts that a
-//! top-level `exec > file` goes on applying -- which leaves the script
-//! with no stdout left to report on itself with.
+//! The cwd and umask halves, and most of the fd half, are in
+//! `bashdiff.rs`, checked against bash. These assert the file's exact
+//! bytes, and that a top-level `exec > file` keeps applying, which
+//! leaves a script no stdout to report on itself.
 
 use std::process::Command;
 
@@ -35,8 +29,8 @@ fn tmp(name: &str) -> std::path::PathBuf {
 #[test]
 fn a_bare_exec_redirect_does_not_escape_the_subshell_that_made_it() {
     let dir = tmp("stdout");
-    // Without the restore this left *everything* printed afterwards
-    // going into the file too -- including in the enclosing script.
+    // Without the restore, everything after went into the file too,
+    // including in the enclosing script.
     let out = bish_in(&dir, "( exec > out.txt; echo inside ); echo outside; echo done");
     assert_eq!(out, "outside\ndone\n", "output after the subshell went somewhere else");
     assert_eq!(std::fs::read_to_string(dir.join("out.txt")).unwrap(), "inside\n");
@@ -63,9 +57,8 @@ fn a_bare_exec_redirect_in_a_nested_subshell_unwinds_one_level_at_a_time() {
 
 #[test]
 fn a_bare_exec_at_the_top_level_is_still_persistent() {
-    // The restore is a subshell's business. A script that redirects
-    // itself means it, and `exec > file` outside any subshell has to go
-    // on applying -- which is the whole idiom.
+    // Restoring is a subshell's business: a top-level `exec > file` means it
+    // and keeps applying.
     let dir = tmp("toplevel");
     let out = bish_in(&dir, "exec > out.txt; echo one; echo two");
     assert_eq!(out, "", "nothing should have reached the real stdout");
@@ -75,8 +68,7 @@ fn a_bare_exec_at_the_top_level_is_still_persistent() {
 
 #[test]
 fn a_subshell_that_redirects_nothing_leaves_the_descriptors_alone() {
-    // The case the whole arrangement exists for: nothing recorded,
-    // nothing restored, and the shell carries on writing where it was.
+    // Nothing recorded, nothing restored, and output carries on as before.
     let dir = tmp("untouched");
     let out = bish_in(&dir, "echo before; ( : ); v=$(:); ( echo in ); echo after");
     assert_eq!(out, "before\nin\nafter\n");
