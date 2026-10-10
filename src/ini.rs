@@ -1,41 +1,26 @@
-// INI: `[section]` headers over `key = value` lines, the format behind
-// `.gitconfig`, systemd units, `.desktop` entries, `setup.cfg`,
-// `tox.ini` and most of `/etc`. Hand-rolled like every other parser
-// here, no crate.
+// INI: `[section]` headers over `key = value` lines, as in `.gitconfig`,
+// systemd units, `.desktop` files, `setup.cfg`, `tox.ini` and most of
+// `/etc`.
 //
-// There is no INI standard, only a family of dialects that disagree
-// with each other -- so the interesting decision in this module is which
-// disagreements to take a side on and which to sit out. The rule
-// followed throughout: **where dialects conflict, prefer the reading
-// that can only ever under-describe the file, never the one that
-// misreads real content as syntax.** Concretely:
+// There's no INI standard, only dialects that disagree. Where they
+// conflict, this takes the reading that can only under-describe a file,
+// never one that misreads content as syntax:
 //
-//   - **Comments are whole-line only** (`;` or `#` as the first
-//     non-blank character), which is also what vim's `dosini` syntax
-//     does. Git and classic Windows INI do allow a trailing `; comment`
-//     after a value, and this deliberately misses those. The other
-//     choice is worse: systemd and the Desktop Entry spec both say a
-//     `#` mid-line is *value text*, so treating one as a comment would
-//     grey out the second half of `ExecStart=/bin/sh -c 'echo #1'` --
-//     wrong about the file's actual content, where missing a comment is
-//     merely quiet.
-//   - **`=` and `:` are both separators**, whichever comes first on the
-//     line. They can't fight: a Windows `path=C:\tmp` and a systemd
-//     `Environment=A:B` both hit `=` first, and Python's configparser
-//     `key: value` has no `=` to lose to.
-//   - **`[remote "origin"]` subsections are recognized everywhere**,
-//     since no other dialect puts a quoted string in a header, so
-//     understanding one costs nothing where it can't appear.
+//   - Comments are whole-line only (`;` or `#` first), as vim's `dosini`
+//     does. git and Windows INI allow a trailing `; comment`, missed
+//     here; but systemd and Desktop Entry treat a mid-line `#` as value
+//     text, and `ExecStart=/bin/sh -c 'echo #1'` must not lose its tail.
+//   - `=` and `:` are both separators, whichever comes first. They can't
+//     conflict: `path=C:\tmp` and `Environment=A:B` hit `=` first, and
+//     configparser's `key: value` has no `=`.
+//   - `[remote "origin"]` subsections are recognized everywhere: no
+//     other dialect quotes inside a header.
 //
-// Parsing is line-by-line and total: every line becomes some `Item`, and
-// nothing a user can type is an error. That is what a highlighter needs
-// (a buffer mid-edit is nonsense most of the time), and unlike JSON it
-// costs nothing here -- INI has no nesting, so a broken line can't
-// change the meaning of the lines below it, and there is no recovery to
-// get wrong.
+// Parsing is line by line and total: every line is some `Item`, never an
+// error, which a highlighter of a half-edited buffer needs. INI has no
+// nesting, so a broken line can't change the lines below.
 //
-// Offsets throughout are **char** offsets, not byte offsets, matching
-// what `highlight::HighlightSpan` is specified in.
+// Offsets are char offsets, as `highlight::HighlightSpan` uses.
 #![allow(dead_code)]
 
 use std::ops::Range;
@@ -50,17 +35,16 @@ pub enum Item {
     /// A whole-line `;`/`#` comment. The span covers the marker and the
     /// text, not the indentation before it.
     Comment { span: Range<usize> },
-    /// `[core]`, or `[remote "origin"]` -- `name` is the bare part,
-    /// `sub` the quoted one (quotes included), `span` the whole header
-    /// including its brackets. A header missing its `]` still parses:
-    /// it is what `[sec` is on the way to being.
+    /// `[core]` or `[remote "origin"]`: `name` is the bare part, `sub` the
+    /// quoted one with quotes, `span` the whole header. A header missing `]`
+    /// still parses, as `[sec` on the way.
     Section { name: Range<usize>, sub: Option<Range<usize>>, span: Range<usize> },
     /// `key = value`. `separator` is the offset of the `=`/`:` itself,
     /// absent for a bare `key` (git writes boolean-true flags that way).
     /// `value` is absent for `key =` with nothing after it.
     Entry { key: Range<usize>, separator: Option<usize>, value: Option<Value>, span: Range<usize> },
-    /// An indented line continuing the value above -- configparser's
-    /// multi-line values, as in `setup.cfg`'s `install_requires`.
+    /// An indented line continuing the value above: configparser's
+    /// multi-line values (`setup.cfg`'s `install_requires`).
     Continuation { value: Value, span: Range<usize> },
     /// A line with nothing on it. Carried rather than dropped so the
     /// items still describe the whole file in order.
@@ -71,23 +55,21 @@ pub enum Item {
 pub struct Value {
     pub span: Range<usize>,
     pub kind: ValueKind,
-    /// `\n`, `\"`, `\\` inside a quoted value, as spans within `span`.
-    /// Empty for every unquoted value: a backslash in bare text is a
-    /// backslash (a Windows path is full of them).
+    /// `\n`, `\"`, `\\` inside a quoted value, as spans in `span`. Empty
+    /// for unquoted values: a backslash in bare text is a backslash (Windows
+    /// paths).
     pub escapes: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
-    /// Opens with `"`. Whether it *closes* is not this type's business
-    /// -- an unterminated quote ends at the end of its line, so typing
-    /// one doesn't restyle the rest of the file.
+    /// Opens with `"`. An unterminated quote ends at the end of its line,
+    /// so typing one doesn't restyle the rest of the file.
     Quoted,
     Number,
     /// One of the words every dialect agrees is a boolean.
     Bool,
-    /// Anything else, which is most values: a path, a command line, a
-    /// URL, an arbitrary string nobody quoted.
+    /// Anything else: a path, a command line, a URL, unquoted text.
     Plain,
 }
 
@@ -95,11 +77,9 @@ pub fn parse(text: &str) -> Document {
     let chars: Vec<char> = text.chars().collect();
     let mut items = Vec::new();
     let mut start = 0usize;
-    // Whether the last entry ended with a separator and no value, which
-    // is what opens a configparser continuation block. Only then is an
-    // indented line below read as a continuation rather than as a key of
-    // its own -- git indents its keys too (`[core]` / tab / `bare`), and
-    // this is what tells the two apart.
+    // Whether the last entry ended in a separator with no value, which
+    // opens a configparser continuation. Only then is an indented line a
+    // continuation rather than a key: git indents its keys too.
     let mut continuing = false;
     while start <= chars.len() {
         let end = chars[start..].iter().position(|c| *c == '\n').map(|i| start + i).unwrap_or(chars.len());
@@ -117,9 +97,8 @@ fn line_item(chars: &[char], line: Range<usize>, continuing: &mut bool) -> Item 
     let indented = chars[line.clone()].first().is_some_and(|c| *c == ' ' || *c == '\t');
     let body = trim(chars, line.clone());
     if body.is_empty() {
-        // A blank line ends a continuation block, the same way it ends a
-        // paragraph: configparser treats an empty line as the end of a
-        // multi-line value unless it is itself indented.
+        // A blank line ends a continuation, as configparser treats an empty
+        // line unless it's indented.
         if !indented {
             *continuing = false;
         }
@@ -130,9 +109,8 @@ fn line_item(chars: &[char], line: Range<usize>, continuing: &mut bool) -> Item 
             *continuing = false;
             Item::Comment { span: body }
         }
-        // Checked before the separator scan on purpose: a continuation
-        // line's text is value, not syntax, and `foo >= 1.0` under an
-        // `install_requires =` would otherwise split at its own `=`.
+        // Before the separator scan: a continuation is value text, and
+        // `foo >= 1.0` under `install_requires =` mustn't split at its `=`.
         _ if *continuing && indented => Item::Continuation { value: value_at(chars, body.clone()), span: body },
         '[' => {
             *continuing = false;
@@ -143,14 +121,12 @@ fn line_item(chars: &[char], line: Range<usize>, continuing: &mut bool) -> Item 
 }
 
 fn section(chars: &[char], body: Range<usize>) -> Item {
-    // The *last* `]`, so a name containing one (`[a]b]`) keeps it rather
-    // than the header ending early. Missing entirely, the header runs to
-    // the end of its line -- a half-typed `[sec` is still a section.
+    // The last `]`, so a name containing one (`[a]b]`) keeps it. Missing,
+    // the header runs to the end of the line: `[sec` is still a section.
     let close = chars[body.clone()].iter().rposition(|c| *c == ']').map(|i| body.start + i);
     let inner = body.start + 1..close.unwrap_or(body.end);
     let inner = trim(chars, inner);
-    // `[remote "origin"]`: the quoted part is the subsection, the rest
-    // the name.
+    // `[remote "origin"]`: the quoted part is the subsection.
     let quote = chars[inner.clone()].iter().position(|c| *c == '"').map(|i| inner.start + i);
     let (name, sub) = match quote {
         Some(q) => (trim(chars, inner.start..q), Some(trim(chars, q..inner.end))),
@@ -162,15 +138,13 @@ fn section(chars: &[char], body: Range<usize>) -> Item {
 fn entry(chars: &[char], body: Range<usize>, continuing: &mut bool) -> Item {
     let separator = chars[body.clone()].iter().position(|c| *c == '=' || *c == ':').map(|i| body.start + i);
     let Some(separator) = separator else {
-        // A bare word: git's own way of writing a true flag. Not a
-        // continuation -- that case was decided before we got here.
+        // A bare word, git's true flag; continuation was decided earlier.
         *continuing = false;
         return Item::Entry { key: body.clone(), separator: None, value: None, span: body };
     };
     let key = trim(chars, body.start..separator);
     let rest = trim(chars, separator + 1..body.end);
-    // An empty value opens a continuation block; anything else closes
-    // one.
+    // An empty value opens a continuation; anything else closes one.
     *continuing = rest.is_empty();
     let value = (!rest.is_empty()).then(|| value_at(chars, rest));
     Item::Entry { key, separator: Some(separator), value, span: body }
@@ -187,11 +161,9 @@ fn value_at(chars: &[char], span: Range<usize>) -> Value {
                     i += 2;
                 }
                 '"' => {
-                    // Everything after the closing quote is left inside
-                    // the value's own span rather than split off: with
-                    // no inline comments there is nothing else it could
-                    // be, and a trailing `\` continuation belongs to the
-                    // value anyway.
+                    // What follows the closing quote stays in the value's
+                    // span: there are no inline comments, and a trailing
+                    // `\` continuation belongs to the value.
                     break;
                 }
                 _ => i += 1,
@@ -210,9 +182,8 @@ fn value_at(chars: &[char], span: Range<usize>) -> Value {
     Value { span, kind, escapes: Vec::new() }
 }
 
-// The words the dialects agree on. `1`/`0` are booleans too in most of
-// them, but they are also numbers, and saying "number" about a digit is
-// never wrong.
+// Words the dialects agree are booleans. `1` and `0` are too in most,
+// but also numbers, which is never wrong.
 fn is_bool(text: &str) -> bool {
     matches!(text.to_ascii_lowercase().as_str(), "true" | "false" | "yes" | "no" | "on" | "off")
 }
@@ -222,13 +193,11 @@ fn is_number(text: &str) -> bool {
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
     }
-    // A size suffix (`1M`, `30s`) is deliberately *not* a number: those
-    // are units, and only some dialects have them.
+    // A size suffix (`1M`, `30s`) isn't a number: units vary by dialect.
     !text.is_empty() && text.parse::<f64>().is_ok() && text.chars().any(|c| c.is_ascii_digit())
 }
 
-// The span with surrounding whitespace (`\r` included, so a CRLF file
-// behaves) removed from both ends.
+// The span trimmed of whitespace, `\r` included, so CRLF files behave.
 fn trim(chars: &[char], span: Range<usize>) -> Range<usize> {
     let blank = |c: char| c == ' ' || c == '\t' || c == '\r';
     let mut start = span.start;
@@ -254,7 +223,6 @@ mod tests {
         text.chars().skip(span.start).take(span.end - span.start).collect()
     }
 
-    // Every line becomes exactly one item, in order, covering the file.
     #[test]
     fn every_line_produces_one_item() {
         assert_eq!(items("a=1\n; c\n\n[s]\n").len(), 5, "the empty last line counts too");
@@ -279,8 +247,8 @@ mod tests {
         assert_eq!(text_of(src, span), "[core]", "the indentation is not part of the header");
     }
 
-    // A header being typed is still a header, or the whole file below it
-    // would restyle on the way to the `]`.
+    // A header being typed is still a header, or everything below would
+    // restyle until the `]`.
     #[test]
     fn an_unclosed_section_header_still_parses() {
         let src = "[sec";
@@ -322,7 +290,7 @@ mod tests {
         );
     }
 
-    // The `#` in a systemd unit's own shell command must survive.
+    // The `#` in a systemd unit's shell command survives.
     #[test]
     fn a_hash_inside_a_value_is_not_a_comment() {
         let src = "ExecStart=/bin/sh -c 'echo #1'";
@@ -339,8 +307,7 @@ mod tests {
         assert!(matches!(items(src)[2], Item::Continuation { .. }));
     }
 
-    // The case that makes the "an empty value opened it" rule necessary:
-    // git indents its keys too, so indentation alone can't decide.
+    // Why an empty value must open the block: git indents keys too.
     #[test]
     fn an_indented_key_under_a_section_is_a_key_not_a_continuation() {
         let src = "[core]\n\tbare = false\n\tfilemode = true\n";
@@ -404,8 +371,7 @@ mod tests {
         assert_eq!(text_of(src, &value.as_ref().unwrap().span), "1");
     }
 
-    // Spans are char offsets, so a non-ASCII line above doesn't shift
-    // everything below by the bytes it happens to take.
+    // Char offsets: a non-ASCII line doesn't shift what's below.
     #[test]
     fn spans_are_char_offsets() {
         let src = "a = \u{e4}\u{e4}\nb = 2\n";
@@ -414,7 +380,7 @@ mod tests {
         assert_eq!(key.start, 7, "char offsets, not the 9 bytes this line actually starts at");
     }
 
-    // Anything at all can be in the buffer while it is being typed.
+    // Anything can be in the buffer while it's typed.
     #[test]
     fn nothing_typeable_panics() {
         for src in ["", "\n", "=", ":", "[", "]", "[]", "[\"\"]", "\"", "\\", "a=", "=a", "   ", "\t\t", "[a] = b", "#", ";"] {
