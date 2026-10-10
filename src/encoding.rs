@@ -1,33 +1,19 @@
-// What a file's bytes say, when they do not say UTF-8.
+// What a file's bytes say when they aren't UTF-8.
 //
-// The editor read every file with `read_to_string`, so a latin-1 file
-// was not a file with an accent in it -- it was an error, and one you
-// could not get past. That also made `.editorconfig`'s `charset` a
-// property this shell parsed and then refused, because honouring it
-// would have meant writing back an encoding it could not read.
+// The set is what `.editorconfig` names (`latin1`, `utf-8`, `utf-8-bom`,
+// `utf-16be`, `utf-16le`), which is also what vim's default
+// `fileencodings` finds in practice. Anything else would need a table and
+// a guess: a byte in 0x80..0xff is a different character in every
+// single-byte encoding, and nothing says which. So the fallback is
+// latin-1, whose table is the byte value, as in vim.
 //
-// The set here is exactly the set `.editorconfig` names -- `latin1`,
-// `utf-8`, `utf-8-bom`, `utf-16be`, `utf-16le` -- which is also what
-// vim's default `fileencodings` finds in practice. Anything else needs
-// a table this shell would have to carry, and a guess about which one:
-// a byte in the 0x80..0xff range is a different character in every
-// single-byte encoding there is, and nothing in the file says which.
-// So the fallback is latin-1, which is the one whose table *is* the
-// byte value, and the one vim falls back to for the same reason.
+// Detection follows vim's `ucs-bom,utf-8,default,latin1`: a BOM decides,
+// then valid UTF-8, then latin-1, which can't fail, so opening a file
+// never fails on its contents.
 //
-// Detection is vim's own `ucs-bom,utf-8,default,latin1` in the same
-// order: a BOM decides it outright, then UTF-8 if the bytes are valid
-// UTF-8, then latin-1, which cannot fail. That last step is why an
-// encoding is *detected* rather than *guessed at*: every byte sequence
-// decodes as latin-1, so opening a file never fails on its contents.
-//
-// What matters as much as reading is writing the same thing back. A
-// buffer remembers what it was decoded from and `save` encodes with it,
-// so a latin-1 file stays latin-1 and a file that had a BOM keeps it.
-// Where that cannot be done -- a character that latin-1 has no byte for
-// -- the save fails and says which character, rather than writing a `?`
-// in its place. A file quietly mangled on save is the failure this
-// module exists to make impossible.
+// A buffer remembers what it was decoded from and `save` encodes with it,
+// so a latin-1 file stays latin-1 and a BOM is kept. A character the
+// encoding can't hold fails the save, naming it, rather than writing `?`.
 #![allow(dead_code)]
 
 /// The encodings this editor can read and write.
@@ -35,17 +21,15 @@
 pub enum Encoding {
     #[default]
     Utf8,
-    /// ISO-8859-1, where the byte *is* the code point. Also the
-    /// fallback for bytes that are not valid UTF-8, since it is the one
-    /// encoding under which every byte sequence means something.
+    /// ISO-8859-1, where the byte is the code point. Also the fallback for
+    /// invalid UTF-8, since every byte sequence means something in it.
     Latin1,
     Utf16Le,
     Utf16Be,
 }
 
 impl Encoding {
-    /// The `.editorconfig` spelling, which is also what this shell
-    /// shows the user.
+    /// The `.editorconfig` spelling, also what's shown to the user.
     pub fn name(self) -> &'static str {
         match self {
             Encoding::Utf8 => "utf-8",
@@ -55,19 +39,17 @@ impl Encoding {
         }
     }
 
-    /// A UTF-16 file without a BOM is a file nothing can identify --
-    /// its bytes are valid latin-1 and will be read back as latin-1, by
-    /// this editor and by vim both. So writing one is refused: the BOM
-    /// rides along whatever the buffer's own `bom` flag says.
+    /// A UTF-16 file without a BOM can't be identified: its bytes read back
+    /// as latin-1, here and in vim. So the BOM is always written, whatever
+    /// the buffer's `bom` says.
     pub fn requires_bom(self) -> bool {
         matches!(self, Encoding::Utf16Le | Encoding::Utf16Be)
     }
 }
 
-/// `.editorconfig`'s `charset` values, plus the aliases that mean the
-/// same thing to vim. `None` for a name this shell cannot honour --
-/// which is a refusal, and stays one, rather than a silent fallback to
-/// UTF-8.
+/// `.editorconfig`'s `charset` values and vim's aliases for them. `None`
+/// for a name this can't honour, a refusal rather than a silent fallback
+/// to UTF-8.
 pub fn parse(name: &str) -> Option<Encoding> {
     match name.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "utf-8" | "utf8" => Some(Encoding::Utf8),
@@ -79,9 +61,8 @@ pub fn parse(name: &str) -> Option<Encoding> {
     }
 }
 
-/// Whether a `charset` name asks for a BOM in its own right.
-/// `utf-8-bom` is the only one that does; the UTF-16 pair get theirs
-/// from `requires_bom`.
+/// Whether a `charset` name itself asks for a BOM: only `utf-8-bom`; the
+/// UTF-16 pair get theirs from `requires_bom`.
 pub fn names_a_bom(name: &str) -> bool {
     matches!(name.trim().to_ascii_lowercase().as_str(), "utf-8-bom" | "utf8-bom")
 }
@@ -91,25 +72,20 @@ pub fn names_a_bom(name: &str) -> bool {
 pub struct Decoded {
     pub text: String,
     pub encoding: Encoding,
-    /// Whether the bytes began with a byte-order mark. Remembered
-    /// separately from the encoding because a UTF-8 file with one and a
-    /// UTF-8 file without one are the same encoding and different
-    /// files.
+    /// Whether the bytes began with a BOM. Separate from the encoding: UTF-8
+    /// with and without one are the same encoding but different files.
     pub bom: bool,
 }
 
 const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
-/// Reads `bytes` as text, working out how, and never failing.
+/// Reads `bytes` as text, working out how; never fails.
 pub fn decode(bytes: &[u8]) -> Decoded {
     if bytes.starts_with(&UTF8_BOM) {
         return Decoded { text: from_utf8_lossy_owned(&bytes[3..]), encoding: Encoding::Utf8, bom: true };
     }
-    // 0xff 0xfe 0x00 0x00 is UTF-32LE, which this editor does not read
-    // -- but it is also a valid UTF-16LE `U+FEFF` followed by `U+0000`,
-    // and reading it as that puts a NUL in the buffer rather than
-    // failing. Not distinguished, because a UTF-32 file is not a thing
-    // this shell claims to open.
+    // `ff fe 00 00` is UTF-32LE, which isn't read, but it's also a valid
+    // UTF-16LE `U+FEFF` then `U+0000`, so it reads as that with a NUL.
     if bytes.starts_with(&[0xff, 0xfe]) {
         return Decoded { text: from_utf16(&bytes[2..], true), encoding: Encoding::Utf16Le, bom: true };
     }
@@ -118,14 +94,14 @@ pub fn decode(bytes: &[u8]) -> Decoded {
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Decoded { text: text.to_string(), encoding: Encoding::Utf8, bom: false },
-        // Every byte is a character, so this is where detection stops.
+        // Every byte is a character, so detection stops here.
         Err(_) => Decoded { text: bytes.iter().map(|&b| b as char).collect(), encoding: Encoding::Latin1, bom: false },
     }
 }
 
-/// The character `encode` could not write, and what it could not write
-/// it as. Carries the character itself because "this file has something
-/// latin-1 cannot say" is not actionable and "line 3 has an em dash" is.
+/// The character `encode` couldn't write, and the encoding it couldn't
+/// write it in. The character makes the error actionable: "line 3 has an
+/// em dash".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unrepresentable {
     pub ch: char,
@@ -138,11 +114,9 @@ impl std::fmt::Display for Unrepresentable {
     }
 }
 
-/// Turns text back into a file's bytes.
-///
-/// Fails rather than substituting: latin-1 has 256 characters and text
-/// that has left them is text this cannot write, so the save stops and
-/// the file on disk stays as it was.
+/// Text to a file's bytes. Fails rather than substituting: text outside
+/// latin-1's 256 characters can't be written, so the save stops and the
+/// file stays as it was.
 pub fn encode(text: &str, encoding: Encoding, bom: bool) -> Result<Vec<u8>, Unrepresentable> {
     let bom = bom || encoding.requires_bom();
     let mut out = Vec::with_capacity(text.len() + 3);
@@ -179,23 +153,18 @@ fn push16(out: &mut Vec<u8>, unit: u16, big_endian: bool) {
     out.extend_from_slice(&bytes);
 }
 
-/// An odd trailing byte is dropped rather than made into a character:
-/// half a code unit is a truncated file, and inventing the other half
-/// would put a character in the buffer the file does not have.
+/// A trailing odd byte is dropped: half a code unit is a truncated file.
 fn from_utf16(bytes: &[u8], little_endian: bool) -> String {
-    // `as_chunks`, so each pair is a `[u8; 2]` the compiler knows the
-    // length of rather than a slice it has to be indexed out of. Its
-    // remainder -- a trailing odd byte, which is half a code unit -- is
-    // dropped, exactly as `chunks_exact` dropped it.
+    // `as_chunks` gives `[u8; 2]` pairs; the remainder, a trailing odd byte,
+    // is dropped.
     let units: Vec<u16> =
         bytes.as_chunks::<2>().0.iter().map(|pair| if little_endian { u16::from_le_bytes(*pair) } else { u16::from_be_bytes(*pair) }).collect();
     String::from_utf16_lossy(&units)
 }
 
-/// Bytes that carried a UTF-8 BOM and then were not UTF-8 after all.
-/// The BOM is the file saying what it is, so it is taken at its word
-/// and the bad bytes become replacement characters, rather than the
-/// whole file being re-read as latin-1 against its own declaration.
+/// Bytes after a UTF-8 BOM that aren't UTF-8. The BOM is taken at its
+/// word, and bad bytes become replacement characters, rather than the
+/// file being reread as latin-1 against its own declaration.
 fn from_utf8_lossy_owned(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -217,9 +186,7 @@ mod tests {
         assert_eq!((d.encoding, d.bom), (Encoding::Utf8, true));
     }
 
-    // The byte that decided it: 0xe9 is `é` in latin-1 and is not a
-    // valid UTF-8 sequence on its own, so a file containing one used to
-    // be a file the editor could not open.
+    // 0xe9 is `é` in latin-1 and not valid UTF-8 alone.
     #[test]
     fn bytes_that_are_not_utf8_are_read_as_latin1() {
         let d = decode(b"caf\xe9\n");
@@ -239,7 +206,7 @@ mod tests {
 
     #[test]
     fn utf16_reaches_past_the_basic_plane() {
-        // U+1F600, which is a surrogate pair.
+        // U+1F600, a surrogate pair.
         let bytes = encode("\u{1f600}", Encoding::Utf16Le, true).unwrap();
         assert_eq!(bytes, b"\xff\xfe\x3d\xd8\x00\xde");
         assert_eq!(decode(&bytes).text, "\u{1f600}");
@@ -265,10 +232,8 @@ mod tests {
         }
     }
 
-    // Latin-1 without a BOM is not identifiable, so this one is the
-    // exception: it round-trips as text and is *detected* as latin-1
-    // only because it is not valid UTF-8. Text that stays inside ASCII
-    // reads back as UTF-8, which is the same string.
+    // Latin-1 without a BOM is detected only by not being valid UTF-8. Text
+    // within ASCII reads back as UTF-8, which is the same string.
     #[test]
     fn ascii_written_as_latin1_reads_back_as_utf8() {
         let bytes = encode("plain\n", Encoding::Latin1, false).unwrap();
