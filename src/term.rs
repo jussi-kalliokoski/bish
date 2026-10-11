@@ -13,7 +13,6 @@ use std::io::{self, Write};
 // The signal numbers come from the platform layer: BSD renumbered the
 // job-control ones, so `SIGTSTP` differs between macOS and Linux.
 pub const SIGINT: i32 = platform::SIGINT;
-#[allow(dead_code)]
 pub const SIGHUP: i32 = platform::SIGHUP;
 pub const SIGTSTP: i32 = platform::SIGTSTP;
 pub const SIGTTIN: i32 = platform::SIGTTIN;
@@ -32,7 +31,6 @@ pub fn ignore_sigint() {
 // that launched it, which sends SIGHUP to its foreground group.
 // `session::daemonize` also `setsid`s; this covers the window before.
 // Inherited across fork and exec, like `ignore_sigint`.
-#[allow(dead_code)]
 pub fn ignore_sighup() {
     platform::ignore_signal(SIGHUP);
 }
