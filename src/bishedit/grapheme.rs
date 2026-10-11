@@ -211,8 +211,9 @@ pub fn prev_boundary(chars: &[char], at: usize) -> usize {
     i
 }
 
-// Each cluster as its own `Vec<char>`, mostly for tests; callers usually
-// want `cluster_range` and the boundary functions.
+// Each cluster as its own `Vec<char>`, for tests; callers want
+// `cluster_range` and the boundary functions.
+#[cfg(test)]
 pub fn clusters(chars: &[char]) -> Vec<Vec<char>> {
     let mut out = Vec::new();
     let mut i = 0;

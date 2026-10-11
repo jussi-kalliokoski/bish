@@ -1,6 +1,5 @@
 // bish-edit's headless core: buffers, motions, highlighting, linting and
 // the rest of what the editor and the line editor share.
-#![allow(dead_code)]
 
 pub mod codehighlight;
 pub mod completion;

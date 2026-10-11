@@ -1567,14 +1567,12 @@ impl<'a> Lexer<'a> {
 // One item from `tokenize_spanned` with its source range, for
 // highlighting and lint. Comments aren't a `Tok` variant, so the
 // parser's matches over `Tok` never see one.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpannedItem {
     Tok(Tok, std::ops::Range<usize>),
     Comment(std::ops::Range<usize>),
 }
 
-#[allow(dead_code)]
 pub struct SpannedResult {
     pub items: Vec<SpannedItem>,
     pub raw_capture_spans: Vec<std::ops::Range<usize>>,
@@ -1587,7 +1585,6 @@ pub struct SpannedResult {
 // A copy of `tokenize`'s dispatch loop rather than a change to it, so
 // nothing here touches execution. Kept in step with `tokenize` by hand;
 // the reasoning for each arm is there.
-#[allow(dead_code)]
 /// The characters that end a word wherever one is read. Not `#`, which
 /// ends a word only where one could begin (a comment); inside a word it's
 /// ordinary (`echo a#b`, which `printf %q` relies on). The two places

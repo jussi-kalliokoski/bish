@@ -33,6 +33,7 @@ impl<C: Clone + PartialEq> UndoTree<C> {
         UndoTree { nodes: vec![Node { snapshot: Snapshot { content, cursor }, parent: None, children: Vec::new() }], current: 0 }
     }
 
+    #[cfg(test)]
     pub fn current(&self) -> &Snapshot<C> {
         &self.nodes[self.current].snapshot
     }

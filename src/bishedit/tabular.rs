@@ -102,14 +102,6 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn style(&self) -> Style {
-        self.style
-    }
-
-    pub fn regions(&self) -> usize {
-        self.regions.len()
-    }
-
     fn widths_for(&self, line: usize) -> Option<&[usize]> {
         self.regions.iter().find(|r| r.lines.contains(&line)).map(|r| r.widths.as_slice())
     }

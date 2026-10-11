@@ -9,7 +9,6 @@
 // Vim's spelling wherever vim has one: `<C-d>`, `<Esc>`, `<CR>`, `<BS>`,
 // `<Tab>`, `<S-Tab>`, `<Space>`, `<Del>`, `<Home>`, `<End>`, `<PageUp>`,
 // `<PageDown>`, the arrows, and `<lt>` for a literal `<`.
-#![allow(dead_code)]
 
 use crate::editor::Key;
 
@@ -590,7 +589,8 @@ impl Matcher {
     }
 
     /// Keys held mid-sequence, for a caller flushing before it leaves the
-    /// mode (see `flush`).
+    /// mode (see `flush`). Only tests ask so far.
+    #[cfg(test)]
     pub fn pending(&self) -> &[Key] {
         &self.buffer
     }
@@ -647,7 +647,8 @@ impl Matcher {
     }
 
     /// Gives back what's held mid-sequence, so leaving the mode doesn't
-    /// swallow it.
+    /// swallow it. Only tests use it so far.
+    #[cfg(test)]
     pub fn flush(&mut self) -> Vec<Key> {
         self.matched = None;
         let already = std::mem::take(&mut self.speculated);

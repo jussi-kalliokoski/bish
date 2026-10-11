@@ -7,7 +7,6 @@
 // is refused, not allocated; and a framing error is terminal, since the
 // framing is the only record of message boundaries. Knows nothing about
 // JSON.
-#![allow(dead_code)]
 
 /// A larger body is refused rather than allocated. Real messages (a
 /// `didChange` with a whole file, a big completion list) are far below

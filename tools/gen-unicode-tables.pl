@@ -205,7 +205,7 @@ print <<"HEADER";
 
 HEADER
 
-print "/// The Unicode this was generated from.\npub const UNICODE_VERSION: &str = \"$VERSION\";\n\n";
+print "/// The Unicode this was generated from.\n#[cfg(test)]\npub const UNICODE_VERSION: &str = \"$VERSION\";\n\n";
 
 print table('WIDE', 'East_Asian_Width is Wide or Fullwidth: two columns on a terminal.', @wide);
 print table('ZERO_WIDTH', 'No column of its own: combining marks, format characters, and the jamo that compose into a preceding syllable.', @zero_width);

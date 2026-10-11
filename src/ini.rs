@@ -21,7 +21,6 @@
 // nesting, so a broken line can't change the lines below.
 //
 // Offsets are char offsets, as `highlight::HighlightSpan` uses.
-#![allow(dead_code)]
 
 use std::ops::Range;
 

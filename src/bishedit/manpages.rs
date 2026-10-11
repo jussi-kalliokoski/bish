@@ -5,7 +5,6 @@
 // Highlighting runs on every keystroke, so `query` never blocks: it
 // returns cached data or `Pending` and parses the page on a background
 // thread.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

@@ -6,6 +6,7 @@
 // can binary-search them; a test in unicode_width.rs checks it.
 
 /// The Unicode this was generated from.
+#[cfg(test)]
 pub const UNICODE_VERSION: &str = "16.0.0";
 
 /// East_Asian_Width is Wide or Fullwidth: two columns on a terminal.

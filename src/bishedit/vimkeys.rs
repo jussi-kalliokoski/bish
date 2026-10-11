@@ -24,6 +24,7 @@ pub enum GotoKind {
     TypeDefinition,
     /// The implementations of an interface, trait or abstract method. No key
     /// reaches it yet; see `feed_g` on `gi`.
+    #[allow(dead_code)]
     Implementation,
     /// `gD`: where it was declared, which some languages separate from where
     /// it's defined.

@@ -6,7 +6,6 @@
 //
 // Patterns are never offered: `Host *.internal` or a wildcard
 // `known_hosts` entry is a rule, not a host you can reach.
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

@@ -1,7 +1,6 @@
 // Tab completion: the candidate and provider types, the walker that decides
 // what kind of word is under the cursor (command name, flag, subcommand or
 // file), and the shell-backed candidate sources.
-#![allow(dead_code)]
 
 use crate::bishedit::fuzzy;
 use crate::bishedit::highlight::{self, is_assignment_prefix_word, resets_command_position};

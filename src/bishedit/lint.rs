@@ -291,25 +291,24 @@ fn line_indent(chars: &[char], pos: usize) -> String {
 enum WordRole {
     AssignmentPrefix,
     CommandName,
-    Argument { command: Option<String>, arg_index: usize },
+    Argument { arg_index: usize },
 }
 
 #[derive(Clone)]
 enum CmdPos {
     ExpectCommand,
-    InCommand { name: Option<String>, arg_index: usize },
+    InCommand { arg_index: usize },
 }
 
 fn resolve_role(cmd_pos: &mut CmdPos, chunks: &[Chunk]) -> WordRole {
     match cmd_pos {
         CmdPos::ExpectCommand if assignment_prefix(chunks).is_some() => WordRole::AssignmentPrefix,
         CmdPos::ExpectCommand => {
-            let name = if let [Chunk::Str(s)] = chunks { Some(s.clone()) } else { None };
-            *cmd_pos = CmdPos::InCommand { name, arg_index: 0 };
+            *cmd_pos = CmdPos::InCommand { arg_index: 0 };
             WordRole::CommandName
         }
-        CmdPos::InCommand { name, arg_index } => {
-            let role = WordRole::Argument { command: name.clone(), arg_index: *arg_index };
+        CmdPos::InCommand { arg_index } => {
+            let role = WordRole::Argument { arg_index: *arg_index };
             *arg_index += 1;
             role
         }
@@ -342,7 +341,7 @@ fn lint_into(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
             cmd_pos = CmdPos::ExpectCommand;
         }
         if matches!(tok, Tok::KwFor | Tok::KwSelect | Tok::KwCase | Tok::KwIn) {
-            cmd_pos = CmdPos::InCommand { name: None, arg_index: 0 };
+            cmd_pos = CmdPos::InCommand { arg_index: 0 };
         }
         match tok {
             Tok::KwLBracket2 => bracket2_depth += 1,

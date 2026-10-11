@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+// On wasm the stub never suspends, so `Suspended` and `Running` go unbuilt.
+#![cfg_attr(target_family = "wasm", allow(dead_code))]
 
 // Two interpreters running at once, in one process, on one thread.
 //

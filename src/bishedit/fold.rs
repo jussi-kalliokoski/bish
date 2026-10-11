@@ -30,10 +30,7 @@ impl Default for Folds {
 }
 
 impl Folds {
-    pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
-    }
-
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &Fold> {
         self.list.iter()
     }

@@ -36,6 +36,7 @@ pub struct Abbr {
 }
 
 impl Abbr {
+    #[cfg(test)]
     pub fn new(name: &str, expansion: &str) -> Abbr {
         Abbr { name: name.to_string(), expansion: expansion.to_string(), lang: DEFAULT_LANG.to_string() }
     }
@@ -224,6 +225,7 @@ pub fn flatten(text: &str) -> String {
 
 /// Whether `text` has a tabstop, deciding whether `abbr` and the completion
 /// menu splice tentatively.
+#[cfg(test)]
 pub fn has_tabstops(text: &str) -> bool {
     parse_pieces(text).iter().any(|p| matches!(p, Piece::Tabstop(..)))
 }
@@ -274,6 +276,7 @@ impl Snippet {
     }
 
     /// How many distinct tabstops: holes, not places.
+    #[cfg(test)]
     pub fn tabstop_count(&self) -> usize {
         self.fills.len()
     }
@@ -480,10 +483,6 @@ impl LiveSnippet {
         host.replace_span(self.start, self.end, &self.original);
         let (line, col) = end_of(self.start, &self.original);
         host.place_cursor(line, col);
-    }
-
-    pub fn line(&self) -> usize {
-        self.start.0
     }
 
     // Every slot as `((line, col), (line, col), is_active)`, for the
