@@ -175,6 +175,10 @@ pub struct ActionContext {
     // those with `arrays`).
     pub variables: Vec<String>,
     pub builtins: Vec<String>,
+    // The builtins `enable -n` took out of service.
+    pub disabled_builtins: Vec<String>,
+    // What `help` has an entry for.
+    pub help_topics: Vec<String>,
     pub shopt_names: Vec<String>,
     pub set_o_names: Vec<String>,
     // Signal names without `SIG` (`HUP`); `resolve_action` adds the prefix
@@ -243,8 +247,8 @@ fn read_dir_names(path: &str) -> Vec<String> {
 }
 
 // Raw candidates for one action, unfiltered by `word` (`resolve_spec`
-// filters every source alike). `binding` and `helptopic` are always empty
-// rather than unknown.
+// filters every source alike). `binding` is always empty rather than
+// unknown.
 pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, word: &str) -> Vec<String> {
     use CompgenAction::*;
     match action {
@@ -261,13 +265,13 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
             names
         }
         Directory => path_entries(cwd, word, true),
-        Disabled => Vec::new(),
-        Enabled => ctx.builtins.clone(),
+        Disabled => ctx.disabled_builtins.clone(),
+        Enabled => ctx.builtins.iter().filter(|b| !ctx.disabled_builtins.contains(b)).cloned().collect(),
         Export => ctx.exported.clone(),
         File => path_entries(cwd, word, false),
         Function => ctx.functions.clone(),
         Group => read_colon_first_field("/etc/group"),
-        HelpTopic => Vec::new(),
+        HelpTopic => ctx.help_topics.clone(),
         Hostname => read_hosts_hostnames(),
         Job => ctx.jobs.clone(),
         Keyword => KEYWORDS.iter().map(|s| s.to_string()).collect(),
@@ -275,8 +279,12 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
         Service => read_dir_names("/etc/init.d"),
         Setopt => ctx.set_o_names.clone(),
         Shopt => ctx.shopt_names.clone(),
-        // `SIG`-prefixed, as bash's `-A signal` prints them, plus EXIT.
-        Signal => std::iter::once("EXIT".to_string()).chain(ctx.signal_names.iter().map(|n| format!("SIG{n}"))).collect(),
+        // As bash prints them: EXIT, the `SIG`-prefixed signals, then the
+        // shell's own trap names.
+        Signal => std::iter::once("EXIT".to_string())
+            .chain(ctx.signal_names.iter().map(|n| format!("SIG{n}")))
+            .chain(["DEBUG", "ERR", "RETURN"].map(str::to_string))
+            .collect(),
         Stopped => ctx.stopped_jobs.clone(),
         User => read_colon_first_field("/etc/passwd"),
         Variable => {
@@ -577,7 +585,25 @@ mod tests {
         let mut c = ctx();
         c.signal_names = vec!["TERM".to_string()];
         let out = resolve_action(CompgenAction::Signal, &c, Path::new("/"), "");
-        assert_eq!(out, vec!["EXIT".to_string(), "SIGTERM".to_string()]);
+        assert_eq!(out, ["EXIT", "SIGTERM", "DEBUG", "ERR", "RETURN"]);
+    }
+
+    #[test]
+    fn enabled_and_disabled_follow_enable_n() {
+        let mut c = ctx();
+        c.builtins = vec!["cd".to_string(), "echo".to_string()];
+        c.disabled_builtins = vec!["echo".to_string()];
+        assert_eq!(resolve_action(CompgenAction::Enabled, &c, Path::new("/"), ""), ["cd"]);
+        assert_eq!(resolve_action(CompgenAction::Disabled, &c, Path::new("/"), ""), ["echo"]);
+        // `-A builtin` keeps a disabled one, as bash does.
+        assert_eq!(resolve_action(CompgenAction::Builtin, &c, Path::new("/"), ""), ["cd", "echo"]);
+    }
+
+    #[test]
+    fn helptopic_lists_what_help_knows() {
+        let mut c = ctx();
+        c.help_topics = vec!["cd".to_string()];
+        assert_eq!(resolve_action(CompgenAction::HelpTopic, &c, Path::new("/"), ""), ["cd"]);
     }
 
     #[test]

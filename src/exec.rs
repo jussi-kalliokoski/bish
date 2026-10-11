@@ -3285,6 +3285,8 @@ impl Shell {
             exported: self.exported_names.iter().cloned().collect(),
             variables,
             builtins: KNOWN_BUILTINS.iter().map(|s| s.to_string()).collect(),
+            disabled_builtins: KNOWN_BUILTINS.iter().filter(|b| self.disabled_builtins.contains(**b)).map(|s| s.to_string()).collect(),
+            help_topics: BUILTIN_HELP.iter().map(|(name, _)| name.to_string()).collect(),
             shopt_names: KNOWN_SHOPT_OPTIONS.iter().map(|(n, _)| n.to_string()).collect(),
             set_o_names: SET_O_OPTIONS.iter().map(|s| s.to_string()).collect(),
             signal_names: all_signals().into_iter().map(|(n, _)| n).collect(),
