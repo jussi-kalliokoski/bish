@@ -10316,6 +10316,8 @@ pub(crate) const COLON_COMMANDS: &[&str] = &[
     "symbols",
     "w",
     "w!",
+    "win",
+    "window",
     "wq",
     "write",
     "write!",

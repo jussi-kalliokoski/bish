@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use crate::bishedit::fuzzy;
-use crate::bishedit::highlight::{self, KNOWN_BUILTINS, is_assignment_prefix_word, resets_command_position};
+use crate::bishedit::highlight::{self, is_assignment_prefix_word, resets_command_position};
 use crate::bishedit::manpages;
 use crate::compgen;
 use crate::lexer::{self, Chunk, SpannedItem, Tok};
@@ -593,7 +593,7 @@ impl<'a> ShellCompletionProvider<'a> {
     // Builtins, functions and PATH commands. Aliases are left out; see
     // `HighlightContext::known_functions` for why.
     fn command_name_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
-        let mut names: HashSet<String> = KNOWN_BUILTINS.iter().map(|s| s.to_string()).collect();
+        let mut names: HashSet<String> = highlight::prompt_builtins().map(str::to_string).collect();
         if let Some(functions) = self.known_functions {
             names.extend(functions.iter().cloned());
         }
@@ -1005,8 +1005,8 @@ mod tests {
         // Prefix-filtered.
         assert!(!names.iter().any(|n| n == "zz-bish-elsewhere"), "{names:?}");
         // And the real environment's PATH isn't consulted as well.
-        let names = display_names(provider.command_name_candidates("tru"));
-        assert!(!names.iter().any(|n| n == "true"), "{names:?}");
+        let names = display_names(provider.command_name_candidates("sor"));
+        assert!(!names.iter().any(|n| n == "sort"), "{names:?}");
     }
 
     #[test]

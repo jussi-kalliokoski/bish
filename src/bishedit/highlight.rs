@@ -854,70 +854,17 @@ pub(crate) fn is_assignment_prefix_word(chunks: &[Chunk]) -> bool {
     is_valid_ident(name)
 }
 
-// A copy of exec.rs's `KNOWN_BUILTINS`, keeping the editor's analysis
-// independent of the execution engine.
-pub(crate) const KNOWN_BUILTINS: &[&str] = &[
-    ":",
-    "cd",
-    "e",
-    "export",
-    "let",
-    "break",
-    "continue",
-    "test",
-    "[",
-    "[[",
-    "return",
-    "shift",
-    "local",
-    "exit",
-    "logout",
-    "read",
-    "mapfile",
-    "readarray",
-    "eval",
-    "source",
-    ".",
-    "trap",
-    "jobs",
-    "disown",
-    "fg",
-    "bg",
-    "wait",
-    "kill",
-    "getopts",
-    "unset",
-    "set",
-    "declare",
-    "typeset",
-    "readonly",
-    "exec",
-    "command",
-    "builtin",
-    "type",
-    "hash",
-    "shopt",
-    "umask",
-    "pushd",
-    "popd",
-    "dirs",
-    "ulimit",
-    "alias",
-    "unalias",
-    "abbr",
-    "bishopt",
-    "compgen",
-    "complete",
-    "compopt",
-    "::bish",
-    "echo",
-    "printf",
-];
+// The builtins a prompt runs: exec.rs's list, less `win` and `window`,
+// which only the editor's colon line runs (it lists them in its own
+// commands).
+pub(crate) fn prompt_builtins() -> impl Iterator<Item = &'static str> {
+    crate::exec::KNOWN_BUILTINS.iter().copied().filter(|b| !matches!(*b, "win" | "window"))
+}
 
 // Valid: a builtin, one of the line's own commands, a session function,
 // an executable file (for a name with `/`), or on PATH. Not aliases.
 fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
-    if KNOWN_BUILTINS.contains(&name) {
+    if prompt_builtins().any(|b| b == name) {
         return true;
     }
     if ctx.line_commands.is_some_and(|c| c.contains(&name)) {
