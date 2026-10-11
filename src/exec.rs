@@ -9654,7 +9654,7 @@ impl Shell {
         // An inherited `_` can still be in the map even once the field
         // has taken over, so both go.
         if self.globals.contains_key(name) {
-            self.global_remove(name);
+            Rc::make_mut(&mut self.globals).remove(name);
         }
     }
 
@@ -9803,7 +9803,7 @@ impl Shell {
                 return;
             }
         }
-        Rc::make_mut(&mut self.globals).remove(name);
+        self.global_remove(name);
     }
 
     // The real environment's value, unless this shell unset the name.
@@ -10036,7 +10036,9 @@ impl Shell {
             Rc::make_mut(&mut self.exported_names).insert("TERM".to_string());
         }
         if colorterm.is_empty() {
-            self.global_remove("COLORTERM");
+            // As `unset` would, so the value this process inherited doesn't
+            // show through.
+            self.remove_var("COLORTERM");
         } else {
             self.assign_var("COLORTERM", colorterm.to_string());
             Rc::make_mut(&mut self.exported_names).insert("COLORTERM".to_string());
@@ -11268,6 +11270,23 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod terminal_capability_tests {
+    // A client attaching without true colour takes `COLORTERM` away from a
+    // session that had it.
+    #[test]
+    fn an_empty_colorterm_unsets_the_variable() {
+        let mut shell = super::Shell::new();
+        shell.run_source_here("COLORTERM=truecolor", "<test>");
+        shell.set_terminal_capability_env("xterm-256color", "");
+        assert_eq!(shell.lookup_var("COLORTERM"), "");
+        // Unset, not just removed: a value this process inherited would
+        // otherwise show through, whether or not the test run has one.
+        assert!(shell.unset_names.contains("COLORTERM"));
+        assert_eq!(shell.lookup_var("TERM"), "xterm-256color");
+    }
 }
 
 #[cfg(test)]
