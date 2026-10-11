@@ -489,7 +489,7 @@ fn host_word(prefix: &str) -> Option<(&str, &str)> {
 
 pub struct ShellCompletionProvider<'a> {
     pub cwd: Option<&'a Path>,
-    pub known_functions: Option<&'a HashSet<String>>,
+    pub session_commands: Option<&'a HashSet<String>>,
     // Registered `complete` specs (a per-prompt snapshot of
     // `Shell::completions` and `default_completion`) and what
     // `compgen::resolve_spec` needs to evaluate one, including a snapshot
@@ -589,11 +589,10 @@ impl<'a> ShellCompletionProvider<'a> {
         Some(as_unranked_candidates(prefix, names))
     }
 
-    // Builtins, functions and PATH commands. Aliases are left out; see
-    // `HighlightContext::known_functions` for why.
+    // Builtins, the session's functions and aliases, and PATH commands.
     fn command_name_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
         let mut names: HashSet<String> = highlight::prompt_builtins().map(str::to_string).collect();
-        if let Some(functions) = self.known_functions {
+        if let Some(functions) = self.session_commands {
             names.extend(functions.iter().cloned());
         }
         // The caller's PATH scan (`Shell::action_context`, once per prompt,
@@ -796,7 +795,7 @@ mod tests {
         let offer = |fignore: Vec<String>, force: bool| {
             let provider = ShellCompletionProvider {
                 cwd: Some(&dir),
-                known_functions: None,
+                session_commands: None,
                 completions: None,
                 default_completion: None,
                 action_ctx: None,
@@ -833,7 +832,7 @@ mod tests {
         let offer = |word: &str| {
             let provider = ShellCompletionProvider {
                 cwd: Some(&dir),
-                known_functions: None,
+                session_commands: None,
                 completions: None,
                 default_completion: None,
                 action_ctx: None,
@@ -925,7 +924,7 @@ mod tests {
     fn command_name_candidates_includes_known_builtins_matching_prefix() {
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -946,7 +945,7 @@ mod tests {
         functions.insert("zz_bish_test_func".to_string());
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: Some(&functions),
+            session_commands: Some(&functions),
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -965,7 +964,7 @@ mod tests {
         // coreutils, as highlight.rs's `is_in_path` tests assume.
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -989,7 +988,7 @@ mod tests {
         };
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: Some(&ctx),
@@ -1068,7 +1067,7 @@ mod tests {
         std::fs::write(dir.join("elsewhere.txt"), b"hi").unwrap();
         let provider = ShellCompletionProvider {
             cwd: Some(dir),
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1126,7 +1125,7 @@ mod tests {
 
         let provider = ShellCompletionProvider {
             cwd: Some(&dir),
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1161,7 +1160,7 @@ mod tests {
             // A cwd unrelated to HOME, so the lookup has to go to $HOME.
             let provider = ShellCompletionProvider {
                 cwd: Some(Path::new("/")),
-                known_functions: None,
+                session_commands: None,
                 completions: None,
                 default_completion: None,
                 action_ctx: None,
@@ -1187,7 +1186,7 @@ mod tests {
     fn file_candidates_yields_nothing_without_a_cwd() {
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1204,7 +1203,7 @@ mod tests {
     fn complete_dispatches_bare_prefix_to_command_names() {
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1228,7 +1227,7 @@ mod tests {
 
         let provider = ShellCompletionProvider {
             cwd: Some(&dir),
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1255,7 +1254,7 @@ mod tests {
         completions.insert("fruit".to_string(), compgen::CompgenSpec { wordlist: Some("apple avocado banana".to_string()), ..Default::default() });
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: Some(&completions),
             default_completion: None,
             action_ctx: None,
@@ -1276,7 +1275,7 @@ mod tests {
         let completions = HashMap::new();
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: Some(&completions),
             default_completion: Some(&default_completion),
             action_ctx: None,
@@ -1297,7 +1296,7 @@ mod tests {
         // to command names.
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1321,7 +1320,7 @@ mod tests {
             completions.insert("cmd".to_string(), spec);
             let provider = ShellCompletionProvider {
                 cwd: None,
-                known_functions: None,
+                session_commands: None,
                 completions: Some(&completions),
                 default_completion: None,
                 action_ctx: None,
@@ -1528,7 +1527,7 @@ mod tests {
     fn the_shell_provider_completes_bishopt_options_too() {
         let provider = ShellCompletionProvider {
             cwd: None,
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1581,7 +1580,7 @@ mod tests {
         std::fs::write(dir.join("zzz-not-a-host.txt"), "").unwrap();
         let provider = ShellCompletionProvider {
             cwd: Some(&dir),
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1606,7 +1605,7 @@ mod tests {
         let dir = guard.path().to_path_buf();
         let provider = ShellCompletionProvider {
             cwd: Some(&dir),
-            known_functions: None,
+            session_commands: None,
             completions: None,
             default_completion: None,
             action_ctx: None,
@@ -1636,7 +1635,7 @@ mod tests {
                 fignore: Vec::new(),
                 force_fignore: true,
                 cwd: Some(&dir),
-                known_functions: None,
+                session_commands: None,
                 completions: None,
                 default_completion: None,
                 action_ctx: None,

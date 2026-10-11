@@ -22,9 +22,9 @@ use std::path::Path;
 #[derive(Clone, Copy, Default)]
 pub struct HighlightContext<'a> {
     pub cwd: Option<&'a Path>,
-    // The session's function names, so calling a function just defined isn't
-    // an invalid command. Aliases aren't included.
-    pub known_functions: Option<&'a HashSet<String>>,
+    // The session's function and alias names, so using one just defined
+    // isn't an invalid command.
+    pub session_commands: Option<&'a HashSet<String>>,
     // Command names the line has that the shell doesn't: on the editor's
     // colon line `:preview` and `:diag` are real commands found nowhere on
     // PATH. `None` at the ordinary prompt.
@@ -861,8 +861,8 @@ pub(crate) fn prompt_builtins() -> impl Iterator<Item = &'static str> {
     crate::exec::KNOWN_BUILTINS.iter().copied().filter(|b| !matches!(*b, "win" | "window"))
 }
 
-// Valid: a builtin, one of the line's own commands, a session function,
-// an executable file (for a name with `/`), or on PATH. Not aliases.
+// Valid: a builtin, one of the line's own commands, a session function or
+// alias, an executable file (for a name with `/`), or on PATH.
 fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
     if prompt_builtins().any(|b| b == name) {
         return true;
@@ -870,7 +870,7 @@ fn is_valid_command_name(name: &str, ctx: &HighlightContext) -> bool {
     if ctx.line_commands.is_some_and(|c| c.contains(&name)) {
         return true;
     }
-    if ctx.known_functions.is_some_and(|f| f.contains(name)) {
+    if ctx.session_commands.is_some_and(|f| f.contains(name)) {
         return true;
     }
     if name.contains('/') {
@@ -1948,7 +1948,7 @@ mod tests {
     fn is_valid_command_name_recognizes_a_known_function() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), ..HighlightContext::default() };
+        let ctx = HighlightContext { cwd: None, session_commands: Some(&functions), ..HighlightContext::default() };
         assert!(is_valid_command_name("my_func", &ctx));
         assert!(!is_valid_command_name("other_func", &ctx));
     }
@@ -2033,7 +2033,7 @@ mod tests {
     fn a_call_to_a_known_function_is_not_flagged_invalid() {
         let mut functions = HashSet::new();
         functions.insert("my_func".to_string());
-        let ctx = HighlightContext { cwd: None, known_functions: Some(&functions), ..HighlightContext::default() };
+        let ctx = HighlightContext { cwd: None, session_commands: Some(&functions), ..HighlightContext::default() };
         let spans = BashHighlighter.highlight("my_func arg", ctx);
         assert!(!spans.iter().any(|s| s.kind == HighlightKind::InvalidCommand), "{spans:?}");
     }

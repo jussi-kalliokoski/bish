@@ -510,14 +510,16 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         // needs to appear mid-browse; a clone is O(1) (see `History`).
         let session_history = app.sessions[&session_id].history.borrow().clone();
         // A snapshot for the same reason: `on_idle`'s borrow would conflict
-        // with borrowing the shell's cwd and functions as arguments. Function
-        // names only, all the command-validity check needs.
+        // with borrowing the shell's cwd and functions as arguments. Names
+        // only: functions and aliases, all the command-validity check needs.
         let cwd_snapshot = app.sessions[&session_id].shell.cwd.clone();
         // Read per prompt, not per shell: a per-directory hook (mise, direnv)
         // rewrites PATH on every `cd`, and the validity check must see the
         // session's PATH (`HighlightContext::path`).
         let path_snapshot = app.sessions[&session_id].shell.raw_var_lookup("PATH");
-        let known_functions: HashSet<String> = app.sessions[&session_id].shell.function_names().map(String::from).collect();
+        let shell = &app.sessions[&session_id].shell;
+        let session_commands: HashSet<String> =
+            shell.function_names().map(String::from).chain(shell.aliases.iter().map(|(name, _)| name.clone())).collect();
         // A snapshot too, of this session's abbreviations for this
         // language: a shell prompt is bash, `abbr`'s default, so an
         // abbreviation written without a language is live here.
@@ -533,7 +535,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         let mouse = app.sessions[&session_id].shell.bishopt_bool("mouse");
         let highlight_ctx = HighlightContext {
             cwd: Some(cwd_snapshot.as_path()),
-            known_functions: Some(&known_functions),
+            session_commands: Some(&session_commands),
             path: Some(&path_snapshot),
             color_overrides: Some(&color_overrides),
             hyperlinks,
@@ -557,7 +559,7 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
             fignore: app.sessions[&session_id].shell.fignore_suffixes(),
             force_fignore: app.sessions[&session_id].shell.shopt_is_on("force_fignore"),
             cwd: Some(cwd_snapshot.as_path()),
-            known_functions: Some(&known_functions),
+            session_commands: Some(&session_commands),
             completions: Some(&completions_snapshot),
             default_completion: default_completion_snapshot.as_ref(),
             action_ctx: Some(&action_ctx_snapshot),

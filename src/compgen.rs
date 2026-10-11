@@ -256,11 +256,13 @@ pub fn resolve_action(action: CompgenAction, ctx: &ActionContext, cwd: &Path, wo
         ArrayVar => ctx.arrays.clone(),
         Binding => Vec::new(),
         Builtin => ctx.builtins.clone(),
-        // Aliases aren't included, unlike bash; see
-        // `ShellCompletionProvider::command_name_candidates`.
+        // In bash's order: aliases, reserved words, functions, builtins,
+        // then PATH.
         Command => {
-            let mut names = ctx.builtins.clone();
+            let mut names = ctx.aliases.clone();
+            names.extend(KEYWORDS.iter().map(|s| s.to_string()));
             names.extend(ctx.functions.iter().cloned());
+            names.extend(ctx.builtins.iter().cloned());
             names.extend(ctx.path_commands.iter().cloned());
             names
         }
@@ -597,6 +599,18 @@ mod tests {
         assert_eq!(resolve_action(CompgenAction::Disabled, &c, Path::new("/"), ""), ["echo"]);
         // `-A builtin` keeps a disabled one, as bash does.
         assert_eq!(resolve_action(CompgenAction::Builtin, &c, Path::new("/"), ""), ["cd", "echo"]);
+    }
+
+    #[test]
+    fn command_is_aliases_keywords_functions_builtins_then_path() {
+        let mut c = ctx();
+        c.aliases = vec!["ll".to_string()];
+        c.functions = vec!["f".to_string()];
+        c.builtins = vec!["cd".to_string()];
+        c.path_commands = vec!["ls".to_string()];
+        let out = resolve_action(CompgenAction::Command, &c, Path::new("/"), "");
+        let at = |n: &str| out.iter().position(|x| x == n).unwrap();
+        assert!(at("ll") < at("if") && at("if") < at("f") && at("f") < at("cd") && at("cd") < at("ls"), "{out:?}");
     }
 
     #[test]
