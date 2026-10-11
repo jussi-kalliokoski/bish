@@ -2698,10 +2698,6 @@ pub(crate) fn language_of_path(path: &std::path::Path) -> String {
     LANGUAGE_BY_EXTENSION.iter().find(|(e, _)| *e == ext).map(|(_, lang)| (*lang).to_string()).unwrap_or(ext)
 }
 
-pub(crate) fn buffer_source(buf: &TextBuffer) -> String {
-    buffer_text(buf)
-}
-
 // The buffer's text, lines joined by newlines, so a highlighter sees a
 // multi-line construct (a heredoc, a JSON object) whole.
 pub(crate) fn buffer_text(buf: &TextBuffer) -> String {

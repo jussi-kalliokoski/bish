@@ -11633,7 +11633,7 @@ fn run_command_mode(
                         // `:help` is.
                         "preview" | "prev" if arg.is_none() => {
                             let language = fileeditor::language_of(tb);
-                            let source = fileeditor::buffer_source(tb);
+                            let source = fileeditor::buffer_text(tb);
                             // The buffer's directory, so a README's
                             // relative links resolve.
                             let render = RenderOptions {

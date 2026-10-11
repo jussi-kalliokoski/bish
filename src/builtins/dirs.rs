@@ -12,7 +12,6 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
         sh_eprintln!(sh, "bish: cd: too many arguments");
         return USAGE_ERROR;
     }
-    let old = sh.cwd.to_string_lossy().into_owned();
     let target = if let Some(dir) = operands.first() {
         if dir.as_str() == "-" {
             // The shell's OLDPWD and HOME, not the process environment's:
@@ -37,7 +36,6 @@ pub(crate) fn run_cd(sh: &mut Shell, args: &[String]) -> i32 {
             }
         }
     };
-    let _ = old;
     // `CDPATH` is searched only for a plain relative name. A directory
     // found through it is printed, as bash does.
     let (target, from_cdpath) = sh.resolve_cdpath(target);

@@ -20,9 +20,10 @@ impl Rgba {
     }
 
     // Canonical text: 6-digit hex when opaque, 8-digit otherwise, never
-    // shorthand, so it round-trips through `parse`. Unused: bishopt echoes a
-    // colour's original text (see `BishOptValue::Color`).
-    #[allow(dead_code)]
+    // shorthand, so it round-trips through `parse`. Only the round-trip test
+    // uses it: bishopt echoes a colour's original text (see
+    // `BishOptValue::Color`).
+    #[cfg(test)]
     pub fn to_hex(self) -> String {
         if self.a == 255 {
             format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)

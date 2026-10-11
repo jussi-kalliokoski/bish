@@ -2500,8 +2500,8 @@ impl Shell {
 
     /// Every exported variable as a child should see it, resolved like
     /// `$name`, so an exported `local` shadows the global. Names and values
-    /// with a NUL are dropped: a C environment string can't hold one (as in
-    /// `export_to_environment`). Borrowed: building owned Strings on every
+    /// with a NUL are dropped: a C environment string can't hold one.
+    /// Borrowed: building owned Strings on every
     /// spawn was about 140 allocations, more work than the spawn.
     fn exported_pairs(&self) -> Vec<(&str, &str)> {
         self.exported_names
@@ -6959,7 +6959,6 @@ impl Shell {
                             };
                             if export_flag {
                                 Rc::make_mut(&mut self.exported_names).insert(n.clone());
-                                self.export_to_environment(&n, &v);
                             }
                             if readonly_flag {
                                 self.readonly_names.insert(n.clone());
@@ -9775,19 +9774,12 @@ impl Shell {
     pub(crate) fn raw_var_write(&mut self, name: &str, value: String) {
         for scope in self.var_scopes.iter_mut().rev() {
             if scope.contains_key(name) {
-                scope.insert(name.to_string(), Some(value.clone()));
-                self.export_to_environment(name, &value);
+                scope.insert(name.to_string(), Some(value));
                 return;
             }
         }
-        self.global_set(name, value.clone());
-        self.export_to_environment(name, &value);
+        self.global_set(name, value);
     }
-
-    /// Does nothing. A child's environment is built from the exported names
-    /// (`Shell::command`), and writing the real environment would leak
-    /// variables between shells sharing the process.
-    fn export_to_environment(&self, _name: &str, _value: &str) {}
 
     // Removes a name from the innermost scope holding it, or the globals,
     // and hides any inherited copy. Shared by `unset` and the restore after
@@ -10201,7 +10193,6 @@ impl Shell {
     pub fn export_var(&mut self, name: &str, value: String) {
         Rc::make_mut(&mut self.exported_names).insert(name.to_string());
         self.assign_var(name, value.clone());
-        self.export_to_environment(name, &value);
     }
 
     // `declare -g`/`local -g`: `assign_var`, but always to the global,
@@ -10269,7 +10260,6 @@ impl Shell {
             // Past any local shadow, which `raw_var_write` would update
             // instead.
             self.global_set(name, value.clone());
-            self.export_to_environment(name, &value);
             return true;
         }
         self.raw_var_write(name, value);
