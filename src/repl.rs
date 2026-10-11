@@ -567,11 +567,12 @@ pub fn run(mut shell: Shell, start_promoted: bool, load_rc: bool) {
         // `session_history` is the snapshot the suggestions engine needs.
         let shell_suggestion = suggestion::HistorySuggestionProvider { history: &session_history, cwd: Some(cwd_snapshot.as_path()) };
         // `= 3*(2+7)` previews its answer instead of a history suggestion.
-        // Variables are read from the process environment; unset reads as 0,
-        // as in shell arithmetic.
+        // Variables come from a snapshot of the shell's (nothing changes them
+        // while a line is typed); unset reads as 0, as in shell arithmetic.
+        let vars_snapshot = app.sessions[&session_id].shell.globals_snapshot();
         let arith_suggestion = suggestion::ArithSuggestionProvider {
             inner: &shell_suggestion,
-            vars: &|name| std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0),
+            vars: &|name| vars_snapshot.get(name).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0),
         };
         // Relative-cursor menu tricks are only safe on a single real
         // terminal; in a promoted pane the extra row could spill into a

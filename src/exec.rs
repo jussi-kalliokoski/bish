@@ -9638,6 +9638,13 @@ impl Shell {
         }
     }
 
+    /// The global variables as they are now, for a reader that can't hold
+    /// the shell: the prompt's `= expr` preview runs while `App` is borrowed.
+    /// An `Rc` clone, so free to take.
+    pub(crate) fn globals_snapshot(&self) -> Rc<std::collections::BTreeMap<String, String>> {
+        Rc::clone(&self.globals)
+    }
+
     /// Writing one, `_` to its field.
     fn global_set(&mut self, name: &str, value: String) {
         match name == "_" {
@@ -11262,6 +11269,18 @@ pub(crate) fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+#[cfg(test)]
+mod globals_snapshot_tests {
+    // A variable that was never exported is still the shell's, and the
+    // prompt's arithmetic preview reads it from here.
+    #[test]
+    fn holds_unexported_variables() {
+        let mut shell = super::Shell::new();
+        shell.run_source_here("width=7", "<test>");
+        assert_eq!(shell.globals_snapshot().get("width").map(String::as_str), Some("7"));
+    }
 }
 
 #[cfg(test)]
