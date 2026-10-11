@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_a_zip_is_reported_rather_than_parsed() {
-        let plain = write_temp("notazip.bin", b"PK\\x03\\x04 but only barely");
+        let plain = write_temp("notazip.bin", b"PK\x03\x04 but only barely");
         assert!(list(&plain).is_err());
         std::fs::remove_file(plain).unwrap();
     }
