@@ -872,6 +872,21 @@ impl<'a> Lexer<'a> {
                         s.push(n);
                     }
                 }
+                // A quote or paren inside a comment counts for nothing:
+                // `# zsh's` would otherwise open a quote. Same word-start
+                // rule as the top level, so `$#`, `${#x}` and `a#b` are
+                // not comments. The text stays in the capture, which is
+                // lexed again when it runs.
+                Some('#') if s.chars().last().is_none_or(|p| p.is_whitespace() || is_metacharacter(p)) => {
+                    s.push('#');
+                    while let Some(c) = self.chars.peek().copied() {
+                        if c == '\n' {
+                            break;
+                        }
+                        s.push(c);
+                        self.advance();
+                    }
+                }
                 Some(c) => s.push(c),
             }
         }
@@ -2507,6 +2522,16 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_comment_inside_parens_opens_no_quote_and_closes_no_paren() {
+        let lexes = |src: &str| super::Lexer::new(src).tokenize().is_ok();
+        assert!(lexes("(\n  # zsh's ERR_RETURN\n  true\n)"));
+        assert!(lexes("x=$(\n  # it's \"here\" (sort of\n  echo a\n)"));
+        assert!(lexes("x=$(echo a # )\n)"));
+        assert!(!lexes("x=$(echo a#'b)"), "a mid-word `#` opens no comment, so the quote is unterminated");
+        assert!(lexes("x=$(echo $# ${#y})"));
     }
 
     // An assignment's value carries a `Tilde` chunk per prefix; a word bash
