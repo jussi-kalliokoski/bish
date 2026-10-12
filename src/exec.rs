@@ -2541,6 +2541,26 @@ impl Shell {
         }
     }
 
+    /// Where an external inside a redirected construct sends stdout: the
+    /// mirror of `ChildStdio::sink_stdout` for builtins.
+    fn effective_stdout(&self, stdio: &ChildStdio) -> Option<Rc<Capture>> {
+        let outer_stdout = || self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.clone());
+        match stdio.out_follows_err {
+            // `>&2` before this construct rebound fd 2: wherever fd 2 is
+            // outside it, which is the real fd 2 if nothing enclosing
+            // moved it.
+            Some(Follows::Outer) => self
+                .stdio_override
+                .as_ref()
+                .and_then(|o| o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok()))
+                .or_else(|| dup_fd_as_file(2))
+                .map(Capture::file)
+                .or_else(outer_stdout),
+            Some(Follows::OwnFile) => stdio.stderr.as_ref().and_then(|f| f.try_clone().ok()).map(Capture::file).or_else(outer_stdout),
+            None => stdio.stdout.clone().or_else(outer_stdout),
+        }
+    }
+
     /// Where an external inside a redirected construct sends stderr: the
     /// mirror of `ChildStdio::sink_stderr` for builtins.
     fn effective_stderr(&self, stdio: &ChildStdio, effective_stdout: &Option<Rc<Capture>>) -> Option<std::fs::File> {
@@ -4376,10 +4396,7 @@ impl Shell {
             }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
-        let effective_stdout: Option<Rc<Capture>> = match &stdio.stdout {
-            Some(c) => Some(Rc::clone(c)),
-            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.clone()),
-        };
+        let effective_stdout = self.effective_stdout(&stdio);
         let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
         child.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
             Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout, stderr: effective_stderr })))
@@ -4493,10 +4510,7 @@ impl Shell {
             }
             None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
         };
-        let effective_stdout: Option<Rc<Capture>> = match &stdio.stdout {
-            Some(c) => Some(Rc::clone(c)),
-            None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdout.clone()),
-        };
+        let effective_stdout = self.effective_stdout(&stdio);
         let effective_stderr = self.effective_stderr(&stdio, &effective_stdout);
         self.stdio_override = if effective_stdin.is_some() || effective_stdout.is_some() || effective_stderr.is_some() {
             Some(Rc::new(RefCell::new(StdioOverride { stdin: effective_stdin, stdout: effective_stdout, stderr: effective_stderr })))
