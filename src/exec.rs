@@ -8140,6 +8140,23 @@ impl Shell {
                 true => self.new_virtual_child(),
                 false => self.child_for_stdio(ChildStdio::default()),
             };
+            // A stage with a pipe reads it on fd 0, where the scheduler puts
+            // it; one without reads the stdin enclosing the pipeline. Only
+            // `child_for_stdio` carries that stdin, so it is set here for
+            // both kinds of child: inside `{ a | b; } <<EOF` the here-doc
+            // belongs to `a`.
+            let enclosing_stdin = match stdin_end {
+                Some(_) => None,
+                None => self.stdio_override.as_ref().and_then(|o| o.borrow().stdin.clone()),
+            };
+            child.stdio_override = {
+                let (stdout, stderr) = match &child.stdio_override {
+                    Some(o) => (o.borrow().stdout.clone(), o.borrow().stderr.as_ref().and_then(|f| f.try_clone().ok())),
+                    None => (None, None),
+                };
+                let any = enclosing_stdin.is_some() || stdout.is_some() || stderr.is_some();
+                any.then(|| Rc::new(RefCell::new(StdioOverride { stdin: enclosing_stdin, stdout, stderr })))
+            };
             // A stage is a subshell, not the login shell; see
             // `run_body_in_child_shell`.
             child.login_shell = false;
@@ -8598,10 +8615,13 @@ impl Shell {
             // fd 1: a builtin writes to the shell's sink, still the
             // enclosing `$( )` capture or pane, so `echo hello | wc -c`
             // would bypass the pipe. As a redirect, the sink follows it, as
-            // for `echo hello >file`.
-            let stdio = match stdout_fd.as_ref().and_then(|fd| fd.try_clone().ok()) {
-                Some(fd) => ChildStdio { stdout: Some(Capture::file(std::fs::File::from(fd))), ..ChildStdio::default() },
-                None => ChildStdio::default(),
+            // for `echo hello >file`. The read end is its explicit stdin
+            // for the same reason: inside `{ a | b; } <<EOF` the enclosing
+            // stdin is the here-doc, which `b` would read instead.
+            let stdio = ChildStdio {
+                stdout: stdout_fd.as_ref().and_then(|fd| fd.try_clone().ok()).map(|fd| Capture::file(std::fs::File::from(fd))),
+                stdin: stdin_fd.as_ref().and_then(|fd| fd.try_clone().ok()).map(std::fs::File::from),
+                ..ChildStdio::default()
             };
             // Armed for the duration: this stage runs inline, so nothing
             // else empties the pane's pty while it writes to a pipe whose
