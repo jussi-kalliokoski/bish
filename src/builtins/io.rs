@@ -72,6 +72,8 @@ pub(crate) fn run_printf(sh: &mut Shell, args: &[String]) -> i32 {
     } else {
         (None, &args[..])
     };
+    // `--` ends the options, so a format can start with `-`.
+    let rest = rest.strip_prefix(&["--".to_string()][..]).unwrap_or(rest);
     let Some(format) = rest.first() else {
         sh_eprintln!(sh, "bish: printf: usage: printf format [arguments]");
         return 1;
