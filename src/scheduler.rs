@@ -73,6 +73,12 @@ thread_local! {
     static DRIVING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Whether a scheduler is already driving this thread. Another one's
+/// `run` would then return at once without running anything.
+pub fn is_driving() -> bool {
+    DRIVING.get()
+}
+
 /// `true` if this call took the guard, and so must give it back.
 fn take_driving() -> bool {
     !DRIVING.replace(true)

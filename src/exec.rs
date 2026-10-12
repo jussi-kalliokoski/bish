@@ -8306,7 +8306,15 @@ impl Shell {
 
         // Two or more stages needing a shell can't take turns inline, each
         // waiting on a pipe the other holds, so they go to the scheduler.
-        if !background && !lastpipe && n >= 2 && commands.iter().filter(|c| self.stage_needs_interpreter(c)).count() >= 2 {
+        // Not from inside a stage the scheduler already runs: it doesn't
+        // nest (see `scheduler::is_driving`), so the inner pipeline's
+        // stages would never run. The path below needs no scheduler.
+        if !background
+            && !lastpipe
+            && n >= 2
+            && !crate::scheduler::is_driving()
+            && commands.iter().filter(|c| self.stage_needs_interpreter(c)).count() >= 2
+        {
             return self.run_multi_scheduled(commands);
         }
         // The one stage that can run in this shell: when exactly one stage
