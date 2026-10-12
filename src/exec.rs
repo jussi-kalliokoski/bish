@@ -4937,7 +4937,10 @@ impl Shell {
         if !sc.redirects.is_empty() || !sc.assigns.is_empty() {
             return None;
         }
-        let argv = self.expand_words(&sc.words);
+        let argv = {
+            let argv = self.expand_words(&sc.words);
+            self.command_word_dropped(argv)
+        };
         (!argv.is_empty()).then_some(argv)
     }
 
@@ -6403,8 +6406,12 @@ impl Shell {
         // Only for a command that runs in this shell. An external's
         // redirects are applied to the process by `resolve_redirects`
         // later, and expanding them here too would expand each target
-        // twice, possibly naming two different files.
-        let runs_here = self.is_active_builtin(&name) || self.functions.contains_key(&name);
+        // twice, possibly naming two different files. For `command NAME`
+        // that is NAME, never as a function.
+        let runs_here = match bare_command_target(argv).filter(|_| name == "command" && self.is_active_builtin("command")) {
+            Some(i) => self.is_active_builtin(&argv[i]),
+            None => self.is_active_builtin(&name) || self.functions.contains_key(&name),
+        };
         let pushed = if runs_here {
             match self.push_builtin_output_sink(&cmd.redirects, &name) {
                 Ok(pushed) => pushed,
@@ -6464,8 +6471,8 @@ impl Shell {
             ":" => return ExecResult::Status(0),
             // `command [-v|-V] name [args...]`. `-v`/`-V` report what
             // `name` resolves to without running it
-            // (`command -v git >/dev/null`). Bare, it runs `name` as an
-            // external, past functions and, unlike bash, builtins too.
+            // (`command -v git >/dev/null`). Bare, it runs `name` past
+            // functions; a builtin is still the builtin, as in bash.
             "command" => {
                 let mut i = 1;
                 let mut mode_v = false;
@@ -6504,50 +6511,20 @@ impl Shell {
                 if self.check_restricted_command_name(&argv[i]) {
                     return ExecResult::Status(1);
                 }
-                let mut ext = self.command(&argv[i]);
                 // `-p` searches a fixed standard path (`getconf PATH`'s
                 // answer) instead of the caller's PATH, for the lookup and
-                // the command's environment, since `Command` uses one PATH
-                // for both.
-                if mode_p {
-                    ext.env("PATH", "/usr/bin:/bin");
-                }
-                ext.args(&argv[i + 1..]);
-                ext.current_dir(&self.cwd);
-                // The construct's stdio, so `command foo` inside a
-                // converted subshell or substitution is captured (mise's
-                // activation shadows itself with a function calling
-                // `command "$__MISE_EXE"`, inside `$( )`).
-                ext.stdin(self.spawn_stdin_stdio());
-                ext.stdout(self.spawn_stdout_stdio());
-                // See `apply_fd_redirects`' pre_exec: otherwise
-                // `command foo` inherits bish's ignored SIGINT and ignores
-                // Ctrl-C.
-                #[cfg(unix)]
-                unsafe {
-                    ext.pre_exec(|| {
-                        crate::platform::default_signal(crate::platform::SIGINT);
-                        Ok(())
-                    });
-                }
-                self.note_external_spawn();
-                return match ext.status() {
-                    Ok(status) => ExecResult::Status(exit_code_from_status(status)),
-                    Err(e) => {
-                        // The same answers and statuses as an ordinary
-                        // command word; see `spawn_external`'s Err arm.
-                        let name = &argv[i];
-                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                        let (text, status) = match (not_found, name.contains('/')) {
-                            (true, false) => ("command not found".to_string(), 127),
-                            (true, true) => (os_message(&e), 127),
-                            (false, _) if std::path::Path::new(name).is_dir() => ("Is a directory".to_string(), 126),
-                            (false, _) => (os_message(&e), 126),
-                        };
-                        sh_eprintln!(self, "bish: {}: {}", name, text);
-                        ExecResult::Status(status)
-                    }
+                // the command's environment.
+                const STANDARD_PATH: &str = "/usr/bin:/bin";
+                let restore = match mode_p {
+                    true => self.apply_prefix_assigns(&[("PATH".to_string(), STANDARD_PATH.to_string())]),
+                    false => Vec::new(),
                 };
+                // The impl rather than the wrapper, which already scoped
+                // the redirects to `argv[i]` (see `bare_command_target`).
+                let inner_name = argv[i].clone();
+                let result = self.dispatch_builtin_or_external_impl(&argv[i..], inner_name, cmd, background, false, &[]);
+                self.restore_prefix_assigns(restore);
+                return result;
             }
             // `builtin NAME [args...]`: the real builtin even when a
             // function shadows it, never an external ("not a shell builtin"
@@ -8008,6 +7985,18 @@ impl Shell {
         let parser::Command::Simple(sc) = cmd else { return true };
         let Some(first) = sc.words.first() else { return true };
         match first.chunks.as_slice() {
+            // `command NAME` for an external NAME is that external, a real
+            // process. As a shell stage it would spawn on its own pipe and
+            // hang the pipeline (`f | command tail -1`). Spawn sites that
+            // trust this answer drop the word with `command_word_dropped`.
+            [crate::lexer::Chunk::Str(name)] | [crate::lexer::Chunk::LiteralStr(name, _)] if name == "command" && self.is_active_builtin(name) => {
+                match sc.words.get(1).map(|w| w.chunks.as_slice()) {
+                    Some([crate::lexer::Chunk::Str(target)] | [crate::lexer::Chunk::LiteralStr(target, _)]) => {
+                        target.starts_with('-') || self.is_active_builtin(target)
+                    }
+                    _ => true,
+                }
+            }
             // A quoted name is the same name (`'wc' -l` runs wc), as in
             // `run_single`. The serializer quotes every word, so a
             // re-exec'd construct arrives this way, and classing a quoted
@@ -8017,6 +8006,20 @@ impl Shell {
             }
             _ => true,
         }
+    }
+
+    /// `argv` without a leading `command` that only means "from PATH", for
+    /// a stage `stage_needs_interpreter` classed as a real process.
+    fn command_word_dropped(&self, mut argv: Vec<String>) -> Vec<String> {
+        if argv.len() >= 2
+            && argv[0] == "command"
+            && self.is_active_builtin("command")
+            && !argv[1].starts_with('-')
+            && !self.is_active_builtin(&argv[1])
+        {
+            argv.remove(0);
+        }
+        argv
     }
 
     /// A pipeline with two or more stages needing a shell, without extra
@@ -8079,7 +8082,10 @@ impl Shell {
             let stdout_end = write_ends[i].take();
             if !is_shell_stage[i] {
                 let parser::Command::Simple(sc) = cmd else { unreachable!("a non-simple command always needs a shell") };
-                let argv: Vec<String> = self.expand_words(&sc.words);
+                let argv: Vec<String> = {
+                    let argv = self.expand_words(&sc.words);
+                    self.command_word_dropped(argv)
+                };
                 if argv.is_empty() {
                     continue;
                 }
@@ -8369,7 +8375,10 @@ impl Shell {
                         kill_all(children);
                         return 1;
                     }
-                    let argv: Vec<String> = self.expand_words(&sc.words);
+                    let argv: Vec<String> = {
+                        let argv = self.expand_words(&sc.words);
+                        self.command_word_dropped(argv)
+                    };
                     if argv.is_empty() {
                         continue;
                     }
@@ -14264,6 +14273,14 @@ fn logical_path(base: &std::path::Path, target: &std::path::Path) -> std::path::
         out.push(part);
     }
     out
+}
+
+/// Where in `command [-p] NAME args...` NAME is, or `None` for the
+/// `-v`/`-V` lookups and a bare `command`, which run nothing.
+fn bare_command_target(argv: &[String]) -> Option<usize> {
+    let i = 1 + argv.get(1..)?.iter().take_while(|a| matches!(a.as_str(), "-v" | "-V" | "-p")).count();
+    let lookup = argv[1..i].iter().any(|a| a != "-p");
+    (!lookup && i < argv.len()).then_some(i)
 }
 
 pub(crate) fn command_own_redirects(cmd: &parser::Command) -> &[Redirect] {
