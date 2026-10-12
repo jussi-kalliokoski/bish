@@ -6310,20 +6310,33 @@ impl Shell {
             }
             if !Self::compound_redirects_are_simple(&cmd.redirects) {
                 // A numbered-fd redirect on a call has no in-process model
-                // (see `run_compound_redirected`), so the body runs as a
-                // redirected compound.
+                // (see `run_compound_redirected`), so the call runs as a
+                // redirected compound. The call, by name with the words
+                // already expanded: the body alone has no function frame,
+                // so its `return` would return from the caller.
+                let literal = |s: &String| parser::Word {
+                    chunks: vec![crate::lexer::Chunk::LiteralStr(s.clone(), crate::lexer::Quoting::Single)],
+                    globbable: false,
+                };
+                let call = parser::Command::Simple(SimpleCommand {
+                    assigns: Vec::new(),
+                    array_assigns: Vec::new(),
+                    array_word_assigns: Vec::new(),
+                    index_assigns: Vec::new(),
+                    words: argv.iter().map(literal).collect(),
+                    redirects: Vec::new(),
+                    rendered: std::cell::OnceCell::new(),
+                });
                 let group = parser::Command::Group(
                     vec![ListItem {
-                        and_or: AndOr { first: Pipeline { commands: vec![body.clone()], negate: false, timed: None }, rest: Vec::new() },
+                        and_or: AndOr { first: Pipeline { commands: vec![call], negate: false, timed: None }, rest: Vec::new() },
                         sep: Sep::Seq,
                         line: self.current_line,
                         end_line: self.current_line,
                     }],
                     Vec::new(),
                 );
-                self.arg_frames.push(argv[1..].to_vec());
                 let result = self.run_compound_redirected(&group, &cmd.redirects, background);
-                self.arg_frames.pop();
                 self.restore_prefix_assigns(restore);
                 return result;
             }
