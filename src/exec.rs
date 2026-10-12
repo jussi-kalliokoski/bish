@@ -7167,55 +7167,57 @@ impl Shell {
                     read_line_or_chars(&mut *reader, nchars, delim, raw)
                 };
 
-                return match got {
-                    None => ExecResult::Status(1),
-                    Some(line) => {
-                        let ifs = self.get_ifs();
-                        // Without `-r` the escapes come off, and what they
-                        // protected is remembered, so an escaped separator
-                        // stays in its field.
-                        let (line, mask) = if raw { (line, Vec::new()) } else { unescape_read_line(&line) };
-                        let chars: Vec<char> = line.chars().collect();
-                        let mask = if raw { vec![false; chars.len()] } else { mask };
-                        if let Some(arr) = array_name {
-                            let parts = ifs_tokenize_masked(&chars, &mask, &ifs);
-                            let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(parts.into_iter().enumerate());
-                            self.arrays.insert(arr.to_string(), map);
-                            self.array_names.insert(arr.to_string());
-                        } else if names.is_empty() {
-                            self.assign_var("REPLY", line.clone());
-                        } else {
-                            let is_ifs_ws = |i: usize| !mask[i] && chars[i].is_whitespace() && ifs.contains(chars[i]);
-                            let mut at = 0;
-                            while at < chars.len() && is_ifs_ws(at) {
-                                at += 1;
+                // End of input with nothing read still assigns, every name
+                // empty, as in bash: `while read -r l || [ -n "$l" ]`
+                // stops on that.
+                let (line, clean) = match got {
+                    Some(line) => (line, clean),
+                    None => (String::new(), false),
+                };
+                let ifs = self.get_ifs();
+                // Without `-r` the escapes come off, and what they
+                // protected is remembered, so an escaped separator
+                // stays in its field.
+                let (line, mask) = if raw { (line, Vec::new()) } else { unescape_read_line(&line) };
+                let chars: Vec<char> = line.chars().collect();
+                let mask = if raw { vec![false; chars.len()] } else { mask };
+                if let Some(arr) = array_name {
+                    let parts = ifs_tokenize_masked(&chars, &mask, &ifs);
+                    let map: std::collections::BTreeMap<usize, String> = crate::sort::btree_map(parts.into_iter().enumerate());
+                    self.arrays.insert(arr.to_string(), map);
+                    self.array_names.insert(arr.to_string());
+                } else if names.is_empty() {
+                    self.assign_var("REPLY", line.clone());
+                } else {
+                    let is_ifs_ws = |i: usize| !mask[i] && chars[i].is_whitespace() && ifs.contains(chars[i]);
+                    let mut at = 0;
+                    while at < chars.len() && is_ifs_ws(at) {
+                        at += 1;
+                    }
+                    for (i, n) in names.iter().enumerate() {
+                        if i == names.len() - 1 {
+                            let mut end = chars.len();
+                            while end > at && is_ifs_ws(end - 1) {
+                                end -= 1;
                             }
-                            for (i, n) in names.iter().enumerate() {
-                                if i == names.len() - 1 {
-                                    let mut end = chars.len();
-                                    while end > at && is_ifs_ws(end - 1) {
-                                        end -= 1;
-                                    }
-                                    let rest: String = chars[at..end].iter().collect();
+                            let rest: String = chars[at..end].iter().collect();
+                            self.assign_var(n, rest);
+                        } else {
+                            match ifs_next_field_masked(&chars, &mask, &ifs, at) {
+                                Some((field, next)) => {
+                                    self.assign_var(n, field);
+                                    at = next;
+                                }
+                                None => {
+                                    let rest: String = chars[at..].iter().collect();
                                     self.assign_var(n, rest);
-                                } else {
-                                    match ifs_next_field_masked(&chars, &mask, &ifs, at) {
-                                        Some((field, next)) => {
-                                            self.assign_var(n, field);
-                                            at = next;
-                                        }
-                                        None => {
-                                            let rest: String = chars[at..].iter().collect();
-                                            self.assign_var(n, rest);
-                                            at = chars.len();
-                                        }
-                                    }
+                                    at = chars.len();
                                 }
                             }
                         }
-                        ExecResult::Status(if clean { 0 } else { 1 })
                     }
-                };
+                }
+                return ExecResult::Status(if clean { 0 } else { 1 });
             }
             // `mapfile`/`readarray [options] [name]`: reads lines from
             // stdin (or the command's `<`, through `read_input_source`)
