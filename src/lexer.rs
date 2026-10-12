@@ -817,15 +817,32 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let mut depth = 1;
         let mut s = String::new();
+        let mut cases = CaseTracker::new();
         loop {
-            match self.advance() {
+            let c = self.advance();
+            if !matches!(c, Some(c) if is_word_char(c)) {
+                cases.end_word();
+            }
+            match c {
                 None => return Err("unterminated '('".to_string()),
+                Some('(') if cases.at_pattern_start() => {
+                    // The optional `(` of `(a|b) ...`. It and the arm's
+                    // `)` are not a nesting level.
+                    cases.cmd_start = false;
+                    s.push('(');
+                }
+                Some(')') if cases.in_pattern() => {
+                    cases.enter_body();
+                    s.push(')');
+                }
                 Some('(') => {
                     depth += 1;
+                    cases.cmd_start = true;
                     s.push('(');
                 }
                 Some(')') => {
                     depth -= 1;
+                    cases.cmd_start = false;
                     if depth == 0 {
                         // `pos` is past the closing `)`, so `pos - 1` is
                         // its index, the content's end.
@@ -835,6 +852,7 @@ impl<'a> Lexer<'a> {
                     s.push(')');
                 }
                 Some('\'') => {
+                    cases.taint();
                     s.push('\'');
                     loop {
                         match self.advance() {
@@ -848,6 +866,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('"') => {
+                    cases.taint();
                     s.push('"');
                     loop {
                         match self.advance() {
@@ -867,6 +886,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some('\\') => {
+                    cases.taint();
                     s.push('\\');
                     if let Some(n) = self.advance() {
                         s.push(n);
@@ -887,7 +907,25 @@ impl<'a> Lexer<'a> {
                         self.advance();
                     }
                 }
-                Some(c) => s.push(c),
+                Some(';') if cases.in_body() && matches!(self.chars.peek(), Some(';' | '&')) => {
+                    s.push(';');
+                    let second = self.advance().unwrap();
+                    s.push(second);
+                    if second == ';' && self.chars.peek() == Some(&'&') {
+                        s.push(self.advance().unwrap());
+                    }
+                    cases.enter_pattern();
+                }
+                Some(c) if is_word_char(c) => {
+                    cases.word.push(c);
+                    s.push(c);
+                }
+                Some(c) => {
+                    if c == '\n' || matches!(c, ';' | '&' | '|') {
+                        cases.cmd_start = true;
+                    }
+                    s.push(c);
+                }
             }
         }
         Ok(s)
@@ -1606,6 +1644,99 @@ pub struct SpannedResult {
 /// that care add it.
 fn is_metacharacter(c: char) -> bool {
     matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
+}
+
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace() && !is_metacharacter(c) && !matches!(c, '\'' | '"' | '\\' | '#')
+}
+
+/// Enough of the grammar for `capture_balanced_parens` to tell a `case`
+/// pattern's `)`, which closes no paren, from the one that ends the
+/// capture: `( case $x in a) b ;; esac )`. The rest of the grammar is
+/// left to the real lex when the capture runs.
+struct CaseTracker {
+    /// The plain word being read; `tainted` once it has a quote or an
+    /// escape in it, so `"case"` is no keyword.
+    word: String,
+    tainted: bool,
+    /// Whether the next word is a command's first, where a keyword can
+    /// be one. In `Pattern`, whether it starts the next pattern.
+    cmd_start: bool,
+    stack: Vec<CaseState>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CaseState {
+    /// Between `case` and `in`.
+    Subject,
+    Pattern,
+    Body,
+}
+
+impl CaseTracker {
+    fn new() -> Self {
+        CaseTracker { word: String::new(), tainted: false, cmd_start: true, stack: Vec::new() }
+    }
+
+    fn taint(&mut self) {
+        self.tainted = true;
+    }
+
+    fn in_pattern(&self) -> bool {
+        self.stack.last() == Some(&CaseState::Pattern)
+    }
+
+    fn at_pattern_start(&self) -> bool {
+        self.in_pattern() && self.cmd_start
+    }
+
+    fn in_body(&self) -> bool {
+        self.stack.last() == Some(&CaseState::Body)
+    }
+
+    fn enter_pattern(&mut self) {
+        *self.stack.last_mut().unwrap() = CaseState::Pattern;
+        self.cmd_start = true;
+    }
+
+    fn enter_body(&mut self) {
+        *self.stack.last_mut().unwrap() = CaseState::Body;
+        self.cmd_start = true;
+    }
+
+    fn end_word(&mut self) {
+        if self.word.is_empty() && !self.tainted {
+            return;
+        }
+        let word = if self.tainted { "" } else { self.word.as_str() };
+        match self.stack.last() {
+            Some(CaseState::Subject) => {
+                if word == "in" {
+                    self.enter_pattern();
+                }
+            }
+            Some(CaseState::Pattern) => {
+                if self.cmd_start && word == "esac" {
+                    self.stack.pop();
+                }
+                self.cmd_start = false;
+            }
+            _ if self.cmd_start && word == "case" => {
+                self.stack.push(CaseState::Subject);
+                self.cmd_start = false;
+            }
+            _ if self.cmd_start && word == "esac" && self.in_body() => {
+                self.stack.pop();
+                self.cmd_start = false;
+            }
+            _ => {
+                let keyword = matches!(word, "then" | "do" | "else" | "elif" | "if" | "while" | "until" | "!" | "{" | "}" | "time");
+                self.cmd_start = self.cmd_start && keyword;
+            }
+        }
+        self.word.clear();
+        self.tainted = false;
+    }
 }
 
 /// Whether `text` is an assignment's name part, as bash decides: an
@@ -2532,6 +2663,28 @@ mod tests {
         assert!(lexes("x=$(echo a # )\n)"));
         assert!(!lexes("x=$(echo a#'b)"), "a mid-word `#` opens no comment, so the quote is unterminated");
         assert!(lexes("x=$(echo $# ${#y})"));
+    }
+
+    #[test]
+    fn a_case_inside_parens_keeps_its_patterns_closing_parens() {
+        let raw = |src: &str| {
+            let toks = super::Lexer::new(src).tokenize().unwrap_or_else(|e| panic!("{src:?}: {e}"));
+            toks.into_iter()
+                .find_map(|(tok, _)| match tok {
+                    super::Tok::Word(chunks, _) => chunks.into_iter().find_map(|c| match c {
+                        super::Chunk::Sub { raw, .. } => Some(raw),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no substitution in {src:?}"))
+        };
+        let body = "case $x in '/'*) (a) ;; (b|c) d ;;& *) e\n esac";
+        assert_eq!(raw(&format!("y=$({body})")), body);
+        assert_eq!(raw(&format!("y=$({body}; echo z)")), format!("{body}; echo z"));
+        assert_eq!(raw("y=$(case a in a) case b in b) c;; esac;; esac)"), "case a in a) case b in b) c;; esac;; esac");
+        assert_eq!(raw("y=$(echo case x in a) b"), "echo case x in a", "only a command's first word is a keyword");
+        assert_eq!(raw("y=$(\"case\" x in a) b"), "\"case\" x in a", "a quoted word is no keyword");
     }
 
     // An assignment's value carries a `Tilde` chunk per prefix; a word bash
